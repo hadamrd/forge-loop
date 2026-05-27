@@ -384,28 +384,6 @@ def test_sdk_rate_limit_mid_stream_emits_error_not_crash(patch_sdk_types: None) 
     assert res.error is not None and "rate_limit" in res.error
 
 
-def test_sdk_budget_hook_aborts_iteration(patch_sdk_types: None) -> None:
-    """When the budget hook says stop, the worker emits an error and bails."""
-    messages = [
-        _FakeAssistantMessage(content=[_FakeTextBlock(text="t1")],
-                              usage={"input_tokens": 1000000}),
-        _FakeAssistantMessage(content=[_FakeTextBlock(text="t2")]),  # should not be reached
-        _FakeResultMessage(result="never seen"),
-    ]
-    calls = {"n": 0}
-    def _hook(_c: float, _u: dict[str, Any], _m: str | None) -> bool:
-        calls["n"] += 1
-        return True  # always trip
-    events: list[dict[str, Any]] = []
-    res = _run(messages, on_event=events.append, budget_should_stop=_hook)
-    err = [e for e in events if e["kind"] == "error"]
-    assert len(err) == 1
-    assert err[0]["error_type"] == "budget_exceeded"
-    # Never got to second assistant text
-    assert sum(1 for e in events if e["kind"] == "assistant_text") == 1
-    assert res.status == "failed"
-
-
 def test_sdk_path_does_not_import_subprocess() -> None:
     """Acceptance criterion: the new worker path is subprocess-free.
 

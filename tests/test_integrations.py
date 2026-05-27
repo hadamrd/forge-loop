@@ -137,7 +137,7 @@ def test_deliver_posts_to_mock_endpoint(tmp_path: Path) -> None:
 def test_dispatch_filters_by_on_list(tmp_path: Path) -> None:
     poster = _MockPoster([200])
     subscribed = _channel(name="a", on=("worker_stuck",))
-    other = _channel(name="b", on=("budget_exceeded",))
+    other = _channel(name="b", on=("redeploy_failed",))
     out = dispatch(
         [subscribed, other],
         {"kind": "worker_stuck", "message": "m", "url": "u"},
@@ -236,7 +236,7 @@ def test_load_channels_reads_yaml_files(tmp_path: Path) -> None:
     (base / "ops.yaml").write_text(
         "kind: slack\n"
         "url: https://hooks.slack.com/x\n"
-        "on: [worker_stuck, budget_exceeded]\n"
+        "on: [worker_stuck, critic_blocking]\n"
         "format: '{kind} :: {message}'\n"
         "retries: 5\n"
     )
@@ -247,7 +247,7 @@ def test_load_channels_reads_yaml_files(tmp_path: Path) -> None:
     assert {c.name for c in channels} == {"ops", "alerts"}
     ops = next(c for c in channels if c.name == "ops")
     assert ops.kind == "slack"
-    assert ops.on == ("worker_stuck", "budget_exceeded")
+    assert ops.on == ("worker_stuck", "critic_blocking")
     assert ops.retries == 5
     assert ops.format == "{kind} :: {message}"
 
@@ -305,12 +305,11 @@ def test_integration_worker_stuck_reaches_slack_endpoint(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
-def _ctx(tmp_path: Path, *, spend: float | None = None) -> cmd_mod.CommandContext:
+def _ctx(tmp_path: Path) -> cmd_mod.CommandContext:
     return cmd_mod.CommandContext(
         pause_file=tmp_path / "loop.pause",
         state_file=tmp_path / "loop.json",
         events_file=tmp_path / "events.jsonl",
-        today_spend=(lambda: spend) if spend is not None else None,
     )
 
 
@@ -376,28 +375,6 @@ def test_status_missing_state_returns_zero(tmp_path: Path) -> None:
     )
     assert res.status == 200
     assert "0" in res.text
-
-
-def test_budget_reports_today_spend(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path, spend=3.14)
-    res = cmd_mod.handle(
-        {"text": "budget", "channel_id": "C-ALLOWED"},
-        _slack_channel(),
-        ctx,
-    )
-    assert res.status == 200
-    assert "$3.14" in res.text
-
-
-def test_budget_missing_ledger_does_not_crash(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path)  # today_spend=None
-    res = cmd_mod.handle(
-        {"text": "budget", "channel_id": "C-ALLOWED"},
-        _slack_channel(),
-        ctx,
-    )
-    assert res.status == 200
-    assert "unavailable" in res.text
 
 
 def test_unknown_command_returns_help_and_does_not_mutate(tmp_path: Path) -> None:
