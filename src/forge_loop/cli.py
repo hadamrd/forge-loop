@@ -203,6 +203,36 @@ def _cmd_stop(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    """Start the operator dashboard (FastAPI + HTMX).
+
+    Defaults to ``127.0.0.1`` to avoid accidentally exposing an unauthed
+    surface. Override with ``--host 0.0.0.0`` only when a token is set
+    via ``LOOP_DASHBOARD_TOKEN`` — the server hard-refuses otherwise.
+    """
+    import os as _os
+
+    from forge_loop.dashboard.app import DashboardBindError
+    from forge_loop.dashboard.app import serve as _serve
+
+    cfg = load()
+    host = args.host or "127.0.0.1"
+    port = int(args.port or _os.environ.get("LOOP_DASHBOARD_PORT") or 8765)
+    roles_dir = Path(args.roles_dir) if args.roles_dir else cfg.repo / "roles"
+    try:
+        _serve(
+            host=host,
+            port=port,
+            state_dir=cfg.state_dir,
+            roles_dir=roles_dir,
+            token=_os.environ.get("LOOP_DASHBOARD_TOKEN") or None,
+        )
+    except DashboardBindError as exc:
+        sys.stderr.write(f"dashboard: {exc}\n")
+        return 2
+    return 0
+
+
 def _cmd_mcp_serve(_args: argparse.Namespace) -> int:
     from forge_loop.mcp_server import serve_stdio
 
@@ -465,18 +495,24 @@ def _cmd_replay(args: argparse.Namespace) -> int:
         return 2
 
     if args.dry_plan:
-        print(json.dumps({
-            "original_tick": plan.original_tick,
-            "replay_tick": plan.replay_tick,
-            "role": plan.role,
-            "invocations": [
+        print(
+            json.dumps(
                 {
-                    "issue": inv.issue, "title": inv.title,
-                    "fixture": str(inv.fixture_path) if inv.fixture_path else None,
-                }
-                for inv in plan.invocations
-            ],
-        }, indent=2))
+                    "original_tick": plan.original_tick,
+                    "replay_tick": plan.replay_tick,
+                    "role": plan.role,
+                    "invocations": [
+                        {
+                            "issue": inv.issue,
+                            "title": inv.title,
+                            "fixture": str(inv.fixture_path) if inv.fixture_path else None,
+                        }
+                        for inv in plan.invocations
+                    ],
+                },
+                indent=2,
+            )
+        )
         return 0
 
     try:
@@ -485,19 +521,27 @@ def _cmd_replay(args: argparse.Namespace) -> int:
         sys.stderr.write(f"[replay] {exc}\n")
         return 3
 
-    print(json.dumps({
-        "original_tick": plan.original_tick,
-        "replay_tick": plan.replay_tick,
-        "captures": [
+    print(
+        json.dumps(
             {
-                "issue": c.issue, "status": c.status,
-                "source": c.source, "cost_usd": c.cost_usd,
-                "commit": c.commit_hash, "diff_chars": len(c.diff_text),
-                "error": c.error,
-            }
-            for c in captures
-        ],
-    }, indent=2))
+                "original_tick": plan.original_tick,
+                "replay_tick": plan.replay_tick,
+                "captures": [
+                    {
+                        "issue": c.issue,
+                        "status": c.status,
+                        "source": c.source,
+                        "cost_usd": c.cost_usd,
+                        "commit": c.commit_hash,
+                        "diff_chars": len(c.diff_text),
+                        "error": c.error,
+                    }
+                    for c in captures
+                ],
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -508,7 +552,9 @@ def _cmd_replay_diff(args: argparse.Namespace) -> int:
     cfg = load()
     try:
         report = _replay.build_diff_report(
-            cfg.events_file, tick=args.tick, replay_tick=args.replay_tick,
+            cfg.events_file,
+            tick=args.tick,
+            replay_tick=args.replay_tick,
         )
     except _replay.ReplayError as exc:
         sys.stderr.write(f"[replay diff] {exc}\n")
@@ -549,8 +595,11 @@ def _cmd_repos_list(args: argparse.Namespace) -> int:
     # can see the most recent global tick that touched each repo, even
     # across loop restarts.
     last_activity: dict[str, dict[str, Any]] = {}
-    sidecar = repos_dir.parent.parent / ".forge" / "multirepo-events.jsonl" \
-        if repos_dir.name == "repos" else repos_dir.parent / "multirepo-events.jsonl"
+    sidecar = (
+        repos_dir.parent.parent / ".forge" / "multirepo-events.jsonl"
+        if repos_dir.name == "repos"
+        else repos_dir.parent / "multirepo-events.jsonl"
+    )
     if sidecar.exists():
         try:
             with open(sidecar) as f:
@@ -559,8 +608,12 @@ def _cmd_repos_list(args: argparse.Namespace) -> int:
                         e = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if e.get("kind") in {"repo_tick_done", "repo_skipped",
-                                          "repo_tick_start", "repo_tick_error"}:
+                    if e.get("kind") in {
+                        "repo_tick_done",
+                        "repo_skipped",
+                        "repo_tick_start",
+                        "repo_tick_error",
+                    }:
                         repo = e.get("repo")
                         if repo:
                             last_activity[repo] = {
@@ -575,16 +628,18 @@ def _cmd_repos_list(args: argparse.Namespace) -> int:
     rows = []
     for spec in specs:
         bad = validate_checkout(spec)
-        rows.append({
-            "name": spec.name,
-            "github": spec.github,
-            "checkout": str(spec.checkout),
-            "disabled": is_disabled(spec),
-            "checkout_invalid": bad,
-            "budget_usd_per_day": spec.budget_usd_per_day,
-            "source": str(spec.source_path) if spec.source_path else None,
-            "last_activity": last_activity.get(spec.name),
-        })
+        rows.append(
+            {
+                "name": spec.name,
+                "github": spec.github,
+                "checkout": str(spec.checkout),
+                "disabled": is_disabled(spec),
+                "checkout_invalid": bad,
+                "budget_usd_per_day": spec.budget_usd_per_day,
+                "source": str(spec.source_path) if spec.source_path else None,
+                "last_activity": last_activity.get(spec.name),
+            }
+        )
 
     if args.json:
         print(json.dumps({"repos_dir": str(repos_dir), "repos": rows}, indent=2))
@@ -592,8 +647,10 @@ def _cmd_repos_list(args: argparse.Namespace) -> int:
 
     print(f"== forge-loop repos ({repos_dir}) ==")
     if not rows:
-        print("  (no repo specs loaded — run `forge-loop init` per-repo or "
-              "create .forge/repos/*.yaml)")
+        print(
+            "  (no repo specs loaded — run `forge-loop init` per-repo or "
+            "create .forge/repos/*.yaml)"
+        )
         return 0
     for r in rows:
         flags = []
@@ -603,8 +660,11 @@ def _cmd_repos_list(args: argparse.Namespace) -> int:
             flags.append(f"INVALID({r['checkout_invalid']})")
         flag_s = "  [" + ", ".join(flags) + "]" if flags else ""
         last = r["last_activity"]
-        last_s = (f"  last: tick {last['tick']} {last['kind']} "
-                  f"({last['ts']})") if last else "  last: never"
+        last_s = (
+            (f"  last: tick {last['tick']} {last['kind']} ({last['ts']})")
+            if last
+            else "  last: never"
+        )
         print(f"  - {r['name']:<20} {r['github']:<30}{flag_s}")
         print(f"    checkout: {r['checkout']}")
         print(f"    budget/day: ${r['budget_usd_per_day']:.2f}{last_s}")
@@ -746,10 +806,12 @@ def _cmd_config_models(args: argparse.Namespace) -> int:
         ("critic", cfg.critic.model, cfg.critic.thinking),
     ]
     if getattr(args, "json", False):
-        print(json.dumps(
-            {role: {"model": m, "thinking": t} for role, m, t in rows},
-            indent=2,
-        ))
+        print(
+            json.dumps(
+                {role: {"model": m, "thinking": t} for role, m, t in rows},
+                indent=2,
+            )
+        )
         return 0
     print(f"{'ROLE':<8} {'MODEL':<22} THINKING")
     for role, model, thinking in rows:
@@ -808,7 +870,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("stop", help="Touch stop file").set_defaults(func=_cmd_stop)
     p_config = sub.add_parser("config", help="Print resolved config")
     p_config.add_argument(
-        "--json", action="store_true",
+        "--json",
+        action="store_true",
         help="Emit JSON (default also emits JSON for back-compat)",
     )
     p_config.set_defaults(func=_cmd_config)
@@ -827,11 +890,11 @@ def main(argv: list[str] | None = None) -> int:
     pipe_sub = p_pipe.add_subparsers(dest="pipeline_cmd", required=True)
     p_pipe_show = pipe_sub.add_parser("show", help="Print the resolved DAG as ASCII art")
     p_pipe_show.add_argument(
-        "--config", default=None,
+        "--config",
+        default=None,
         help="Path to pipeline.yaml (default: ./.forge/pipeline.yaml)",
     )
-    p_pipe_show.add_argument("--json", action="store_true",
-                              help="Emit JSON instead of ASCII art")
+    p_pipe_show.add_argument("--json", action="store_true", help="Emit JSON instead of ASCII art")
     p_pipe_show.set_defaults(func=_cmd_pipeline_show)
 
     p_repos = sub.add_parser(
@@ -841,7 +904,8 @@ def main(argv: list[str] | None = None) -> int:
     repos_sub = p_repos.add_subparsers(dest="repos_cmd", required=True)
     p_repos_list = repos_sub.add_parser("list", help="List loaded repos + last activity")
     p_repos_list.add_argument(
-        "--repos-dir", default=None,
+        "--repos-dir",
+        default=None,
         help="Override the .forge/repos directory (default: $LOOP_REPOS_DIR or ./.forge/repos)",
     )
     p_repos_list.add_argument("--json", action="store_true")
@@ -867,6 +931,28 @@ def main(argv: list[str] | None = None) -> int:
         "--force", action="store_true", help="Bypass in-flight and cooldown fingerprint guards"
     )
     p_retry.set_defaults(func=_cmd_retry)
+
+    p_dash = sub.add_parser(
+        "dashboard",
+        help="Run the operator dashboard (HTMX-driven FastAPI app)",
+    )
+    p_dash.add_argument(
+        "--host",
+        default=None,
+        help="Bind host. Default 127.0.0.1; refuses 0.0.0.0 without LOOP_DASHBOARD_TOKEN.",
+    )
+    p_dash.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port (default 8765 or $LOOP_DASHBOARD_PORT)",
+    )
+    p_dash.add_argument(
+        "--roles-dir",
+        default=None,
+        help="Directory holding role yaml files (default: <repo>/roles)",
+    )
+    p_dash.set_defaults(func=_cmd_dashboard)
 
     p_mcp = sub.add_parser("mcp", help="MCP server (expose tools to MCP clients)")
     mcp_sub = p_mcp.add_subparsers(dest="mcp_cmd", required=True)
@@ -933,21 +1019,25 @@ def main(argv: list[str] | None = None) -> int:
     # Default action (no subcommand): the actual replay run.
     p_replay.add_argument("--tick", type=int, help="Original tick number to replay")
     p_replay.add_argument(
-        "--role", default="worker", choices=("worker",),
+        "--role",
+        default="worker",
+        choices=("worker",),
         help="Which role to replay (only 'worker' supported per #24 scope)",
     )
     p_replay.add_argument("--brief", help="Path to the new brief file (.md / .tmpl)")
     p_replay.add_argument(
         "--fixtures-dir",
         help="Directory of recorded SDK sessions for zero-cost replay "
-             "(expects tick-{N}-issue-{n}.jsonl or issue-{n}.jsonl)",
+        "(expects tick-{N}-issue-{n}.jsonl or issue-{n}.jsonl)",
     )
     p_replay.add_argument(
-        "--suffix", default="r",
+        "--suffix",
+        default="r",
         help="Suffix appended to the original tick id for replay events (default: r)",
     )
     p_replay.add_argument(
-        "--dry-plan", action="store_true",
+        "--dry-plan",
+        action="store_true",
         help="Print the assembled invocations and exit without running anything",
     )
     p_replay.set_defaults(func=_cmd_replay)
@@ -958,10 +1048,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_replay_diff.add_argument("--tick", type=int, required=True, help="Original tick")
     p_replay_diff.add_argument(
-        "--replay-tick", required=True, help="Replay tick id (e.g. '42r')",
+        "--replay-tick",
+        required=True,
+        help="Replay tick id (e.g. '42r')",
     )
     p_replay_diff.add_argument(
-        "--json", action="store_true", help="Emit JSON instead of human-readable",
+        "--json",
+        action="store_true",
+        help="Emit JSON instead of human-readable",
     )
     p_replay_diff.set_defaults(func=_cmd_replay_diff)
 

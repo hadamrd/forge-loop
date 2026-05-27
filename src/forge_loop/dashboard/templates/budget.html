@@ -1,0 +1,18 @@
+{% extends "_base.html" %}
+{% block title %}budget — forge-loop{% endblock %}
+{% block body %}
+<h2>spend on {{ today }}: ${{ '%.4f'|format(budget.total_usd) }}</h2>
+<h3>top 10 most-expensive issues today</h3>
+{% if budget.top_issues %}
+<table>
+  <thead><tr><th>issue</th><th>spend</th></tr></thead>
+  <tbody>
+  {% for issue, spend in budget.top_issues %}
+  <tr><td>{{ issue }}</td><td>${{ '%.4f'|format(spend) }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>no cost events today.</p>
+{% endif %}
+{% endblock %}

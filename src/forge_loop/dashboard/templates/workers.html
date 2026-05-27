@@ -1,0 +1,26 @@
+{% extends "_base.html" %}
+{% block title %}workers — forge-loop{% endblock %}
+{% block body %}
+<h2>in-flight workers</h2>
+{% if workers %}
+<table>
+  <thead><tr><th>worker</th><th>issue</th><th>started</th><th>action</th></tr></thead>
+  <tbody>
+  {% for w in workers %}
+  <tr>
+    <td><code>{{ w.worker_id }}</code></td>
+    <td>{% if w.issue %}#{{ w.issue }}{% endif %}</td>
+    <td>{{ w.started_ts }}</td>
+    <td>
+      <form method="post" action="/workers/{{ w.worker_id }}/kill">
+        <button type="submit">kill</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>no in-flight workers.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,25 @@
+{% extends "_base.html" %}
+{% block title %}events — forge-loop{% endblock %}
+{% block body %}
+<section>
+  <h2>queue depth: {{ queue_depth }} · in-flight: {{ workers|length }}</h2>
+  {% if workers %}
+  <ul class="workers">
+    {% for w in workers %}
+    <li><code>{{ w.worker_id }}</code>{% if w.issue %} · #{{ w.issue }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+<section hx-ext="sse" sse-connect="/events/stream">
+  <h3>live events</h3>
+  <ul id="events" hx-swap="afterbegin" sse-swap="message"></ul>
+  <h3>recent (snapshot)</h3>
+  <ul id="snapshot">
+    {% for e in events %}
+    <li><code>{{ e.ts }}</code> <strong>{{ e.kind }}</strong>
+      {% if e.issue %}#{{ e.issue }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}
