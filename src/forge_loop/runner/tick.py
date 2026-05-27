@@ -299,13 +299,22 @@ def _tick(cfg: Config, tick: int) -> None:
         },
     )
 
-    # Post-merge: reap each merged worker's worktree (gap #2 — they were piling
-    # up. The next attempt's _prep_worktree would clean them, but only on
-    # collision; successful merges left them dangling.)
+    # Post-tick: reap EVERY worker's worktree (merged, open, failed, timeout).
+    # Originally only merged worktrees were reaped, on the theory that an
+    # operator might want to spelunk a failed worktree. In practice it never
+    # happens — the per-worker SDK log under docs/ops/loop-runner-logs/ is
+    # the artifact operators actually read, and failed worktrees just pile
+    # up under /tmp/wt-loop-* until the next boot-time reaper finds them.
+    # Reaping unconditionally here keeps the disk clean tick-to-tick.
+    # PRs that are "open" (worker pushed branch but didn't auto-merge —
+    # e.g. risk_gated, critic blocked) still have the branch on origin so
+    # the operator's PR review surface is unaffected.
     for o in outcomes:
-        if o.status == "merged":
-            _reap_worktree(cfg.repo, o.issue)
-            append_event(cfg.events_file, "worktree_reaped", issue=o.issue)
+        _reap_worktree(cfg.repo, o.issue)
+        append_event(
+            cfg.events_file, "worktree_reaped",
+            issue=o.issue, status=o.status,
+        )
 
     if merged_nums and cfg.deploy_task:
         ok, log = redeploy(cfg.repo, cfg.deploy_task)

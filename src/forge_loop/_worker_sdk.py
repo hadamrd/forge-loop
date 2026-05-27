@@ -235,6 +235,9 @@ async def run_sdk_session(
     model: str | None = None,
     thinking_budget: str | None = None,
     allowed_mcp_servers: Iterable[str] | None = None,
+    load_timeout_ms: int | None = None,
+    strict_mcp_config: bool = False,
+    mcp_servers: dict[str, Any] | None = None,
 ) -> SDKRunResult:
     """Drive one Claude Agent SDK session and stream typed WorkerEvents.
 
@@ -308,6 +311,23 @@ async def run_sdk_session(
         base_kwargs["allowed_tools"] = build_allowed_tools_patterns(allow_servers)
     if model:
         base_kwargs["model"] = model
+    # SDK init knobs (issue: Titan dogfood hit "Control request timeout:
+    # initialize" because the operator's global Claude config had ~10 MCP
+    # servers totalling ~250 tools to enumerate at session start).
+    #   * ``load_timeout_ms`` extends the SDK's init-handshake window
+    #     beyond its ~60s default. 180s (3 min) gives slow MCP enumeration
+    #     room without hiding a genuinely wedged session.
+    #   * ``strict_mcp_config`` + ``mcp_servers`` together let the worker
+    #     bypass the operator's global MCP config entirely and run with
+    #     ONLY the explicit set the loop provides. Workers don't need the
+    #     operator's Gmail/Drive/Calendar/playwright/persistent-shell etc.
+    if load_timeout_ms is not None:
+        base_kwargs["load_timeout_ms"] = int(load_timeout_ms)
+    if strict_mcp_config:
+        base_kwargs["strict_mcp_config"] = True
+        # When strict, an empty `mcp_servers` means "no MCP servers at all".
+        # The default below is the operator's explicit allow-list (may be {}).
+        base_kwargs["mcp_servers"] = dict(mcp_servers or {})
     def _instantiate(**extra: Any) -> Any:
         """Build ClaudeAgentOptions, degrading gracefully on TypeErrors.
 
@@ -316,19 +336,26 @@ async def run_sdk_session(
         the per-role model knob working even on a stale SDK pin.
         """
         kwargs = {**base_kwargs, **extra}
+        _OPTIONAL_KNOBS = (
+            "thinking_budget",
+            "allowed_tools",
+            "load_timeout_ms",
+            "strict_mcp_config",
+            "mcp_servers",
+        )
         try:
             return options_cls(**kwargs)
         except TypeError as exc:
             msg = str(exc)
-            for cand in ("thinking_budget", "allowed_tools"):
+            for cand in _OPTIONAL_KNOBS:
                 if cand in msg and cand in kwargs:
                     kwargs.pop(cand, None)
                     try:
                         return options_cls(**kwargs)
                     except TypeError:
                         continue
-            # Last-ditch: drop all the optional knobs.
-            for cand in ("thinking_budget", "allowed_tools"):
+            # Last-ditch: drop every optional knob.
+            for cand in _OPTIONAL_KNOBS:
                 kwargs.pop(cand, None)
             return options_cls(**kwargs)
 

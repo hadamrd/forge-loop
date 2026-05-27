@@ -311,6 +311,9 @@ def run_worker(
     model: str | None = None,
     thinking: str | None = None,
     allowed_mcp_servers: tuple[str, ...] | None = None,
+    load_timeout_ms: int | None = None,
+    strict_mcp_config: bool = False,
+    mcp_servers: dict[str, Any] | None = None,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -319,6 +322,12 @@ def run_worker(
 
     ``model`` / ``thinking`` (issue #34) are threaded through to the SDK so
     each role can be tuned independently of the Claude Code CLI default.
+
+    ``load_timeout_ms`` / ``strict_mcp_config`` / ``mcp_servers`` defend the
+    worker session against operator-global MCP config slowness (~250 tools
+    enumerated at init can blow the SDK's default 60s timeout). Operators
+    set these via ``worker.load_timeout_ms`` / ``worker.strict_mcp_config`` /
+    ``worker.mcp_servers`` in forge-loop.yaml or the matching env vars.
     """
     n = issue["number"]
     title = issue["title"]
@@ -353,6 +362,9 @@ def run_worker(
         model=model,
         thinking=thinking,
         allowed_mcp_servers=allowed_mcp_servers,
+        load_timeout_ms=load_timeout_ms,
+        strict_mcp_config=strict_mcp_config,
+        mcp_servers=mcp_servers,
     )
 
 
@@ -368,6 +380,9 @@ def _run_worker_sdk(
     model: str | None = None,
     thinking: str | None = None,
     allowed_mcp_servers: tuple[str, ...] | None = None,
+    load_timeout_ms: int | None = None,
+    strict_mcp_config: bool = False,
+    mcp_servers: dict[str, Any] | None = None,
 ) -> WorkerOutcome:
     """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
 
@@ -399,6 +414,9 @@ def _run_worker_sdk(
                 model=model,
                 thinking_budget=thinking,
                 allowed_mcp_servers=allowed_mcp_servers,
+                load_timeout_ms=load_timeout_ms,
+                strict_mcp_config=strict_mcp_config,
+                mcp_servers=mcp_servers,
             )
 
         timed_out = False
