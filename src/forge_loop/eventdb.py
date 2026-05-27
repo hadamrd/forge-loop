@@ -19,9 +19,83 @@ This is a READ-ONLY layer. Writes still go through ``state.append_event``.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 import duckdb
+
+# ---------------------------------------------------------------------------
+# WorkerEvent — typed discriminated union emitted by the SDK-based worker
+# (forge_loop._worker_sdk). Each event is a dict with a ``kind`` discriminant
+# plus ``seq`` (monotonic per-session) and ``ts`` (ISO-8601 UTC). The runner
+# consumes this stream instead of parsing stream-json log lines.
+# ---------------------------------------------------------------------------
+
+
+class _BaseWorkerEvent(TypedDict):
+    seq: int
+    ts: str
+    kind: str
+
+
+class TurnStartEvent(_BaseWorkerEvent):
+    kind: Literal["turn_start"]  # type: ignore[misc]
+    data: dict[str, Any]
+
+
+class ToolUseEvent(_BaseWorkerEvent):
+    kind: Literal["tool_use"]  # type: ignore[misc]
+    tool: str
+    input: dict[str, Any]
+    tool_use_id: str
+
+
+class ToolResultEvent(_BaseWorkerEvent):
+    kind: Literal["tool_result"]  # type: ignore[misc]
+    tool_use_id: str
+    is_error: bool
+    content: str
+
+
+class AssistantTextEvent(_BaseWorkerEvent):
+    kind: Literal["assistant_text"]  # type: ignore[misc]
+    text: str
+
+
+class FinalResultEvent(_BaseWorkerEvent):
+    kind: Literal["final_result"]  # type: ignore[misc]
+    result: str
+    cost_usd: float
+    usage: dict[str, Any]
+    model: str
+    num_turns: int
+    is_error: bool
+
+
+class ErrorEvent(_BaseWorkerEvent):
+    kind: Literal["error"]  # type: ignore[misc]
+    error_type: str
+    message: str
+    retry_hint: str | None
+
+
+WorkerEvent = (
+    TurnStartEvent
+    | ToolUseEvent
+    | ToolResultEvent
+    | AssistantTextEvent
+    | FinalResultEvent
+    | ErrorEvent
+)
+
+
+WORKER_EVENT_KINDS: tuple[str, ...] = (
+    "turn_start",
+    "tool_use",
+    "tool_result",
+    "assistant_text",
+    "final_result",
+    "error",
+)
 
 
 def _con(events_path: Path, summaries_path: Path | None = None) -> duckdb.DuckDBPyConnection:

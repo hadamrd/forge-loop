@@ -304,22 +304,26 @@ def test_full_run_worker_records_ledger_on_success(
     wt = tmp_path / "wt"
     wt.mkdir()
     monkeypatch.setattr(W, "_prep_worktree", lambda repo, n, b: (wt, None))
-    monkeypatch.setattr(W, "_extract_outcome",
-                        lambda log_path: ("https://github.com/x/y/pull/1", "merged"))
     monkeypatch.setattr(W, "_read_subagent_events", lambda wt: [])
 
-    class _PopenStub:
-        def __init__(self, *a: Any, **kw: Any) -> None:
-            self.returncode = 0
-        def wait(self, timeout: float | None = None) -> int:
-            time.sleep(0.05)
-            return 0
-        def terminate(self) -> None:
-            pass
-        def kill(self) -> None:
-            pass
+    # Stub out the SDK session: return a successful merged outcome directly,
+    # bypassing the real claude_agent_sdk transport so the test stays hermetic.
+    from forge_loop._worker_sdk import SDKRunResult
+    from forge_loop import _worker_sdk as _wsdk
 
-    monkeypatch.setattr(W.subprocess, "Popen", _PopenStub)
+    async def _fake_session(prompt: str, **kw: Any) -> SDKRunResult:
+        return SDKRunResult(
+            pr_url="https://github.com/x/y/pull/1",
+            status="merged",
+            cost_usd=0.05,
+            usage={"input_tokens": 100, "output_tokens": 20},
+            model="claude-sonnet-4-6",
+            final_result_text='{"issue":77,"pr":"https://github.com/x/y/pull/1","status":"merged"}',
+            error=None,
+            events=[],
+            duration_s=0.01,
+        )
+    monkeypatch.setattr(_wsdk, "run_sdk_session", _fake_session)
 
     ledger = tmp_path / "spend.jsonl"
     outcome = W.run_worker(
