@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import signal
 import subprocess
 import time
@@ -545,15 +546,25 @@ def _tick(cfg: Config, tick: int) -> None:
     if merged_nums and cfg.deploy_task:
         ok, log = redeploy(cfg.repo, cfg.deploy_task)
         append_event(cfg.events_file, "redeploy", task=cfg.deploy_task, ok=ok, detail=log)
-        # Deploy-fail escalation: 3 in a row → halt (gap #6).
-        if not ok and _consecutive_deploy_fails(cfg) >= 3:
-            append_event(cfg.events_file, "deploy_drift_halt",
-                         consecutive_fails=_consecutive_deploy_fails(cfg))
-            with contextlib.suppress(OSError):
-                (cfg.state_dir / "loop-runner.HALT").write_text(
-                    "deploy: 3 consecutive failures\n"
-                )
-            cfg.stop_file.touch()
+        # Deploy-fail escalation. Default is WARN-ONLY: a misconfigured
+        # deploy.task (e.g. operator forgot to set it for a non-Taskfile
+        # project) used to halt the entire loop on tick #3 — which then
+        # blocked the loop from even fixing the bug. Now we warn first;
+        # the operator opts in to the hard halt via LOOP_DEPLOY_DRIFT_HALT=1.
+        # This gate is the prime example of a default-on safety mechanism
+        # that became an active foot-gun.
+        fails = _consecutive_deploy_fails(cfg)
+        if not ok and fails >= 3:
+            append_event(cfg.events_file, "deploy_drift_warn",
+                         consecutive_fails=fails)
+            if os.environ.get("LOOP_DEPLOY_DRIFT_HALT") == "1":
+                append_event(cfg.events_file, "deploy_drift_halt",
+                             consecutive_fails=fails)
+                with contextlib.suppress(OSError):
+                    (cfg.state_dir / "loop-runner.HALT").write_text(
+                        "deploy: 3 consecutive failures (opt-in halt)\n"
+                    )
+                cfg.stop_file.touch()
 
     # Drift detector (gap #3): record outcome signature, halt if 3-in-a-row.
     had_workers = bool(outcomes)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC
@@ -57,6 +58,120 @@ def _cmd_cluster_status(args: argparse.Namespace) -> int:
         "surface). Use 'forge-loop status' and 'forge-loop events' instead.\n"
     )
     return 2
+
+
+def _cmd_doctor(_args: argparse.Namespace) -> int:
+    """One-shot health check.
+
+    Aggregates the checks an operator typically runs by hand after a
+    surprise (a worker stalled, the loop seems quiet, a recent merge).
+    Prints a green/yellow/red line per check and exits 0 if all green,
+    1 if any red. Yellow is informational and does not affect exit code.
+    """
+    import glob
+    import shutil
+    import subprocess as _sp
+
+    # Doctor must run even when config is broken — that's the whole
+    # point of running it. Fall back to a minimal stub so the checks
+    # that don't need a real cfg still execute.
+    try:
+        cfg = load()
+        cfg_ok = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ✗ config load failed: {exc}")
+        cfg = None
+        cfg_ok = False
+    red = not cfg_ok  # config-broken counts as a red signal
+
+    def line(status: str, label: str, detail: str = "") -> None:
+        nonlocal red
+        marker = {"green": "✓", "yellow": "~", "red": "✗"}[status]
+        print(f"  {marker} {label}" + (f" — {detail}" if detail else ""))
+        if status == "red":
+            red = True
+
+    print("forge-loop doctor:")
+
+    # 1. Halt markers — should NOT exist on a healthy install
+    if cfg_ok:
+        halt = cfg.state_dir / "loop-runner.HALT"
+        stop = cfg.stop_file
+        if halt.exists():
+            line("red", "halt marker present", f"remove {halt}")
+        else:
+            line("green", "no halt marker")
+        if stop.exists():
+            line("yellow", "stop file pending", f"will halt at next tick boundary ({stop})")
+
+    # 2. tmux session — try to find a forge-loop-named one
+    tmux_bin = shutil.which("tmux")
+    if tmux_bin is None:
+        line("yellow", "tmux not installed", "operator usually runs forge-loop in a tmux session")
+    else:
+        try:
+            r = _sp.run([tmux_bin, "ls"], capture_output=True, text=True, timeout=5)
+            sessions = [
+                row.split(":", 1)[0]
+                for row in r.stdout.splitlines()
+                if row.startswith("forge-loop")
+            ]
+            if sessions:
+                line("green", f"tmux sessions: {', '.join(sessions)}")
+            else:
+                line("yellow", "no forge-loop tmux session", "run with: forge-loop run")
+        except _sp.SubprocessError:
+            line("yellow", "tmux probe failed")
+
+    # 3. Orphan worktrees — anything under /tmp/wt-loop-*
+    orphans = sorted(glob.glob("/tmp/wt-loop-*"))
+    if orphans:
+        line(
+            "yellow",
+            f"{len(orphans)} orphan worktree(s) under /tmp/wt-loop-*",
+            "the runner reaps these at next boot",
+        )
+    else:
+        line("green", "no orphan worktrees")
+
+    # 4. Code freshness — does the local checkout match origin/trunk?
+    if cfg_ok:
+        try:
+            local = _sp.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=cfg.repo, capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            # Best-effort fetch with a short timeout; offline → just skip.
+            _sp.run(
+                ["git", "fetch", "origin", "trunk", "--quiet"],
+                cwd=cfg.repo, capture_output=True, timeout=10,
+            )
+            remote = _sp.run(
+                ["git", "rev-parse", "origin/trunk"],
+                cwd=cfg.repo, capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            if local and remote and local == remote:
+                line("green", f"code matches origin/trunk @ {local[:8]}")
+            elif local and remote:
+                line(
+                    "yellow",
+                    "local trunk behind origin",
+                    f"local={local[:8]} origin={remote[:8]}",
+                )
+            else:
+                line("yellow", "could not compare to origin/trunk")
+        except (_sp.SubprocessError, OSError):
+            line("yellow", "git probe failed")
+
+    # 5. Halt-causing env vars — surface them so the operator knows
+    drift_halt_opt_in = os.environ.get("LOOP_DEPLOY_DRIFT_HALT") == "1"
+    line(
+        "yellow" if drift_halt_opt_in else "green",
+        "deploy-drift halt",
+        "ENABLED (opt-in)" if drift_halt_opt_in else "disabled (default)",
+    )
+
+    return 1 if red else 0
 
 
 def _cmd_status(_args: argparse.Namespace) -> int:
@@ -924,6 +1039,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.set_defaults(func=_cmd_run)
     sub.add_parser("status", help="Print current state file").set_defaults(func=_cmd_status)
+    sub.add_parser(
+        "doctor",
+        help="One-shot health check: tmux session, code freshness, orphan worktrees, halt markers",
+    ).set_defaults(func=_cmd_doctor)
 
     p_cluster = sub.add_parser(
         "cluster",
