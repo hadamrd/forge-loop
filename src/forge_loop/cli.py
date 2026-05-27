@@ -25,12 +25,84 @@ from forge_loop.state import tail_events
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    import os as _os
+
+    # Propagate --queue to the runner via env var so the wiring stays
+    # localized (runner.py reads LOOP_QUEUE_URL and bootstraps the
+    # cluster coordinator). Default of None keeps the historical
+    # in-memory behaviour.
+    queue_url = getattr(args, "queue", None)
+    if queue_url:
+        _os.environ["LOOP_QUEUE_URL"] = queue_url
+
     orch = getattr(args, "orchestrator", "sync")
     if orch == "async":
         from forge_loop.runner import run_async as run_async_loop
 
         return run_async_loop(load())
     return run_loop(load())
+
+
+def _cmd_cluster_status(args: argparse.Namespace) -> int:
+    """Enumerate live runners via the shared registry.
+
+    Reads ``<prefix>:runners:*`` keys from Redis and prints each runner's
+    host, in-flight count, leader flag, and seconds since last heartbeat.
+    Falls back to a clear error if the broker is unreachable — operator
+    needs an actionable signal, not a Python traceback.
+    """
+
+    import json as _json
+    import time as _time
+
+    from forge_loop.cluster import RunnerRegistry
+    from forge_loop.queue import QueueUnavailable, default_host_id
+    from forge_loop.queue.redis_backend import _load_redis  # noqa: PLC2701
+
+    try:
+        redis = _load_redis()
+        client = redis.Redis.from_url(args.queue, decode_responses=True)
+        client.ping()
+    except QueueUnavailable as exc:
+        sys.stderr.write(f"cluster status: {exc}\n")
+        return 2
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"cluster status: cannot reach {args.queue}: {exc}\n")
+        return 2
+
+    # The registry is read-only here — runner_id/host_id don't matter
+    # for ``list_runners``; pass placeholders so we don't fight the API.
+    registry = RunnerRegistry(client, runner_id="cli", host_id=default_host_id())
+    runners = registry.list_runners()
+    now = _time.time()
+    if args.json:
+        sys.stdout.write(
+            _json.dumps(
+                [
+                    {
+                        "runner_id": r.runner_id,
+                        "host_id": r.host_id,
+                        "in_flight": r.in_flight,
+                        "is_leader": r.is_leader,
+                        "age_s": round(now - r.last_heartbeat, 2),
+                    }
+                    for r in runners
+                ]
+            )
+            + "\n"
+        )
+        return 0
+    if not runners:
+        sys.stdout.write("no live runners\n")
+        return 0
+    sys.stdout.write(f"{'RUNNER':<28} {'HOST':<24} {'LEAD':<5} {'INFLIGHT':<10} AGE\n")
+    for r in runners:
+        sys.stdout.write(
+            f"{r.runner_id:<28} {r.host_id:<24} "
+            f"{'yes' if r.is_leader else '-':<5} {r.in_flight:<10} "
+            f"{now - r.last_heartbeat:.1f}s\n"
+        )
+    return 0
 
 
 def _cmd_status(_args: argparse.Namespace) -> int:
@@ -716,8 +788,31 @@ def main(argv: list[str] | None = None) -> int:
         "sequentially. 'async' runs three independent asyncio queues so a slow PO "
         "or critic does not block other tickets (see runner_async.py).",
     )
+    p_run.add_argument(
+        "--queue",
+        default=None,
+        help="Queue backend URL. Default: in-memory (single host). "
+        "Pass redis://host:port/db to share work across multiple runner processes.",
+    )
     p_run.set_defaults(func=_cmd_run)
     sub.add_parser("status", help="Print current state file").set_defaults(func=_cmd_status)
+
+    p_cluster = sub.add_parser(
+        "cluster",
+        help="Cluster-mode commands (multi-host runner coordination)",
+    )
+    cluster_sub = p_cluster.add_subparsers(dest="cluster_cmd", required=True)
+    p_cluster_status = cluster_sub.add_parser(
+        "status",
+        help="List live runners and their current load",
+    )
+    p_cluster_status.add_argument(
+        "--queue",
+        required=True,
+        help="Redis URL (must match the one runners booted with)",
+    )
+    p_cluster_status.add_argument("--json", action="store_true")
+    p_cluster_status.set_defaults(func=_cmd_cluster_status)
 
     p_events = sub.add_parser("events", help="Tail the events log")
     p_events.add_argument("-n", type=int, default=30, help="lines to show (default 30)")
