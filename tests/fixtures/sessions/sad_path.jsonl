@@ -1,0 +1,8 @@
+{"schema": "forge-loop-session/v1", "issue": 9002, "title": "fix: handle null DB session", "recorded_at": "2026-05-21T11:00:00+00:00", "claude_argv": ["claude", "-p", "<brief>", "--max-turns", "120", "--allow-dangerously-skip-permissions", "--add-dir", "/tmp/wt", "--output-format", "stream-json", "--verbose"], "duration_s": 95.2, "_note": "synthetic sad-path: worker errors out before opening PR"}
+{"seq": 1, "type": "system", "subtype": "init", "session_id": "sess-sad-001", "cwd": "/tmp/wt"}
+{"seq": 2, "type": "assistant", "message": {"content": [{"type": "text", "text": "Investigating."}]}}
+{"seq": 3, "type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pytest tests/ -q"}}]}}
+{"seq": 4, "type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ImportError: cannot import name 'foo'", "is_error": true}]}}
+{"seq": 5, "type": "assistant", "message": {"content": [{"type": "text", "text": "Cannot proceed — repo has unrelated import error blocking my test runner. Bailing."}]}}
+{"seq": 6, "type": "result", "subtype": "error", "result": "Blocked.\n{\"issue\": 9002, \"pr\": null, \"status\": \"failed\", \"note\": \"unrelated import error\"}"}
+{"type": "outcome", "pr": null, "status": "failed", "returncode": 1}

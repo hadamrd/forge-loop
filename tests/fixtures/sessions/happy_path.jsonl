@@ -1,0 +1,15 @@
+{"schema": "forge-loop-session/v1", "issue": 9001, "title": "feat: add metric exporter", "recorded_at": "2026-05-20T10:00:00+00:00", "claude_argv": ["claude", "-p", "<brief>", "--max-turns", "120", "--allow-dangerously-skip-permissions", "--add-dir", "/tmp/wt", "--output-format", "stream-json", "--verbose"], "duration_s": 412.5, "_note": "synthetic happy-path baseline; hand-authored from a redacted real session"}
+{"seq": 1, "type": "system", "subtype": "init", "session_id": "sess-happy-001", "cwd": "/tmp/wt"}
+{"seq": 2, "type": "assistant", "message": {"content": [{"type": "text", "text": "Reading issue and project layout."}]}}
+{"seq": 3, "type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/tmp/wt/src/exporter.py"}}]}}
+{"seq": 4, "type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "(file contents)"}]}}
+{"seq": 5, "type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t2", "name": "Edit", "input": {"file_path": "/tmp/wt/src/exporter.py", "old_string": "pass", "new_string": "emit_metric()"}}]}}
+{"seq": 6, "type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t2", "content": "ok"}]}}
+{"seq": 7, "type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t3", "name": "Bash", "input": {"command": "pytest tests/test_exporter.py -q"}}]}}
+{"seq": 8, "type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t3", "content": "5 passed"}]}}
+{"seq": 9, "type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t4", "name": "Bash", "input": {"command": "gh pr create --title 'feat: metric exporter' --body '...'"}}]}}
+{"seq": 10, "type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t4", "content": "https://github.com/h/r/pull/9101"}]}}
+{"seq": 11, "type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t5", "name": "Bash", "input": {"command": "gh pr merge 9101 --squash --auto --delete-branch"}}]}}
+{"seq": 12, "type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t5", "content": "merged"}]}}
+{"seq": 13, "type": "result", "subtype": "success", "result": "Done.\n{\"issue\": 9001, \"pr\": \"https://github.com/h/r/pull/9101\", \"status\": \"merged\", \"note\": \"shipped\"}"}
+{"type": "outcome", "pr": "https://github.com/h/r/pull/9101", "status": "merged", "returncode": 0}
