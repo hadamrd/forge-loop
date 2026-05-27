@@ -627,6 +627,42 @@ def events_count_by_kind(since_minutes: int | None = None) -> list[dict[str, Any
     return _eventdb.count_by_kind(cfg.events_file, since_minutes=since_minutes)
 
 
+# ── One-call situational awareness (issue #64) ──────────────────────────────
+
+
+@mcp.tool()
+def loop_snapshot(since_minutes: int = 15) -> dict[str, Any]:
+    """Single-call ``what is the loop doing`` snapshot.
+
+    Returns a flat dict with everything an operator (or LLM agent)
+    typically needs to debug the loop in one round-trip, replacing the
+    usual fan-out of ``loop_status`` + ``events_recent`` + ``gh pr list``
+    + ``ls /tmp/wt-loop-*`` + ``attempts_history``.
+
+    Keys (see ``forge_loop.snapshot.build_snapshot`` for the contract):
+        - ``tick``, ``state``, ``runner_id`` — from the state file +
+          ``loop_start`` event.
+        - ``queue_depth`` — count of issues carrying the configured
+          ready label.
+        - ``in_flight`` — list of ``{issue, branch, worktree,
+          last_event_age_s, sdk_log_size}`` per active worker.
+        - ``recent_kinds`` — ``{kind: count}`` over the window.
+        - ``open_prs`` — ``[{number, title, branch}, ...]`` for the
+          configured repo.
+        - ``halt_marker`` — ``{present, path, age_s, reason}``.
+        - ``last_drift_event`` — most-recent ``*drift*`` event in the
+          window (or ``None``).
+
+    SDK log content is intentionally NOT included — use ``worker_logs``
+    (separate tool) for that. The payload is sized to fit in a single
+    LLM system message.
+    """
+    from forge_loop.snapshot import build_snapshot
+
+    cfg = load_config()
+    return build_snapshot(cfg, since_minutes=since_minutes)
+
+
 def serve_stdio() -> int:
     """Entry point for ``forge-loop mcp serve``. Runs the MCP server on stdio."""
     mcp.run()
