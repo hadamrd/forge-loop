@@ -503,7 +503,7 @@ def _tick(cfg: Config, tick: int) -> None:
             _reap_worktree(cfg.repo, o.issue)
             append_event(cfg.events_file, "worktree_reaped", issue=o.issue)
 
-    if merged_nums:
+    if merged_nums and cfg.deploy_task:
         ok, log = redeploy(cfg.repo, cfg.deploy_task)
         append_event(cfg.events_file, "redeploy", task=cfg.deploy_task, ok=ok, detail=log)
         # Deploy-fail escalation: 3 in a row → halt (gap #6).
