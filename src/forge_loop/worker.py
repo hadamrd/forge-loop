@@ -82,6 +82,7 @@ def make_brief(
     lumen_top_k: int = 3,
     lumen_test_pattern: str = "**/*Test.*",
     coauthor: str = "",
+    dry_run: bool = False,
 ) -> str:
     """Render the worker brief for an issue.
 
@@ -131,7 +132,7 @@ def make_brief(
 
     from forge_loop.briefs import render_brief
 
-    return render_brief(
+    rendered = render_brief(
         "worker",
         n=n,
         worktree=worktree,
@@ -145,6 +146,10 @@ def make_brief(
         coauthor_line=coauthor_line,
         final_status=final_status,
     )
+    if dry_run:
+        from forge_loop.replay import apply_dry_run_to_brief
+        rendered = apply_dry_run_to_brief(rendered)
+    return rendered
 
 
 def brief_template_hash() -> str:

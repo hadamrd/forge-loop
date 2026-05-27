@@ -454,6 +454,98 @@ def _cmd_brief(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_replay(args: argparse.Namespace) -> int:
+    """`forge-loop replay --tick N --role worker --brief brief.md`
+
+    Re-runs every worker that ran in tick N using the brief loaded from
+    ``--brief``. Output is captured as a synthetic replay tick (``Nr``)
+    in the events log; ``replay: true`` is stamped on every event so
+    downstream consumers can filter.
+
+    Dry-run guarantees: replay NEVER pushes branches or opens PRs —
+    fixture-backed invocations replay locally; without a fixture the
+    invocation is recorded as ``skipped_no_fixture`` (live worker
+    re-dispatch in replay mode is intentionally not wired up here to
+    keep the dry-run contract airtight).
+    """
+    from pathlib import Path
+
+    from forge_loop import replay as _replay
+
+    cfg = load()
+    brief_text = Path(args.brief).read_text(encoding="utf-8")
+    fixtures_dir = Path(args.fixtures_dir).resolve() if args.fixtures_dir else None
+
+    try:
+        plan = _replay.plan_replay(
+            cfg.events_file,
+            tick=args.tick,
+            role=args.role,
+            new_brief=brief_text,
+            fixtures_dir=fixtures_dir,
+            replay_suffix=args.suffix,
+        )
+    except _replay.ReplayError as exc:
+        sys.stderr.write(f"[replay] {exc}\n")
+        return 2
+
+    if args.dry_plan:
+        print(json.dumps({
+            "original_tick": plan.original_tick,
+            "replay_tick": plan.replay_tick,
+            "role": plan.role,
+            "invocations": [
+                {
+                    "issue": inv.issue, "title": inv.title,
+                    "fixture": str(inv.fixture_path) if inv.fixture_path else None,
+                }
+                for inv in plan.invocations
+            ],
+        }, indent=2))
+        return 0
+
+    try:
+        captures = _replay.run_replay_tick(plan, events_path=cfg.events_file)
+    except _replay.ReplayError as exc:
+        sys.stderr.write(f"[replay] {exc}\n")
+        return 3
+
+    print(json.dumps({
+        "original_tick": plan.original_tick,
+        "replay_tick": plan.replay_tick,
+        "captures": [
+            {
+                "issue": c.issue, "status": c.status,
+                "source": c.source, "cost_usd": c.cost_usd,
+                "commit": c.commit_hash, "diff_chars": len(c.diff_text),
+                "error": c.error,
+            }
+            for c in captures
+        ],
+    }, indent=2))
+    return 0
+
+
+def _cmd_replay_diff(args: argparse.Namespace) -> int:
+    """`forge-loop replay diff --tick N --replay-tick Nr` — side-by-side report."""
+    from forge_loop import replay as _replay
+
+    cfg = load()
+    try:
+        report = _replay.build_diff_report(
+            cfg.events_file, tick=args.tick, replay_tick=args.replay_tick,
+        )
+    except _replay.ReplayError as exc:
+        sys.stderr.write(f"[replay diff] {exc}\n")
+        return 2
+
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        sys.stdout.write(_replay.render_diff_report_text(report))
+    return 0
+
+
 def _cmd_config(_args: argparse.Namespace) -> int:
     cfg = load()
     out = {
@@ -578,7 +670,56 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_brief.set_defaults(func=_cmd_brief)
 
+    p_replay = sub.add_parser(
+        "replay",
+        help="Time-travel: re-run a past tick with a modified brief (dry-run, no PRs)",
+    )
+    replay_sub = p_replay.add_subparsers(dest="replay_cmd")
+    # Default action (no subcommand): the actual replay run.
+    p_replay.add_argument("--tick", type=int, help="Original tick number to replay")
+    p_replay.add_argument(
+        "--role", default="worker", choices=("worker",),
+        help="Which role to replay (only 'worker' supported per #24 scope)",
+    )
+    p_replay.add_argument("--brief", help="Path to the new brief file (.md / .tmpl)")
+    p_replay.add_argument(
+        "--fixtures-dir",
+        help="Directory of recorded SDK sessions for zero-cost replay "
+             "(expects tick-{N}-issue-{n}.jsonl or issue-{n}.jsonl)",
+    )
+    p_replay.add_argument(
+        "--suffix", default="r",
+        help="Suffix appended to the original tick id for replay events (default: r)",
+    )
+    p_replay.add_argument(
+        "--dry-plan", action="store_true",
+        help="Print the assembled invocations and exit without running anything",
+    )
+    p_replay.set_defaults(func=_cmd_replay)
+
+    p_replay_diff = replay_sub.add_parser(
+        "diff",
+        help="Side-by-side per-issue report: original tick vs replay tick",
+    )
+    p_replay_diff.add_argument("--tick", type=int, required=True, help="Original tick")
+    p_replay_diff.add_argument(
+        "--replay-tick", required=True, help="Replay tick id (e.g. '42r')",
+    )
+    p_replay_diff.add_argument(
+        "--json", action="store_true", help="Emit JSON instead of human-readable",
+    )
+    p_replay_diff.set_defaults(func=_cmd_replay_diff)
+
     args = parser.parse_args(argv)
+    # `replay diff` lands here with replay_cmd="diff"; rewire the func.
+    if getattr(args, "cmd", None) == "replay" and getattr(args, "replay_cmd", None) == "diff":
+        args.func = _cmd_replay_diff
+    elif (
+        getattr(args, "cmd", None) == "replay"
+        and getattr(args, "replay_cmd", None) is None
+        and (args.tick is None or not args.brief)
+    ):
+        parser.error("replay: --tick and --brief are required (or use `replay diff`)")
     return int(args.func(args))
 
 
