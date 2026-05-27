@@ -1,0 +1,78 @@
+# forge-loop configuration — copy to `forge-loop.yaml` and adjust.
+# All keys are optional except `repo.github`; env vars (LOOP_*) override YAML values.
+
+repo:
+  # REQUIRED — set via LOOP_GH_REPO env or this field (e.g. owner/repo).
+  github: owner/repo
+  # Worktree root for per-issue checkouts (one /tmp/wt-loop-<N>/ each tick).
+  worktree_root: /tmp
+
+deploy:
+  # `task` target invoked when a tick lands any merged PR. Override via
+  # LOOP_DEPLOY_TASK env. If unset, redeploy is a no-op.
+  task: ""
+
+scheduling:
+  # Workers dispatched in parallel per tick.
+  parallel: 3
+  # Gap between ticks when there's work; also the idle-loop interval.
+  tick_interval_s: 60
+  # Hard-cap per worker subprocess.
+  worker_timeout_s: 3600
+  # 0 = forever. Bound when smoke-testing.
+  max_ticks: 0
+  # Every Nth tick runs the backlog-maintenance subagent instead of fixing
+  # issues. Set to 0 to disable.
+  maintenance_every_n_ticks: 5
+
+labels:
+  # Issues with this label are picked up by workers.
+  ready: "loop:ready"
+  # The maintenance subagent uses this label to mark issues needing triage.
+  triage: "loop:triage"
+  # Issues that workers reported as `status=failed` are auto-labeled with this
+  # so they show up in the next maintenance pass.
+  blocked: "loop:blocked"
+  # Optional: issues tagged this label skip auto-merge (human review required).
+  risk_gate: "risk:high"
+
+# Optional: configure the Lumen test-discovery pattern. Match the test-file
+# glob for your stack: e.g. "**/*Test.java" for JUnit, "**/test_*.py" for pytest.
+lumen:
+  top_k: 3
+  test_pattern: "**/*Test.*"
+
+briefs:
+  # Optional: override the worker brief preamble.
+  # worker_preamble: |
+  #   You are an autonomous worker...
+
+  # The maintenance brief drives the backlog-grooming subagent each
+  # maintenance tick.
+  maintenance: |
+    You are the backlog-maintenance subagent for the sprint loop.
+
+    Your job: groom open issues so the next sprint tick has a clean,
+    high-leverage queue.
+
+    Do:
+    1. List open issues via `gh issue list --state open --limit 50 --json number,title,body,labels,createdAt,updatedAt`.
+    2. Identify and act on:
+       - **Stale**: no activity in 14+ days AND no `loop:ready` label → comment
+         "ping — is this still relevant?" and add `loop:triage`. Don't close
+         (too aggressive).
+       - **Duplicates**: near-identical titles or bodies → close the older one
+         with a comment pointing to the newer.
+       - **Untriaged**: missing priority label (P0/P1/P2) → add the most
+         defensible default + `loop:triage`.
+       - **Bad titles**: vague ("fix bug", "improve thing") → rewrite via
+         `gh issue edit <N> --title "..."` to a clear `area(scope): action`.
+       - **Missing context**: issues with empty bodies → comment requesting
+         details, add `loop:triage`.
+       - **Ready to dispatch**: well-formed P0/P1 issues missing `loop:ready` →
+         add `loop:ready` so the next non-maintenance tick picks them up.
+    3. Output a single JSON line as your FINAL OUTPUT (no prose after):
+       {"acted_on": <count>, "added_ready": [...], "closed_dupes": [...], "retitled": [...]}
+
+    Do NOT create new issues. Do NOT touch PRs. Do NOT push code.
+    Constraints: ≤25 actions per run. Pick the most leveraged ones.

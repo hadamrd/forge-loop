@@ -1,0 +1,48 @@
+[project]
+name = "forge-loop"
+version = "0.1.0"
+description = "Autonomous multi-worker dispatcher for Claude Code — picks up GitHub issues by label, dispatches parallel workers in git worktrees, watches PRs, merges, and redeploys."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp >=1.0",
+  "pyyaml >=6.0",
+  "duckdb >=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest >=8.0",
+  "pytest-cov >=5.0",
+  "ruff >=0.6",
+  "mypy >=1.10",
+  "types-PyYAML >=6.0",
+]
+
+[project.scripts]
+forge-loop = "forge_loop.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forge_loop"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]  # line-too-long handled by format
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
