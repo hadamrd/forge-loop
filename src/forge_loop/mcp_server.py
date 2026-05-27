@@ -15,9 +15,10 @@ from __future__ import annotations
 import functools
 import os
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -34,6 +35,7 @@ from forge_loop.deploy import redeploy as _redeploy
 from forge_loop.maintenance import run_maintenance as _run_maintenance
 from forge_loop.runner import run as _run_loop
 from forge_loop.worker import run_worker as _run_worker
+from forge_loop.worker_logs import read_worker_logs as _read_worker_logs
 
 mcp = FastMCP("forge-loop")
 
@@ -329,6 +331,38 @@ def loop_status() -> dict[str, Any]:
         return {"state": "uninitialised"}
     result: dict[str, Any] = json.loads(cfg.state_file.read_text())
     return result
+
+
+@mcp.tool()
+def worker_logs(
+    issue: int,
+    kind_filter: str | None = None,
+    tail: int = 50,
+    attempt: int | None = None,
+) -> list[dict[str, Any]]:
+    """Tail the per-worker stream-json log for ``issue`` (#63).
+
+    Returns the ``tail`` most-recent events from the worker log under
+    ``cfg.logs_dir/worker-<issue>-*.log``. Optionally filtered by event
+    ``kind`` (e.g. ``"tool_use"``, ``"assistant_text"``,
+    ``"final_result"``, ``"error"``, ``"tool_result"``).
+
+    ``attempt`` selects which run when an issue was retried:
+    ``None`` / ``1`` = latest, ``2`` = previous, etc.
+
+    Fat payloads (``tool_use.input``, ``tool_result.content``) are
+    truncated to 500 chars per row so the response fits in a typical
+    Claude context window. Returns ``[]`` (NOT an error) when no log
+    exists yet — the worker may still be starting up.
+    """
+    cfg = load_config()
+    return _read_worker_logs(
+        cfg.logs_dir,
+        issue,
+        kind_filter=kind_filter,
+        tail=tail,
+        attempt=attempt,
+    )
 
 
 @mcp.tool()
