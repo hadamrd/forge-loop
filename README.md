@@ -1,6 +1,6 @@
 # forge-loop
 
-> Autonomous multi-worker dispatcher for Claude Code.
+> Autonomous multi-worker dispatcher for Claude Code and Codex.
 > File an issue, label it `loop:ready`, walk away.
 
 forge-loop turns a Claude Code subscription into an unattended swarm of
@@ -58,6 +58,7 @@ This isn't a "code generator". It is a **harness** — a runner that lets the op
 | Surface | Status | Notes |
 |---|---|---|
 | **SDK worker (Opus 4.7)** | **stable** | Native Anthropic SDK, typed event stream |
+| **Codex provider** | beta | `codex exec` backend for worker / PO / critic roles |
 | **Typed critic (`CriticReport`)** | **stable** | sev1/sev2/sev3 findings, gates auto-merge on sev1 |
 | **Retry + fingerprint cooldown** | **stable** | Skips in-flight and cooldown duplicates |
 | **PO spec expander** | **stable** | Rewrites thin issue bodies into feature-grade specs |
@@ -97,7 +98,9 @@ forge-loop run                                   # foreground (Ctrl-C to stop)
 tmux new -d -s loop "forge-loop run"
 ```
 
-Prerequisites: `gh` authenticated, `git`, Python 3.11+, `claude` CLI signed in on a subscription plan.
+Prerequisites: `gh` authenticated, `git`, Python 3.11+, and at least one
+configured agent provider: `claude` CLI signed in on a subscription plan or
+`codex` CLI signed in locally.
 
 ---
 
@@ -126,6 +129,9 @@ labels:
   blocked: loop:blocked
   risk_gate: risk:high                # auto-merge skipped; human review
 
+agent:
+  provider: claude                    # claude or codex; role blocks can override
+
 critic:
   enabled: true                       # typed-rubric review before merge
 
@@ -134,13 +140,38 @@ attempts:
 
 worker:
   brief_template: .forge-loop/briefs/worker.md.tmpl
+  provider: claude
   model: claude-opus-4-7
   thinking: medium
 
 po:
   brief_template: .forge-loop/briefs/po.md.tmpl
+  provider: claude
   model: claude-opus-4-7
   thinking: high
+```
+
+### Agent providers
+
+Claude remains the default and uses the Claude Agent SDK for workers. Codex is
+available through the local `codex exec` CLI for worker, PO, and critic roles.
+Set it globally:
+
+```yaml
+agent:
+  provider: codex
+```
+
+or per role:
+
+```yaml
+worker:
+  provider: codex
+  model: gpt-5-codex   # optional; omit or set "" to use the Codex CLI default
+po:
+  provider: claude
+critic:
+  provider: codex
 ```
 
 ### Env-var overrides (highest priority)
@@ -148,8 +179,10 @@ po:
 | Var | Effect |
 |---|---|
 | `LOOP_GH_REPO` | `owner/repo` — required |
+| `LOOP_AGENT_PROVIDER` | Global provider: `claude` or `codex` |
+| `LOOP_WORKER_PROVIDER` / `LOOP_PO_PROVIDER` / `LOOP_CRITIC_PROVIDER` | Per-role provider override |
 | `LOOP_WORKER_BRIEF` / `LOOP_PO_BRIEF` / `LOOP_CRITIC_BRIEF` | Path to a custom brief template |
-| `LOOP_WORKER_MODEL` / `LOOP_PO_MODEL` / `LOOP_CRITIC_MODEL` | Per-role model override |
+| `LOOP_WORKER_MODEL` / `LOOP_PO_MODEL` / `LOOP_CRITIC_MODEL` | Per-role model override; Codex may be blank to use CLI default |
 | `LOOP_PARALLEL` / `LOOP_TICK_INTERVAL_S` | Scheduling |
 | `LOOP_DEPLOY_TASK` | Task target run after merges. Empty = skip |
 | `LOOP_DEPLOY_DRIFT_HALT=1` | Opt in to the 3-fails-then-halt brake |
@@ -394,7 +427,7 @@ The PO pass rewrites thin tickets — but it can't invent intent. Spend two minu
 - **Subscription billing only.** forge-loop assumes the operator is on a Claude Code subscription (flat fee). The budget tracking that existed in early versions was removed in #38; if you need per-token gating because you're paying per call, file an issue.
 - **Secrets.** The loop never reads secrets. Workers should fetch them via your project's secret manager (Infisical, Vault, sealed-secrets). The bundled worker brief explicitly forbids plaintext secrets in commits.
 - **Identity.** All `gh` calls go through the operator's `gh auth login`. Workers commit under the operator's git identity (configurable via `LOOP_COAUTHOR` for the `Co-Authored-By:` trailer).
-- **Rate limits.** GitHub: the loop's pickup query is one `gh issue list` per tick (cheap). `gh pr merge --auto` doesn't poll. Anthropic: Opus 4.7 via SDK; rate limits hit naturally if you push parallel > 5 on a free workspace.
+- **Rate limits.** GitHub: the loop's pickup query is one `gh issue list` per tick (cheap). `gh pr merge --auto` doesn't poll. Agent-provider limits depend on the configured backend: Anthropic Opus via SDK or the local Codex CLI.
 - **Cost.** Observed: $3-$5 per shipped PR on Opus 4.7, $9 wasted per duplicate-race (rare). Roughly $50-$100/week for a full unattended-overnight workflow.
 
 ---
@@ -423,4 +456,4 @@ MIT — see [LICENSE](LICENSE). Contributions under the same license.
 
 forge-loop was extracted from the harness that built [Titan](https://github.com/hadamrd/dashboard-plugin) — a post-Jenkins CI/CD product — on its own backlog. The recursive-bootstrap dogfooding pattern (the loop shipping its own features) is documented in the repository's commit history; PRs #2, #27, #41, #62 are particularly worth reading.
 
-Built on [Claude Code](https://claude.com/claude-code) + the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python).
+Built on [Claude Code](https://claude.com/claude-code) + the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python), with optional Codex CLI support.

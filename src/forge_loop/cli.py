@@ -212,15 +212,23 @@ def _cmd_doctor(_args: SimpleNamespace) -> int:
         try:
             local = _sp.run(
                 ["git", "rev-parse", "HEAD"],
-                cwd=cfg.repo, capture_output=True, text=True, timeout=5,
+                cwd=cfg.repo,
+                capture_output=True,
+                text=True,
+                timeout=5,
             ).stdout.strip()
             _sp.run(
                 ["git", "fetch", "origin", "trunk", "--quiet"],
-                cwd=cfg.repo, capture_output=True, timeout=10,
+                cwd=cfg.repo,
+                capture_output=True,
+                timeout=10,
             )
             remote = _sp.run(
                 ["git", "rev-parse", "origin/trunk"],
-                cwd=cfg.repo, capture_output=True, text=True, timeout=5,
+                cwd=cfg.repo,
+                capture_output=True,
+                text=True,
+                timeout=5,
             ).stdout.strip()
             if local and remote and local == remote:
                 line("green", f"code matches origin/trunk @ {local[:8]}")
@@ -308,9 +316,7 @@ def _cmd_status(args: SimpleNamespace) -> int:
         for line in raw[-5:]:
             try:
                 e = json.loads(line)
-                last_5_events.append(
-                    {"ts": str(e.get("ts", "?")), "kind": str(e.get("kind", "?"))}
-                )
+                last_5_events.append({"ts": str(e.get("ts", "?")), "kind": str(e.get("kind", "?"))})
             except json.JSONDecodeError:
                 pass
 
@@ -318,11 +324,21 @@ def _cmd_status(args: SimpleNamespace) -> int:
     try:
         r = subprocess.run(
             [
-                "gh", "issue", "list", "--repo", cfg.github_repo,
-                "--label", cfg.labels.ready, "--state", "open",
-                "--json", "number",
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                cfg.github_repo,
+                "--label",
+                cfg.labels.ready,
+                "--state",
+                "open",
+                "--json",
+                "number",
             ],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         if r.returncode == 0:
             queue_depth = len(json.loads(r.stdout or "[]"))
@@ -360,9 +376,8 @@ def _cmd_status(args: SimpleNamespace) -> int:
 
     if halt_reason:
         table.add_row("[red]HALTED[/red]", halt_reason)
-    pid_render = (
-        f"{pid_text or '(no pidfile)'} "
-        + ("[green](alive)[/green]" if pid_alive else "[red](NOT running)[/red]")
+    pid_render = f"{pid_text or '(no pidfile)'} " + (
+        "[green](alive)[/green]" if pid_alive else "[red](NOT running)[/red]"
     )
     table.add_row("pid", pid_render)
     table.add_row(
@@ -832,8 +847,10 @@ def _cmd_repos_list(args: SimpleNamespace) -> int:
                     except json.JSONDecodeError:
                         continue
                     if e.get("kind") in {
-                        "repo_tick_done", "repo_skipped",
-                        "repo_tick_start", "repo_tick_error",
+                        "repo_tick_done",
+                        "repo_skipped",
+                        "repo_tick_start",
+                        "repo_tick_error",
                     }:
                         repo = e.get("repo")
                         if repo:
@@ -992,9 +1009,21 @@ def _cmd_config(args: SimpleNamespace) -> int:
         "worker_timeout_s": cfg.worker_timeout_s,
         "state_file": str(cfg.state_file),
         "events_file": str(cfg.events_file),
-        "worker": {"model": cfg.worker.model, "thinking": cfg.worker.thinking},
-        "po": {"model": cfg.po.model, "thinking": cfg.po.thinking},
-        "critic": {"model": cfg.critic.model, "thinking": cfg.critic.thinking},
+        "worker": {
+            "provider": cfg.worker.provider,
+            "model": cfg.worker.model,
+            "thinking": cfg.worker.thinking,
+        },
+        "po": {
+            "provider": cfg.po.provider,
+            "model": cfg.po.model,
+            "thinking": cfg.po.thinking,
+        },
+        "critic": {
+            "provider": cfg.critic.provider,
+            "model": cfg.critic.model,
+            "thinking": cfg.critic.thinking,
+        },
     }
     # Historical surface: ``config`` always emits JSON (the ``--json`` flag
     # was a no-op kept for back-compat). Preserve that.
@@ -1006,21 +1035,21 @@ def _cmd_config(args: SimpleNamespace) -> int:
 def _cmd_config_models(args: SimpleNamespace) -> int:
     cfg = load()
     rows = [
-        ("worker", cfg.worker.model, cfg.worker.thinking),
-        ("po", cfg.po.model, cfg.po.thinking),
-        ("critic", cfg.critic.model, cfg.critic.thinking),
+        ("worker", cfg.worker.provider, cfg.worker.model, cfg.worker.thinking),
+        ("po", cfg.po.provider, cfg.po.model, cfg.po.thinking),
+        ("critic", cfg.critic.provider, cfg.critic.model, cfg.critic.thinking),
     ]
     if getattr(args, "json", False):
         typer.echo(
             json.dumps(
-                {role: {"model": m, "thinking": t} for role, m, t in rows},
+                {role: {"provider": p, "model": m, "thinking": t} for role, p, m, t in rows},
                 indent=2,
             )
         )
         return 0
-    typer.echo(f"{'ROLE':<8} {'MODEL':<22} THINKING")
-    for role, model, thinking in rows:
-        typer.echo(f"{role:<8} {model:<22} {thinking}")
+    typer.echo(f"{'ROLE':<8} {'PROVIDER':<8} {'MODEL':<22} THINKING")
+    for role, provider, model, thinking in rows:
+        typer.echo(f"{role:<8} {provider:<8} {model or '<default>':<22} {thinking}")
     return 0
 
 
@@ -1038,12 +1067,9 @@ def _cmd_roles_list(args: SimpleNamespace) -> int:
                     "model": r.model,
                     "timeout_s": r.timeout_s,
                     "budget_usd": r.budget_usd,
-                    "triggers": [
-                        {"on": t.on, "filter": t.filter} for t in r.triggers
-                    ],
+                    "triggers": [{"on": t.on, "filter": t.filter} for t in r.triggers],
                     "actions": [
-                        {"mcp_tools": list(a.mcp_tools), "shell": a.shell}
-                        for a in r.actions
+                        {"mcp_tools": list(a.mcp_tools), "shell": a.shell} for a in r.actions
                     ],
                     "output_schema": r.output_schema,
                     "source": r.source_path,
@@ -1051,9 +1077,7 @@ def _cmd_roles_list(args: SimpleNamespace) -> int:
                 }
                 for r in result.roles
             ],
-            "errors": [
-                {"source": e.source, "message": e.message} for e in result.errors
-            ],
+            "errors": [{"source": e.source, "message": e.message} for e in result.errors],
         }
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
         return 0
@@ -1063,7 +1087,8 @@ def _cmd_roles_list(args: SimpleNamespace) -> int:
     for r in result.roles:
         triggers = (
             ", ".join(
-                t.on + (f"[{','.join(f'{k}={v}' for k, v in t.filter.items())}]" if t.filter else "")
+                t.on
+                + (f"[{','.join(f'{k}={v}' for k, v in t.filter.items())}]" if t.filter else "")
                 for t in r.triggers
             )
             or "(none)"
@@ -1178,11 +1203,7 @@ def cmd_dashboard(
         typer.echo("dashboard: choose --web or --tui, not both", err=True)
         raise typer.Exit(code=2)
     mode = "tui" if tui else "web"
-    _exit(
-        _cmd_dashboard(
-            SimpleNamespace(mode=mode, host=host, port=port, roles_dir=roles_dir)
-        )
-    )
+    _exit(_cmd_dashboard(SimpleNamespace(mode=mode, host=host, port=port, roles_dir=roles_dir)))
 
 
 @app.command("init", help="Scaffold forge-loop config in a project.")
@@ -1194,9 +1215,7 @@ def cmd_init(
 ) -> None:
     _exit(
         _cmd_init(
-            SimpleNamespace(
-                target=target, repo=repo, force=force, create_labels=create_labels
-            )
+            SimpleNamespace(target=target, repo=repo, force=force, create_labels=create_labels)
         )
     )
 
@@ -1215,8 +1234,11 @@ def cmd_record_session(
     _exit(
         _cmd_record_session(
             SimpleNamespace(
-                issue=issue, issue_file=issue_file, out=out,
-                worktree=worktree, timeout=timeout,
+                issue=issue,
+                issue_file=issue_file,
+                out=out,
+                worktree=worktree,
+                timeout=timeout,
             )
         )
     )
@@ -1239,8 +1261,14 @@ def cmd_brief(
     _exit(
         _cmd_brief(
             SimpleNamespace(
-                kind=kind, issue=issue, issue_file=issue_file, worktree=worktree,
-                pr=pr, repo=repo, risk_gated=risk_gated, raw=raw,
+                kind=kind,
+                issue=issue,
+                issue_file=issue_file,
+                worktree=worktree,
+                pr=pr,
+                repo=repo,
+                risk_gated=risk_gated,
+                raw=raw,
             )
         )
     )
@@ -1341,8 +1369,12 @@ def cmd_replay(
     _exit(
         _cmd_replay(
             SimpleNamespace(
-                tick=tick, role=role, brief=brief,
-                fixtures_dir=fixtures_dir, suffix=suffix, dry_plan=dry_plan,
+                tick=tick,
+                role=role,
+                brief=brief,
+                fixtures_dir=fixtures_dir,
+                suffix=suffix,
+                dry_plan=dry_plan,
             )
         )
     )

@@ -25,9 +25,9 @@ import yaml
 # startup if an operator sets ``LOOP_*_MODEL`` (or the yaml equivalent) to
 # something that does not parse — much better than a cryptic SDK failure
 # at first dispatch.
-_MODEL_PATTERN = re.compile(
-    r"^claude-(opus|sonnet|haiku)-\d+-\d+(-[a-z0-9.-]+)?$"
-)
+_MODEL_PATTERN = re.compile(r"^claude-(opus|sonnet|haiku)-\d+-\d+(-[a-z0-9.-]+)?$")
+_CODEX_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+_AGENT_PROVIDERS = frozenset({"claude", "codex"})
 
 # Thinking-budget tiers we expose. ``off`` disables extended thinking
 # entirely; ``low``/``medium``/``high`` map to ascending budgets the SDK
@@ -43,7 +43,23 @@ class ModelConfigError(ValueError):
     """
 
 
-def _validate_model(value: str, source: str) -> str:
+def _validate_provider(value: str, source: str) -> str:
+    if value not in _AGENT_PROVIDERS:
+        raise ModelConfigError(
+            f"unknown agent provider {value!r} for {source}: "
+            f"expected one of {sorted(_AGENT_PROVIDERS)}"
+        )
+    return value
+
+
+def _validate_model(value: str, source: str, provider: str = "claude") -> str:
+    if provider == "codex":
+        if value == "" or _CODEX_MODEL_PATTERN.match(value):
+            return value
+        raise ModelConfigError(
+            f"unknown Codex model alias {value!r} for {source}: "
+            "expected an empty value for the Codex CLI default or a safe model name"
+        )
     if not _MODEL_PATTERN.match(value):
         raise ModelConfigError(
             f"unknown model alias {value!r} for {source}: "
@@ -116,6 +132,7 @@ class CriticConfig:
     # surface stays uniform across roles.
     model: str = "claude-sonnet-4-6"
     thinking: str = "off"
+    provider: str = "claude"
 
 
 @dataclass(frozen=True)
@@ -131,12 +148,14 @@ class POConfig:
     yet expose a thinking-budget flag. The field is wired through and will
     activate once the PO migrates to the SDK (see follow-up of issue #34).
     """
+
     enabled: bool = True
     timeout_s: int = 480
     max_to_expand_per_tick: int = 2
     # Per-role model (issue #34). PO needs hard thinking about spec quality.
     model: str = "claude-opus-4-7"
     thinking: str = "high"
+    provider: str = "claude"
 
 
 # Bundled default of MCP servers the worker is allowed to call (issue #60).
@@ -161,8 +180,10 @@ class WorkerConfig:
     list would break the worker since it relies on at least the
     forge-loop server.
     """
+
     model: str = "claude-opus-4-7"
     thinking: str = "medium"
+    provider: str = "claude"
     allowed_mcp_tools: tuple[str, ...] = DEFAULT_ALLOWED_MCP_SERVERS
 
 
@@ -180,6 +201,7 @@ class LumenConfig:
     (K discovered + 1 authored). Graceful-degrade is non-negotiable: if Lumen
     is offline the brief still renders and the worker continues.
     """
+
     top_k: int = 3
 
 
@@ -195,7 +217,9 @@ class Config:
     parallel: int = 3
     tick_interval_s: int = 60
     max_ticks: int = 0
-    worker_timeout_s: int = 7200  # fail-safe wall ceiling; idle-kill is the primary killer (watchdog)
+    worker_timeout_s: int = (
+        7200  # fail-safe wall ceiling; idle-kill is the primary killer (watchdog)
+    )
     maintenance_every_n_ticks: int = 0  # 0 = off
 
     # Deploy (no default — operators set LOOP_DEPLOY_TASK or repo.deploy.task in YAML)
@@ -341,19 +365,37 @@ def load() -> Config:
     critic_block = y.get("critic") or {}
     po_block = y.get("po") or {}
     worker_block = y.get("worker") or {}
+    agent_block = y.get("agent") or {}
     attempts_block = y.get("attempts") or {}
     lumen_block = y.get("lumen") or {}
 
     def _resolve_role(
-        env_model: str, env_thinking: str,
+        env_model: str,
+        env_thinking: str,
+        env_provider: str,
         block: dict[str, Any],
-        default_model: str, default_thinking: str,
-    ) -> tuple[str, str]:
+        default_model: str,
+        default_thinking: str,
+    ) -> tuple[str, str, str]:
+        raw_provider = os.environ.get(env_provider)
+        provider_source = env_provider
+        if raw_provider is None:
+            raw_provider = os.environ.get("LOOP_AGENT_PROVIDER")
+            provider_source = "LOOP_AGENT_PROVIDER"
+        if raw_provider is None:
+            raw_provider = block.get("provider", agent_block.get("provider", "claude"))
+            provider_source = (
+                f"yaml: {env_provider.lower().replace('loop_', '').replace('_provider', '')}"
+                ".provider"
+            )
+        provider = _validate_provider(str(raw_provider), provider_source)
         raw_model = os.environ.get(env_model)
         model_source = env_model
         if raw_model is None:
-            raw_model = block.get("model", default_model)
-            model_source = f"yaml: {env_model.lower().replace('loop_', '').replace('_model', '')}.model"
+            raw_model = block.get("model", default_model if provider == "claude" else "")
+            model_source = (
+                f"yaml: {env_model.lower().replace('loop_', '').replace('_model', '')}.model"
+            )
         raw_thinking = os.environ.get(env_thinking)
         thinking_source = env_thinking
         if raw_thinking is None:
@@ -363,22 +405,35 @@ def load() -> Config:
                 ".thinking"
             )
         return (
-            _validate_model(str(raw_model), model_source),
+            provider,
+            _validate_model(str(raw_model), model_source, provider),
             _validate_thinking(str(raw_thinking), thinking_source),
         )
 
-    worker_model, worker_thinking = _resolve_role(
-        "LOOP_WORKER_MODEL", "LOOP_WORKER_THINKING",
-        worker_block, "claude-opus-4-7", "medium",
+    worker_provider, worker_model, worker_thinking = _resolve_role(
+        "LOOP_WORKER_MODEL",
+        "LOOP_WORKER_THINKING",
+        "LOOP_WORKER_PROVIDER",
+        worker_block,
+        "claude-opus-4-7",
+        "medium",
     )
     worker_allowed = _resolve_allowed_mcp_tools(worker_block)
-    po_model, po_thinking = _resolve_role(
-        "LOOP_PO_MODEL", "LOOP_PO_THINKING",
-        po_block, "claude-opus-4-7", "high",
+    po_provider, po_model, po_thinking = _resolve_role(
+        "LOOP_PO_MODEL",
+        "LOOP_PO_THINKING",
+        "LOOP_PO_PROVIDER",
+        po_block,
+        "claude-opus-4-7",
+        "high",
     )
-    critic_model, critic_thinking = _resolve_role(
-        "LOOP_CRITIC_MODEL", "LOOP_CRITIC_THINKING",
-        critic_block, "claude-sonnet-4-6", "off",
+    critic_provider, critic_model, critic_thinking = _resolve_role(
+        "LOOP_CRITIC_MODEL",
+        "LOOP_CRITIC_THINKING",
+        "LOOP_CRITIC_PROVIDER",
+        critic_block,
+        "claude-sonnet-4-6",
+        "off",
     )
 
     github_repo = os.environ.get("LOOP_GH_REPO") or repo_block.get("github")
@@ -428,6 +483,7 @@ def load() -> Config:
             ),
             model=critic_model,
             thinking=critic_thinking,
+            provider=critic_provider,
         ),
         po=POConfig(
             enabled=bool(po_block.get("enabled", True)),
@@ -435,10 +491,12 @@ def load() -> Config:
             max_to_expand_per_tick=int(po_block.get("max_to_expand_per_tick", 2)),
             model=po_model,
             thinking=po_thinking,
+            provider=po_provider,
         ),
         worker=WorkerConfig(
             model=worker_model,
             thinking=worker_thinking,
+            provider=worker_provider,
             allowed_mcp_tools=worker_allowed,
         ),
         attempts=AttemptsConfig(

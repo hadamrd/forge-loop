@@ -36,6 +36,26 @@ labels:
   # Optional: issues tagged this label skip auto-merge (human review required).
   risk_gate: "risk:high"
 
+agent:
+  # Default provider for worker / PO / critic. Use per-role provider fields
+  # below to mix providers.
+  provider: claude
+
+worker:
+  provider: claude
+  model: claude-opus-4-7
+  thinking: medium
+
+po:
+  provider: claude
+  model: claude-opus-4-7
+  thinking: high
+
+critic:
+  provider: claude
+  model: claude-sonnet-4-6
+  thinking: off
+
 # Optional: configure the Lumen test-discovery pattern. Match the test-file
 # glob for your stack: e.g. "**/*Test.java" for JUnit, "**/test_*.py" for pytest.
 lumen:

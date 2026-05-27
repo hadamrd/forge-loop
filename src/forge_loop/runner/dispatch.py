@@ -63,20 +63,27 @@ def _run_workers(
     from forge_loop.runner._pipeline_driver import (
         pipeline_driven_enabled as _pipeline_enabled,
     )
+
     used_pipeline = False
     if _pipeline_enabled(cfg):
         used_pipeline = True
-        append_event(cfg.events_file, "pipeline_dispatch_start", tick=tick,
-                     issues=[i["number"] for i in issues])
+        append_event(
+            cfg.events_file,
+            "pipeline_dispatch_start",
+            tick=tick,
+            issues=[i["number"] for i in issues],
+        )
         try:
             outcomes = _pipeline_dispatch(
-                cfg, issues, workers_meta, tick,
+                cfg,
+                issues,
+                workers_meta,
+                tick,
                 master_log_path=master_log_path,
                 bus_emit=bus_emit,
             )
         except Exception as ex_:  # noqa: BLE001 — must not kill the tick
-            append_event(cfg.events_file, "pipeline_dispatch_failed",
-                         tick=tick, err=str(ex_)[:300])
+            append_event(cfg.events_file, "pipeline_dispatch_failed", tick=tick, err=str(ex_)[:300])
             # Fall back to the legacy chain so a broken pipeline.yaml
             # does not strand the loop.
             used_pipeline = False
@@ -85,7 +92,11 @@ def _run_workers(
         with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
             futures = [
                 ex.submit(
-                    run_worker, i, cfg.repo, cfg.logs_dir, cfg.worker_timeout_s,
+                    run_worker,
+                    i,
+                    cfg.repo,
+                    cfg.logs_dir,
+                    cfg.worker_timeout_s,
                     risk_gated=meta["risk_gated"],
                     past_attempts=meta["past_attempts"],
                     emit=bus_emit,
@@ -95,6 +106,7 @@ def _run_workers(
                     tick=tick,
                     model=cfg.worker.model,
                     thinking=cfg.worker.thinking,
+                    provider=getattr(cfg.worker, "provider", "claude"),
                     allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
                 )
                 for i, meta in dispatch
@@ -103,9 +115,10 @@ def _run_workers(
                 outcomes.append(fut.result())
 
     for o in outcomes:
-        _mlog.info(master_log_path,
-                   f"worker #{o.issue} {o.status} ({o.duration_s:.0f}s) "
-                   f"pr={o.pr_url or '-'}")
+        _mlog.info(
+            master_log_path,
+            f"worker #{o.issue} {o.status} ({o.duration_s:.0f}s) pr={o.pr_url or '-'}",
+        )
 
     return outcomes, used_pipeline
 
@@ -120,15 +133,20 @@ def _run_critic_for_outcomes(
         if o.status in {"open", "merged"} and o.pr_url:
             try:
                 critic_outcome = _critic_review(
-                    o.pr_url, o.issue,
-                    cfg.repo, cfg.logs_dir,
+                    o.pr_url,
+                    o.issue,
+                    cfg.repo,
+                    cfg.logs_dir,
                     timeout_s=cfg.critic.timeout_s,
                     emit=bus_emit,
                     model=cfg.critic.model,
+                    provider=getattr(cfg.critic, "provider", "claude"),
                 )
                 append_event(
-                    cfg.events_file, "critic_done",
-                    issue=o.issue, pr=o.pr_url,
+                    cfg.events_file,
+                    "critic_done",
+                    issue=o.issue,
+                    pr=o.pr_url,
                     verdict=critic_outcome.verdict,
                     reasons=critic_outcome.reasons,
                     duration_s=round(critic_outcome.duration_s, 1),
@@ -140,17 +158,23 @@ def _run_critic_for_outcomes(
                         lines = _gh.pr_changed_lines(o.pr_url, repo=cfg.github_repo)
                         apply_critic_report(
                             critic_outcome.report,
-                            o.pr_url, lines,
+                            o.pr_url,
+                            lines,
                             cfg.critic.block_on_sev2,
                             cfg.critic.min_findings_for_approve,
-                            gh=_gh, repo=cfg.github_repo, emit=bus_emit,
+                            gh=_gh,
+                            repo=cfg.github_repo,
+                            emit=bus_emit,
                         )
                     except Exception as act_ex:
-                        append_event(cfg.events_file, "critic_actions_failed",
-                                     issue=o.issue, err=str(act_ex)[:200])
+                        append_event(
+                            cfg.events_file,
+                            "critic_actions_failed",
+                            issue=o.issue,
+                            err=str(act_ex)[:200],
+                        )
             except Exception as ex_:
-                append_event(cfg.events_file, "critic_failed",
-                             issue=o.issue, err=str(ex_)[:200])
+                append_event(cfg.events_file, "critic_failed", issue=o.issue, err=str(ex_)[:200])
 
 
 def run_multirepo(
@@ -174,6 +198,7 @@ def run_multirepo(
         specs = load_repos(repos_dir)
     except RepoLoadError as e:
         import sys
+
         sys.stderr.write(f"[multirepo] failed to load repos: {e}\n")
         return 2
 
@@ -182,16 +207,18 @@ def run_multirepo(
     sidecar_events.parent.mkdir(parents=True, exist_ok=True)
     state = MultirepoRunState()
 
-    append_event(sidecar_events, "multirepo_loop_start",
-                 repos=[s.name for s in specs])
+    append_event(sidecar_events, "multirepo_loop_start", repos=[s.name for s in specs])
 
     tick = 0
     while _boot._RUN:
         tick += 1
         run_multirepo_tick(
-            specs, tick,
-            state=state, template=template,
-            events_file=sidecar_events, tick_fn=_tick,
+            specs,
+            tick,
+            state=state,
+            template=template,
+            events_file=sidecar_events,
+            tick_fn=_tick,
         )
         if template and template.max_ticks and tick >= template.max_ticks:
             append_event(sidecar_events, "max_ticks_reached", tick=tick)

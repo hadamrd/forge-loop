@@ -84,6 +84,7 @@ def expand_thin_specs(
     brief_template: str | None = None,
     max_to_expand: int = 3,
     model: str | None = None,
+    provider: str = "claude",
 ) -> list[POOutcome]:
     """Run the PO pass over up to ``max_to_expand`` thin issues.
 
@@ -112,7 +113,15 @@ def expand_thin_specs(
             github_repo=github_repo,
         )
         outcomes.append(
-            _run_one(issue["number"], brief, repo, logs_dir, timeout_s, model=model)
+            _run_one(
+                issue["number"],
+                brief,
+                repo,
+                logs_dir,
+                timeout_s,
+                model=model,
+                provider=provider,
+            )
         )
         n_expanded += 1
 
@@ -162,10 +171,46 @@ def _run_one(
     timeout_s: int,
     *,
     model: str | None = None,
+    provider: str = "claude",
 ) -> POOutcome:
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"po-{issue_number}-{int(time.time())}.log"
     started = time.time()
+
+    if provider == "codex":
+        from forge_loop.agent_backend import extract_last_json_object, run_codex_exec
+
+        result = run_codex_exec(
+            prompt=brief,
+            cwd=repo,
+            log_path=log_path,
+            timeout_s=timeout_s,
+            model=model,
+            add_dirs=[repo],
+        )
+        if result.timed_out:
+            return POOutcome(
+                issue=issue_number,
+                skipped=False,
+                reason="po-timeout",
+                sections_added=[],
+                duration_s=result.duration_s,
+                stdout_tail="(timeout)",
+                error=result.error,
+            )
+        parsed = extract_last_json_object(result.last_message) or {
+            "skipped": False,
+            "reason": "no-final-json",
+        }
+        return POOutcome(
+            issue=issue_number,
+            skipped=bool(parsed.get("skipped", False)),
+            reason=str(parsed.get("reason", "")),
+            sections_added=list(parsed.get("sections_added", []) or []),
+            duration_s=result.duration_s,
+            stdout_tail=_tail(log_path, 400),
+            error=result.error,
+        )
 
     try:
         with open(log_path, "wb") as logf:

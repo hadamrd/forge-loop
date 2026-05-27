@@ -128,6 +128,7 @@ def review_pr(
     brief_template: str | None = None,
     emit: Callable[[str, dict[str, Any]], None] | None = None,
     model: str | None = None,
+    provider: str = "claude",
 ) -> CriticOutcome:
     """Spawn the critic subagent against an open PR. Synchronous.
 
@@ -147,6 +148,56 @@ def review_pr(
     last_log_path: Path | None = None
     parse_error: str | None = None
     retries = 0
+
+    if provider == "codex":
+        from forge_loop.agent_backend import run_codex_exec
+
+        log_path = logs_dir / f"critic-{issue_number}-{int(time.time())}-codex.log"
+        result = run_codex_exec(
+            prompt=brief,
+            cwd=repo,
+            log_path=log_path,
+            timeout_s=timeout_s,
+            model=model,
+            add_dirs=[repo],
+        )
+        if result.timed_out:
+            return CriticOutcome(
+                verdict="error",
+                reasons=[],
+                duration_s=result.duration_s,
+                stdout_tail="(timeout)",
+                error=result.error,
+            )
+        report, parse_error = parse_report_from_text(result.last_message)
+        tail = _tail(log_path, 500)
+        if report is None:
+            if emit is not None:
+                emit(
+                    "critic_parse_failed",
+                    {
+                        "issue": issue_number,
+                        "pr": pr_url,
+                        "err": (parse_error or result.error or "no_json_found")[:200],
+                        "retries": 0,
+                    },
+                )
+            return CriticOutcome(
+                verdict="error",
+                reasons=[],
+                duration_s=result.duration_s,
+                stdout_tail=tail,
+                error=parse_error or result.error or "critic_parse_failed",
+            )
+        verdict = _verdict_from_overall(report.overall)
+        reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
+        return CriticOutcome(
+            verdict=verdict,
+            reasons=reasons,
+            duration_s=result.duration_s,
+            stdout_tail=tail,
+            report=report,
+        )
 
     for attempt in range(2):  # initial + 1 retry
         log_path = logs_dir / f"critic-{issue_number}-{int(time.time())}-{attempt}.log"

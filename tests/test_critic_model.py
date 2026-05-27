@@ -26,9 +26,10 @@ def test_review_pr_threads_model_into_subprocess(tmp_path: Path) -> None:
         captured["argv"] = list(argv)
         return MagicMock(returncode=0)
 
-    with patch.object(
-        critic, "subprocess", MagicMock(run=fake_run, TimeoutExpired=Exception)
-    ), patch.object(critic, "ensure_subagent_trusted", lambda *_a, **_k: None):
+    with (
+        patch.object(critic, "subprocess", MagicMock(run=fake_run, TimeoutExpired=Exception)),
+        patch.object(critic, "ensure_subagent_trusted", lambda *_a, **_k: None),
+    ):
         critic.review_pr(
             "https://github.com/o/r/pull/1",
             123,
@@ -50,9 +51,10 @@ def test_review_pr_without_model_omits_flag(tmp_path: Path) -> None:
         captured["argv"] = list(argv)
         return MagicMock(returncode=0)
 
-    with patch.object(
-        critic, "subprocess", MagicMock(run=fake_run, TimeoutExpired=Exception)
-    ), patch.object(critic, "ensure_subagent_trusted", lambda *_a, **_k: None):
+    with (
+        patch.object(critic, "subprocess", MagicMock(run=fake_run, TimeoutExpired=Exception)),
+        patch.object(critic, "ensure_subagent_trusted", lambda *_a, **_k: None),
+    ):
         critic.review_pr(
             "https://github.com/o/r/pull/1",
             123,
@@ -62,3 +64,33 @@ def test_review_pr_without_model_omits_flag(tmp_path: Path) -> None:
             brief_template="dummy",
         )
     assert "--model" not in captured["argv"]
+
+
+def test_review_pr_codex_provider_uses_codex_backend(tmp_path: Path, monkeypatch) -> None:
+    from forge_loop import agent_backend
+
+    captured: dict[str, object] = {}
+
+    def fake_codex(**kwargs):
+        captured.update(kwargs)
+        return agent_backend.AgentRunResult(
+            provider="codex",
+            log_path=kwargs["log_path"],
+            last_message='{"overall": "approve", "findings": []}',
+            duration_s=0.5,
+        )
+
+    monkeypatch.setattr(agent_backend, "run_codex_exec", fake_codex)
+    with patch.object(critic, "ensure_subagent_trusted", lambda *_a, **_k: None):
+        outcome = critic.review_pr(
+            "https://github.com/o/r/pull/1",
+            123,
+            tmp_path,
+            tmp_path / "logs",
+            timeout_s=10,
+            brief_template="dummy",
+            provider="codex",
+            model="gpt-5-codex",
+        )
+    assert captured["model"] == "gpt-5-codex"
+    assert outcome.verdict == "approved"

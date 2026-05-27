@@ -35,8 +35,10 @@ def test_expand_thin_specs_threads_model_through_to_subprocess(
         captured["argv"] = list(argv)
         return MagicMock(returncode=0)
 
-    with patch.object(po, "subprocess", MagicMock(run=fake_run, TimeoutExpired=Exception)), \
-         patch.object(po, "ensure_subagent_trusted", lambda *_a, **_k: None):
+    with (
+        patch.object(po, "subprocess", MagicMock(run=fake_run, TimeoutExpired=Exception)),
+        patch.object(po, "ensure_subagent_trusted", lambda *_a, **_k: None),
+    ):
         po.expand_thin_specs(
             [{"number": 1, "title": "t", "body": "thin body"}],
             tmp_path,
@@ -60,11 +62,14 @@ def test_expand_thin_specs_no_model_means_no_model_flag(tmp_path: Path) -> None:
         captured["argv"] = list(argv)
         return MagicMock(returncode=0)
 
-    with patch.object(po, "subprocess", MagicMock(run=fake_run, TimeoutExpired=Exception)), \
-         patch.object(po, "ensure_subagent_trusted", lambda *_a, **_k: None):
+    with (
+        patch.object(po, "subprocess", MagicMock(run=fake_run, TimeoutExpired=Exception)),
+        patch.object(po, "ensure_subagent_trusted", lambda *_a, **_k: None),
+    ):
         po.expand_thin_specs(
             [{"number": 1, "title": "t", "body": "thin"}],
-            tmp_path, tmp_path / "logs",
+            tmp_path,
+            tmp_path / "logs",
             github_repo="o/r",
             timeout_s=10,
             brief_template="dummy",
@@ -72,3 +77,38 @@ def test_expand_thin_specs_no_model_means_no_model_flag(tmp_path: Path) -> None:
         )
 
     assert "--model" not in captured["argv"]
+
+
+def test_expand_thin_specs_codex_provider_uses_codex_backend(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from forge_loop import agent_backend
+
+    captured: dict[str, object] = {}
+
+    def fake_codex(**kwargs):
+        captured.update(kwargs)
+        return agent_backend.AgentRunResult(
+            provider="codex",
+            log_path=kwargs["log_path"],
+            last_message='{"skipped": false, "reason": "expanded", "sections_added": ["Acceptance"]}',
+            duration_s=0.5,
+        )
+
+    monkeypatch.setattr(agent_backend, "run_codex_exec", fake_codex)
+    with patch.object(po, "ensure_subagent_trusted", lambda *_a, **_k: None):
+        outcomes = po.expand_thin_specs(
+            [{"number": 1, "title": "t", "body": "thin"}],
+            tmp_path,
+            tmp_path / "logs",
+            github_repo="o/r",
+            timeout_s=10,
+            brief_template="dummy",
+            max_to_expand=1,
+            provider="codex",
+            model="gpt-5-codex",
+        )
+
+    assert captured["model"] == "gpt-5-codex"
+    assert outcomes[0].sections_added == ["Acceptance"]

@@ -99,7 +99,10 @@ def _build_default_handlers(
         meta = ctx.extras.get("meta") or {}
         tick = ctx.extras.get("tick", 0)
         out = run_worker_fn(
-            ctx.issue, cfg.repo, cfg.logs_dir, cfg.worker_timeout_s,
+            ctx.issue,
+            cfg.repo,
+            cfg.logs_dir,
+            cfg.worker_timeout_s,
             risk_gated=meta.get("risk_gated", False),
             past_attempts=meta.get("past_attempts") or [],
             emit=bus_emit,
@@ -109,6 +112,7 @@ def _build_default_handlers(
             tick=tick,
             model=cfg.worker.model,
             thinking=cfg.worker.thinking,
+            provider=getattr(cfg.worker, "provider", "claude"),
             allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
         )
         ok = out.status in {"merged", "open"}
@@ -137,15 +141,19 @@ def _build_default_handlers(
             return StepOutcome(role="critic", status="ok", detail="worker not open/merged")
         try:
             c = critic_review_fn(
-                worker_outcome.pr_url, worker_outcome.issue,
-                cfg.repo, cfg.logs_dir,
+                worker_outcome.pr_url,
+                worker_outcome.issue,
+                cfg.repo,
+                cfg.logs_dir,
                 timeout_s=cfg.critic.timeout_s,
                 emit=bus_emit,
                 model=cfg.critic.model,
+                provider=getattr(cfg.critic, "provider", "claude"),
             )
         except Exception as e:  # noqa: BLE001 — boundary
             return StepOutcome(
-                role="critic", status="failed",
+                role="critic",
+                status="failed",
                 detail=f"{type(e).__name__}: {e}",
             )
         return StepOutcome(role="critic", status="ok", detail=getattr(c, "verdict", "?"), payload=c)
@@ -209,31 +217,41 @@ def dispatch_via_pipeline(
         # StepContext.upstream_outcomes). Handlers mutate this dict
         # via a thin wrapper below.
         all_prior: dict[str, StepOutcome] = {}
-        extras = {"meta": meta, "cfg": cfg, "tick": tick,
-                  "_all_prior_outcomes": all_prior}
+        extras = {"meta": meta, "cfg": cfg, "tick": tick, "_all_prior_outcomes": all_prior}
         # Wrap each handler to record its outcome into ``all_prior``
         # so later steps (e.g. critic after reviewer after worker) can
         # see what worker produced even when they aren't direct parents.
         wrapped: dict[str, Any] = {}
         for role, h in handlers.items():
+
             def _wrap(role_=role, h_=h, sink=all_prior):
                 def runner(ctx):
                     out = h_(ctx)
                     sink[role_] = out
                     return out
+
                 return runner
+
             wrapped[role] = _wrap()
         executor = PipelineExecutor(dag, wrapped, events=_events_sink)
-        bus_emit("pipeline_run_start", {
-            "issue": issue["number"], "roles": list(dag.order),
-            "tick": tick,
-        })
+        bus_emit(
+            "pipeline_run_start",
+            {
+                "issue": issue["number"],
+                "roles": list(dag.order),
+                "tick": tick,
+            },
+        )
         result = executor.run(issue, extras=extras)
-        bus_emit("pipeline_run_done", {
-            "issue": issue["number"], "end_state": result.end_state,
-            "tick": tick,
-            "statuses": {r: o.status for r, o in result.outcomes.items()},
-        })
+        bus_emit(
+            "pipeline_run_done",
+            {
+                "issue": issue["number"],
+                "end_state": result.end_state,
+                "tick": tick,
+                "statuses": {r: o.status for r, o in result.outcomes.items()},
+            },
+        )
 
         worker_step = result.outcomes.get("worker")
         if worker_step is not None and isinstance(worker_step.payload, WorkerOutcome):
@@ -242,13 +260,15 @@ def dispatch_via_pipeline(
             # Worker step did not execute (skipped) or returned a non-
             # WorkerOutcome payload. Synthesise a no-op WorkerOutcome so
             # callers can keep their flat list invariant.
-            outcomes.append(WorkerOutcome(
-                issue=issue["number"],
-                title=issue.get("title", ""),
-                pr_url=None,
-                status="no_pr",
-                duration_s=0.0,
-                stdout_tail="",
-                error=f"pipeline end_state={result.end_state}",
-            ))
+            outcomes.append(
+                WorkerOutcome(
+                    issue=issue["number"],
+                    title=issue.get("title", ""),
+                    pr_url=None,
+                    status="no_pr",
+                    duration_s=0.0,
+                    stdout_tail="",
+                    error=f"pipeline end_state={result.end_state}",
+                )
+            )
     return outcomes

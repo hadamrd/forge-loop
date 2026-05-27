@@ -113,8 +113,8 @@ def make_brief(
         "    STOP. DO NOT enable auto-merge. The `risk:high` label on this issue\n"
         "    means a human must review. Post a comment on the PR: 'Risk-gated;\n"
         "    ready for human review.' Your status is `open` (not `merged`)."
-        if risk_gated else
-        "10. `gh pr create` with a clear title + body (the body should restate\n"
+        if risk_gated
+        else "10. `gh pr create` with a clear title + body (the body should restate\n"
         "    the acceptance criteria and how they're tested).\n"
         "11. `gh pr merge <N> --squash --auto --delete-branch`."
     )
@@ -123,8 +123,8 @@ def make_brief(
 
     final_status = (
         f'{{"issue": {n}, "pr": "<url>", "status": "open", "note": "risk-gated"}}'
-        if risk_gated else
-        f'{{"issue": {n}, "pr": "<url-or-null>", "status": "merged|open|failed", "note": "<short>"}}'
+        if risk_gated
+        else f'{{"issue": {n}, "pr": "<url-or-null>", "status": "merged|open|failed", "note": "<short>"}}'
     )
 
     coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
@@ -147,6 +147,7 @@ def make_brief(
     )
     if dry_run:
         from forge_loop.replay import apply_dry_run_to_brief
+
         rendered = apply_dry_run_to_brief(rendered)
     return rendered
 
@@ -220,7 +221,8 @@ def _prep_worktree(repo: Path, n: int, branch: str) -> tuple[Path, str | None]:
         subprocess.run(["chmod", "-R", "u+w", str(claude_dir)], capture_output=True)
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(wt)],
-        cwd=repo, capture_output=True,
+        cwd=repo,
+        capture_output=True,
     )
     # If a previous failed attempt left a local branch lying around, delete
     # it so `git worktree add -B` can recreate it cleanly off the freshest
@@ -228,7 +230,8 @@ def _prep_worktree(repo: Path, n: int, branch: str) -> tuple[Path, str | None]:
     # an explicit delete to fail loudly if the branch is still in use.
     subprocess.run(
         ["git", "branch", "-D", branch],
-        cwd=repo, capture_output=True,
+        cwd=repo,
+        capture_output=True,
     )
     # Force-update origin/trunk so the worktree always starts at the freshest
     # commit, even if many PRs landed during the prior tick. `+refs/heads/...`
@@ -236,11 +239,14 @@ def _prep_worktree(repo: Path, n: int, branch: str) -> tuple[Path, str | None]:
     # happen for trunk, but if it does we want the upstream view).
     subprocess.run(
         ["git", "fetch", "--prune", "origin", "+refs/heads/trunk:refs/remotes/origin/trunk"],
-        cwd=repo, capture_output=True,
+        cwd=repo,
+        capture_output=True,
     )
     r = subprocess.run(
         ["git", "worktree", "add", str(wt), "-B", branch, "origin/trunk"],
-        cwd=repo, capture_output=True, text=True,
+        cwd=repo,
+        capture_output=True,
+        text=True,
     )
     if r.returncode != 0:
         return wt, r.stderr
@@ -310,6 +316,7 @@ def run_worker(
     tick: int | None = None,
     model: str | None = None,
     thinking: str | None = None,
+    provider: str = "claude",
     allowed_mcp_servers: tuple[str, ...] | None = None,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
@@ -327,20 +334,36 @@ def run_worker(
     worktree, err = _prep_worktree(repo, n, branch)
     if err is not None:
         return WorkerOutcome(
-            issue=n, title=title, pr_url=None, status="failed",
-            duration_s=0.0, stdout_tail=err[-500:],
+            issue=n,
+            title=title,
+            pr_url=None,
+            status="failed",
+            duration_s=0.0,
+            stdout_tail=err[-500:],
             error="worktree-create-failed",
         )
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"worker-{n}-{int(time.time())}.log"
     brief = make_brief(
-        issue, worktree,
-        risk_gated=risk_gated, past_attempts=past_attempts,
+        issue,
+        worktree,
+        risk_gated=risk_gated,
+        past_attempts=past_attempts,
         lumen_top_k=lumen_top_k,
         lumen_test_pattern=lumen_test_pattern,
         coauthor=coauthor,
     )
+
+    if provider == "codex":
+        return _run_worker_codex(
+            issue=issue,
+            worktree=worktree,
+            log_path=log_path,
+            brief=brief,
+            timeout_s=timeout_s,
+            model=model,
+        )
 
     return _run_worker_sdk(
         issue=issue,
@@ -353,6 +376,68 @@ def run_worker(
         model=model,
         thinking=thinking,
         allowed_mcp_servers=allowed_mcp_servers,
+    )
+
+
+def _run_worker_codex(
+    *,
+    issue: dict[str, Any],
+    worktree: Path,
+    log_path: Path,
+    brief: str,
+    timeout_s: int,
+    model: str | None = None,
+) -> WorkerOutcome:
+    """Drive a worker through ``codex exec`` and map it to WorkerOutcome."""
+    from forge_loop.agent_backend import (
+        extract_github_pr,
+        extract_last_json_object,
+        run_codex_exec,
+    )
+
+    n = issue["number"]
+    title = issue["title"]
+    result = run_codex_exec(
+        prompt=brief,
+        cwd=worktree,
+        log_path=log_path,
+        timeout_s=timeout_s,
+        model=model,
+        add_dirs=[worktree],
+    )
+    if result.timed_out:
+        return WorkerOutcome(
+            issue=n,
+            title=title,
+            pr_url=None,
+            status="timeout",
+            duration_s=result.duration_s,
+            stdout_tail="(timeout)",
+            error=result.error,
+            usage={},
+            model=model or "",
+        )
+    obj = extract_last_json_object(result.last_message) or {}
+    pr_url = obj.get("pr") if isinstance(obj.get("pr"), str) else None
+    status = obj.get("status") if isinstance(obj.get("status"), str) else "no_pr"
+    if pr_url is None:
+        pr_url = extract_github_pr(result.last_message)
+        if pr_url:
+            status = "open"
+    if result.error and pr_url is None:
+        status = "failed"
+    return WorkerOutcome(
+        issue=n,
+        title=title,
+        pr_url=pr_url,
+        status=status,
+        duration_s=result.duration_s,
+        stdout_tail=_tail(log_path, 500),
+        events=_read_subagent_events(worktree),
+        cost_usd=0.0,
+        usage={},
+        model=model or "",
+        error=result.error,
     )
 
 
@@ -383,6 +468,7 @@ def _run_worker_sdk(
     started = time.time()
 
     with open(log_path, "w", encoding="utf-8") as log_fh:
+
         def _on_event(ev: dict[str, Any]) -> None:
             with contextlib.suppress(OSError):
                 log_fh.write(json.dumps(ev, default=str) + "\n")
@@ -414,10 +500,16 @@ def _run_worker_sdk(
         # Record the *requested* model so the audit trail is informative
         # even when no response ever arrived (issue #34).
         return WorkerOutcome(
-            issue=n, title=title, pr_url=None, status="timeout",
-            duration_s=duration, stdout_tail="(timeout)",
+            issue=n,
+            title=title,
+            pr_url=None,
+            status="timeout",
+            duration_s=duration,
+            stdout_tail="(timeout)",
             error=f"worker exceeded {timeout_s}s",
-            cost_usd=0.0, usage={}, model=model or "",
+            cost_usd=0.0,
+            usage={},
+            model=model or "",
         )
 
     assert result is not None
@@ -433,10 +525,16 @@ def _run_worker_sdk(
 
     events = _read_subagent_events(worktree)
     return WorkerOutcome(
-        issue=n, title=title, pr_url=pr_url, status=status,
-        duration_s=duration, stdout_tail=_tail(log_path, 500),
+        issue=n,
+        title=title,
+        pr_url=pr_url,
+        status=status,
+        duration_s=duration,
+        stdout_tail=_tail(log_path, 500),
         events=events,
-        cost_usd=cost_usd, usage=dict(result.usage or {}), model=model_seen,
+        cost_usd=cost_usd,
+        usage=dict(result.usage or {}),
+        model=model_seen,
         error=result.error,
     )
 
