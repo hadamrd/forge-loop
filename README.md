@@ -37,6 +37,71 @@ merges, and redeploys.
 Every Nth tick is a maintenance pass: a PM agent triages/retitles/dedupes
 the backlog. Risk-gated issues skip auto-merge.
 
+## Stability matrix
+
+forge-loop's surface is split into a **stable** core and a quarantined
+**experimental** ring (issue #39). The default `pip install forge-loop`
+ships ONLY the stable surface; experiments require an extra and a
+matching feature flag.
+
+### STABLE (default install — supported)
+
+| Module | What it does |
+|---|---|
+| `forge_loop.worker` | Claude Agent SDK worker (Opus 4.7) — the main dispatch path |
+| `forge_loop.critic` | Typed CriticReport + per-finding gating |
+| `forge_loop.attempts` | Per-issue attempts ledger w/ retry + cooldown |
+| `forge_loop.briefs/*` | Externalised worker / PO / critic brief templates |
+| `forge_loop.po` | PO spec-expander for thin tickets |
+| `forge_loop.maintenance` | Periodic maintenance pass (triage / dedupe) |
+| `forge_loop.watchdog` | Liveness watchdog + idle-kill |
+| `forge_loop.runner` | Synchronous tick loop (PO → workers → critics) |
+| `forge_loop.queue.in_memory` | Default queue (test / in-process) |
+| `forge_loop.queue.sqlite` | Durable embedded queue (WAL) — production default |
+
+### EXPERIMENTAL (gated, requires `pip install 'forge-loop[experimental]'`)
+
+| Module | Why it's experimental |
+|---|---|
+| `forge_loop.multirepo` | One loop serves N repos — zero downstream operator yet |
+| `forge_loop.runner_async` | Three-stage asyncio orchestrator — sync path is the supported one |
+| `forge_loop.dashboard` | Stdlib HTTP `/metrics` + `/healthz` — no scrape consumer yet |
+| `forge_loop.integrations.*` | Slack / Discord / generic-webhook adapters |
+| `forge_loop.observability.*` | Prometheus + OpenTelemetry exporters |
+| `forge_loop.replay` | Time-travel re-run of a past tick with a new brief |
+| `forge_loop.pipeline` | Declarative role-chain pipeline (`.forge/pipeline.yaml`) |
+
+Each experimental module's top-level import calls
+`forge_loop._extras.require_experimental()`, which raises a clear
+`ImportError` naming the extra to install if the gate is not satisfied.
+Set `FORGE_LOOP_EXPERIMENTAL=1` to bypass the gate during local development.
+
+### REMOVED in #39
+
+| Module | Reason |
+|---|---|
+| `forge_loop.queue.redis_backend` | Premature distribution — no real 2+ host operator. Replaced by `SQLiteQueue`. |
+| `forge_loop.cluster` (election + coordinator) | Same reason — single-host is the supported surface. |
+
+## Running on a Claude subscription (flat-fee mode)
+
+forge-loop is designed for an operator running on a Claude Pro / Max /
+Team subscription, not a metered API key. **Per-token budget tracking is
+not supported** in this mode — the loop's spend gauges will read $0 and
+the `LOOP_DAILY_BUDGET_USD` / `LOOP_TICK_BUDGET_USD` knobs are no-ops.
+
+What you get instead:
+
+* The watchdog wall-clock budget (`LOOP_WORKER_TIMEOUT_S`) still applies
+  per worker — it's the actual safety net under a flat fee.
+* `forge-loop status` reports tick counts, PRs merged, failures.
+* Cooldowns + attempts ledger still gate retries, so a stuck issue
+  can't burn unbounded wall time.
+
+If you DO have a metered key and want token accounting, set up a
+separate billing scrape — the current default is "operator pays a flat
+fee, we count work done not tokens spent".
+
 ## Quickstart
 
 ```sh

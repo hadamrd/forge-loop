@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Autonomous multi-worker dispatcher for Claude Code — picks up GitHub issues by label, dispatches parallel workers in git worktrees, watches PRs, merges, and redeploys."
 readme = "README.md"
 requires-python = ">=3.11"
+# STABLE surface only (issue #39). Anything heavier — fastapi, uvicorn,
+# prometheus_client, opentelemetry, jinja2, redis — lives in the
+# [experimental] extra and is gated by ``forge_loop._extras``.
 dependencies = [
   "mcp >=1.0",
   "pyyaml >=6.0",
@@ -14,17 +17,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-observability = [
+# All quarantined / experimental features (multirepo, dashboard, async
+# orchestrator, slack/discord/webhook adapters, prometheus + otel
+# exporters, replay, pipeline DAG) live behind this extra. Install with:
+#   pip install 'forge-loop[experimental]'
+experimental = [
+  "fastapi >=0.110",
+  "uvicorn >=0.30",
   "prometheus_client >=0.20",
   "opentelemetry-api >=1.25",
   "opentelemetry-sdk >=1.25",
   "opentelemetry-exporter-otlp >=1.25",
-]
-# Optional Redis-backed queue + leader election for multi-host runners
-# (issue #19). Default stays in-memory; install with `pip install
-# 'forge-loop[redis]'` to enable `forge-loop run --queue redis://...`.
-redis = [
-  "redis >=5.0",
+  "jinja2 >=3.1",
 ]
 dev = [
   "pytest >=8.0",
@@ -32,8 +36,13 @@ dev = [
   "ruff >=0.6",
   "mypy >=1.10",
   "types-PyYAML >=6.0",
-  "fakeredis >=2.20",
-  "redis >=5.0",
+  "fastapi >=0.110",
+  "uvicorn >=0.30",
+  "prometheus_client >=0.20",
+  "opentelemetry-api >=1.25",
+  "opentelemetry-sdk >=1.25",
+  "opentelemetry-exporter-otlp >=1.25",
+  "jinja2 >=3.1",
 ]
 
 [project.scripts]
@@ -61,6 +70,19 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
 ignore = ["E501"]  # line-too-long handled by format
+
+[tool.ruff.lint.per-file-ignores]
+# Experimental modules (issue #39) call the extras gate before any
+# other import so an unprepared environment fails fast with a clear
+# error rather than crashing partway through a chain of imports. That
+# forces E402 / I001 violations that are by-design.
+"src/forge_loop/multirepo/__init__.py" = ["E402", "I001"]
+"src/forge_loop/dashboard/__init__.py" = ["E402", "I001"]
+"src/forge_loop/integrations/__init__.py" = ["E402", "I001"]
+"src/forge_loop/observability/__init__.py" = ["E402", "I001"]
+"src/forge_loop/pipeline/__init__.py" = ["E402", "I001"]
+"src/forge_loop/replay.py" = ["E402", "I001"]
+"src/forge_loop/runner_async.py" = ["E402", "I001"]
 
 [tool.mypy]
 python_version = "3.11"

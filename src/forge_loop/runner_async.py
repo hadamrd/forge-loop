@@ -29,8 +29,14 @@ This module is dependency-injected: pass in ``po_fn``, ``worker_fn``,
 swap in fakes that simulate slow calls deterministically.
 """
 
+
 from __future__ import annotations
 
+
+# Experimental gate (issue #39): refuse to import unless the [experimental]
+# extra is installed. Stable surface only in the default install.
+from forge_loop._extras import require_experimental as _require_experimental
+_require_experimental('runner_async')
 import asyncio
 import contextlib
 import os

@@ -31,7 +31,7 @@ from forge_loop.worker import _subagent_env, ensure_subagent_trusted
 
 VALID_OVERALL = {"approve", "request_changes", "block"}
 VALID_SEVERITY = {"sev1", "sev2", "sev3"}
-VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs"}
+VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs", "product"}
 
 
 def _default_brief() -> str:

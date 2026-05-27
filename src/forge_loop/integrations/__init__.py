@@ -18,8 +18,14 @@ All notification + command activity is recorded as ``integration_event`` (or
 via :func:`forge_loop.state.append_event`.
 """
 
+
 from __future__ import annotations
 
+
+# Experimental gate (issue #39): refuse to import unless the [experimental]
+# extra is installed. Stable surface only in the default install.
+from forge_loop._extras import require_experimental as _require_experimental
+_require_experimental('integrations')
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
