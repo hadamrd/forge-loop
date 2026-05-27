@@ -221,6 +221,48 @@ def post_review_comment(
     return r.returncode == 0
 
 
+def get_issue_state(issue: int, repo: str | None = None) -> str | None:
+    """Return the issue's current state (``"OPEN"``/``"CLOSED"``) or ``None``
+    on failure (network, auth, bad number).
+
+    Used by the runner's pre-merge gate (issue #65): an operator who closes
+    an issue mid-flight (close-as-dup, not-planned, scope change) expects
+    the loop to STOP, even if a worker has already opened a PR. Callers
+    treat ``None`` conservatively — same as CLOSED — because the operator's
+    intent to stop must not be silently overridden by a transient gh
+    outage.
+    """
+    repo = _require_repo(repo)
+    r = subprocess.run(
+        [
+            "gh", "issue", "view", str(issue),
+            "--repo", repo,
+            "--json", "state",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return None
+    try:
+        obj = json.loads(r.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    state = obj.get("state")
+    if not isinstance(state, str):
+        return None
+    return state.upper()
+
+
+def pr_comment(pr: int | str, body: str, repo: str | None = None) -> bool:
+    """Post a top-level comment on a PR. Returns True on success."""
+    repo = _require_repo(repo)
+    r = subprocess.run(
+        ["gh", "pr", "comment", str(pr), "--repo", repo, "--body", body],
+        capture_output=True, text=True, check=False,
+    )
+    return r.returncode == 0
+
+
 def _pr_number(pr: int | str) -> str:
     """Extract a PR number from an int / URL / numeric string."""
     s = str(pr)

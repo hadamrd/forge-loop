@@ -260,6 +260,28 @@ def _tick(cfg: Config, tick: int) -> None:
     if cfg.critic.enabled and not _used_pipeline:
         _run_critic_for_outcomes(cfg, outcomes, _bus_emit)
 
+    # Issue #65 — pre-merge gate. AFTER the critic has had its say but
+    # BEFORE we declare any outcome "merged", re-check that the source
+    # issue is still OPEN. An operator who closed it mid-flight
+    # (close-as-dup / not-planned / scope-change) wants the loop to STOP,
+    # even if the worker raced to the finish. Conservative on gh failure:
+    # refuse rather than risk landing a 1300-LOC refactor on a closed
+    # ticket.
+    from forge_loop import gh as _gh
+    from forge_loop.runner.merge_gate import apply_issue_closed_gate
+    refused = apply_issue_closed_gate(
+        outcomes,
+        gh=_gh,
+        repo=cfg.github_repo,
+        events_file=cfg.events_file,
+        emit=_bus_emit,
+    )
+    if refused:
+        _mlog.info(
+            master_log_path,
+            f"merge gate refused {len(refused)} PR(s) — closed issues: {refused}",
+        )
+
     merged_nums = [o.issue for o in outcomes if o.status == "merged"]
     append_event(
         cfg.events_file,
