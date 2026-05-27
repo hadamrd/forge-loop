@@ -540,6 +540,54 @@ def _tick(cfg: Config, tick: int) -> None:
     _short_sleep(cfg.tick_interval_s, cfg)
 
 
+def run_multirepo(
+    repos_dir: Path,
+    template: Config | None = None,
+) -> int:
+    """Run the loop across N repos discovered under ``repos_dir``.
+
+    Each global tick iterates every enabled repo in name-sorted order and
+    runs the regular single-repo ``_tick`` body against a per-repo
+    ``Config``. Per-repo state / events stay under each checkout; the
+    cross-repo orchestration events (start/done, skips) land in a small
+    sidecar log under ``<loop_home>/.forge/multirepo-events.jsonl``.
+    """
+    from forge_loop.multirepo import RepoLoadError, load_repos
+    from forge_loop.multirepo.runner import MultirepoRunState, run_multirepo_tick
+
+    try:
+        specs = load_repos(repos_dir)
+    except RepoLoadError as e:
+        import sys
+        sys.stderr.write(f"[multirepo] failed to load repos: {e}\n")
+        return 2
+
+    loop_home = repos_dir.parent.parent  # <home>/.forge/repos/ → <home>
+    sidecar_events = loop_home / ".forge" / "multirepo-events.jsonl"
+    sidecar_events.parent.mkdir(parents=True, exist_ok=True)
+    state = MultirepoRunState()
+
+    append_event(sidecar_events, "multirepo_loop_start",
+                 repos=[s.name for s in specs])
+
+    tick = 0
+    while _RUN:
+        tick += 1
+        run_multirepo_tick(
+            specs, tick,
+            state=state, template=template,
+            events_file=sidecar_events, tick_fn=_tick,
+        )
+        if template and template.max_ticks and tick >= template.max_ticks:
+            append_event(sidecar_events, "max_ticks_reached", tick=tick)
+            break
+        interval = template.tick_interval_s if template else 60
+        time.sleep(interval)
+
+    append_event(sidecar_events, "multirepo_loop_stop", tick=tick)
+    return 0
+
+
 def run(cfg: Config) -> int:
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
