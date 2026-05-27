@@ -1,880 +1,168 @@
-"""Main loop body — orchestrates ticks (pick → dispatch → wait → maybe-redeploy)."""
+"""Main loop body — orchestrates ticks (pick → dispatch → wait → maybe-redeploy).
+
+This module is a thin facade. The implementation was split into focused
+submodules in issue #50:
+
+- ``runner.boot``     — signal handlers, version-check / self-restart,
+                        orphan worktree reaper, ``run`` and ``run_async``
+                        entry points.
+- ``runner.tick``     — the main ``_tick`` body and immediate helpers.
+- ``runner.dispatch`` — worker spawning, critic-loop wiring, and the
+                        multirepo dispatch glue (``run_multirepo``).
+- ``runner.drift``    — outcome-drift + deploy-drift detection.
+- ``runner._helpers`` — pure utility functions (pre-existing).
+- ``runner._pipeline_driver`` — opt-in pipeline-driven dispatch (pre-existing).
+
+The names re-exported below preserve every import path callers and tests
+previously relied on (``from forge_loop.runner import run``,
+``_reap_orphan_worktrees``, ``_installed_version``, ``_tick`` …).
+"""
 
 from __future__ import annotations
 
-import contextlib
-import json
-import os
-import signal
-import subprocess
-import time
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
-from pathlib import Path
-from typing import Any
+import sys as _sys
+import types as _types
 
-from forge_loop import attempts as _attempts
-from forge_loop import gh as _gh
-from forge_loop import master_log as _mlog
-from forge_loop import worker as _worker
-from forge_loop.config import Config
-from forge_loop.critic import review_pr as _critic_review
-from forge_loop.critic_actions import apply_critic_report
-from forge_loop.deploy import redeploy
-from forge_loop.gh import fetch_issue, top_issues
-from forge_loop.maintenance import run_maintenance
-from forge_loop.po import expand_thin_specs as _po_expand
+from forge_loop.config import Config as _Config
 
-# Helpers extracted into _helpers.py to keep this orchestrator file
-# manageable. Re-exported under their old underscored names for backward
-# compat with any test or external caller that imported them from here.
+# Names re-exported here so tests / callers can keep importing them from
+# ``forge_loop.runner``. The proxy class below makes any *write* to one of
+# these names propagate to the submodule that actually consumes it, so
+# legacy ``monkeypatch.setattr(forge_loop.runner, ...)`` calls in tests
+# continue to bite the actual call sites after the #50 split.
+from forge_loop.deploy import redeploy as redeploy
+from forge_loop.gh import fetch_issue as fetch_issue
+from forge_loop.gh import top_issues as top_issues
+from forge_loop.runner import boot as _boot
+from forge_loop.runner import dispatch as _dispatch_mod
+from forge_loop.runner import tick as _tick_mod
 from forge_loop.runner._helpers import (
     consecutive_deploy_fails as _consecutive_deploy_fails_impl,
 )
 from forge_loop.runner._helpers import (
-    consume_force_set as _consume_force_set_impl,
+    consume_force_set as _consume_force_set_impl,  # noqa: F401 — re-export
 )
 from forge_loop.runner._helpers import (
     error_signature as _error_signature,
 )
 from forge_loop.runner._helpers import (
-    force_retry_file as _force_retry_file_impl,
+    force_retry_file as _force_retry_file_impl,  # noqa: F401 — re-export
 )
 from forge_loop.runner._helpers import (
     installed_version as _installed_version,
 )
 from forge_loop.runner._helpers import (
-    reap_orphan_worktrees as _reap_orphan_worktrees_impl,
+    reap_orphan_worktrees as _reap_orphan_worktrees_impl,  # noqa: F401 — re-export
 )
 from forge_loop.runner._helpers import (
     reap_worktree as _reap_worktree,
 )
-from forge_loop.state import append_event, consolidate_sprint, write_state
-from forge_loop.worker import WorkerOutcome, run_worker
 
-_RUN = True
+# Boot / lifecycle.
+from forge_loop.runner.boot import (
+    _install_signal_handlers,
+    _reap_orphan_worktrees,
+    _short_sleep,
+    _validate_pipeline_if_configured,
+    run,
+    run_async,
+)
+
+# Dispatch.
+from forge_loop.runner.dispatch import (
+    _run_critic_for_outcomes,
+    _run_workers,
+    _sev_counts,
+    run_multirepo,
+)
+
+# Drift.
+from forge_loop.runner.drift import (
+    _RECENT_OUTCOMES,
+    _check_drift_and_maybe_halt,
+    _maybe_deploy_drift_halt,
+)
+
+# Tick body + its thin shims.
+from forge_loop.runner.tick import (
+    _consume_force_set,
+    _force_retry_file,
+    _tick,
+)
+
+# Worker symbol re-export (proxy target — see _RunnerFacadeModule).
+from forge_loop.worker import run_worker as run_worker
 
 
-def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
-    """Backward-compat shim: forwards to ``runner._helpers``."""
-    return _reap_orphan_worktrees_impl(repo, events_file)
-
-
-def _consecutive_deploy_fails(cfg: Config) -> int:
+def _consecutive_deploy_fails(cfg: _Config) -> int:
+    """Backward-compat shim — forwards to ``runner._helpers``."""
     return _consecutive_deploy_fails_impl(cfg.events_file)
 
 
-def _force_retry_file(cfg: Config) -> Path:
-    return _force_retry_file_impl(cfg.state_dir)
-
-
-def _consume_force_set(cfg: Config) -> set[int]:
-    return _consume_force_set_impl(cfg.state_dir)
-
-
-def _sev_counts(outcome: Any) -> dict[str, int]:
-    """Tally sev1/sev2/sev3 from a CriticOutcome.report. Safe on None."""
-    report = getattr(outcome, "report", None)
-    counts = {"sev1": 0, "sev2": 0, "sev3": 0}
-    if report is None:
-        return counts
-    for f in report.findings:
-        if f.severity in counts:
-            counts[f.severity] += 1
-    return counts
-
-# Drift detector — keep last 3 tick outcomes' summary tuples
-# Each entry: (had_workers: bool, all_failed: bool, error_signature: str)
-_RECENT_OUTCOMES: deque[tuple[bool, bool, str]] = deque(maxlen=3)
-
-
-def _check_drift_and_maybe_halt(cfg: Config) -> bool:
-    """Returns True if the loop should halt due to drift."""
-    if len(_RECENT_OUTCOMES) < 3:
-        return False
-    # All 3 must be worker-bearing AND all 3 must have failed AND same signature
-    sigs = {sig for had_w, all_failed, sig in _RECENT_OUTCOMES if had_w and all_failed}
-    if len(sigs) == 1 and all(had_w and all_failed for had_w, all_failed, _ in _RECENT_OUTCOMES):
-        sig = next(iter(sigs))
-        append_event(cfg.events_file, "loop_drift_halt", signature=sig,
-                     last_3=list(_RECENT_OUTCOMES))
-        # File a loop:halt issue so the operator wakes up to a clear signal.
-        title = f"loop: drift halt — 3 ticks in a row failed ({sig})"
-        body = (
-            f"The sprint loop self-halted at {time.strftime('%Y-%m-%dT%H:%M:%S%z')} "
-            f"after 3 consecutive ticks failed with the same signature: `{sig}`.\n\n"
-            f"Last 3 outcomes (had_workers, all_failed, signature):\n"
-            + "\n".join(f"- {o}" for o in _RECENT_OUTCOMES)
-            + "\n\nSee `docs/ops/loop-runner-events.jsonl` for the full trail. "
-            "Resolve the root cause and remove the `docs/ops/loop-runner.stop` "
-            "file to resume."
-        )
-        with contextlib.suppress(subprocess.TimeoutExpired, FileNotFoundError):
-            subprocess.run(
-                ["gh", "issue", "create",
-                 "--repo", cfg.github_repo,
-                 "--title", title,
-                 "--label", "loop:halt",
-                 "--body", body],
-                capture_output=True, timeout=30,
-            )
-        # Best-effort push notification via tput-bell + a marker file the
-        # operator can grep for.
-        with contextlib.suppress(OSError):
-            (cfg.state_dir / "loop-runner.HALT").write_text(
-                f"drift: {sig}\nseen at: {time.time()}\n"
-            )
-        cfg.stop_file.touch()
-        return True
-    return False
-
-
-def _install_signal_handlers(cfg: Config) -> None:
-    def _stop(*_: Any) -> None:
-        global _RUN
-        _RUN = False
-        append_event(cfg.events_file, "signal_stop")
-
-    def _pause_toggle(*_: Any) -> None:
-        if cfg.pause_file.exists():
-            cfg.pause_file.unlink()
-            append_event(cfg.events_file, "signal_resume")
-        else:
-            cfg.pause_file.touch()
-            append_event(cfg.events_file, "signal_pause")
-
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGUSR1, _pause_toggle)
-
-
-def _short_sleep(seconds: int, cfg: Config) -> None:
-    """Sleep but stay responsive to stop/pause signals + touchfiles."""
-    for _ in range(seconds):
-        if not _RUN or cfg.stop_file.exists() or cfg.pause_file.exists():
-            return
-        time.sleep(1)
-
-
-def _tick(cfg: Config, tick: int) -> None:
-    # Maintenance ticks: every Nth tick, run the AI-as-PM subagent instead
-    # of dispatching workers. The maintenance agent grooms + triages the
-    # backlog so subsequent ticks have a clean queue.
-    if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
-        write_state(cfg.state_file, {"state": "maintenance", "tick": tick})
-        append_event(cfg.events_file, "maintenance_start", tick=tick)
-        brief = cfg.briefs.maintenance  # may be None → maintenance.run_maintenance uses default
-        outcome = run_maintenance(
-            cfg.repo, cfg.logs_dir,
-            brief=brief if brief else None,  # type: ignore[arg-type]
-        ) if brief else run_maintenance(cfg.repo, cfg.logs_dir)
-        append_event(
-            cfg.events_file, "maintenance_done", tick=tick,
-            acted_on=outcome.acted_on,
-            added_ready=outcome.added_ready,
-            closed_dupes=outcome.closed_dupes,
-            retitled=outcome.retitled,
-            duration_s=round(outcome.duration_s, 1),
-        )
-        write_state(cfg.state_file, {
-            "state": "between-ticks", "tick": tick,
-            "last_maintenance": {
-                "acted_on": outcome.acted_on,
-                "added_ready": outcome.added_ready,
-            },
-        })
-        _short_sleep(cfg.tick_interval_s, cfg)
-        return
-
-    try:
-        issues = top_issues(cfg.labels.ready, cfg.parallel, repo=cfg.github_repo)
-    except subprocess.CalledProcessError as e:
-        append_event(cfg.events_file, "gh_list_failed", err=(e.stderr or "")[:200])
-        write_state(cfg.state_file, {"state": "gh_error", "tick": tick})
-        _short_sleep(60, cfg)
-        return
-
-    if not issues:
-        append_event(cfg.events_file, "tick_idle", tick=tick)
-        write_state(
-            cfg.state_file,
-            {"state": "idle", "tick": tick, "next_check_s": cfg.tick_interval_s},
-        )
-        _short_sleep(cfg.tick_interval_s, cfg)
-        return
-
-    # PO spec-expansion pass (gap: workers ship janitor PRs when issue bodies
-    # are thin; the PO subagent rewrites bodies to feature-grade specs before
-    # dispatch). Idempotent — issues already expanded carry the marker.
-    if cfg.po.enabled:
-        write_state(cfg.state_file, {"state": "po_expanding", "tick": tick})
-        append_event(cfg.events_file, "po_start", tick=tick,
-                     issues=[i["number"] for i in issues])
-        po_outcomes = _po_expand(
-            issues, cfg.repo, cfg.logs_dir,
-            github_repo=cfg.github_repo,
-            timeout_s=cfg.po.timeout_s,
-            max_to_expand=cfg.po.max_to_expand_per_tick,
-            model=cfg.po.model,
-        )
-        expanded_nums = [o.issue for o in po_outcomes if not o.skipped]
-        append_event(
-            cfg.events_file, "po_done", tick=tick,
-            expanded=expanded_nums,
-            skipped=[o.issue for o in po_outcomes if o.skipped],
-            outcomes=[{"issue": o.issue, "skipped": o.skipped,
-                       "reason": o.reason,
-                       "sections_added": o.sections_added,
-                       "duration_s": round(o.duration_s, 1),
-                       "error": o.error} for o in po_outcomes],
-        )
-        # Re-fetch any issues whose bodies were just rewritten so the workers
-        # see the new spec, not the stale snapshot we captured at tick start.
-        if expanded_nums:
-            refreshed = []
-            for issue in issues:
-                if issue["number"] in expanded_nums:
-                    fresh = fetch_issue(issue["number"], repo=cfg.github_repo)
-                    refreshed.append(fresh or issue)
-                else:
-                    refreshed.append(issue)
-            issues = refreshed
-
-    write_state(
-        cfg.state_file,
-        {
-            "state": "running",
-            "tick": tick,
-            "dispatched": [{"issue": i["number"], "title": i["title"]} for i in issues],
-        },
-    )
-    append_event(cfg.events_file, "tick_start", tick=tick, issues=[i["number"] for i in issues])
-
-    # Per-issue: detect risk-gate + fetch past attempt history (if enabled).
-    # Also apply the fingerprint-based skip guards (in-flight / cooldown) so
-    # a half-finished prior dispatch doesn't get re-done and dupe a PR.
-    risk_gate_label = cfg.labels.risk_gate
-    workers_meta: list[dict[str, Any]] = []
-    force_set = _consume_force_set(cfg)
-    cooldown_s = _attempts.cooldown_from_env()
-    brief_hash = _worker.brief_template_hash()
-    issues_to_dispatch: list[dict[str, Any]] = []
-    for i in issues:
-        labels = [lab.get("name", "") for lab in (i.get("labels") or [])]
-        gated = bool(risk_gate_label) and risk_gate_label in labels
-        past: list[dict[str, Any]] = []
-        corrupt = 0
-        if cfg.attempts.enabled:
-            past, corrupt = _attempts.fetch_history_strict(
-                i["number"], repo=cfg.github_repo,
-            )
-            if corrupt:
-                append_event(
-                    cfg.events_file, "attempts_corrupt",
-                    issue=i["number"], rows=corrupt,
-                )
-        fp = _attempts.compute_fingerprint(
-            i["number"], i.get("body") or "", brief_hash,
-        )
-        forced = i["number"] in force_set
-        if cfg.attempts.enabled and not forced:
-            decision = _attempts.classify_skip(
-                past, fp, cooldown_s=cooldown_s,
-            )
-            if decision.kind == "in_flight":
-                append_event(
-                    cfg.events_file, "worker_skip_in_flight",
-                    issue=i["number"], pr_url=decision.pr_url,
-                    fingerprint=fp[:12], matched_ts=decision.matched_ts,
-                )
-                continue
-            if decision.kind == "cooldown":
-                append_event(
-                    cfg.events_file, "worker_skip_cooldown",
-                    issue=i["number"], fingerprint=fp[:12],
-                    cooldown_remaining_s=decision.cooldown_remaining_s,
-                    matched_ts=decision.matched_ts,
-                )
-                continue
-        trimmed = past[-cfg.attempts.max_history_in_brief:] if past else []
-        workers_meta.append({
-            "risk_gated": gated, "past_attempts": trimmed,
-            "brief_fingerprint": fp, "forced": forced,
-        })
-        issues_to_dispatch.append(i)
-    issues = issues_to_dispatch
-
-    if not issues:
-        # All candidates were skipped (in-flight or cooldown). Idle the tick.
-        append_event(cfg.events_file, "tick_all_skipped", tick=tick)
-        write_state(
-            cfg.state_file,
-            {"state": "idle", "tick": tick, "next_check_s": cfg.tick_interval_s},
-        )
-        _short_sleep(cfg.tick_interval_s, cfg)
-        return
-
-    # Bus emitter: any thread (runner, watchdog, etc) calls this to push an
-    # event into the shared JSONL. Bound to cfg here so workers can wire it
-    # through without importing module state.
-    def _bus_emit(kind: str, payload: dict[str, Any]) -> None:
-        append_event(cfg.events_file, kind, **payload)
-
-    master_log_path = cfg.logs_dir / "master.log"
-    _mlog.info(master_log_path,
-               f"tick {tick} dispatching {len(issues)} worker(s): "
-               f"{[i['number'] for i in issues]}")
-
-    # forge-loop assumes Claude Code subscription-mode billing (flat). The
-    # per-tick token-cost gate was removed in issue #38: it only made sense
-    # under per-token billing, and the implementation was buggy under the
-    # subscription operator persona we actually support.
-    outcomes: list[WorkerOutcome] = []
-    dispatch = list(zip(issues, workers_meta, strict=True))
-
-    # Issue #49 — pipeline-driven dispatch path. When `.forge/pipeline.yaml`
-    # is present AND the operator opted in via LOOP_PIPELINE_DRIVEN=1, route
-    # the per-issue worker/critic chain through pipeline.executor.run()
-    # instead of the legacy hardcoded ThreadPoolExecutor → critic loop
-    # below. The legacy path remains the default. The pipeline path emits
-    # its own per-step events and applies the critic via the chain itself,
-    # so the post-worker critic block further down is skipped when this
-    # path takes over.
-    from forge_loop.runner._pipeline_driver import (
-        dispatch_via_pipeline as _pipeline_dispatch,
-    )
-    from forge_loop.runner._pipeline_driver import (
-        pipeline_driven_enabled as _pipeline_enabled,
-    )
-    _used_pipeline = False
-    if _pipeline_enabled(cfg):
-        _used_pipeline = True
-        append_event(cfg.events_file, "pipeline_dispatch_start", tick=tick,
-                     issues=[i["number"] for i in issues])
-        try:
-            outcomes = _pipeline_dispatch(
-                cfg, issues, workers_meta, tick,
-                master_log_path=master_log_path,
-                bus_emit=_bus_emit,
-            )
-        except Exception as ex_:  # noqa: BLE001 — must not kill the tick
-            append_event(cfg.events_file, "pipeline_dispatch_failed",
-                         tick=tick, err=str(ex_)[:300])
-            # Fall back to the legacy chain so a broken pipeline.yaml
-            # does not strand the loop.
-            _used_pipeline = False
-
-    if not _used_pipeline:
-        with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
-            futures = [
-                ex.submit(
-                    run_worker, i, cfg.repo, cfg.logs_dir, cfg.worker_timeout_s,
-                    risk_gated=meta["risk_gated"],
-                    past_attempts=meta["past_attempts"],
-                    emit=_bus_emit,
-                    lumen_top_k=cfg.lumen.top_k,
-                    lumen_test_pattern=cfg.lumen_test_pattern,
-                    coauthor=cfg.coauthor,
-                    tick=tick,
-                    model=cfg.worker.model,
-                    thinking=cfg.worker.thinking,
-                )
-                for i, meta in dispatch
-            ]
-            for fut in futures:
-                outcomes.append(fut.result())
-
-    for o in outcomes:
-        _mlog.info(master_log_path,
-                   f"worker #{o.issue} {o.status} ({o.duration_s:.0f}s) "
-                   f"pr={o.pr_url or '-'}")
-
-    # Persist this attempt as a GH issue comment (per-issue history grows).
-    fingerprint_by_issue = {
-        i["number"]: meta.get("brief_fingerprint", "")
-        for i, meta in zip(issues, workers_meta, strict=True)
-    }
-    if cfg.attempts.enabled:
-        for o in outcomes:
-            try:
-                _attempts.record(
-                    o.issue, status=o.status, pr_url=o.pr_url,
-                    duration_s=o.duration_s,
-                    note=(o.error or "")[:200],
-                    event_count=len(o.events or []),
-                    repo=cfg.github_repo,
-                    brief_fingerprint=fingerprint_by_issue.get(o.issue, ""),
-                )
-            except Exception as ex_:  # don't fail tick on history-write error
-                append_event(cfg.events_file, "attempt_record_failed",
-                             issue=o.issue, err=str(ex_)[:200])
-
-    # Critic agent: review PRs the workers opened, before auto-merge fires.
-    # In pipeline-driven mode the critic ran as a chain step already.
-    if cfg.critic.enabled and not _used_pipeline:
-        for o in outcomes:
-            if o.status in {"open", "merged"} and o.pr_url:
-                try:
-                    critic_outcome = _critic_review(
-                        o.pr_url, o.issue,
-                        cfg.repo, cfg.logs_dir,
-                        timeout_s=cfg.critic.timeout_s,
-                        emit=_bus_emit,
-                        model=cfg.critic.model,
-                    )
-                    append_event(
-                        cfg.events_file, "critic_done",
-                        issue=o.issue, pr=o.pr_url,
-                        verdict=critic_outcome.verdict,
-                        reasons=critic_outcome.reasons,
-                        duration_s=round(critic_outcome.duration_s, 1),
-                        sev_counts=_sev_counts(critic_outcome),
-                        parse_retries=critic_outcome.parse_retries,
-                    )
-                    if critic_outcome.report is not None:
-                        try:
-                            lines = _gh.pr_changed_lines(o.pr_url, repo=cfg.github_repo)
-                            apply_critic_report(
-                                critic_outcome.report,
-                                o.pr_url, lines,
-                                cfg.critic.block_on_sev2,
-                                cfg.critic.min_findings_for_approve,
-                                gh=_gh, repo=cfg.github_repo, emit=_bus_emit,
-                            )
-                        except Exception as act_ex:
-                            append_event(cfg.events_file, "critic_actions_failed",
-                                         issue=o.issue, err=str(act_ex)[:200])
-                except Exception as ex_:
-                    append_event(cfg.events_file, "critic_failed",
-                                 issue=o.issue, err=str(ex_)[:200])
-
-    merged_nums = [o.issue for o in outcomes if o.status == "merged"]
-    append_event(
-        cfg.events_file,
-        "tick_done",
-        tick=tick,
-        merged=merged_nums,
-        outcomes=[asdict(o) for o in outcomes],
-    )
-    write_state(
-        cfg.state_file,
-        {
-            "state": "redeploying" if merged_nums else "finishing-tick",
-            "tick": tick,
-            "outcomes": [asdict(o) for o in outcomes],
-        },
-    )
-
-    # Post-merge: reap each merged worker's worktree (gap #2 — they were piling
-    # up. The next attempt's _prep_worktree would clean them, but only on
-    # collision; successful merges left them dangling.)
-    for o in outcomes:
-        if o.status == "merged":
-            _reap_worktree(cfg.repo, o.issue)
-            append_event(cfg.events_file, "worktree_reaped", issue=o.issue)
-
-    if merged_nums and cfg.deploy_task:
-        ok, log = redeploy(cfg.repo, cfg.deploy_task)
-        append_event(cfg.events_file, "redeploy", task=cfg.deploy_task, ok=ok, detail=log)
-        # Deploy-fail escalation. Default is WARN-ONLY: a misconfigured
-        # deploy.task (e.g. operator forgot to set it for a non-Taskfile
-        # project) used to halt the entire loop on tick #3 — which then
-        # blocked the loop from even fixing the bug. Now we warn first;
-        # the operator opts in to the hard halt via LOOP_DEPLOY_DRIFT_HALT=1.
-        # This gate is the prime example of a default-on safety mechanism
-        # that became an active foot-gun.
-        fails = _consecutive_deploy_fails(cfg)
-        if not ok and fails >= 3:
-            append_event(cfg.events_file, "deploy_drift_warn",
-                         consecutive_fails=fails)
-            if os.environ.get("LOOP_DEPLOY_DRIFT_HALT") == "1":
-                append_event(cfg.events_file, "deploy_drift_halt",
-                             consecutive_fails=fails)
-                with contextlib.suppress(OSError):
-                    (cfg.state_dir / "loop-runner.HALT").write_text(
-                        "deploy: 3 consecutive failures (opt-in halt)\n"
-                    )
-                cfg.stop_file.touch()
-
-    # Drift detector (gap #3): record outcome signature, halt if 3-in-a-row.
-    had_workers = bool(outcomes)
-    all_failed = had_workers and all(o.status not in {"merged", "open"} for o in outcomes)
-    sig = "ok" if not all_failed else _error_signature(
-        outcomes[0].error if outcomes else None,
-        outcomes[0].stdout_tail if outcomes else "",
-    )
-    _RECENT_OUTCOMES.append((had_workers, all_failed, sig))
-    if _check_drift_and_maybe_halt(cfg):
-        return
-
-    # End-of-tick consolidation — write a 1-line summary, flush noisy events.
-    summary = consolidate_sprint(
-        cfg.events_file,
-        cfg.summaries_file,
-        tick,
-        [asdict(o) for o in outcomes],
-    )
-    append_event(cfg.events_file, "sprint_consolidated", **summary)
-
-    write_state(cfg.state_file, {"state": "between-ticks", "tick": tick, "last_summary": summary})
-    _short_sleep(cfg.tick_interval_s, cfg)
-
-
-def run_multirepo(
-    repos_dir: Path,
-    template: Config | None = None,
-) -> int:
-    """Run the loop across N repos discovered under ``repos_dir``.
-
-    Each global tick iterates every enabled repo in name-sorted order and
-    runs the regular single-repo ``_tick`` body against a per-repo
-    ``Config``. Per-repo state / events stay under each checkout; the
-    cross-repo orchestration events (start/done, skips) land in a small
-    sidecar log under ``<loop_home>/.forge/multirepo-events.jsonl``.
-    """
-    from forge_loop.multirepo import RepoLoadError, load_repos
-    from forge_loop.multirepo.runner import MultirepoRunState, run_multirepo_tick
-
-    try:
-        specs = load_repos(repos_dir)
-    except RepoLoadError as e:
-        import sys
-        sys.stderr.write(f"[multirepo] failed to load repos: {e}\n")
-        return 2
-
-    loop_home = repos_dir.parent.parent  # <home>/.forge/repos/ → <home>
-    sidecar_events = loop_home / ".forge" / "multirepo-events.jsonl"
-    sidecar_events.parent.mkdir(parents=True, exist_ok=True)
-    state = MultirepoRunState()
-
-    append_event(sidecar_events, "multirepo_loop_start",
-                 repos=[s.name for s in specs])
-
-    tick = 0
-    while _RUN:
-        tick += 1
-        run_multirepo_tick(
-            specs, tick,
-            state=state, template=template,
-            events_file=sidecar_events, tick_fn=_tick,
-        )
-        if template and template.max_ticks and tick >= template.max_ticks:
-            append_event(sidecar_events, "max_ticks_reached", tick=tick)
-            break
-        interval = template.tick_interval_s if template else 60
-        time.sleep(interval)
-
-    append_event(sidecar_events, "multirepo_loop_stop", tick=tick)
-    return 0
-
-
-def _validate_pipeline_if_configured(cfg: Config) -> None:
-    """Load + validate `.forge/pipeline.yaml` at runner startup.
-
-    Soft: if the file is missing we silently skip (legacy hardcoded flow
-    remains the default). If it exists but is invalid (cycle, unknown
-    role ref, ambiguous after) we emit a `pipeline_invalid` event and
-    raise — operators should see this at startup, not mid-tick.
-    """
-    pipeline_yaml = cfg.repo / ".forge" / "pipeline.yaml"
-    if not pipeline_yaml.exists():
-        return
-    try:
-        from forge_loop.pipeline import build_dag, load_pipeline
-        spec = load_pipeline(pipeline_yaml)
-        dag = build_dag(spec)
-    except Exception as e:  # noqa: BLE001 — boundary
-        append_event(
-            cfg.events_file, "pipeline_invalid",
-            path=str(pipeline_yaml), error=str(e),
-        )
-        raise
-    append_event(
-        cfg.events_file, "pipeline_loaded",
-        path=str(pipeline_yaml),
-        roles=list(dag.order),
-        roots=list(dag.roots),
-    )
-
-
-def run(cfg: Config) -> int:
-    cfg.state_dir.mkdir(parents=True, exist_ok=True)
-    cfg.logs_dir.mkdir(parents=True, exist_ok=True)
-    cfg.events_file.touch()
-
-    _install_signal_handlers(cfg)
-
-    # Boot-time orphan worktree cleanup. /tmp/wt-loop-* should never
-    # outlive the loop process; if any are on disk now (operator killed
-    # the previous tmux mid-tick, crash, etc.) they would otherwise
-    # accumulate forever. The runner is the only owner of these paths.
-    _reap_orphan_worktrees(cfg.repo, cfg.events_file)
-
-    # Stamp the installed version so we can detect a self-upgrade
-    # (a merged PR bumped our own packaging) and gracefully restart.
-    boot_version = _installed_version()
-
-    # Queue bootstrap. Default = in-memory (zero infra, single host).
-    # Set LOOP_QUEUE_URL=sqlite:///path/to/queue.db for the durable
-    # embedded backend. Multi-host Redis support was removed in #39.
-    import os as _os
-
-    from forge_loop.queue import build_queue, default_host_id
-
-    queue_url = _os.environ.get("LOOP_QUEUE_URL")
-    queue = build_queue(queue_url)
-    host_id = default_host_id()
-
-    append_event(
-        cfg.events_file,
-        "loop_start",
-        parallel=cfg.parallel,
-        tick_interval=cfg.tick_interval_s,
-        max_ticks=cfg.max_ticks,
-        label=cfg.labels.ready,
-        runner_id=host_id,
-        host_id=host_id,
-        distributed=False,
-        queue_backend=(queue_url or "memory"),
-    )
-    write_state(cfg.state_file, {"state": "starting", "tick": 0, "parallel": cfg.parallel})
-
-    # Issue #18 — if `.forge/pipeline.yaml` exists, validate it at startup so
-    # the operator sees a clear ValidationError BEFORE we start dispatching.
-    # The full chain-driven dispatch is opt-in (see forge_loop.pipeline), so
-    # this validation does not change the legacy PO→worker→critic flow.
-    _validate_pipeline_if_configured(cfg)
-
-    tick = 0
-    while _RUN:
-        if cfg.stop_file.exists():
-            append_event(cfg.events_file, "stop_file_seen")
-            cfg.stop_file.unlink()
-            break
-        if cfg.pause_file.exists():
-            write_state(cfg.state_file, {"state": "paused", "tick": tick})
-            time.sleep(15)
-            continue
-
-        tick += 1
-        if cfg.max_ticks and tick > cfg.max_ticks:
-            append_event(cfg.events_file, "max_ticks_reached", tick=tick)
-            break
-
-        # Self-upgrade detection: if a merged PR bumped our own package
-        # version, the running process is on stale code. Exit cleanly so
-        # the all-nighter shim re-execs us against the fresh install.
-        # Skipped if boot_version is empty (we never knew our version) or
-        # if the current read also returns empty (importlib hiccup).
-        if boot_version:
-            current_version = _installed_version()
-            if current_version and current_version != boot_version:
-                append_event(
-                    cfg.events_file,
-                    "version_changed_restart",
-                    boot_version=boot_version,
-                    current_version=current_version,
-                )
-                break
-
-        _tick(cfg, tick)
-
-    write_state(cfg.state_file, {"state": "stopped", "tick": tick})
-    append_event(cfg.events_file, "loop_stop", tick=tick)
-    # Close SQLite queue if it exposes close(); InMemoryQueue is a no-op.
-    close = getattr(queue, "close", None)
-    if callable(close):
-        close()
-    return 0
+def __getattr__(name: str):  # pragma: no cover — thin compat shim
+    if name == "_RUN":
+        return _boot._RUN
+    raise AttributeError(f"module 'forge_loop.runner' has no attribute {name!r}")
 
 
 # ---------------------------------------------------------------------------
-# Async orchestrator entry point (issue #7).
-# Wires the real PO / worker / critic functions into AsyncOrchestrator and
-# loops just like ``run`` above, but ticks dispatch into the pipeline instead
-# of running each stage sequentially.
+# monkeypatch proxy
+#
+# Tests that historically did
+#     monkeypatch.setattr(forge_loop.runner, "top_issues", fake)
+# expect the patched callable to be the one ``_tick`` actually invokes. After
+# the #50 split, ``_tick`` lives in ``runner.tick`` and binds ``top_issues``
+# there. To keep the legacy patch targets working without test edits, we
+# install a Module subclass whose ``__setattr__`` mirrors writes onto the
+# submodule that actually consumes the symbol.
+#
+# The mapping below is closed-world (only the names tests have historically
+# patched). New names fall through to plain attribute assignment.
 # ---------------------------------------------------------------------------
-def run_async(cfg: Config) -> int:
-    import asyncio
+_PROXY_TICK_NAMES = frozenset({
+    "top_issues", "fetch_issue", "_reap_worktree",
+    "_short_sleep", "redeploy",
+})
+_PROXY_DISPATCH_NAMES = frozenset({"run_worker"})
 
-    from forge_loop.runner_async import (
-        AsyncPools,
-        AsyncQueueCaps,
-        run_async_tick,
-    )
 
-    cfg.state_dir.mkdir(parents=True, exist_ok=True)
-    cfg.logs_dir.mkdir(parents=True, exist_ok=True)
-    cfg.events_file.touch()
-    _install_signal_handlers(cfg)
+class _RunnerFacadeModule(_types.ModuleType):
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in _PROXY_TICK_NAMES:
+            _tick_mod.__dict__[name] = value
+        if name in _PROXY_DISPATCH_NAMES:
+            _dispatch_mod.__dict__[name] = value
+        if name == "_short_sleep":
+            _boot.__dict__["_short_sleep"] = value
+        super().__setattr__(name, value)
 
-    pools = AsyncPools.from_env(default_worker=cfg.parallel)
-    caps = AsyncQueueCaps()
 
-    def _bus_emit(kind: str, payload: dict[str, Any]) -> None:
-        append_event(cfg.events_file, kind, **payload)
+_sys.modules[__name__].__class__ = _RunnerFacadeModule
 
-    append_event(
-        cfg.events_file, "loop_start",
-        parallel=cfg.parallel, tick_interval=cfg.tick_interval_s,
-        max_ticks=cfg.max_ticks, label=cfg.labels.ready,
-        orchestrator="async",
-        pools={"po": pools.po, "worker": pools.worker, "critic": pools.critic},
-    )
-    write_state(cfg.state_file, {
-        "state": "starting", "tick": 0,
-        "orchestrator": "async",
-        "pools": {"po": pools.po, "worker": pools.worker, "critic": pools.critic},
-    })
 
-    async def _po_fn(issue: dict[str, Any]) -> dict[str, Any]:
-        if not cfg.po.enabled:
-            return {"issue": issue["number"], "skipped": True, "reason": "po_disabled"}
-        outs = await asyncio.to_thread(
-            _po_expand, [issue], cfg.repo, cfg.logs_dir,
-            github_repo=cfg.github_repo,
-            timeout_s=cfg.po.timeout_s,
-            max_to_expand=1,
-            model=cfg.po.model,
-        )
-        if not outs:
-            return {"issue": issue["number"], "skipped": True, "reason": "po_no_op"}
-        o = outs[0]
-        return {
-            "issue": o.issue, "skipped": o.skipped, "reason": o.reason,
-            "sections_added": o.sections_added,
-        }
-
-    async def _worker_fn(issue: dict[str, Any], _po: dict[str, Any]) -> dict[str, Any]:
-        if not _po.get("skipped"):
-            fresh = await asyncio.to_thread(
-                fetch_issue, issue["number"], cfg.github_repo,
-            )
-            if fresh:
-                issue = fresh
-        labels = [lab.get("name", "") for lab in (issue.get("labels") or [])]
-        gated = bool(cfg.labels.risk_gate) and cfg.labels.risk_gate in labels
-        past: list[dict[str, Any]] = []
-        if cfg.attempts.enabled:
-            past = await asyncio.to_thread(
-                _attempts.fetch_history, issue["number"], cfg.github_repo,
-            )
-            past = past[-cfg.attempts.max_history_in_brief:] if past else []
-        o = await asyncio.to_thread(
-            run_worker, issue, cfg.repo, cfg.logs_dir, cfg.worker_timeout_s,
-            risk_gated=gated, past_attempts=past, emit=_bus_emit,
-            lumen_top_k=cfg.lumen.top_k,
-            lumen_test_pattern=cfg.lumen_test_pattern,
-            coauthor=cfg.coauthor,
-            model=cfg.worker.model,
-            thinking=cfg.worker.thinking,
-        )
-        return {
-            "issue": o.issue, "title": o.title,
-            "pr_url": o.pr_url, "status": o.status,
-            "duration_s": o.duration_s, "error": o.error,
-        }
-
-    async def _critic_fn(wr: dict[str, Any]) -> dict[str, Any]:
-        if not cfg.critic.enabled or not wr.get("pr_url"):
-            return {"issue": wr.get("issue"), "verdict": "skipped", "reasons": []}
-        c = await asyncio.to_thread(
-            _critic_review, wr["pr_url"], wr["issue"],
-            cfg.repo, cfg.logs_dir, cfg.critic.timeout_s, None, _bus_emit,
-            cfg.critic.model,
-        )
-        if c.report is not None:
-            try:
-                lines = await asyncio.to_thread(
-                    _gh.pr_changed_lines, wr["pr_url"], cfg.github_repo,
-                )
-                await asyncio.to_thread(
-                    apply_critic_report,
-                    c.report, wr["pr_url"], lines,
-                    cfg.critic.block_on_sev2,
-                    cfg.critic.min_findings_for_approve,
-                    _gh, cfg.github_repo, _bus_emit,
-                )
-            except Exception as act_ex:
-                append_event(cfg.events_file, "critic_actions_failed",
-                             issue=wr.get("issue"), err=str(act_ex)[:200])
-        return {
-            "issue": wr.get("issue"), "verdict": c.verdict,
-            "reasons": c.reasons, "duration_s": c.duration_s,
-            "sev_counts": _sev_counts(c),
-            "parse_retries": c.parse_retries,
-        }
-
-    tick = 0
-
-    async def _one_tick() -> None:
-        nonlocal tick
-        tick += 1
-        try:
-            issues = await asyncio.to_thread(
-                top_issues, cfg.labels.ready, cfg.parallel, cfg.github_repo,
-            )
-        except subprocess.CalledProcessError as e:
-            append_event(cfg.events_file, "gh_list_failed", err=(e.stderr or "")[:200])
-            await asyncio.sleep(min(60, cfg.tick_interval_s))
-            return
-        if not issues:
-            append_event(cfg.events_file, "tick_idle", tick=tick)
-            write_state(cfg.state_file, {"state": "idle", "tick": tick})
-            await asyncio.sleep(cfg.tick_interval_s)
-            return
-
-        append_event(cfg.events_file, "tick_start", tick=tick,
-                     issues=[i["number"] for i in issues], orchestrator="async")
-        write_state(cfg.state_file, {
-            "state": "running", "tick": tick,
-            "dispatched": [{"issue": i["number"], "title": i["title"]} for i in issues],
-        })
-        results, stats = await run_async_tick(
-            issues, pools=pools, caps=caps,
-            po_fn=_po_fn, worker_fn=_worker_fn, critic_fn=_critic_fn,
-            emit=_bus_emit,
-            po_timeout_s=float(cfg.po.timeout_s),
-            worker_timeout_s=float(cfg.worker_timeout_s),
-            critic_timeout_s=float(cfg.critic.timeout_s),
-        )
-        merged = [r["issue"] for r in results
-                  if (r.get("worker") or {}).get("status") == "merged"]
-        append_event(cfg.events_file, "tick_done", tick=tick,
-                     merged=merged, results=results,
-                     stats={
-                         "po": stats.po.__dict__,
-                         "worker": stats.worker.__dict__,
-                         "critic": stats.critic.__dict__,
-                     })
-        for issue_num in merged:
-            _reap_worktree(cfg.repo, issue_num)
-        if merged and cfg.deploy_task:
-            ok, log = await asyncio.to_thread(redeploy, cfg.repo, cfg.deploy_task)
-            append_event(cfg.events_file, "redeploy",
-                         task=cfg.deploy_task, ok=ok, detail=log)
-        write_state(cfg.state_file, {"state": "between-ticks", "tick": tick})
-        await asyncio.sleep(cfg.tick_interval_s)
-
-    async def _main() -> None:
-        while _RUN:
-            if cfg.stop_file.exists():
-                append_event(cfg.events_file, "stop_file_seen")
-                cfg.stop_file.unlink()
-                break
-            if cfg.pause_file.exists():
-                write_state(cfg.state_file, {"state": "paused", "tick": tick})
-                await asyncio.sleep(15)
-                continue
-            if cfg.max_ticks and tick >= cfg.max_ticks:
-                append_event(cfg.events_file, "max_ticks_reached", tick=tick + 1)
-                break
-            await _one_tick()
-
-    try:
-        asyncio.run(_main())
-    finally:
-        write_state(cfg.state_file, {"state": "stopped", "tick": tick})
-        append_event(cfg.events_file, "loop_stop", tick=tick)
-    return 0
+__all__ = [
+    "_RECENT_OUTCOMES",
+    "_check_drift_and_maybe_halt",
+    "_consecutive_deploy_fails",
+    "_consume_force_set",
+    "_error_signature",
+    "_force_retry_file",
+    "_install_signal_handlers",
+    "_installed_version",
+    "_maybe_deploy_drift_halt",
+    "_reap_orphan_worktrees",
+    "_reap_worktree",
+    "_run_critic_for_outcomes",
+    "_run_workers",
+    "_sev_counts",
+    "_short_sleep",
+    "_tick",
+    "_validate_pipeline_if_configured",
+    "fetch_issue",
+    "redeploy",
+    "run",
+    "run_async",
+    "run_multirepo",
+    "run_worker",
+    "top_issues",
+]
