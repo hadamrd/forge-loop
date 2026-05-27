@@ -588,6 +588,35 @@ def run_multirepo(
     return 0
 
 
+def _validate_pipeline_if_configured(cfg: Config) -> None:
+    """Load + validate `.forge/pipeline.yaml` at runner startup.
+
+    Soft: if the file is missing we silently skip (legacy hardcoded flow
+    remains the default). If it exists but is invalid (cycle, unknown
+    role ref, ambiguous after) we emit a `pipeline_invalid` event and
+    raise — operators should see this at startup, not mid-tick.
+    """
+    pipeline_yaml = cfg.repo / ".forge" / "pipeline.yaml"
+    if not pipeline_yaml.exists():
+        return
+    try:
+        from forge_loop.pipeline import build_dag, load_pipeline
+        spec = load_pipeline(pipeline_yaml)
+        dag = build_dag(spec)
+    except Exception as e:  # noqa: BLE001 — boundary
+        append_event(
+            cfg.events_file, "pipeline_invalid",
+            path=str(pipeline_yaml), error=str(e),
+        )
+        raise
+    append_event(
+        cfg.events_file, "pipeline_loaded",
+        path=str(pipeline_yaml),
+        roles=list(dag.order),
+        roots=list(dag.roots),
+    )
+
+
 def run(cfg: Config) -> int:
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -604,6 +633,12 @@ def run(cfg: Config) -> int:
         label=cfg.labels.ready,
     )
     write_state(cfg.state_file, {"state": "starting", "tick": 0, "parallel": cfg.parallel})
+
+    # Issue #18 — if `.forge/pipeline.yaml` exists, validate it at startup so
+    # the operator sees a clear ValidationError BEFORE we start dispatching.
+    # The full chain-driven dispatch is opt-in (see forge_loop.pipeline), so
+    # this validation does not change the legacy PO→worker→critic flow.
+    _validate_pipeline_if_configured(cfg)
 
     tick = 0
     while _RUN:

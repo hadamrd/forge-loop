@@ -1,0 +1,27 @@
+# Default role chain executed by `forge-loop run`.
+#
+# Each step lists:
+#   role       — required; the role handler name
+#   on         — (root steps only) event trigger
+#   after      — string or list; upstream role(s) that must finish first
+#   parallel   — fan-out for this role (default 1)
+#   condition  — optional gate (labels: any-of match, all_approve: bool)
+#
+# Run `forge-loop pipeline show` to print the resolved DAG.
+
+default_chain:
+  - role: po
+    on: issue_labeled_ready
+  - role: worker
+    after: po
+    parallel: 3
+  - role: critic
+    after: worker
+  - role: security-reviewer
+    after: critic
+    condition:
+      labels: ["security-sensitive"]
+  - role: merge
+    after: [critic, security-reviewer]
+    condition:
+      all_approve: true
