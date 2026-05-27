@@ -23,7 +23,11 @@ from forge_loop.runner import run as run_loop
 from forge_loop.state import tail_events
 
 
-def _cmd_run(_args: argparse.Namespace) -> int:
+def _cmd_run(args: argparse.Namespace) -> int:
+    orch = getattr(args, "orchestrator", "sync")
+    if orch == "async":
+        from forge_loop.runner import run_async as run_async_loop
+        return run_async_loop(load())
     return run_loop(load())
 
 
@@ -215,7 +219,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("run", help="Run the loop in the foreground").set_defaults(func=_cmd_run)
+    p_run = sub.add_parser("run", help="Run the loop in the foreground")
+    p_run.add_argument(
+        "--orchestrator", choices=("sync", "async"), default="sync",
+        help="Pipeline orchestrator. 'sync' (default, stable) ticks PO→workers→critics "
+             "sequentially. 'async' runs three independent asyncio queues so a slow PO "
+             "or critic does not block other tickets (see runner_async.py).",
+    )
+    p_run.set_defaults(func=_cmd_run)
     sub.add_parser("status", help="Print current state file").set_defaults(func=_cmd_status)
 
     p_events = sub.add_parser("events", help="Tail the events log")
