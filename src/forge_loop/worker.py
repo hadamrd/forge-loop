@@ -311,6 +311,8 @@ def run_worker(
     ticket_budget_usd: float | None = None,
     spend_ledger: Path | None = None,
     tick: int | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -358,6 +360,8 @@ def run_worker(
         emit=emit,
         spend_ledger=spend_ledger,
         tick=tick,
+        model=model,
+        thinking=thinking,
     )
 
 
@@ -373,6 +377,8 @@ def _run_worker_sdk(
     emit: Callable[[str, dict[str, Any]], None] | None,
     spend_ledger: Path | None,
     tick: int | None,
+    model: str | None = None,
+    thinking: str | None = None,
 ) -> WorkerOutcome:
     """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
 
@@ -434,6 +440,8 @@ def _run_worker_sdk(
                 permission_mode="bypassPermissions",
                 on_event=_on_event,
                 budget_should_stop=_budget_should_stop,
+                model=model,
+                thinking_budget=thinking,
             )
 
         timed_out = False
@@ -472,36 +480,45 @@ def _run_worker_sdk(
         ))
 
     if budget_tripped["v"]:
-        model = (result.model if result is not None else "") or ""
+        # Prefer the response's reported model, fall back to the *requested*
+        # model so the ledger row carries something meaningful even when the
+        # session aborted before any AssistantMessage arrived (issue #34).
+        observed = (result.model if result is not None else "") or ""
+        ledger_model = observed or (model or "")
         if emit is not None:
             emit("budget_exceeded", {
                 "issue": n, "cost_usd": round(snap.cost_usd, 4),
                 "ceiling_usd": round(resolved_budget, 4),
                 "fallbacks": snap.fallbacks,
             })
-        _record_spend("budget_exceeded", model)
+        _record_spend("budget_exceeded", ledger_model)
         return WorkerOutcome(
             issue=n, title=title, pr_url=None, status="budget_exceeded",
             duration_s=duration,
             stdout_tail=_tail(log_path, 500),
             error=f"ticket budget ${resolved_budget:.4f} exceeded "
                   f"(spent ${snap.cost_usd:.4f})",
-            cost_usd=snap.cost_usd, usage=usage_summary, model=model,
+            cost_usd=snap.cost_usd, usage=usage_summary, model=ledger_model,
             budget_usd=resolved_budget,
         )
 
     if timed_out:
-        _record_spend("timeout", "")
+        # Use the requested model so the ledger row is informative even
+        # when no response ever arrived (issue #34).
+        timeout_model = model or ""
+        _record_spend("timeout", timeout_model)
         return WorkerOutcome(
             issue=n, title=title, pr_url=None, status="timeout",
             duration_s=duration, stdout_tail="(timeout)",
             error=f"worker exceeded {timeout_s}s",
-            cost_usd=snap.cost_usd, usage=usage_summary, model="",
+            cost_usd=snap.cost_usd, usage=usage_summary, model=timeout_model,
             budget_usd=resolved_budget,
         )
 
     assert result is not None  # neither branch above
-    model_seen = result.model or ""
+    # ``result.model`` already falls back to the requested model when the
+    # response carried none (see _worker_sdk.run_sdk_session). We trust it.
+    model_seen = result.model or (model or "")
     # Prefer the SDK's authoritative grand-total cost when present
     # (tracker accumulates per-turn — they should agree to within rounding,
     # but the result-event total is the source of truth).

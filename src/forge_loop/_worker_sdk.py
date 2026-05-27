@@ -153,6 +153,8 @@ async def run_sdk_session(
     budget_should_stop: BudgetHook | None = None,
     query_fn: Any = None,
     options_cls: Any = None,
+    model: str | None = None,
+    thinking_budget: str | None = None,
 ) -> SDKRunResult:
     """Drive one Claude Agent SDK session and stream typed WorkerEvents.
 
@@ -204,13 +206,26 @@ async def run_sdk_session(
         if on_event is not None:
             on_event(ev)
 
-    options = options_cls(
-        cwd=str(cwd),
-        max_turns=max_turns,
-        permission_mode=permission_mode,
-        add_dirs=[str(p) for p in add_dirs],
-        env=env if env is not None else _clean_sdk_env(),
-    )
+    # Build ClaudeAgentOptions. ``model`` is well-supported across SDK
+    # versions; ``thinking_budget`` is newer — if the installed SDK does
+    # not accept it we transparently retry without it (the role still
+    # gets the requested model, just without an explicit thinking knob).
+    base_kwargs: dict[str, Any] = {
+        "cwd": str(cwd),
+        "max_turns": max_turns,
+        "permission_mode": permission_mode,
+        "add_dirs": [str(p) for p in add_dirs],
+        "env": env if env is not None else _clean_sdk_env(),
+    }
+    if model:
+        base_kwargs["model"] = model
+    if thinking_budget and thinking_budget != "off":
+        try:
+            options = options_cls(**base_kwargs, thinking_budget=thinking_budget)
+        except TypeError:
+            options = options_cls(**base_kwargs)
+    else:
+        options = options_cls(**base_kwargs)
 
     try:
         async for message in query_fn(prompt=prompt, options=options):
@@ -289,12 +304,18 @@ async def run_sdk_session(
     pr_url, status = _extract_pr_status(final_text)
     if error_str is not None and pr_url is None or is_error and pr_url is None:
         status = "failed"
+    # Ledger rows expect a model name — fall back to the *requested* model
+    # when the response carried none (early-abort, transport error, or an
+    # SDK version that does not populate AssistantMessage.model). This
+    # preserves the operator's audit trail across roles and was a regression
+    # point flagged in issue #34's acceptance criteria.
+    resolved_model = model_seen or (model or "")
     return SDKRunResult(
         pr_url=pr_url,
         status=status,
         cost_usd=cost_usd,
         usage=usage,
-        model=model_seen,
+        model=resolved_model,
         final_result_text=final_text,
         error=error_str,
         events=events,
