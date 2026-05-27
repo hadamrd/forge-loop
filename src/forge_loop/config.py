@@ -14,7 +14,7 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import yaml
 
@@ -90,7 +90,7 @@ class LumenConfig:
 @dataclass(frozen=True)
 class Config:
     repo: Path
-    github_repo: Optional[str] = None
+    github_repo: str | None = None
     coauthor: str = ""
     lumen_test_pattern: str = "**/*Test.*"
     worktree_root: Path = field(default_factory=lambda: Path("/tmp"))
@@ -154,6 +154,10 @@ class Config:
     @property
     def logs_dir(self) -> Path:
         return self.state_dir / "loop-runner-logs"
+
+    @property
+    def spend_ledger(self) -> Path:
+        return self.state_dir / "loop-runner-spend.jsonl"
 
 
 def _yaml_config_path(repo: Path) -> Path | None:

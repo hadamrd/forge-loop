@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from forge_loop import attempts as _attempts
+from forge_loop import budget as _budget
 from forge_loop import master_log as _mlog
 from forge_loop.config import Config
 from forge_loop.critic import review_pr as _critic_review
@@ -281,7 +282,29 @@ def _tick(cfg: Config, tick: int) -> None:
                f"tick {tick} dispatching {len(issues)} worker(s): "
                f"{[i['number'] for i in issues]}")
 
+    # Per-tick budget gate (issue #6). We dispatch workers up to but not past
+    # the ceiling: if the projected ceiling+ticket budget would blow the tick
+    # cap, the remaining issues are deferred. In-flight workers continue to
+    # THEIR own ticket ceiling — the tick cap only gates new dispatches.
+    tick_cap = _budget.tick_budget()
     outcomes: list[WorkerOutcome] = []
+    deferred: list[int] = []
+    projected = 0.0
+    dispatch: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for i, meta in zip(issues, workers_meta, strict=True):
+        labels = i.get("labels") or []
+        ticket_cap = _budget.ticket_budget_for(labels)
+        if projected + ticket_cap > tick_cap and dispatch:
+            deferred.append(i["number"])
+            continue
+        dispatch.append((i, meta))
+        projected += ticket_cap
+    if deferred:
+        append_event(cfg.events_file, "tick_budget_gate",
+                     tick=tick, deferred=deferred,
+                     projected_usd=round(projected, 4),
+                     tick_cap_usd=round(tick_cap, 4))
+
     with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
         futures = [
             ex.submit(
@@ -292,8 +315,10 @@ def _tick(cfg: Config, tick: int) -> None:
                 lumen_top_k=cfg.lumen.top_k,
                 lumen_test_pattern=cfg.lumen_test_pattern,
                 coauthor=cfg.coauthor,
+                spend_ledger=cfg.spend_ledger,
+                tick=tick,
             )
-            for i, meta in zip(issues, workers_meta, strict=True)
+            for i, meta in dispatch
         ]
         for fut in futures:
             outcomes.append(fut.result())

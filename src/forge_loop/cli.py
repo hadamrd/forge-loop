@@ -238,6 +238,54 @@ def _cmd_record_session(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_budget(args: argparse.Namespace) -> int:
+    """Print today's spend, current tick spend, top 5 most expensive issues."""
+    from forge_loop import budget as _budget
+
+    cfg = load()
+    ledger = cfg.spend_ledger
+
+    today = _budget.today_spend(ledger)
+    tick_n: int | None = args.tick
+    if tick_n is None and cfg.state_file.exists():
+        try:
+            tick_n = int(json.loads(cfg.state_file.read_text()).get("tick", 0)) or None
+        except (json.JSONDecodeError, ValueError, OSError):
+            tick_n = None
+    tick_total = _budget.tick_spend(ledger, tick_n) if tick_n else 0.0
+    top = _budget.top_expensive_issues(ledger, n=5)
+
+    ticket_cap = _budget.ticket_budget_for(None)
+    tick_cap = _budget.tick_budget()
+
+    out = {
+        "today_usd": round(today, 4),
+        "tick": tick_n,
+        "tick_usd": round(tick_total, 4),
+        "tick_budget_usd": tick_cap,
+        "default_ticket_budget_usd": ticket_cap,
+        "top_5": [{"issue": n, "cost_usd": round(c, 4)} for n, c in top],
+        "ledger": str(ledger),
+    }
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return 0
+    print("== forge-loop budget ==")
+    print(f"  today        : ${out['today_usd']:.4f}")
+    print(f"  tick {out['tick'] or '-':>4}    : ${out['tick_usd']:.4f}"
+          f"  (cap ${out['tick_budget_usd']:.2f})")
+    print(f"  ticket cap   : ${out['default_ticket_budget_usd']:.2f}"
+          " (override per-issue with budget:<n> label)")
+    if top:
+        print("  top 5 issues by spend:")
+        for n, c in top:
+            print(f"    #{n}  ${c:.4f}")
+    else:
+        print("  (no spend recorded yet)")
+    print(f"  ledger       : {ledger}")
+    return 0
+
+
 def _cmd_config(_args: argparse.Namespace) -> int:
     cfg = load()
     out = {
@@ -279,6 +327,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("resume", help="Remove pause file").set_defaults(func=_cmd_resume)
     sub.add_parser("stop", help="Touch stop file").set_defaults(func=_cmd_stop)
     sub.add_parser("config", help="Print resolved config").set_defaults(func=_cmd_config)
+
+    p_budget = sub.add_parser(
+        "budget",
+        help="Show today's token spend, current tick spend, top 5 issues",
+    )
+    p_budget.add_argument("--tick", type=int, default=None,
+                          help="Tick number to report (default: current tick from state file)")
+    p_budget.add_argument("--json", action="store_true",
+                          help="Emit JSON instead of human-readable")
+    p_budget.set_defaults(func=_cmd_budget)
 
     p_mcp = sub.add_parser("mcp", help="MCP server (expose tools to MCP clients)")
     mcp_sub = p_mcp.add_subparsers(dest="mcp_cmd", required=True)
