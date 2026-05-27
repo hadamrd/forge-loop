@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
 import json
@@ -61,11 +62,15 @@ class WorkerOutcome:
     issue: int
     title: str
     pr_url: str | None
-    status: str  # merged | open | failed | timeout | no_pr
+    status: str  # merged | open | failed | timeout | no_pr | budget_exceeded
     duration_s: float
     stdout_tail: str
     error: str | None = None
     events: list[dict[str, Any]] | None = None  # appended by subagent via sprint-events.jsonl
+    cost_usd: float = 0.0
+    usage: dict[str, Any] | None = None
+    model: str = ""
+    budget_usd: float = 0.0
 
 
 def make_brief(
@@ -386,17 +391,30 @@ def run_worker(
     lumen_top_k: int = 3,
     lumen_test_pattern: str = "**/*Test.*",
     coauthor: str = "",
+    ticket_budget_usd: float | None = None,
+    spend_ledger: Path | None = None,
+    tick: int | None = None,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
     ``emit(kind, payload)`` is the bus emitter — used for watchdog events.
     Passed in by the runner; if omitted, watchdog events are silently dropped.
     """
+    from forge_loop.budget import (
+        SpendRecord,
+        TicketBudgetTracker,
+        append_spend,
+        ticket_budget_for,
+        utc_now_iso,
+    )
     from forge_loop.watchdog import WorkerWatchdog
 
     n = issue["number"]
     title = issue["title"]
     branch = _branch_name(n, title)
+    labels = issue.get("labels") or []
+    resolved_budget = ticket_budget_for(labels, default=ticket_budget_usd)
+    tracker = TicketBudgetTracker(ceiling_usd=resolved_budget)
 
     worktree, err = _prep_worktree(repo, n, branch)
     if err is not None:
@@ -446,6 +464,12 @@ def run_worker(
             )
             watchdog.start()
 
+        budget_killer = _BudgetWatcher(
+            proc=proc, log_path=log_path, tracker=tracker,
+            emit=emit, issue=n,
+        )
+        budget_killer.start()
+
         try:
             proc.wait(timeout=timeout_s)
             proc_returncode = proc.returncode
@@ -460,25 +484,179 @@ def run_worker(
         finally:
             if watchdog is not None:
                 watchdog.stop()
+            budget_killer.stop()
+            budget_killer.scan_once()  # final pass — catch usage on the tail
 
     duration = time.time() - started
 
+    snap = tracker.snapshot
+    usage_summary = {
+        "input_tokens": snap.input_tokens,
+        "output_tokens": snap.output_tokens,
+        "cache_creation_input_tokens": snap.cache_creation_input_tokens,
+        "cache_read_input_tokens": snap.cache_read_input_tokens,
+        "events": snap.events,
+        "fallbacks": snap.fallbacks,
+    }
+    model_seen = budget_killer.last_model or ""
+
+    def _record_spend(status_for_ledger: str) -> None:
+        if spend_ledger is None:
+            return
+        append_spend(spend_ledger, SpendRecord(
+            ts=utc_now_iso(),
+            issue=n,
+            cost_usd=snap.cost_usd,
+            input_tokens=snap.input_tokens,
+            output_tokens=snap.output_tokens,
+            cache_creation_input_tokens=snap.cache_creation_input_tokens,
+            cache_read_input_tokens=snap.cache_read_input_tokens,
+            status=status_for_ledger,
+            model=model_seen,
+            tick=tick,
+            fallbacks=snap.fallbacks,
+        ))
+
+    if budget_killer.tripped:
+        if emit is not None:
+            emit("budget_exceeded", {
+                "issue": n, "cost_usd": round(snap.cost_usd, 4),
+                "ceiling_usd": round(resolved_budget, 4),
+                "fallbacks": snap.fallbacks,
+            })
+        _record_spend("budget_exceeded")
+        return WorkerOutcome(
+            issue=n, title=title, pr_url=None, status="budget_exceeded",
+            duration_s=duration,
+            stdout_tail=_tail(log_path, 500),
+            error=f"ticket budget ${resolved_budget:.4f} exceeded "
+                  f"(spent ${snap.cost_usd:.4f})",
+            cost_usd=snap.cost_usd, usage=usage_summary, model=model_seen,
+            budget_usd=resolved_budget,
+        )
+
     if timed_out:
+        _record_spend("timeout")
         return WorkerOutcome(
             issue=n, title=title, pr_url=None, status="timeout",
             duration_s=duration, stdout_tail="(timeout)",
             error=f"worker exceeded {timeout_s}s",
+            cost_usd=snap.cost_usd, usage=usage_summary, model=model_seen,
+            budget_usd=resolved_budget,
         )
 
     pr_url, status = _extract_outcome(log_path)
     if pr_url is None and proc_returncode != 0:
         status = "failed"
     events = _read_subagent_events(worktree)
+    _record_spend(status)
     return WorkerOutcome(
         issue=n, title=title, pr_url=pr_url, status=status,
         duration_s=duration, stdout_tail=_tail(log_path, 500),
         events=events,
+        cost_usd=snap.cost_usd, usage=usage_summary, model=model_seen,
+        budget_usd=resolved_budget,
     )
+
+
+class _BudgetWatcher:
+    """Tail the worker's stream-json log, accumulate cost, kill on ceiling.
+
+    The Claude Agent SDK emits a ``usage`` block on each ``assistant`` message
+    event and a final ``result`` event with totals. We tail the log file
+    every poll interval, push every new usage event into the TicketBudgetTracker,
+    and SIGTERM the subprocess as soon as the configured ceiling is crossed.
+
+    Belt-and-suspenders against missing-data: the tracker treats malformed
+    usage as worst-case, so a streamer bug cannot silently undercount the
+    budget and let a runaway worker burn through $30.
+    """
+
+    poll_interval_s: float = 5.0
+
+    def __init__(
+        self, *,
+        proc: subprocess.Popen[bytes],
+        log_path: Path,
+        tracker: Any,  # TicketBudgetTracker
+        emit: Callable[[str, dict[str, Any]], None] | None,
+        issue: int,
+    ) -> None:
+        self._proc = proc
+        self._log_path = log_path
+        self._tracker = tracker
+        self._emit = emit
+        self._issue = issue
+        self._stop = False
+        self._thread: Any = None
+        self._read_offset = 0
+        self._buf = b""
+        self.tripped = False
+        self.last_model: str | None = None
+
+    def start(self) -> None:
+        import threading as _t
+        self._thread = _t.Thread(target=self._loop, name=f"budget-{self._issue}", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _loop(self) -> None:
+        while not self._stop:
+            self.scan_once()
+            if self.tripped:
+                return
+            time.sleep(self.poll_interval_s)
+
+    def scan_once(self) -> None:
+        from forge_loop.budget import extract_usage
+        try:
+            size = self._log_path.stat().st_size
+        except OSError:
+            return
+        if size <= self._read_offset:
+            return
+        try:
+            with open(self._log_path, "rb") as f:
+                f.seek(self._read_offset)
+                chunk = f.read(size - self._read_offset)
+        except OSError:
+            return
+        self._read_offset = size
+        self._buf += chunk
+        # Split on newlines; keep the trailing partial line for the next scan.
+        lines = self._buf.split(b"\n")
+        self._buf = lines[-1]
+        crossed = False
+        for raw in lines[:-1]:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            model, usage = extract_usage(event)
+            if model:
+                self.last_model = model
+            if usage is None:
+                continue
+            if self._tracker.add(model, usage):
+                crossed = True
+        if crossed and not self.tripped:
+            self.tripped = True
+            if self._emit is not None:
+                snap = self._tracker.snapshot
+                self._emit("budget_worker_killed", {
+                    "issue": self._issue,
+                    "cost_usd": round(snap.cost_usd, 4),
+                    "ceiling_usd": round(self._tracker.ceiling_usd, 4),
+                })
+            with contextlib.suppress(OSError, ProcessLookupError):
+                self._proc.terminate()
 
 
 def _read_subagent_events(worktree: Path) -> list[dict[str, Any]]:

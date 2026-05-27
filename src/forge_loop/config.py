@@ -162,6 +162,10 @@ class Config:
     def logs_dir(self) -> Path:
         return self.state_dir / "loop-runner-logs"
 
+    @property
+    def spend_ledger(self) -> Path:
+        return self.state_dir / "loop-runner-spend.jsonl"
+
 
 def _yaml_config_path(repo: Path) -> Path | None:
     """Locate `forge-loop.yaml` in priority order."""
