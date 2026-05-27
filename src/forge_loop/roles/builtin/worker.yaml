@@ -1,0 +1,16 @@
+# Default Worker role (issue #17).
+name: worker
+brief_template: forge_loop/briefs/worker.md.tmpl
+model: claude-sonnet-4-7
+timeout_s: 3600
+budget_usd: 5.0
+triggers:
+  - "on": tick
+    filter: {}
+actions:
+  - mcp_tools:
+      - gh_issue_read
+      - gh_pr_create
+      - gh_pr_update
+    shell: true
+output_schema: worker
