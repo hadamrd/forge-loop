@@ -33,48 +33,12 @@ VALID_OVERALL = {"approve", "request_changes", "block"}
 VALID_SEVERITY = {"sev1", "sev2", "sev3"}
 VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs"}
 
-DEFAULT_BRIEF = """You are the CRITIC agent in a Titan sprint loop. A worker just opened a PR.
-Your job: review it and emit a structured JSON CriticReport.
 
-PR URL: {pr_url}
-Linked issue: #{issue_number}
+def _default_brief() -> str:
+    """Load the critic brief template — bundled or operator-overridden."""
+    from forge_loop.briefs import load_template
 
-DO:
-1. Read the issue via `gh issue view {issue_number} --comments` to learn the
-   acceptance criteria. Note any "Acceptance" or "Out of scope" sections.
-2. Read the PR diff: `gh pr diff {pr_url}`.
-3. Read the PR description: `gh pr view {pr_url} --json title,body,additions,deletions`.
-4. Decide overall + per-finding. Use the rubric:
-   - sev1 = correctness/security bug, missing acceptance criterion,
-     or test that doesn't actually exercise the change. Blocks merge.
-   - sev2 = meaningful concern (untested error path, weak assertion,
-     scope creep affecting reviewers). Worth fixing before merge.
-   - sev3 = nit / suggestion. Non-blocking.
-   Categories: correctness | security | style | tests | docs.
-
-DO NOT:
-- push code or edit files.
-- comment on formatting (the formatter does that).
-- post review comments yourself — the runner does that from your report.
-
-FINAL OUTPUT (one JSON line, no prose after it, no markdown fence):
-{{"overall": "approve|request_changes|block",
-  "findings": [
-    {{"severity": "sev1|sev2|sev3",
-      "category": "correctness|security|style|tests|docs",
-      "file": "path/to/file" or null,
-      "line": 42 or null,
-      "message": "what's wrong and what to do"}}
-  ],
-  "issue": {issue_number}}}
-
-Hard rules:
-- "approve" with an empty findings list on a large diff is a red flag —
-  if you can't find anything, emit "request_changes" with at least one
-  sev3 noting what you reviewed.
-- If genuinely uncertain about a finding, lean toward emitting it as sev3
-  rather than swallowing it.
-- The JSON object MUST be on the LAST line of your output and parse cleanly."""
+    return load_template("critic")
 
 
 @dataclass
@@ -139,7 +103,7 @@ def review_pr(
     ``error`` verdict (the runner then leaves the PR alone — no auto-block,
     no auto-approve — so a human can intervene).
     """
-    template = brief_template or DEFAULT_BRIEF
+    template = brief_template or _default_brief()
     brief = template.format(pr_url=pr_url, issue_number=issue_number)
 
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -158,11 +122,16 @@ def review_pr(
             with open(log_path, "wb") as logf:
                 subprocess.run(
                     [
-                        "claude", "-p", brief,
-                        "--max-turns", "20",
+                        "claude",
+                        "-p",
+                        brief,
+                        "--max-turns",
+                        "20",
                         "--allow-dangerously-skip-permissions",
-                        "--add-dir", str(repo),
-                        "--output-format", "stream-json",
+                        "--add-dir",
+                        str(repo),
+                        "--output-format",
+                        "stream-json",
                         "--verbose",
                     ],
                     cwd=repo,
@@ -173,7 +142,8 @@ def review_pr(
                 )
         except subprocess.TimeoutExpired:
             return CriticOutcome(
-                verdict="error", reasons=[],
+                verdict="error",
+                reasons=[],
                 duration_s=time.time() - started,
                 stdout_tail="(timeout)",
                 error=f"critic exceeded {timeout_s}s",
@@ -190,14 +160,20 @@ def review_pr(
 
     if report is None:
         if emit is not None:
-            emit("critic_parse_failed", {
-                "issue": issue_number, "pr": pr_url,
-                "err": (parse_error or "no_json_found")[:200],
-                "retries": retries,
-            })
+            emit(
+                "critic_parse_failed",
+                {
+                    "issue": issue_number,
+                    "pr": pr_url,
+                    "err": (parse_error or "no_json_found")[:200],
+                    "retries": retries,
+                },
+            )
         return CriticOutcome(
-            verdict="error", reasons=[],
-            duration_s=duration, stdout_tail=tail,
+            verdict="error",
+            reasons=[],
+            duration_s=duration,
+            stdout_tail=tail,
             error=parse_error or "critic_parse_failed",
             parse_retries=retries,
         )
@@ -205,9 +181,12 @@ def review_pr(
     verdict = _verdict_from_overall(report.overall)
     reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
     return CriticOutcome(
-        verdict=verdict, reasons=reasons,
-        duration_s=duration, stdout_tail=tail,
-        report=report, parse_retries=retries,
+        verdict=verdict,
+        reasons=reasons,
+        duration_s=duration,
+        stdout_tail=tail,
+        report=report,
+        parse_retries=retries,
     )
 
 
