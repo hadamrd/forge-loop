@@ -28,7 +28,37 @@ from forge_loop.po import expand_thin_specs as _po_expand
 from forge_loop.state import append_event, consolidate_sprint, write_state
 from forge_loop.worker import WorkerOutcome, run_worker
 
+# Helpers extracted into _helpers.py to keep this orchestrator file
+# manageable. Re-exported under their old underscored names for backward
+# compat with any test or external caller that imported them from here.
+from forge_loop.runner._helpers import (
+    consecutive_deploy_fails as _consecutive_deploy_fails_impl,
+    consume_force_set as _consume_force_set_impl,
+    error_signature as _error_signature,
+    force_retry_file as _force_retry_file_impl,
+    installed_version as _installed_version,
+    reap_orphan_worktrees as _reap_orphan_worktrees_impl,
+    reap_worktree as _reap_worktree,
+)
+
 _RUN = True
+
+
+def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
+    """Backward-compat shim: forwards to ``runner._helpers``."""
+    return _reap_orphan_worktrees_impl(repo, events_file)
+
+
+def _consecutive_deploy_fails(cfg: Config) -> int:
+    return _consecutive_deploy_fails_impl(cfg.events_file)
+
+
+def _force_retry_file(cfg: Config) -> Path:
+    return _force_retry_file_impl(cfg.state_dir)
+
+
+def _consume_force_set(cfg: Config) -> set[int]:
+    return _consume_force_set_impl(cfg.state_dir)
 
 
 def _sev_counts(outcome: Any) -> dict[str, int]:
@@ -45,100 +75,6 @@ def _sev_counts(outcome: Any) -> dict[str, int]:
 # Drift detector — keep last 3 tick outcomes' summary tuples
 # Each entry: (had_workers: bool, all_failed: bool, error_signature: str)
 _RECENT_OUTCOMES: deque[tuple[bool, bool, str]] = deque(maxlen=3)
-
-
-def _reap_worktree(repo: Path, issue: int) -> None:
-    """Force-remove a worker's worktree after success. Best-effort."""
-    wt = Path(f"/tmp/wt-loop-{issue}")
-    if not wt.exists():
-        return
-    # The planted .claude/ is locked read-only (chmod 555). Unlock first.
-    claude_dir = wt / ".claude"
-    if claude_dir.exists():
-        subprocess.run(
-            ["chmod", "-R", "u+w", str(claude_dir)],
-            capture_output=True,
-        )
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", str(wt)],
-        cwd=repo, capture_output=True,
-    )
-
-
-def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
-    """Boot-time cleanup of stale /tmp/wt-loop-* worktrees.
-
-    A worktree is "orphan" if either:
-      * the worktree dir still exists but `git worktree list` no longer
-        knows about it (the loop crashed mid-cleanup), OR
-      * the worktree IS in `git worktree list` but no live process holds
-        a lock on it (the previous loop exited without reaping).
-
-    We reap aggressively at boot — there's no active loop yet, so any
-    /tmp/wt-loop-* on disk is by definition stale.
-
-    Returns the number reaped (for telemetry).
-    """
-    import glob
-    reaped = 0
-    for path in sorted(glob.glob("/tmp/wt-loop-*")):
-        # Defensive: only reap the loop's own worktree pattern.
-        # Skip anything else even if it slipped under /tmp/wt-loop-*.
-        try:
-            issue = int(Path(path).name.removeprefix("wt-loop-").split("-")[0])
-        except ValueError:
-            continue
-        _reap_worktree(repo, issue)
-        if not Path(path).exists():
-            reaped += 1
-    if reaped:
-        append_event(events_file, "orphan_worktrees_reaped", count=reaped)
-    # Also prune any git-internal worktree entries that no longer have a
-    # backing dir — these can accumulate when a worktree is rm -rf'd
-    # without `git worktree remove`.
-    subprocess.run(
-        ["git", "worktree", "prune"],
-        cwd=repo, capture_output=True,
-    )
-    return reaped
-
-
-def _installed_version() -> str:
-    """Best-effort read of the installed forge-loop version.
-
-    Used to detect a self-upgrade mid-run (i.e. the loop merged a PR
-    that bumped its own packaging). Returns empty string on failure —
-    a missing version is treated as "unchanged" so the runner won't
-    spuriously restart itself.
-    """
-    try:
-        from importlib.metadata import version
-        return version("forge-loop")
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def _error_signature(outcome_error: str | None, stdout_tail: str) -> str:
-    """Reduce a failure to a stable signature for drift detection.
-
-    Looks for known terminal patterns; falls back to first 60 chars of error.
-    """
-    blob = f"{outcome_error or ''} {stdout_tail or ''}"[:2000].lower()
-    patterns = [
-        ("exit code 137", "oom-exit-137"),
-        ("watchdog_worker_killed", "watchdog-kill"),
-        ("worker exceeded", "wall-timeout"),
-        ("worktree-create-failed", "worktree-create-fail"),
-        ("gh_list_failed", "gh-list-fail"),
-        ("permission denied", "permission-denied"),
-        ("rate limit", "rate-limit"),
-    ]
-    for needle, tag in patterns:
-        if needle in blob:
-            return tag
-    if outcome_error:
-        return f"err:{outcome_error[:60].strip().lower()}"
-    return "unknown"
 
 
 def _check_drift_and_maybe_halt(cfg: Config) -> bool:
@@ -180,57 +116,6 @@ def _check_drift_and_maybe_halt(cfg: Config) -> bool:
         cfg.stop_file.touch()
         return True
     return False
-
-
-def _force_retry_file(cfg: Config) -> Path:
-    return cfg.state_dir / "loop-runner.force-retry.json"
-
-
-def _consume_force_set(cfg: Config) -> set[int]:
-    """Read & clear the force-retry marker. Issues listed here bypass
-    fingerprint guards exactly once. Written by `forge-loop retry --force`.
-    """
-    path = _force_retry_file(cfg)
-    if not path.exists():
-        return set()
-    try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        path.unlink(missing_ok=True)
-        return set()
-    nums: set[int] = set()
-    for n in payload.get("issues") or []:
-        try:
-            nums.add(int(n))
-        except (TypeError, ValueError):
-            continue
-    path.unlink(missing_ok=True)
-    return nums
-
-
-def _consecutive_deploy_fails(cfg: Config) -> int:
-    """Best-effort scan of the tail of events for consecutive failed redeploys."""
-    if not cfg.events_file.exists():
-        return 0
-    try:
-        with open(cfg.events_file) as f:
-            lines = f.readlines()[-200:]
-    except OSError:
-        return 0
-    count = 0
-    for line in reversed(lines):
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if e.get("kind") != "redeploy":
-            continue
-        if e.get("ok"):
-            break
-        count += 1
-        if count >= 5:  # cap scan
-            break
-    return count
 
 
 def _install_signal_handlers(cfg: Config) -> None:
