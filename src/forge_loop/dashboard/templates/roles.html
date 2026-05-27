@@ -1,0 +1,14 @@
+{% extends "_base.html" %}
+{% block title %}roles — forge-loop{% endblock %}
+{% block body %}
+<h2>roles</h2>
+{% if roles %}
+<ul>
+  {% for name in roles %}
+  <li><a href="/roles/{{ name }}">{{ name }}</a></li>
+  {% endfor %}
+</ul>
+{% else %}
+<p>no role yaml files found.</p>
+{% endif %}
+{% endblock %}

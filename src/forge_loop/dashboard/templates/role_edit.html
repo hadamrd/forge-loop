@@ -1,0 +1,9 @@
+{% extends "_base.html" %}
+{% block title %}{{ name }} — roles{% endblock %}
+{% block body %}
+<h2>edit {{ name }}</h2>
+<form method="post" action="/roles/{{ name }}">
+  <textarea name="body" rows="24" cols="100">{{ body }}</textarea>
+  <div><button type="submit">save</button> · <a href="/roles">back</a></div>
+</form>
+{% endblock %}
