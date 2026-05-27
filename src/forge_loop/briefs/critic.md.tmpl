@@ -15,7 +15,19 @@ DO:
    - sev2 = meaningful concern (untested error path, weak assertion,
      scope creep affecting reviewers). Worth fixing before merge.
    - sev3 = nit / suggestion. Non-blocking.
-   Categories: correctness | security | style | tests | docs.
+   Categories: correctness | security | style | tests | docs | product.
+
+NO-SCAFFOLD-THEATRE RULE (issue #39):
+   A PR that adds a configurable backend, an integration adapter, a
+   dashboard / metrics exporter, or any other "plug-in" surface WITHOUT
+   a downstream consumer wired up in the same repo on the same PR is
+   scaffold theatre. Emit a sev2 finding with category="product" naming
+   the orphan code; the operator must either wire it up or quarantine
+   it behind the [experimental] extra before merge. Examples:
+     * adding a redis/postgres queue backend with no operator using it
+     * adding a Slack adapter with no event in the runner that sends to it
+     * adding a Prometheus exporter no scrape job consumes
+   Default surface stays minimal; experiments live in extras.
 
 DO NOT:
 - push code or edit files.
@@ -26,7 +38,7 @@ FINAL OUTPUT (one JSON line, no prose after it, no markdown fence):
 {{"overall": "approve|request_changes|block",
   "findings": [
     {{"severity": "sev1|sev2|sev3",
-      "category": "correctness|security|style|tests|docs",
+      "category": "correctness|security|style|tests|docs|product",
       "file": "path/to/file" or null,
       "line": 42 or null,
       "message": "what's wrong and what to do"}}

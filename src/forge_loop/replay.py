@@ -29,8 +29,14 @@ and fixture-backed replay doesn't spawn the worker at all.
 Out of scope (per the issue): replay across role changes, live A/B.
 """
 
+
 from __future__ import annotations
 
+
+# Experimental gate (issue #39): refuse to import unless the [experimental]
+# extra is installed. Stable surface only in the default install.
+from forge_loop._extras import require_experimental as _require_experimental
+_require_experimental('replay')
 import json
 import re
 from dataclasses import asdict, dataclass, field

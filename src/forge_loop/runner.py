@@ -624,18 +624,16 @@ def run(cfg: Config) -> int:
 
     _install_signal_handlers(cfg)
 
-    # Cluster bootstrap (issue #19). Opt-in via LOOP_QUEUE_URL env var.
-    # The default (no env var, in-memory queue) keeps the single-host
-    # behaviour identical so existing deployments need no change.
+    # Queue bootstrap. Default = in-memory (zero infra, single host).
+    # Set LOOP_QUEUE_URL=sqlite:///path/to/queue.db for the durable
+    # embedded backend. Multi-host Redis support was removed in #39.
     import os as _os
 
-    from forge_loop.cluster import ClusterCoordinator
-    from forge_loop.queue import build_queue
+    from forge_loop.queue import build_queue, default_host_id
 
     queue_url = _os.environ.get("LOOP_QUEUE_URL")
     queue = build_queue(queue_url)
-    cluster = ClusterCoordinator(queue=queue, queue_url=queue_url)
-    cluster.start()
+    host_id = default_host_id()
 
     append_event(
         cfg.events_file,
@@ -644,9 +642,10 @@ def run(cfg: Config) -> int:
         tick_interval=cfg.tick_interval_s,
         max_ticks=cfg.max_ticks,
         label=cfg.labels.ready,
-        runner_id=cluster.runner_id,
-        host_id=cluster.host_id,
-        distributed=cluster.is_distributed,
+        runner_id=host_id,
+        host_id=host_id,
+        distributed=False,
+        queue_backend=(queue_url or "memory"),
     )
     write_state(cfg.state_file, {"state": "starting", "tick": 0, "parallel": cfg.parallel})
 
@@ -676,7 +675,10 @@ def run(cfg: Config) -> int:
 
     write_state(cfg.state_file, {"state": "stopped", "tick": tick})
     append_event(cfg.events_file, "loop_stop", tick=tick)
-    cluster.stop()
+    # Close SQLite queue if it exposes close(); InMemoryQueue is a no-op.
+    close = getattr(queue, "close", None)
+    if callable(close):
+        close()
     return 0
 
 

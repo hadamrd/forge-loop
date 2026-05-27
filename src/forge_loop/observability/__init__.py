@@ -20,8 +20,14 @@ the optional deps are missing or config is unset, calls turn into cheap
 no-ops so production code stays clean.
 """
 
+
 from __future__ import annotations
 
+
+# Experimental gate (issue #39): refuse to import unless the [experimental]
+# extra is installed. Stable surface only in the default install.
+from forge_loop._extras import require_experimental as _require_experimental
+_require_experimental('observability')
 import os
 from typing import TYPE_CHECKING
 
