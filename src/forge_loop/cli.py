@@ -196,6 +196,48 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_record_session(args: argparse.Namespace) -> int:
+    """Record a real Claude Agent SDK session to a JSONL fixture (test-only).
+
+    Operator-driven counterpart to the test-time SessionReplayer: spawns
+    `claude -p` exactly like the loop does, tees stream-json to the fixture,
+    writes a trailer with the observed outcome.
+
+    SECRETS are NOT auto-redacted (issue #9 out-of-scope); review before commit.
+    """
+    from pathlib import Path
+
+    from forge_loop._testing.recorder import SessionRecorder
+    from forge_loop.worker import make_brief
+
+    issue: dict[str, Any]
+    if args.issue_file:
+        issue = json.loads(Path(args.issue_file).read_text())
+    else:
+        r = subprocess.run(
+            ["gh", "issue", "view", str(args.issue),
+             "--json", "number,title,body"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            sys.stderr.write(f"gh issue view failed: {r.stderr}\n")
+            return 2
+        issue = json.loads(r.stdout)
+
+    worktree = Path(args.worktree).resolve() if args.worktree else Path.cwd().resolve()
+    brief = make_brief(issue, worktree)
+    rec = SessionRecorder(issue=issue, worktree=worktree, brief=brief)
+    result = rec.record(Path(args.out), timeout_s=args.timeout)
+    print(json.dumps({
+        "fixture": str(result.fixture_path),
+        "events": result.event_count,
+        "duration_s": round(result.duration_s, 2),
+        "pr": result.pr_url,
+        "status": result.status,
+    }, indent=2))
+    return 0
+
+
 def _cmd_config(_args: argparse.Namespace) -> int:
     cfg = load()
     out = {
@@ -249,6 +291,19 @@ def main(argv: list[str] | None = None) -> int:
     p_init.add_argument("--create-labels", action="store_true",
                         help="Also create the loop's GH labels via gh CLI")
     p_init.set_defaults(func=_cmd_init)
+
+    p_rec = sub.add_parser(
+        "record-session",
+        help="Record a real Claude Agent SDK session to a JSONL fixture (test-only)",
+    )
+    rec_src = p_rec.add_mutually_exclusive_group(required=True)
+    rec_src.add_argument("--issue", type=int, help="GitHub issue number to fetch via `gh`")
+    rec_src.add_argument("--issue-file", help="Path to a local JSON file with the issue payload")
+    p_rec.add_argument("--out", required=True, help="Output fixture path (JSONL)")
+    p_rec.add_argument("--worktree", help="Worktree directory (default: cwd)")
+    p_rec.add_argument("--timeout", type=int, default=900,
+                       help="Subprocess timeout in seconds (default 900)")
+    p_rec.set_defaults(func=_cmd_record_session)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

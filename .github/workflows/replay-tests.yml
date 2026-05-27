@@ -1,0 +1,37 @@
+name: replay-tests
+
+on:
+  pull_request:
+    branches: [trunk]
+  workflow_dispatch:
+    inputs:
+      record:
+        description: "Also re-record fixtures (manual only — requires CLAUDE_API auth)"
+        required: false
+        default: "false"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          pip install -e '.[dev]'
+      - name: Replay tests (no network, no claude subprocess)
+        run: |
+          pytest tests/test_session_replay.py -v
+
+  record:
+    # Recording is gated to manual workflow_dispatch runs only — it spawns
+    # the real `claude` CLI and is expensive + non-deterministic. PR runs
+    # only ever replay existing fixtures.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.record == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Recording job — wire up claude auth + fixtures here when needed."
