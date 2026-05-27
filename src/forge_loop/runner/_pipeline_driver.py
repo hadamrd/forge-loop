@@ -109,6 +109,7 @@ def _build_default_handlers(
             tick=tick,
             model=cfg.worker.model,
             thinking=cfg.worker.thinking,
+            allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
         )
         ok = out.status in {"merged", "open"}
         return StepOutcome(

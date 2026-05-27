@@ -28,6 +28,87 @@ from typing import Any
 
 EventEmitter = Callable[[dict[str, Any]], None]
 
+# Hard cap on tool definitions injected into the SDK init message
+# (issue #60). The bundled allow-list (forge-loop + lumen + github) plus
+# the standard built-in tools sits comfortably under this. A regression
+# test asserts a session never exceeds the cap; if it does, the filter
+# stopped working and the worker is paying for a 250-tool firehose
+# again. Bump deliberately if a new allowed server pushes us close.
+ALLOWED_TOOL_HARD_CAP: int = 60
+
+# Bundled fallback when the operator-configured allow-list matches zero
+# servers actually present in the SDK init message — we emit a
+# ``worker_mcp_filter_no_match`` event and use this instead so the
+# worker doesn't end up with an empty MCP toolbox.
+_BUNDLED_DEFAULT_ALLOWED: tuple[str, ...] = ("forge-loop", "lumen", "github")
+
+
+def build_allowed_tools_patterns(allowed_servers: Iterable[str]) -> list[str]:
+    """Build the SDK ``allowed_tools`` list for a given MCP server allow-list.
+
+    The SDK / Claude Code CLI honours glob-style entries — ``mcp__<server>__*``
+    keeps every tool from that server while dropping every tool from servers
+    that don't appear. The built-in tools (Read, Bash, etc.) are NOT listed
+    here because adding them would *narrow* the worker — leaving
+    ``allowed_tools`` empty for the built-in side lets the SDK ship its
+    normal Sonnet/Opus tool surface intact.
+
+    Returns a list of ``mcp__<server>__*`` patterns. Deduped, order-preserving.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in allowed_servers:
+        name = str(s).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(f"mcp__{name}__*")
+    return out
+
+
+def resolve_mcp_filter(
+    *,
+    actual_servers: Iterable[str],
+    allow_list: Iterable[str],
+    emit: EventEmitter,
+    default: Iterable[str] = _BUNDLED_DEFAULT_ALLOWED,
+) -> tuple[str, ...]:
+    """Compute the effective allow-list and emit diagnostic events.
+
+    - Always emits ``worker_mcp_filtered`` with ``kept`` / ``dropped`` so the
+      master log shows which servers were dropped from this session.
+    - If the operator-configured allow-list matches NONE of the actually
+      loaded servers (typical cause: typo like ``forg-loop``), emit
+      ``worker_mcp_filter_no_match`` and fall back to ``default`` so the
+      worker isn't left with an empty toolbox.
+
+    Returns the allow-list to apply (server names, deduped).
+    """
+    actual = list(dict.fromkeys(str(s) for s in actual_servers))
+    allow = tuple(dict.fromkeys(str(s).strip() for s in allow_list if str(s).strip()))
+    matched = [s for s in allow if s in actual]
+    if actual and allow and not matched:
+        emit({
+            "kind": "worker_mcp_filter_no_match",
+            "configured": list(allow),
+            "available": actual,
+            "fallback": list(default),
+        })
+        resolved = tuple(dict.fromkeys(default))
+        kept = [s for s in resolved if s in actual]
+        dropped = [s for s in actual if s not in resolved]
+    else:
+        resolved = allow if allow else tuple(default)
+        kept = [s for s in resolved if (not actual) or s in actual]
+        dropped = [s for s in actual if s not in resolved]
+    emit({
+        "kind": "worker_mcp_filtered",
+        "kept": list(kept),
+        "dropped": list(dropped),
+        "configured": list(allow),
+    })
+    return resolved
+
 
 @dataclass
 class SDKRunResult:
@@ -153,6 +234,7 @@ async def run_sdk_session(
     options_cls: Any = None,
     model: str | None = None,
     thinking_budget: str | None = None,
+    allowed_mcp_servers: Iterable[str] | None = None,
 ) -> SDKRunResult:
     """Drive one Claude Agent SDK session and stream typed WorkerEvents.
 
@@ -212,24 +294,76 @@ async def run_sdk_session(
         "add_dirs": [str(p) for p in add_dirs],
         "env": env if env is not None else _clean_sdk_env(),
     }
+    # MCP server allow-list (issue #60). The default bundled allow-list
+    # lives in :mod:`forge_loop.config`; if the caller passes ``None`` we
+    # still apply the bundled default so a forgetful caller doesn't
+    # accidentally ship the 250-tool firehose.
+    allow_servers: tuple[str, ...] = tuple(
+        s for s in (allowed_mcp_servers or _BUNDLED_DEFAULT_ALLOWED) if s
+    )
+    if allow_servers:
+        # Prefer the SDK kwarg name (``allowed_tools``). If the installed
+        # SDK doesn't accept it we transparently degrade — the spec lists
+        # ``disallowed_tools`` as the fallback path.
+        base_kwargs["allowed_tools"] = build_allowed_tools_patterns(allow_servers)
     if model:
         base_kwargs["model"] = model
-    if thinking_budget and thinking_budget != "off":
+    def _instantiate(**extra: Any) -> Any:
+        """Build ClaudeAgentOptions, degrading gracefully on TypeErrors.
+
+        Older SDKs may not accept ``allowed_tools`` or ``thinking_budget``;
+        rather than crash the worker, we strip them and retry. This keeps
+        the per-role model knob working even on a stale SDK pin.
+        """
+        kwargs = {**base_kwargs, **extra}
         try:
-            options = options_cls(**base_kwargs, thinking_budget=thinking_budget)
-        except TypeError:
-            options = options_cls(**base_kwargs)
+            return options_cls(**kwargs)
+        except TypeError as exc:
+            msg = str(exc)
+            for cand in ("thinking_budget", "allowed_tools"):
+                if cand in msg and cand in kwargs:
+                    kwargs.pop(cand, None)
+                    try:
+                        return options_cls(**kwargs)
+                    except TypeError:
+                        continue
+            # Last-ditch: drop all the optional knobs.
+            for cand in ("thinking_budget", "allowed_tools"):
+                kwargs.pop(cand, None)
+            return options_cls(**kwargs)
+
+    if thinking_budget and thinking_budget != "off":
+        options = _instantiate(thinking_budget=thinking_budget)
     else:
-        options = options_cls(**base_kwargs)
+        options = _instantiate()
 
     try:
         async for message in query_fn(prompt=prompt, options=options):
             if isinstance(message, SystemMessage):
                 if getattr(message, "subtype", "") == "init":
+                    init_data = dict(getattr(message, "data", {}) or {})
                     emit({
                         "kind": "turn_start",
-                        "data": dict(getattr(message, "data", {}) or {}),
+                        "data": init_data,
                     })
+                    # Surface which MCP servers survived the allow-list
+                    # filter (issue #60). The init payload's
+                    # ``mcp_servers`` is a list of {name, status} dicts in
+                    # newer SDKs and a list of names in older ones.
+                    raw_servers = init_data.get("mcp_servers") or []
+                    actual_names: list[str] = []
+                    for entry in raw_servers:
+                        if isinstance(entry, dict):
+                            nm = entry.get("name") or entry.get("server")
+                            if isinstance(nm, str):
+                                actual_names.append(nm)
+                        elif isinstance(entry, str):
+                            actual_names.append(entry)
+                    resolve_mcp_filter(
+                        actual_servers=actual_names,
+                        allow_list=allow_servers,
+                        emit=emit,
+                    )
                 continue
             if isinstance(message, AssistantMessage):
                 model_seen = getattr(message, "model", "") or model_seen

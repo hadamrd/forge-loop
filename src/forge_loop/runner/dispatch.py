@@ -95,6 +95,7 @@ def _run_workers(
                     tick=tick,
                     model=cfg.worker.model,
                     thinking=cfg.worker.thinking,
+                    allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
                 )
                 for i, meta in dispatch
             ]
