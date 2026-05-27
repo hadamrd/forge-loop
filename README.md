@@ -197,20 +197,59 @@ deferred — both still run via `claude -p` subprocess and the CLI does
 not expose a thinking flag; they'll wire up once those roles migrate to
 the Claude Agent SDK.
 
-## CLI
+## CLI / UI
+
+The CLI is a [Typer](https://typer.tiangolo.com/) app with [Rich](https://rich.readthedocs.io)
+output (issue #47). Every command supports `--help` / `-h`, ships with
+auto-generated shell completion (`forge-loop --install-completion`), and
+respects `NO_COLOR` / `TERM=dumb` for CI-friendly rendering.
 
 ```sh
 forge-loop init [--create-labels]    # scaffold forge-loop.yaml + manual/ in a project
 forge-loop run                       # run the loop in the foreground
-forge-loop status                    # print current state file
-forge-loop events -n 30              # tail event JSONL
-forge-loop config                    # print resolved config
+forge-loop status                    # operator-facing health surface (Rich panel)
+forge-loop status --json             # raw machine-parseable blob for scripts
+forge-loop doctor                    # one-shot health check (config-independent checks still run)
+forge-loop events -n 30              # tail event JSONL (Rich-coloured + JSON syntax highlight)
+forge-loop events -n 30 --raw        # raw JSONL, no colour — pipe into jq / grep / files
+forge-loop config                    # print resolved config (always JSON)
 forge-loop config models             # print per-role model + thinking-budget
 forge-loop pause                     # pause after current tick
 forge-loop resume
 forge-loop stop                      # graceful stop
 forge-loop mcp serve                 # run as an MCP server on stdio
 ```
+
+### Operator dashboard — web vs. TUI
+
+`forge-loop dashboard` ships in two flavours:
+
+```sh
+forge-loop dashboard --web                  # FastAPI/HTMX dashboard (default; binds 127.0.0.1)
+forge-loop dashboard --tui                  # Textual TUI in your terminal
+```
+
+The TUI requires the optional `[ui]` extra:
+
+```sh
+pip install 'forge-loop[ui]'
+```
+
+It surfaces a live events stream, current queue depth (from the cached
+sidecar so it doesn't hammer `gh`), the list of in-flight workers, and
+a rolling budget panel. Keybindings:
+
+- `k` — publish a `worker_kill_requested` event for the first in-flight
+  worker (the runner watches `state_dir/kill-requests.jsonl` and
+  delivers the actual signal — the TUI's contract is *publishing
+  intent*),
+- `r` — force-refresh the panels,
+- `q` — quit.
+
+Backward compatibility: every shell invocation that worked under the
+previous argparse era still works — same flag names, same exit codes,
+same machine-parseable output (`status --json`, `events --raw`,
+`config --json`, etc.).
 
 ## MCP server
 
