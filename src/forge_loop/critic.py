@@ -4,14 +4,16 @@ After a worker opens a PR, we (optionally) dispatch a critic subagent that:
 - reads the diff
 - reads the linked issue's acceptance criteria
 - checks tests + pre-commit gates ran
-- posts ``gh pr review --approve`` OR ``--request-changes`` on the PR
+- returns a typed CriticReport (overall + per-finding severity)
 
-If the critic requests changes, the worker's auto-merge is preempted by the
-review block. If the critic approves, auto-merge proceeds as normal.
+The runner consumes the report to:
+- block auto-merge on any sev1 finding (and label PR ``critic:blocking``)
+- post sev2/sev3 findings as inline PR review comments (or a summary)
+- gate "approve with zero findings" against ``LOOP_CRITIC_MIN_FINDINGS``
+  so an empty rubber-stamp on a large diff is surfaced as suspicious.
 
 Trade-off: a critic pass adds ~30-90s per PR but catches the class of
-regressions auto-merge alone misses (issue's acceptance criteria not met,
-fix is too narrow, tests added but don't actually exercise the change).
+regressions auto-merge alone misses.
 """
 
 from __future__ import annotations
@@ -20,13 +22,19 @@ import json
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from forge_loop.worker import _subagent_env, ensure_subagent_trusted
 
+VALID_OVERALL = {"approve", "request_changes", "block"}
+VALID_SEVERITY = {"sev1", "sev2", "sev3"}
+VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs"}
+
 DEFAULT_BRIEF = """You are the CRITIC agent in a Titan sprint loop. A worker just opened a PR.
-Your job: review it before auto-merge.
+Your job: review it and emit a structured JSON CriticReport.
 
 PR URL: {pr_url}
 Linked issue: #{issue_number}
@@ -34,37 +42,85 @@ Linked issue: #{issue_number}
 DO:
 1. Read the issue via `gh issue view {issue_number} --comments` to learn the
    acceptance criteria. Note any "Acceptance" or "Out of scope" sections.
-2. Read the PR diff: `gh pr diff {pr_url}` (or the number form).
-3. Read the PR description: `gh pr view {pr_url} --json title,body`.
-4. Decide: does the diff satisfy the issue's acceptance criteria?
-   - Was a relevant test added or modified?
-   - Is the fix the smallest correct one? (Out-of-scope bloat is a red flag.)
-   - Are pre-commit gates 0-5 honored?
-   - Are there obvious correctness gaps (untested error paths, hardcoded
-     values, swallowed exceptions)?
+2. Read the PR diff: `gh pr diff {pr_url}`.
+3. Read the PR description: `gh pr view {pr_url} --json title,body,additions,deletions`.
+4. Decide overall + per-finding. Use the rubric:
+   - sev1 = correctness/security bug, missing acceptance criterion,
+     or test that doesn't actually exercise the change. Blocks merge.
+   - sev2 = meaningful concern (untested error path, weak assertion,
+     scope creep affecting reviewers). Worth fixing before merge.
+   - sev3 = nit / suggestion. Non-blocking.
+   Categories: correctness | security | style | tests | docs.
 
-POST EXACTLY ONE REVIEW:
-- Approve: `gh pr review {pr_url} --approve --body "<one-line reason>"`
-- Block:   `gh pr review {pr_url} --request-changes --body "<numbered list of issues>"`
+DO NOT:
+- push code or edit files.
+- comment on formatting (the formatter does that).
+- post review comments yourself — the runner does that from your report.
 
-FINAL OUTPUT (one JSON line, no prose after):
-{{"verdict": "approved|changes_requested", "reasons": ["..."], "issue": {issue_number}}}
+FINAL OUTPUT (one JSON line, no prose after it, no markdown fence):
+{{"overall": "approve|request_changes|block",
+  "findings": [
+    {{"severity": "sev1|sev2|sev3",
+      "category": "correctness|security|style|tests|docs",
+      "file": "path/to/file" or null,
+      "line": 42 or null,
+      "message": "what's wrong and what to do"}}
+  ],
+  "issue": {issue_number}}}
 
 Hard rules:
-- Do NOT push code. Do NOT edit files.
-- Do NOT comment on style (the formatter does that).
-- Focus on correctness + scope + tests.
-- If genuinely uncertain, lean APPROVE (CI + tests still gate; this is a
-  qualitative review layer, not a blocker)."""
+- "approve" with an empty findings list on a large diff is a red flag —
+  if you can't find anything, emit "request_changes" with at least one
+  sev3 noting what you reviewed.
+- If genuinely uncertain about a finding, lean toward emitting it as sev3
+  rather than swallowing it.
+- The JSON object MUST be on the LAST line of your output and parse cleanly."""
+
+
+@dataclass
+class Finding:
+    severity: str  # sev1 | sev2 | sev3
+    category: str  # correctness | security | style | tests | docs
+    file: str | None
+    line: int | None
+    message: str
+
+    def is_valid(self) -> bool:
+        return (
+            self.severity in VALID_SEVERITY
+            and self.category in VALID_CATEGORY
+            and isinstance(self.message, str)
+            and bool(self.message.strip())
+            and (self.file is None or isinstance(self.file, str))
+            and (self.line is None or isinstance(self.line, int))
+        )
+
+
+@dataclass
+class CriticReport:
+    overall: str  # approve | request_changes | block
+    findings: list[Finding] = field(default_factory=list)
+    raw: str = ""
+
+    def severities(self) -> set[str]:
+        return {f.severity for f in self.findings}
+
+    def has_sev1(self) -> bool:
+        return any(f.severity == "sev1" for f in self.findings)
+
+    def has_sev2(self) -> bool:
+        return any(f.severity == "sev2" for f in self.findings)
 
 
 @dataclass
 class CriticOutcome:
-    verdict: str  # approved | changes_requested | error
+    verdict: str  # approved | changes_requested | blocked | error
     reasons: list[str]
     duration_s: float
     stdout_tail: str
+    report: CriticReport | None = None
     error: str | None = None
+    parse_retries: int = 0
 
 
 def review_pr(
@@ -74,82 +130,194 @@ def review_pr(
     logs_dir: Path,
     timeout_s: int = 600,
     brief_template: str | None = None,
+    emit: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> CriticOutcome:
-    """Spawn the critic subagent against an open PR. Synchronous."""
+    """Spawn the critic subagent against an open PR. Synchronous.
+
+    If the subagent's final JSON fails to parse, retry ONCE. If the retry
+    also fails, emit ``critic_parse_failed`` via ``emit`` and surface an
+    ``error`` verdict (the runner then leaves the PR alone — no auto-block,
+    no auto-approve — so a human can intervene).
+    """
     template = brief_template or DEFAULT_BRIEF
     brief = template.format(pr_url=pr_url, issue_number=issue_number)
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     ensure_subagent_trusted(repo)
-    log_path = logs_dir / f"critic-{issue_number}-{int(time.time())}.log"
 
     started = time.time()
-    try:
-        with open(log_path, "wb") as logf:
-            subprocess.run(
-                [
-                    "claude", "-p", brief,
-                    "--max-turns", "20",
-                    "--allow-dangerously-skip-permissions",
-                    "--add-dir", str(repo),
-                    "--output-format", "stream-json",
-                    "--verbose",
-                ],
-                cwd=repo,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                timeout=timeout_s,
-                env=_subagent_env(),
+    report: CriticReport | None = None
+    last_log_path: Path | None = None
+    parse_error: str | None = None
+    retries = 0
+
+    for attempt in range(2):  # initial + 1 retry
+        log_path = logs_dir / f"critic-{issue_number}-{int(time.time())}-{attempt}.log"
+        last_log_path = log_path
+        try:
+            with open(log_path, "wb") as logf:
+                subprocess.run(
+                    [
+                        "claude", "-p", brief,
+                        "--max-turns", "20",
+                        "--allow-dangerously-skip-permissions",
+                        "--add-dir", str(repo),
+                        "--output-format", "stream-json",
+                        "--verbose",
+                    ],
+                    cwd=repo,
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout_s,
+                    env=_subagent_env(),
+                )
+        except subprocess.TimeoutExpired:
+            return CriticOutcome(
+                verdict="error", reasons=[],
+                duration_s=time.time() - started,
+                stdout_tail="(timeout)",
+                error=f"critic exceeded {timeout_s}s",
+                parse_retries=retries,
             )
-    except subprocess.TimeoutExpired:
-        return CriticOutcome(
-            verdict="error", reasons=[], duration_s=time.time() - started,
-            stdout_tail="(timeout)", error=f"critic exceeded {timeout_s}s",
-        )
+
+        report, parse_error = parse_report_from_log(log_path)
+        if report is not None:
+            break
+        retries = attempt + 1  # we just consumed one parse attempt
 
     duration = time.time() - started
-    verdict, reasons = _extract_verdict(log_path)
+    tail = _tail(last_log_path, 500) if last_log_path else ""
+
+    if report is None:
+        if emit is not None:
+            emit("critic_parse_failed", {
+                "issue": issue_number, "pr": pr_url,
+                "err": (parse_error or "no_json_found")[:200],
+                "retries": retries,
+            })
+        return CriticOutcome(
+            verdict="error", reasons=[],
+            duration_s=duration, stdout_tail=tail,
+            error=parse_error or "critic_parse_failed",
+            parse_retries=retries,
+        )
+
+    verdict = _verdict_from_overall(report.overall)
+    reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
     return CriticOutcome(
         verdict=verdict, reasons=reasons,
-        duration_s=duration, stdout_tail=_tail(log_path, 500),
+        duration_s=duration, stdout_tail=tail,
+        report=report, parse_retries=retries,
     )
 
 
-def _extract_verdict(log_path: Path) -> tuple[str, list[str]]:
-    last = ""
-    with open(log_path, "rb") as f:
-        for raw in f:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if e.get("type") == "result":
-                last = e.get("result", "") or ""
+def _verdict_from_overall(overall: str) -> str:
+    if overall == "approve":
+        return "approved"
+    if overall == "block":
+        return "blocked"
+    if overall == "request_changes":
+        return "changes_requested"
+    return "error"
 
-    for chunk in reversed(last.strip().splitlines()):
+
+def parse_report_from_log(log_path: Path) -> tuple[CriticReport | None, str | None]:
+    """Extract the final JSON CriticReport from a claude stream-json log.
+
+    Returns (report, None) on success or (None, error_message) on failure.
+    """
+    last_result = ""
+    try:
+        with open(log_path, "rb") as f:
+            for raw in f:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("type") == "result":
+                    last_result = e.get("result", "") or ""
+    except OSError as ex:
+        return None, f"log_read_failed: {ex}"
+
+    if not last_result.strip():
+        return None, "empty_result"
+
+    return parse_report_from_text(last_result)
+
+
+_JSON_OBJ_RE = re.compile(r"\{(?:[^{}]|(?:\{[^{}]*\}))*\}", re.DOTALL)
+
+
+def parse_report_from_text(text: str) -> tuple[CriticReport | None, str | None]:
+    """Find the LAST valid JSON object with an ``overall`` field in ``text``.
+
+    Tolerates surrounding prose / markdown fences. Returns (None, msg) on
+    failure so the caller can decide whether to retry.
+    """
+    # First try: the last non-empty line as a clean JSON object.
+    for chunk in reversed(text.strip().splitlines()):
         chunk = chunk.strip()
+        if chunk.startswith("```"):
+            continue
         if chunk.startswith("{") and chunk.endswith("}"):
             try:
                 obj = json.loads(chunk)
-                return (
-                    str(obj.get("verdict", "error")),
-                    list(obj.get("reasons", []) or []),
-                )
             except json.JSONDecodeError:
                 continue
+            rep = _coerce_report(obj, raw=chunk)
+            if rep is not None:
+                return rep, None
 
-    # Fallback: text scan for "approved" / "changes_requested"
-    if re.search(r"\bchanges[_ ]requested\b", last, re.IGNORECASE):
-        return "changes_requested", []
-    if re.search(r"\bapproved\b", last, re.IGNORECASE):
-        return "approved", []
-    return "error", []
+    # Fallback: scan for any JSON object that has an "overall" key.
+    matches = list(_JSON_OBJ_RE.finditer(text))
+    for m in reversed(matches):
+        try:
+            obj = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict) or "overall" not in obj:
+            continue
+        rep = _coerce_report(obj, raw=m.group(0))
+        if rep is not None:
+            return rep, None
+
+    return None, "no_valid_report"
 
 
-def _tail(path: Path, n: int) -> str:
+def _coerce_report(obj: dict[str, Any], raw: str) -> CriticReport | None:
+    overall = obj.get("overall")
+    if overall not in VALID_OVERALL:
+        return None
+    raw_findings = obj.get("findings") or []
+    if not isinstance(raw_findings, list):
+        return None
+    findings: list[Finding] = []
+    for item in raw_findings:
+        if not isinstance(item, dict):
+            continue
+        line = item.get("line")
+        if isinstance(line, str) and line.isdigit():
+            line = int(line)
+        elif not isinstance(line, int):
+            line = None
+        f = Finding(
+            severity=str(item.get("severity", "")),
+            category=str(item.get("category", "")),
+            file=item.get("file") if isinstance(item.get("file"), str) else None,
+            line=line,
+            message=str(item.get("message", "")),
+        )
+        if f.is_valid():
+            findings.append(f)
+    return CriticReport(overall=overall, findings=findings, raw=raw)
+
+
+def _tail(path: Path | None, n: int) -> str:
+    if path is None:
+        return ""
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -158,3 +326,48 @@ def _tail(path: Path, n: int) -> str:
             return f.read().decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Legacy verdict extractor — kept for backwards compatibility with
+# tests/callers that pre-date the typed report. Prefer ``parse_report_from_log``.
+# ---------------------------------------------------------------------------
+def _extract_verdict(log_path: Path) -> tuple[str, list[str]]:
+    report, _ = parse_report_from_log(log_path)
+    if report is not None:
+        verdict = _verdict_from_overall(report.overall)
+        reasons = [f.message for f in report.findings]
+        return verdict, reasons
+
+    last = ""
+    try:
+        with open(log_path, "rb") as f:
+            for raw in f:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("type") == "result":
+                    last = e.get("result", "") or ""
+    except OSError:
+        return "error", []
+
+    for chunk in reversed(last.strip().splitlines()):
+        chunk = chunk.strip()
+        if chunk.startswith("{") and chunk.endswith("}"):
+            try:
+                obj = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            v = obj.get("verdict")
+            if v:
+                return str(v), list(obj.get("reasons", []) or [])
+
+    if re.search(r"\bchanges[_ ]requested\b", last, re.IGNORECASE):
+        return "changes_requested", []
+    if re.search(r"\bapproved\b", last, re.IGNORECASE):
+        return "approved", []
+    return "error", []

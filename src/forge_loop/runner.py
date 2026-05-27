@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from forge_loop import attempts as _attempts
+from forge_loop import gh as _gh
 from forge_loop import master_log as _mlog
 from forge_loop.config import Config
 from forge_loop.critic import review_pr as _critic_review
+from forge_loop.critic_actions import apply_critic_report
 from forge_loop.deploy import redeploy
 from forge_loop.gh import fetch_issue, top_issues
 from forge_loop.maintenance import run_maintenance
@@ -25,6 +27,18 @@ from forge_loop.state import append_event, consolidate_sprint, write_state
 from forge_loop.worker import WorkerOutcome, run_worker
 
 _RUN = True
+
+
+def _sev_counts(outcome: Any) -> dict[str, int]:
+    """Tally sev1/sev2/sev3 from a CriticOutcome.report. Safe on None."""
+    report = getattr(outcome, "report", None)
+    counts = {"sev1": 0, "sev2": 0, "sev3": 0}
+    if report is None:
+        return counts
+    for f in report.findings:
+        if f.severity in counts:
+            counts[f.severity] += 1
+    return counts
 
 # Drift detector — keep last 3 tick outcomes' summary tuples
 # Each entry: (had_workers: bool, all_failed: bool, error_signature: str)
@@ -327,6 +341,7 @@ def _tick(cfg: Config, tick: int) -> None:
                         o.pr_url, o.issue,
                         cfg.repo, cfg.logs_dir,
                         timeout_s=cfg.critic.timeout_s,
+                        emit=_bus_emit,
                     )
                     append_event(
                         cfg.events_file, "critic_done",
@@ -334,7 +349,22 @@ def _tick(cfg: Config, tick: int) -> None:
                         verdict=critic_outcome.verdict,
                         reasons=critic_outcome.reasons,
                         duration_s=round(critic_outcome.duration_s, 1),
+                        sev_counts=_sev_counts(critic_outcome),
+                        parse_retries=critic_outcome.parse_retries,
                     )
+                    if critic_outcome.report is not None:
+                        try:
+                            lines = _gh.pr_changed_lines(o.pr_url, repo=cfg.github_repo)
+                            apply_critic_report(
+                                critic_outcome.report,
+                                o.pr_url, lines,
+                                cfg.critic.block_on_sev2,
+                                cfg.critic.min_findings_for_approve,
+                                gh=_gh, repo=cfg.github_repo, emit=_bus_emit,
+                            )
+                        except Exception as act_ex:
+                            append_event(cfg.events_file, "critic_actions_failed",
+                                         issue=o.issue, err=str(act_ex)[:200])
                 except Exception as ex_:
                     append_event(cfg.events_file, "critic_failed",
                                  issue=o.issue, err=str(ex_)[:200])
@@ -528,11 +558,28 @@ def run_async(cfg: Config) -> int:
             return {"issue": wr.get("issue"), "verdict": "skipped", "reasons": []}
         c = await asyncio.to_thread(
             _critic_review, wr["pr_url"], wr["issue"],
-            cfg.repo, cfg.logs_dir, cfg.critic.timeout_s,
+            cfg.repo, cfg.logs_dir, cfg.critic.timeout_s, None, _bus_emit,
         )
+        if c.report is not None:
+            try:
+                lines = await asyncio.to_thread(
+                    _gh.pr_changed_lines, wr["pr_url"], cfg.github_repo,
+                )
+                await asyncio.to_thread(
+                    apply_critic_report,
+                    c.report, wr["pr_url"], lines,
+                    cfg.critic.block_on_sev2,
+                    cfg.critic.min_findings_for_approve,
+                    _gh, cfg.github_repo, _bus_emit,
+                )
+            except Exception as act_ex:
+                append_event(cfg.events_file, "critic_actions_failed",
+                             issue=wr.get("issue"), err=str(act_ex)[:200])
         return {
             "issue": wr.get("issue"), "verdict": c.verdict,
             "reasons": c.reasons, "duration_s": c.duration_s,
+            "sev_counts": _sev_counts(c),
+            "parse_retries": c.parse_retries,
         }
 
     tick = 0
