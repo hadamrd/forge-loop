@@ -281,6 +281,9 @@ def run_async(cfg: Config) -> int:
             model=cfg.worker.model,
             thinking=cfg.worker.thinking,
             allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+            load_timeout_ms=cfg.worker.load_timeout_ms,
+            strict_mcp_config=cfg.worker.strict_mcp_config,
+            mcp_servers=cfg.worker.mcp_servers,
         )
         return {
             "issue": o.issue, "title": o.title,

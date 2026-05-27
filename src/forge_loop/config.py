@@ -164,6 +164,22 @@ class WorkerConfig:
     model: str = "claude-opus-4-7"
     thinking: str = "medium"
     allowed_mcp_tools: tuple[str, ...] = DEFAULT_ALLOWED_MCP_SERVERS
+    # SDK init knobs. 180000 ms = 3 min handshake budget; the SDK's
+    # ~60s default times out on operators whose global Claude config
+    # has many MCP servers (Gmail/Drive/Calendar/playwright/persistent-shell)
+    # because every connected server is queried at session start.
+    load_timeout_ms: int = 180000
+    # ``strict_mcp_config=True`` tells the SDK to ignore the operator's
+    # global Claude MCP config and load ONLY ``mcp_servers``. Default ON
+    # because workers don't need the operator's personal stack — they
+    # need at most lumen + forge-loop + github (per ``allowed_mcp_tools``).
+    # Empty ``mcp_servers={}`` under strict mode = zero MCP servers.
+    strict_mcp_config: bool = True
+    # Per-worker MCP server definitions when strict mode is on. Empty by
+    # default — the worker's allowed_tools whitelist still applies, and
+    # the worker's built-in tools (Bash/Read/Edit/etc) cover most tickets.
+    # Operators with project-specific MCP servers populate this in yaml.
+    mcp_servers: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -440,6 +456,15 @@ def load() -> Config:
             model=worker_model,
             thinking=worker_thinking,
             allowed_mcp_tools=worker_allowed,
+            load_timeout_ms=_env_int(
+                "LOOP_WORKER_LOAD_TIMEOUT_MS",
+                int(worker_block.get("load_timeout_ms", 180000)),
+            ),
+            strict_mcp_config=_env_bool(
+                "LOOP_WORKER_STRICT_MCP",
+                bool(worker_block.get("strict_mcp_config", True)),
+            ),
+            mcp_servers=dict(worker_block.get("mcp_servers") or {}),
         ),
         attempts=AttemptsConfig(
             enabled=bool(attempts_block.get("enabled", True)),
