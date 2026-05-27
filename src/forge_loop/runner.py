@@ -64,6 +64,59 @@ def _reap_worktree(repo: Path, issue: int) -> None:
     )
 
 
+def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
+    """Boot-time cleanup of stale /tmp/wt-loop-* worktrees.
+
+    A worktree is "orphan" if either:
+      * the worktree dir still exists but `git worktree list` no longer
+        knows about it (the loop crashed mid-cleanup), OR
+      * the worktree IS in `git worktree list` but no live process holds
+        a lock on it (the previous loop exited without reaping).
+
+    We reap aggressively at boot — there's no active loop yet, so any
+    /tmp/wt-loop-* on disk is by definition stale.
+
+    Returns the number reaped (for telemetry).
+    """
+    import glob
+    reaped = 0
+    for path in sorted(glob.glob("/tmp/wt-loop-*")):
+        # Defensive: only reap the loop's own worktree pattern.
+        # Skip anything else even if it slipped under /tmp/wt-loop-*.
+        try:
+            issue = int(Path(path).name.removeprefix("wt-loop-").split("-")[0])
+        except ValueError:
+            continue
+        _reap_worktree(repo, issue)
+        if not Path(path).exists():
+            reaped += 1
+    if reaped:
+        append_event(events_file, "orphan_worktrees_reaped", count=reaped)
+    # Also prune any git-internal worktree entries that no longer have a
+    # backing dir — these can accumulate when a worktree is rm -rf'd
+    # without `git worktree remove`.
+    subprocess.run(
+        ["git", "worktree", "prune"],
+        cwd=repo, capture_output=True,
+    )
+    return reaped
+
+
+def _installed_version() -> str:
+    """Best-effort read of the installed forge-loop version.
+
+    Used to detect a self-upgrade mid-run (i.e. the loop merged a PR
+    that bumped its own packaging). Returns empty string on failure —
+    a missing version is treated as "unchanged" so the runner won't
+    spuriously restart itself.
+    """
+    try:
+        from importlib.metadata import version
+        return version("forge-loop")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _error_signature(outcome_error: str | None, stdout_tail: str) -> str:
     """Reduce a failure to a stable signature for drift detection.
 
@@ -610,6 +663,16 @@ def run(cfg: Config) -> int:
 
     _install_signal_handlers(cfg)
 
+    # Boot-time orphan worktree cleanup. /tmp/wt-loop-* should never
+    # outlive the loop process; if any are on disk now (operator killed
+    # the previous tmux mid-tick, crash, etc.) they would otherwise
+    # accumulate forever. The runner is the only owner of these paths.
+    _reap_orphan_worktrees(cfg.repo, cfg.events_file)
+
+    # Stamp the installed version so we can detect a self-upgrade
+    # (a merged PR bumped our own packaging) and gracefully restart.
+    boot_version = _installed_version()
+
     # Queue bootstrap. Default = in-memory (zero infra, single host).
     # Set LOOP_QUEUE_URL=sqlite:///path/to/queue.db for the durable
     # embedded backend. Multi-host Redis support was removed in #39.
@@ -656,6 +719,22 @@ def run(cfg: Config) -> int:
         if cfg.max_ticks and tick > cfg.max_ticks:
             append_event(cfg.events_file, "max_ticks_reached", tick=tick)
             break
+
+        # Self-upgrade detection: if a merged PR bumped our own package
+        # version, the running process is on stale code. Exit cleanly so
+        # the all-nighter shim re-execs us against the fresh install.
+        # Skipped if boot_version is empty (we never knew our version) or
+        # if the current read also returns empty (importlib hiccup).
+        if boot_version:
+            current_version = _installed_version()
+            if current_version and current_version != boot_version:
+                append_event(
+                    cfg.events_file,
+                    "version_changed_restart",
+                    boot_version=boot_version,
+                    current_version=current_version,
+                )
+                break
 
         _tick(cfg, tick)
 
