@@ -16,6 +16,7 @@ import json
 import subprocess
 import sys
 from datetime import UTC
+from pathlib import Path
 from typing import Any
 
 from forge_loop.config import load
@@ -546,6 +547,143 @@ def _cmd_replay_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+def _default_repos_dir() -> Path:
+    """Where the loop expects ``.forge/repos/*.yaml`` to live.
+
+    Defaults to ``<cwd>/.forge/repos`` so the loop home is wherever the
+    operator invokes ``forge-loop`` from; override with ``LOOP_REPOS_DIR``.
+    """
+    import os
+    from pathlib import Path
+
+    env = os.environ.get("LOOP_REPOS_DIR")
+    return Path(env).expanduser() if env else Path.cwd() / ".forge" / "repos"
+
+
+def _cmd_repos_list(args: argparse.Namespace) -> int:
+    """`forge-loop repos list` — print loaded repos + last tick activity."""
+    from forge_loop.multirepo import RepoLoadError, is_disabled, load_repos, validate_checkout
+
+    repos_dir = Path(args.repos_dir) if args.repos_dir else _default_repos_dir()
+    try:
+        specs = load_repos(repos_dir)
+    except RepoLoadError as e:
+        sys.stderr.write(f"[repos list] {e}\n")
+        return 2
+
+    # Last-activity is read from the sidecar events log so the operator
+    # can see the most recent global tick that touched each repo, even
+    # across loop restarts.
+    last_activity: dict[str, dict[str, Any]] = {}
+    sidecar = repos_dir.parent.parent / ".forge" / "multirepo-events.jsonl" \
+        if repos_dir.name == "repos" else repos_dir.parent / "multirepo-events.jsonl"
+    if sidecar.exists():
+        try:
+            with open(sidecar) as f:
+                for line in f.readlines()[-1000:]:
+                    try:
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if e.get("kind") in {"repo_tick_done", "repo_skipped",
+                                          "repo_tick_start", "repo_tick_error"}:
+                        repo = e.get("repo")
+                        if repo:
+                            last_activity[repo] = {
+                                "ts": e.get("ts"),
+                                "kind": e.get("kind"),
+                                "reason": e.get("reason") or "",
+                                "tick": e.get("tick"),
+                            }
+        except OSError:
+            pass
+
+    rows = []
+    for spec in specs:
+        bad = validate_checkout(spec)
+        rows.append({
+            "name": spec.name,
+            "github": spec.github,
+            "checkout": str(spec.checkout),
+            "disabled": is_disabled(spec),
+            "checkout_invalid": bad,
+            "budget_usd_per_day": spec.budget_usd_per_day,
+            "source": str(spec.source_path) if spec.source_path else None,
+            "last_activity": last_activity.get(spec.name),
+        })
+
+    if args.json:
+        print(json.dumps({"repos_dir": str(repos_dir), "repos": rows}, indent=2))
+        return 0
+
+    print(f"== forge-loop repos ({repos_dir}) ==")
+    if not rows:
+        print("  (no repo specs loaded — run `forge-loop init` per-repo or "
+              "create .forge/repos/*.yaml)")
+        return 0
+    for r in rows:
+        flags = []
+        if r["disabled"]:
+            flags.append("DISABLED")
+        if r["checkout_invalid"]:
+            flags.append(f"INVALID({r['checkout_invalid']})")
+        flag_s = "  [" + ", ".join(flags) + "]" if flags else ""
+        last = r["last_activity"]
+        last_s = (f"  last: tick {last['tick']} {last['kind']} "
+                  f"({last['ts']})") if last else "  last: never"
+        print(f"  - {r['name']:<20} {r['github']:<30}{flag_s}")
+        print(f"    checkout: {r['checkout']}")
+        print(f"    budget/day: ${r['budget_usd_per_day']:.2f}{last_s}")
+    return 0
+
+
+def _cmd_repos_disable(args: argparse.Namespace) -> int:
+    from forge_loop.multirepo import (
+        RepoLoadError,
+        disable_repo,
+        load_repos,
+    )
+
+    repos_dir = Path(args.repos_dir) if args.repos_dir else _default_repos_dir()
+    try:
+        specs = load_repos(repos_dir)
+    except RepoLoadError as e:
+        sys.stderr.write(f"[repos disable] {e}\n")
+        return 2
+    match = next((s for s in specs if s.name == args.name), None)
+    if not match:
+        sys.stderr.write(f"[repos disable] no such repo: {args.name}\n")
+        return 2
+    flag = disable_repo(match, reason=args.reason or "")
+    print(f"[repos disable] {match.name} → flag at {flag}")
+    return 0
+
+
+def _cmd_repos_enable(args: argparse.Namespace) -> int:
+    from forge_loop.multirepo import (
+        RepoLoadError,
+        enable_repo,
+        load_repos,
+    )
+
+    repos_dir = Path(args.repos_dir) if args.repos_dir else _default_repos_dir()
+    try:
+        specs = load_repos(repos_dir)
+    except RepoLoadError as e:
+        sys.stderr.write(f"[repos enable] {e}\n")
+        return 2
+    match = next((s for s in specs if s.name == args.name), None)
+    if not match:
+        sys.stderr.write(f"[repos enable] no such repo: {args.name}\n")
+        return 2
+    cleared = enable_repo(match)
+    if cleared:
+        print(f"[repos enable] cleared disable flag for {match.name}")
+    else:
+        print(f"[repos enable] {match.name} was not disabled (no-op)")
+    return 0
+
+
 def _cmd_config(_args: argparse.Namespace) -> int:
     cfg = load()
     out = {
@@ -589,6 +727,30 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("resume", help="Remove pause file").set_defaults(func=_cmd_resume)
     sub.add_parser("stop", help="Touch stop file").set_defaults(func=_cmd_stop)
     sub.add_parser("config", help="Print resolved config").set_defaults(func=_cmd_config)
+
+    p_repos = sub.add_parser(
+        "repos",
+        help="Multirepo management: list/enable/disable repos under .forge/repos/",
+    )
+    repos_sub = p_repos.add_subparsers(dest="repos_cmd", required=True)
+    p_repos_list = repos_sub.add_parser("list", help="List loaded repos + last activity")
+    p_repos_list.add_argument(
+        "--repos-dir", default=None,
+        help="Override the .forge/repos directory (default: $LOOP_REPOS_DIR or ./.forge/repos)",
+    )
+    p_repos_list.add_argument("--json", action="store_true")
+    p_repos_list.set_defaults(func=_cmd_repos_list)
+
+    p_repos_dis = repos_sub.add_parser("disable", help="Skip a repo until re-enabled")
+    p_repos_dis.add_argument("name", help="Repo name (matches the `name:` field)")
+    p_repos_dis.add_argument("--reason", default=None)
+    p_repos_dis.add_argument("--repos-dir", default=None)
+    p_repos_dis.set_defaults(func=_cmd_repos_disable)
+
+    p_repos_en = repos_sub.add_parser("enable", help="Resume processing a disabled repo")
+    p_repos_en.add_argument("name")
+    p_repos_en.add_argument("--repos-dir", default=None)
+    p_repos_en.set_defaults(func=_cmd_repos_enable)
 
     p_budget = sub.add_parser(
         "budget",
