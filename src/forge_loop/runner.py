@@ -624,6 +624,19 @@ def run(cfg: Config) -> int:
 
     _install_signal_handlers(cfg)
 
+    # Cluster bootstrap (issue #19). Opt-in via LOOP_QUEUE_URL env var.
+    # The default (no env var, in-memory queue) keeps the single-host
+    # behaviour identical so existing deployments need no change.
+    import os as _os
+
+    from forge_loop.cluster import ClusterCoordinator
+    from forge_loop.queue import build_queue
+
+    queue_url = _os.environ.get("LOOP_QUEUE_URL")
+    queue = build_queue(queue_url)
+    cluster = ClusterCoordinator(queue=queue, queue_url=queue_url)
+    cluster.start()
+
     append_event(
         cfg.events_file,
         "loop_start",
@@ -631,6 +644,9 @@ def run(cfg: Config) -> int:
         tick_interval=cfg.tick_interval_s,
         max_ticks=cfg.max_ticks,
         label=cfg.labels.ready,
+        runner_id=cluster.runner_id,
+        host_id=cluster.host_id,
+        distributed=cluster.is_distributed,
     )
     write_state(cfg.state_file, {"state": "starting", "tick": 0, "parallel": cfg.parallel})
 
@@ -660,6 +676,7 @@ def run(cfg: Config) -> int:
 
     write_state(cfg.state_file, {"state": "stopped", "tick": tick})
     append_event(cfg.events_file, "loop_stop", tick=tick)
+    cluster.stop()
     return 0
 
 

@@ -20,12 +20,20 @@ observability = [
   "opentelemetry-sdk >=1.25",
   "opentelemetry-exporter-otlp >=1.25",
 ]
+# Optional Redis-backed queue + leader election for multi-host runners
+# (issue #19). Default stays in-memory; install with `pip install
+# 'forge-loop[redis]'` to enable `forge-loop run --queue redis://...`.
+redis = [
+  "redis >=5.0",
+]
 dev = [
   "pytest >=8.0",
   "pytest-cov >=5.0",
   "ruff >=0.6",
   "mypy >=1.10",
   "types-PyYAML >=6.0",
+  "fakeredis >=2.20",
+  "redis >=5.0",
 ]
 
 [project.scripts]
