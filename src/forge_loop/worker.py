@@ -90,13 +90,7 @@ def make_brief(
 
     ``past_attempts`` (non-empty): includes a "PREVIOUS ATTEMPTS" section
     so the worker can learn from prior tries.
-
-    The template body lives in ``src/forge_loop/briefs/worker.md.tmpl``
-    and is loaded via :mod:`forge_loop.briefs` (which honours the
-    ``LOOP_WORKER_BRIEF`` env override).
     """
-    from forge_loop.briefs import render_brief
-
     body = (issue.get("body") or "")[:6000]
     n = issue["number"]
 
@@ -119,8 +113,8 @@ def make_brief(
         "    STOP. DO NOT enable auto-merge. The `risk:high` label on this issue\n"
         "    means a human must review. Post a comment on the PR: 'Risk-gated;\n"
         "    ready for human review.' Your status is `open` (not `merged`)."
-        if risk_gated
-        else "10. `gh pr create` with a clear title + body (the body should restate\n"
+        if risk_gated else
+        "10. `gh pr create` with a clear title + body (the body should restate\n"
         "    the acceptance criteria and how they're tested).\n"
         "11. `gh pr merge <N> --squash --auto --delete-branch`."
     )
@@ -129,11 +123,13 @@ def make_brief(
 
     final_status = (
         f'{{"issue": {n}, "pr": "<url>", "status": "open", "note": "risk-gated"}}'
-        if risk_gated
-        else f'{{"issue": {n}, "pr": "<url-or-null>", "status": "merged|open|failed", "note": "<short>"}}'
+        if risk_gated else
+        f'{{"issue": {n}, "pr": "<url-or-null>", "status": "merged|open|failed", "note": "<short>"}}'
     )
 
     coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
+
+    from forge_loop.briefs import render_brief
 
     return render_brief(
         "worker",
@@ -220,8 +216,7 @@ def _prep_worktree(repo: Path, n: int, branch: str) -> tuple[Path, str | None]:
         subprocess.run(["chmod", "-R", "u+w", str(claude_dir)], capture_output=True)
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(wt)],
-        cwd=repo,
-        capture_output=True,
+        cwd=repo, capture_output=True,
     )
     # If a previous failed attempt left a local branch lying around, delete
     # it so `git worktree add -B` can recreate it cleanly off the freshest
@@ -229,8 +224,7 @@ def _prep_worktree(repo: Path, n: int, branch: str) -> tuple[Path, str | None]:
     # an explicit delete to fail loudly if the branch is still in use.
     subprocess.run(
         ["git", "branch", "-D", branch],
-        cwd=repo,
-        capture_output=True,
+        cwd=repo, capture_output=True,
     )
     # Force-update origin/trunk so the worktree always starts at the freshest
     # commit, even if many PRs landed during the prior tick. `+refs/heads/...`
@@ -238,14 +232,11 @@ def _prep_worktree(repo: Path, n: int, branch: str) -> tuple[Path, str | None]:
     # happen for trunk, but if it does we want the upstream view).
     subprocess.run(
         ["git", "fetch", "--prune", "origin", "+refs/heads/trunk:refs/remotes/origin/trunk"],
-        cwd=repo,
-        capture_output=True,
+        cwd=repo, capture_output=True,
     )
     r = subprocess.run(
         ["git", "worktree", "add", str(wt), "-B", branch, "origin/trunk"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
+        cwd=repo, capture_output=True, text=True,
     )
     if r.returncode != 0:
         return wt, r.stderr
@@ -322,13 +313,9 @@ def run_worker(
     Passed in by the runner; if omitted, watchdog events are silently dropped.
     """
     from forge_loop.budget import (
-        SpendRecord,
         TicketBudgetTracker,
-        append_spend,
         ticket_budget_for,
-        utc_now_iso,
     )
-    from forge_loop.watchdog import WorkerWatchdog
 
     n = issue["number"]
     title = issue["title"]
@@ -340,93 +327,118 @@ def run_worker(
     worktree, err = _prep_worktree(repo, n, branch)
     if err is not None:
         return WorkerOutcome(
-            issue=n,
-            title=title,
-            pr_url=None,
-            status="failed",
-            duration_s=0.0,
-            stdout_tail=err[-500:],
+            issue=n, title=title, pr_url=None, status="failed",
+            duration_s=0.0, stdout_tail=err[-500:],
             error="worktree-create-failed",
         )
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"worker-{n}-{int(time.time())}.log"
     brief = make_brief(
-        issue,
-        worktree,
-        risk_gated=risk_gated,
-        past_attempts=past_attempts,
+        issue, worktree,
+        risk_gated=risk_gated, past_attempts=past_attempts,
         lumen_top_k=lumen_top_k,
         lumen_test_pattern=lumen_test_pattern,
         coauthor=coauthor,
     )
 
+    return _run_worker_sdk(
+        issue=issue,
+        worktree=worktree,
+        log_path=log_path,
+        brief=brief,
+        timeout_s=timeout_s,
+        tracker=tracker,
+        resolved_budget=resolved_budget,
+        emit=emit,
+        spend_ledger=spend_ledger,
+        tick=tick,
+    )
+
+
+def _run_worker_sdk(
+    *,
+    issue: dict[str, Any],
+    worktree: Path,
+    log_path: Path,
+    brief: str,
+    timeout_s: int,
+    tracker: Any,  # TicketBudgetTracker
+    resolved_budget: float,
+    emit: Callable[[str, dict[str, Any]], None] | None,
+    spend_ledger: Path | None,
+    tick: int | None,
+) -> WorkerOutcome:
+    """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
+
+    All subprocess/CLI-parsing concerns are gone: the SDK delivers typed
+    messages, we accumulate per-turn cost via the same TicketBudgetTracker
+    the old log-tailing path used, and a final ResultMessage carries the
+    grand-total cost + usage. The events.jsonl format (one JSON dict per
+    line, ``kind`` + ``ts`` discriminant) is preserved for backward compat
+    with anything that tails the worker log.
+    """
+    from forge_loop._worker_sdk import run_sdk_session
+    from forge_loop.budget import (
+        SpendRecord,
+        append_spend,
+        extract_usage,
+        utc_now_iso,
+    )
+
+    n = issue["number"]
+    title = issue["title"]
     started = time.time()
-    timed_out = False
-    proc_returncode = -1
 
-    # Popen so the watchdog has a handle to terminate the subprocess
-    # if the worker stalls (no events written, no log progress).
-    with open(log_path, "wb") as logf:
-        proc = subprocess.Popen(
-            [
-                "claude",
-                "-p",
+    budget_tripped = {"v": False}
+
+    with open(log_path, "w", encoding="utf-8") as log_fh:
+        def _on_event(ev: dict[str, Any]) -> None:
+            with contextlib.suppress(OSError):
+                log_fh.write(json.dumps(ev, default=str) + "\n")
+                log_fh.flush()
+
+        def _budget_should_stop(
+            _cost: float, _usage: dict[str, Any], _model: str | None,
+        ) -> bool:
+            if budget_tripped["v"]:
+                return True
+            fake_event = {
+                "type": "assistant",
+                "message": {"model": _model or "", "usage": _usage or {}},
+            }
+            m, u = extract_usage(fake_event)
+            if u is not None and tracker.add(m, u):
+                budget_tripped["v"] = True
+                if emit is not None:
+                    snap = tracker.snapshot
+                    emit("budget_worker_killed", {
+                        "issue": n,
+                        "cost_usd": round(snap.cost_usd, 4),
+                        "ceiling_usd": round(tracker.ceiling_usd, 4),
+                    })
+                return True
+            return False
+
+        async def _drive() -> Any:
+            return await run_sdk_session(
                 brief,
-                "--max-turns",
-                "120",
-                "--allow-dangerously-skip-permissions",
-                "--add-dir",
-                str(worktree),
-                "--output-format",
-                "stream-json",
-                "--verbose",
-            ],
-            cwd=worktree,
-            stdout=logf,
-            stderr=subprocess.STDOUT,
-            env=_subagent_env(),
-        )
-
-        watchdog: WorkerWatchdog | None = None
-        if emit is not None:
-            watchdog = WorkerWatchdog(
-                proc=proc,
-                worktree=worktree,
-                log_path=log_path,
-                emit=emit,
-                issue=n,
+                cwd=worktree,
+                max_turns=120,
+                add_dirs=[worktree],
+                permission_mode="bypassPermissions",
+                on_event=_on_event,
+                budget_should_stop=_budget_should_stop,
             )
-            watchdog.start()
 
-        budget_killer = _BudgetWatcher(
-            proc=proc,
-            log_path=log_path,
-            tracker=tracker,
-            emit=emit,
-            issue=n,
-        )
-        budget_killer.start()
-
+        timed_out = False
+        result: Any = None
         try:
-            proc.wait(timeout=timeout_s)
-            proc_returncode = proc.returncode
-        except subprocess.TimeoutExpired:
+            result = _run_with_timeout(_drive, timeout_s)
+        except TimeoutError:
             timed_out = True
-            proc.terminate()
-            try:
-                proc.wait(timeout=10.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            proc_returncode = -1
-        finally:
-            if watchdog is not None:
-                watchdog.stop()
-            budget_killer.stop()
-            budget_killer.scan_once()  # final pass — catch usage on the tail
 
     duration = time.time() - started
-
     snap = tracker.snapshot
     usage_summary = {
         "input_tokens": snap.input_tokens,
@@ -436,88 +448,94 @@ def run_worker(
         "events": snap.events,
         "fallbacks": snap.fallbacks,
     }
-    model_seen = budget_killer.last_model or ""
 
-    def _record_spend(status_for_ledger: str) -> None:
+    def _record_spend(status_for_ledger: str, model: str) -> None:
         if spend_ledger is None:
             return
-        append_spend(
-            spend_ledger,
-            SpendRecord(
-                ts=utc_now_iso(),
-                issue=n,
-                cost_usd=snap.cost_usd,
-                input_tokens=snap.input_tokens,
-                output_tokens=snap.output_tokens,
-                cache_creation_input_tokens=snap.cache_creation_input_tokens,
-                cache_read_input_tokens=snap.cache_read_input_tokens,
-                status=status_for_ledger,
-                model=model_seen,
-                tick=tick,
-                fallbacks=snap.fallbacks,
-            ),
-        )
-
-    if budget_killer.tripped:
-        if emit is not None:
-            emit(
-                "budget_exceeded",
-                {
-                    "issue": n,
-                    "cost_usd": round(snap.cost_usd, 4),
-                    "ceiling_usd": round(resolved_budget, 4),
-                    "fallbacks": snap.fallbacks,
-                },
-            )
-        _record_spend("budget_exceeded")
-        return WorkerOutcome(
+        append_spend(spend_ledger, SpendRecord(
+            ts=utc_now_iso(),
             issue=n,
-            title=title,
-            pr_url=None,
-            status="budget_exceeded",
+            cost_usd=snap.cost_usd,
+            input_tokens=snap.input_tokens,
+            output_tokens=snap.output_tokens,
+            cache_creation_input_tokens=snap.cache_creation_input_tokens,
+            cache_read_input_tokens=snap.cache_read_input_tokens,
+            status=status_for_ledger,
+            model=model,
+            tick=tick,
+            fallbacks=snap.fallbacks,
+        ))
+
+    if budget_tripped["v"]:
+        model = (result.model if result is not None else "") or ""
+        if emit is not None:
+            emit("budget_exceeded", {
+                "issue": n, "cost_usd": round(snap.cost_usd, 4),
+                "ceiling_usd": round(resolved_budget, 4),
+                "fallbacks": snap.fallbacks,
+            })
+        _record_spend("budget_exceeded", model)
+        return WorkerOutcome(
+            issue=n, title=title, pr_url=None, status="budget_exceeded",
             duration_s=duration,
             stdout_tail=_tail(log_path, 500),
-            error=f"ticket budget ${resolved_budget:.4f} exceeded (spent ${snap.cost_usd:.4f})",
-            cost_usd=snap.cost_usd,
-            usage=usage_summary,
-            model=model_seen,
+            error=f"ticket budget ${resolved_budget:.4f} exceeded "
+                  f"(spent ${snap.cost_usd:.4f})",
+            cost_usd=snap.cost_usd, usage=usage_summary, model=model,
             budget_usd=resolved_budget,
         )
 
     if timed_out:
-        _record_spend("timeout")
+        _record_spend("timeout", "")
         return WorkerOutcome(
-            issue=n,
-            title=title,
-            pr_url=None,
-            status="timeout",
-            duration_s=duration,
-            stdout_tail="(timeout)",
+            issue=n, title=title, pr_url=None, status="timeout",
+            duration_s=duration, stdout_tail="(timeout)",
             error=f"worker exceeded {timeout_s}s",
-            cost_usd=snap.cost_usd,
-            usage=usage_summary,
-            model=model_seen,
+            cost_usd=snap.cost_usd, usage=usage_summary, model="",
             budget_usd=resolved_budget,
         )
 
-    pr_url, status = _extract_outcome(log_path)
-    if pr_url is None and proc_returncode != 0:
+    assert result is not None  # neither branch above
+    model_seen = result.model or ""
+    # Prefer the SDK's authoritative grand-total cost when present
+    # (tracker accumulates per-turn — they should agree to within rounding,
+    # but the result-event total is the source of truth).
+    cost_usd = result.cost_usd if result.cost_usd > 0 else snap.cost_usd
+
+    pr_url = result.pr_url
+    status = result.status
+    if result.error is not None and pr_url is None:
         status = "failed"
+
     events = _read_subagent_events(worktree)
-    _record_spend(status)
+    _record_spend(status, model_seen)
     return WorkerOutcome(
-        issue=n,
-        title=title,
-        pr_url=pr_url,
-        status=status,
-        duration_s=duration,
-        stdout_tail=_tail(log_path, 500),
+        issue=n, title=title, pr_url=pr_url, status=status,
+        duration_s=duration, stdout_tail=_tail(log_path, 500),
         events=events,
-        cost_usd=snap.cost_usd,
-        usage=usage_summary,
-        model=model_seen,
+        cost_usd=cost_usd, usage=usage_summary, model=model_seen,
         budget_usd=resolved_budget,
+        error=result.error,
     )
+
+
+def _run_with_timeout(coro_factory: Callable[[], Any], timeout_s: int) -> Any:
+    """Run an async coroutine factory under a wall-clock timeout.
+
+    Uses ``anyio.run`` + ``anyio.fail_after`` so we share the SDK's event
+    loop. Raises :class:`TimeoutError` on deadline expiry — the caller
+    converts that to a ``timeout`` WorkerOutcome.
+    """
+    import anyio
+
+    async def _wrap() -> Any:
+        with anyio.fail_after(float(timeout_s)):
+            return await coro_factory()
+
+    try:
+        return anyio.run(_wrap)
+    except TimeoutError:
+        raise
 
 
 class _BudgetWatcher:
@@ -536,8 +554,7 @@ class _BudgetWatcher:
     poll_interval_s: float = 5.0
 
     def __init__(
-        self,
-        *,
+        self, *,
         proc: subprocess.Popen[bytes],
         log_path: Path,
         tracker: Any,  # TicketBudgetTracker
@@ -558,7 +575,6 @@ class _BudgetWatcher:
 
     def start(self) -> None:
         import threading as _t
-
         self._thread = _t.Thread(target=self._loop, name=f"budget-{self._issue}", daemon=True)
         self._thread.start()
 
@@ -576,7 +592,6 @@ class _BudgetWatcher:
 
     def scan_once(self) -> None:
         from forge_loop.budget import extract_usage
-
         try:
             size = self._log_path.stat().st_size
         except OSError:
@@ -614,14 +629,11 @@ class _BudgetWatcher:
             self.tripped = True
             if self._emit is not None:
                 snap = self._tracker.snapshot
-                self._emit(
-                    "budget_worker_killed",
-                    {
-                        "issue": self._issue,
-                        "cost_usd": round(snap.cost_usd, 4),
-                        "ceiling_usd": round(self._tracker.ceiling_usd, 4),
-                    },
-                )
+                self._emit("budget_worker_killed", {
+                    "issue": self._issue,
+                    "cost_usd": round(snap.cost_usd, 4),
+                    "ceiling_usd": round(self._tracker.ceiling_usd, 4),
+                })
             with contextlib.suppress(OSError, ProcessLookupError):
                 self._proc.terminate()
 
