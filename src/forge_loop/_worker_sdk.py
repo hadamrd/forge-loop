@@ -27,7 +27,6 @@ from typing import Any
 # subprocess-free (issue #2 acceptance criterion); a unit test enforces it.
 
 EventEmitter = Callable[[dict[str, Any]], None]
-BudgetHook = Callable[[float, dict[str, Any], str | None], bool]
 
 
 @dataclass
@@ -150,16 +149,12 @@ async def run_sdk_session(
     add_dirs: Iterable[Path] = (),
     permission_mode: str = "bypassPermissions",
     on_event: EventEmitter | None = None,
-    budget_should_stop: BudgetHook | None = None,
     query_fn: Any = None,
     options_cls: Any = None,
 ) -> SDKRunResult:
     """Drive one Claude Agent SDK session and stream typed WorkerEvents.
 
     ``on_event`` receives every event dict (the new typed stream).
-    ``budget_should_stop(cost, usage, model)`` is consulted after every
-    assistant turn; returning True aborts the iteration with an ``error``
-    event of type ``budget_exceeded``.
 
     ``query_fn`` / ``options_cls`` are injection points for tests — leaving
     them None imports the real ``claude_agent_sdk`` at call time.
@@ -233,17 +228,6 @@ async def run_sdk_session(
                             "input": _safe_input(block.input),
                             "tool_use_id": block.id,
                         })
-                if budget_should_stop is not None and budget_should_stop(
-                    cost_usd, usage, model_seen,
-                ):
-                    emit({
-                        "kind": "error",
-                        "error_type": "budget_exceeded",
-                        "message": "ticket budget exceeded",
-                        "retry_hint": None,
-                    })
-                    error_str = "budget_exceeded: ticket budget exceeded"
-                    break
                 continue
             if isinstance(message, UserMessage):
                 content = getattr(message, "content", None)
