@@ -232,7 +232,7 @@ client) by adding to your `mcp.json`:
 }
 ```
 
-Exposed tools include `dev_sprint_workflow_start` (top-level), `gh_top_issues`,
+Exposed tools include `run_sprint_workflow` (top-level), `gh_top_issues`,
 `gh_create_issue`, `groom_backlog`, `dispatch_worker`, `critic_review_pr`,
 `redeploy_project`, `loop_status`, `loop_events`, `events_query`,
 `manual_lookup`, and more.
