@@ -265,6 +265,7 @@ def _tick(cfg: Config, tick: int) -> None:
             github_repo=cfg.github_repo,
             timeout_s=cfg.po.timeout_s,
             max_to_expand=cfg.po.max_to_expand_per_tick,
+            model=cfg.po.model,
         )
         expanded_nums = [o.issue for o in po_outcomes if not o.skipped]
         append_event(
@@ -392,6 +393,8 @@ def _tick(cfg: Config, tick: int) -> None:
                 lumen_test_pattern=cfg.lumen_test_pattern,
                 coauthor=cfg.coauthor,
                 tick=tick,
+                model=cfg.worker.model,
+                thinking=cfg.worker.thinking,
             )
             for i, meta in dispatch
         ]
@@ -433,6 +436,7 @@ def _tick(cfg: Config, tick: int) -> None:
                         cfg.repo, cfg.logs_dir,
                         timeout_s=cfg.critic.timeout_s,
                         emit=_bus_emit,
+                        model=cfg.critic.model,
                     )
                     append_event(
                         cfg.events_file, "critic_done",
@@ -711,6 +715,7 @@ def run_async(cfg: Config) -> int:
             github_repo=cfg.github_repo,
             timeout_s=cfg.po.timeout_s,
             max_to_expand=1,
+            model=cfg.po.model,
         )
         if not outs:
             return {"issue": issue["number"], "skipped": True, "reason": "po_no_op"}
@@ -737,8 +742,12 @@ def run_async(cfg: Config) -> int:
             past = past[-cfg.attempts.max_history_in_brief:] if past else []
         o = await asyncio.to_thread(
             run_worker, issue, cfg.repo, cfg.logs_dir, cfg.worker_timeout_s,
-            gated, past, _bus_emit,
-            cfg.lumen.top_k, cfg.lumen_test_pattern, cfg.coauthor,
+            risk_gated=gated, past_attempts=past, emit=_bus_emit,
+            lumen_top_k=cfg.lumen.top_k,
+            lumen_test_pattern=cfg.lumen_test_pattern,
+            coauthor=cfg.coauthor,
+            model=cfg.worker.model,
+            thinking=cfg.worker.thinking,
         )
         return {
             "issue": o.issue, "title": o.title,
@@ -752,6 +761,7 @@ def run_async(cfg: Config) -> int:
         c = await asyncio.to_thread(
             _critic_review, wr["pr_url"], wr["issue"],
             cfg.repo, cfg.logs_dir, cfg.critic.timeout_s, None, _bus_emit,
+            cfg.critic.model,
         )
         if c.report is not None:
             try:

@@ -147,6 +147,56 @@ Two layers, in priority order: env vars > YAML.
 See [`forge-loop.example.yaml`](forge-loop.example.yaml) for the full schema.
 `forge-loop init` scaffolds a starter config in any project.
 
+### Choosing models per role
+
+The loop runs three agent roles with very different cognitive shapes, so
+each gets its own model + thinking-budget knob (issue #34). Defaults are
+tuned for the trade-off observers in the loop's own dogfooding session
+identified:
+
+| Role     | Default model        | Default thinking | Why                                                |
+| -------- | -------------------- | ---------------- | -------------------------------------------------- |
+| `worker` | `claude-opus-4-7`    | `medium`         | medium-effort implementation across many files     |
+| `po`     | `claude-opus-4-7`    | `high`           | hard thinking about spec quality before workers go |
+| `critic` | `claude-sonnet-4-6`  | `off`            | rubric-checking is fast and cheap on Sonnet        |
+
+Override via env (highest precedence) or YAML:
+
+```sh
+export LOOP_WORKER_MODEL=claude-sonnet-4-6
+export LOOP_WORKER_THINKING=low
+export LOOP_PO_MODEL=claude-opus-4-7
+export LOOP_PO_THINKING=high
+export LOOP_CRITIC_MODEL=claude-sonnet-4-6
+export LOOP_CRITIC_THINKING=off
+```
+
+```yaml
+worker:
+  model: claude-opus-4-7
+  thinking: medium
+po:
+  model: claude-opus-4-7
+  thinking: high
+critic:
+  model: claude-sonnet-4-6
+  thinking: "off"        # quote — bare ``off`` is YAML's false
+```
+
+Inspect what's actually resolved at runtime:
+
+```sh
+forge-loop config models           # human-readable table
+forge-loop config models --json    # machine-readable
+```
+
+Unknown model aliases (e.g. `opus-99`) fail loudly at startup with the
+offending value named, rather than silently at first dispatch.
+Thinking-budget configurability for the PO and critic is currently
+deferred — both still run via `claude -p` subprocess and the CLI does
+not expose a thinking flag; they'll wire up once those roles migrate to
+the Claude Agent SDK.
+
 ## CLI
 
 ```sh
@@ -155,6 +205,7 @@ forge-loop run                       # run the loop in the foreground
 forge-loop status                    # print current state file
 forge-loop events -n 30              # tail event JSONL
 forge-loop config                    # print resolved config
+forge-loop config models             # print per-role model + thinking-budget
 forge-loop pause                     # pause after current tick
 forge-loop resume
 forge-loop stop                      # graceful stop

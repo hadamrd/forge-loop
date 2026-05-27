@@ -28,6 +28,15 @@ Boundaries:
 
 Falls back to a no-op if the issue body already meets the spec bar
 (has a clear acceptance section + at least one test requirement).
+
+Model knob
+----------
+``expand_thin_specs`` accepts an optional ``model`` arg (issue #34) which
+threads through as ``--model <name>`` on the underlying ``claude -p``
+subprocess invocation. Thinking-budget configurability for the PO role
+is INTENTIONALLY deferred — the `claude -p` CLI does not expose a
+thinking-budget flag, so we wait until the PO migrates to the Claude
+Agent SDK (separate follow-up issue) before wiring that knob.
 """
 
 from __future__ import annotations
@@ -74,6 +83,7 @@ def expand_thin_specs(
     timeout_s: int = 480,
     brief_template: str | None = None,
     max_to_expand: int = 3,
+    model: str | None = None,
 ) -> list[POOutcome]:
     """Run the PO pass over up to ``max_to_expand`` thin issues.
 
@@ -101,7 +111,9 @@ def expand_thin_specs(
             issue_body=body[:4000],
             github_repo=github_repo,
         )
-        outcomes.append(_run_one(issue["number"], brief, repo, logs_dir, timeout_s))
+        outcomes.append(
+            _run_one(issue["number"], brief, repo, logs_dir, timeout_s, model=model)
+        )
         n_expanded += 1
 
     return outcomes
@@ -117,12 +129,39 @@ def _looks_substantive(body: str) -> bool:
     return sum([has_acceptance, has_tests, has_scope]) >= 2
 
 
+def _build_po_argv(brief: str, repo: Path, model: str | None) -> list[str]:
+    """Assemble the ``claude -p`` argv for the PO subagent.
+
+    Split out so unit tests can assert on the argv directly without
+    monkey-patching subprocess.run gymnastics. ``--model`` is threaded
+    through when ``model`` is set (issue #34).
+    """
+    argv = [
+        "claude",
+        "-p",
+        brief,
+        "--max-turns",
+        "25",
+        "--allow-dangerously-skip-permissions",
+        "--add-dir",
+        str(repo),
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ]
+    if model:
+        argv.extend(["--model", model])
+    return argv
+
+
 def _run_one(
     issue_number: int,
     brief: str,
     repo: Path,
     logs_dir: Path,
     timeout_s: int,
+    *,
+    model: str | None = None,
 ) -> POOutcome:
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"po-{issue_number}-{int(time.time())}.log"
@@ -131,19 +170,7 @@ def _run_one(
     try:
         with open(log_path, "wb") as logf:
             subprocess.run(
-                [
-                    "claude",
-                    "-p",
-                    brief,
-                    "--max-turns",
-                    "25",
-                    "--allow-dangerously-skip-permissions",
-                    "--add-dir",
-                    str(repo),
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                ],
+                _build_po_argv(brief, repo, model),
                 cwd=repo,
                 stdout=logf,
                 stderr=subprocess.STDOUT,

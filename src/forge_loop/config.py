@@ -11,12 +11,58 @@ Keep this module side-effect-free so tests can swap it cheaply.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+# Recognised Claude model aliases. Matches the canonical
+# ``claude-<family>-<major>-<minor>`` pattern (e.g. ``claude-opus-4-7``,
+# ``claude-sonnet-4-6``). Loader-side validation raises a clear error at
+# startup if an operator sets ``LOOP_*_MODEL`` (or the yaml equivalent) to
+# something that does not parse — much better than a cryptic SDK failure
+# at first dispatch.
+_MODEL_PATTERN = re.compile(
+    r"^claude-(opus|sonnet|haiku)-\d+-\d+(-[a-z0-9.-]+)?$"
+)
+
+# Thinking-budget tiers we expose. ``off`` disables extended thinking
+# entirely; ``low``/``medium``/``high`` map to ascending budgets the SDK
+# can translate. Validated identically to the model knob.
+_THINKING_VALUES = frozenset({"off", "low", "medium", "high"})
+
+
+class ModelConfigError(ValueError):
+    """Raised at config load time when a per-role model/thinking knob is invalid.
+
+    The message names the offending value AND the source knob (env var name
+    or yaml path) so the operator can fix the typo without grepping.
+    """
+
+
+def _validate_model(value: str, source: str) -> str:
+    if not _MODEL_PATTERN.match(value):
+        raise ModelConfigError(
+            f"unknown model alias {value!r} for {source}: "
+            "expected something like 'claude-opus-4-7' or 'claude-sonnet-4-6'"
+        )
+    return value
+
+
+def _validate_thinking(value: str, source: str) -> str:
+    # YAML 1.1 parses bare ``off``/``on`` as booleans — accept that quirk
+    # so operators don't have to remember to quote ``thinking: "off"``.
+    if value == "False":
+        value = "off"
+    if value not in _THINKING_VALUES:
+        raise ModelConfigError(
+            f"unknown thinking value {value!r} for {source}: "
+            f"expected one of {sorted(_THINKING_VALUES)}"
+        )
+    return value
 
 
 def _repo_root() -> Path:
@@ -62,6 +108,14 @@ class CriticConfig:
     # let auto-merge proceed, label the PR ``critic:suspicious``, and surface
     # a ``critic_suspicious_approve`` event for the operator.
     min_findings_for_approve: int = 50
+    # Per-role model (issue #34). Critic is fine on Sonnet — the work is
+    # rubric-checking against a spec, not novel synthesis.
+    # NOTE: thinking-budget config for the critic is deferred until it
+    # migrates from `claude -p` subprocess to the SDK; until then this is a
+    # placeholder and the field is preserved only so the resolved-config
+    # surface stays uniform across roles.
+    model: str = "claude-sonnet-4-6"
+    thinking: str = "off"
 
 
 @dataclass(frozen=True)
@@ -71,10 +125,30 @@ class POConfig:
     The worker's PR depth tracks the issue body's spec depth. Without this
     pass, the loop ships one-line PRs even for issues that are actually
     feature-shaped.
+
+    NOTE: ``thinking`` is recorded here for completeness, but the PO still
+    runs via ``claude -p`` subprocess (not the SDK), and the CLI does not
+    yet expose a thinking-budget flag. The field is wired through and will
+    activate once the PO migrates to the SDK (see follow-up of issue #34).
     """
     enabled: bool = True
     timeout_s: int = 480
     max_to_expand_per_tick: int = 2
+    # Per-role model (issue #34). PO needs hard thinking about spec quality.
+    model: str = "claude-opus-4-7"
+    thinking: str = "high"
+
+
+@dataclass(frozen=True)
+class WorkerConfig:
+    """Per-role worker model + thinking-budget (issue #34).
+
+    Workers do medium-effort implementation: a default of Opus with medium
+    thinking is the sweet spot identified by the operators in the issue
+    body. Both knobs are independently overridable via env or yaml.
+    """
+    model: str = "claude-opus-4-7"
+    thinking: str = "medium"
 
 
 @dataclass(frozen=True)
@@ -123,6 +197,9 @@ class Config:
 
     # PO spec-expander
     po: POConfig = field(default_factory=POConfig)
+
+    # Per-role worker model + thinking-budget (issue #34)
+    worker: WorkerConfig = field(default_factory=WorkerConfig)
 
     # Per-issue attempt history
     attempts: AttemptsConfig = field(default_factory=AttemptsConfig)
@@ -213,8 +290,45 @@ def load() -> Config:
     briefs_block = y.get("briefs") or {}
     critic_block = y.get("critic") or {}
     po_block = y.get("po") or {}
+    worker_block = y.get("worker") or {}
     attempts_block = y.get("attempts") or {}
     lumen_block = y.get("lumen") or {}
+
+    def _resolve_role(
+        env_model: str, env_thinking: str,
+        block: dict[str, Any],
+        default_model: str, default_thinking: str,
+    ) -> tuple[str, str]:
+        raw_model = os.environ.get(env_model)
+        model_source = env_model
+        if raw_model is None:
+            raw_model = block.get("model", default_model)
+            model_source = f"yaml: {env_model.lower().replace('loop_', '').replace('_model', '')}.model"
+        raw_thinking = os.environ.get(env_thinking)
+        thinking_source = env_thinking
+        if raw_thinking is None:
+            raw_thinking = block.get("thinking", default_thinking)
+            thinking_source = (
+                f"yaml: {env_thinking.lower().replace('loop_', '').replace('_thinking', '')}"
+                ".thinking"
+            )
+        return (
+            _validate_model(str(raw_model), model_source),
+            _validate_thinking(str(raw_thinking), thinking_source),
+        )
+
+    worker_model, worker_thinking = _resolve_role(
+        "LOOP_WORKER_MODEL", "LOOP_WORKER_THINKING",
+        worker_block, "claude-opus-4-7", "medium",
+    )
+    po_model, po_thinking = _resolve_role(
+        "LOOP_PO_MODEL", "LOOP_PO_THINKING",
+        po_block, "claude-opus-4-7", "high",
+    )
+    critic_model, critic_thinking = _resolve_role(
+        "LOOP_CRITIC_MODEL", "LOOP_CRITIC_THINKING",
+        critic_block, "claude-sonnet-4-6", "off",
+    )
 
     github_repo = os.environ.get("LOOP_GH_REPO") or repo_block.get("github")
     if not github_repo:
@@ -261,11 +375,19 @@ def load() -> Config:
                 "LOOP_CRITIC_MIN_FINDINGS",
                 int(critic_block.get("min_findings_for_approve", 50)),
             ),
+            model=critic_model,
+            thinking=critic_thinking,
         ),
         po=POConfig(
             enabled=bool(po_block.get("enabled", True)),
             timeout_s=int(po_block.get("timeout_s", 480)),
             max_to_expand_per_tick=int(po_block.get("max_to_expand_per_tick", 2)),
+            model=po_model,
+            thinking=po_thinking,
+        ),
+        worker=WorkerConfig(
+            model=worker_model,
+            thinking=worker_thinking,
         ),
         attempts=AttemptsConfig(
             enabled=bool(attempts_block.get("enabled", True)),

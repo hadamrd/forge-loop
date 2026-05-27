@@ -14,6 +14,14 @@ The runner consumes the report to:
 
 Trade-off: a critic pass adds ~30-90s per PR but catches the class of
 regressions auto-merge alone misses.
+
+Model knob
+----------
+``review_pr`` accepts an optional ``model`` arg (issue #34) which is
+threaded through to the underlying ``claude -p`` subprocess as
+``--model <name>``. Thinking-budget configurability is deferred until
+the critic migrates from `claude -p` to the Claude Agent SDK (separate
+follow-up issue) — the CLI has no thinking-budget flag today.
 """
 
 from __future__ import annotations
@@ -87,6 +95,30 @@ class CriticOutcome:
     parse_retries: int = 0
 
 
+def _build_critic_argv(brief: str, repo: Path, model: str | None) -> list[str]:
+    """Assemble the ``claude -p`` argv for the critic subagent.
+
+    Split out so unit tests can assert on the argv directly. ``--model``
+    is threaded through when ``model`` is set (issue #34).
+    """
+    argv = [
+        "claude",
+        "-p",
+        brief,
+        "--max-turns",
+        "20",
+        "--allow-dangerously-skip-permissions",
+        "--add-dir",
+        str(repo),
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ]
+    if model:
+        argv.extend(["--model", model])
+    return argv
+
+
 def review_pr(
     pr_url: str,
     issue_number: int,
@@ -95,6 +127,7 @@ def review_pr(
     timeout_s: int = 600,
     brief_template: str | None = None,
     emit: Callable[[str, dict[str, Any]], None] | None = None,
+    model: str | None = None,
 ) -> CriticOutcome:
     """Spawn the critic subagent against an open PR. Synchronous.
 
@@ -121,19 +154,7 @@ def review_pr(
         try:
             with open(log_path, "wb") as logf:
                 subprocess.run(
-                    [
-                        "claude",
-                        "-p",
-                        brief,
-                        "--max-turns",
-                        "20",
-                        "--allow-dangerously-skip-permissions",
-                        "--add-dir",
-                        str(repo),
-                        "--output-format",
-                        "stream-json",
-                        "--verbose",
-                    ],
+                    _build_critic_argv(brief, repo, model),
                     cwd=repo,
                     stdout=logf,
                     stderr=subprocess.STDOUT,

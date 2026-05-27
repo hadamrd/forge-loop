@@ -308,11 +308,16 @@ def run_worker(
     lumen_test_pattern: str = "**/*Test.*",
     coauthor: str = "",
     tick: int | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
     ``emit(kind, payload)`` is the bus emitter — used for watchdog events.
     Passed in by the runner; if omitted, watchdog events are silently dropped.
+
+    ``model`` / ``thinking`` (issue #34) are threaded through to the SDK so
+    each role can be tuned independently of the Claude Code CLI default.
     """
     n = issue["number"]
     title = issue["title"]
@@ -344,6 +349,8 @@ def run_worker(
         timeout_s=timeout_s,
         emit=emit,
         tick=tick,
+        model=model,
+        thinking=thinking,
     )
 
 
@@ -356,6 +363,8 @@ def _run_worker_sdk(
     timeout_s: int,
     emit: Callable[[str, dict[str, Any]], None] | None,
     tick: int | None,
+    model: str | None = None,
+    thinking: str | None = None,
 ) -> WorkerOutcome:
     """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
 
@@ -384,6 +393,8 @@ def _run_worker_sdk(
                 add_dirs=[worktree],
                 permission_mode="bypassPermissions",
                 on_event=_on_event,
+                model=model,
+                thinking_budget=thinking,
             )
 
         timed_out = False
@@ -396,15 +407,19 @@ def _run_worker_sdk(
     duration = time.time() - started
 
     if timed_out:
+        # Record the *requested* model so the audit trail is informative
+        # even when no response ever arrived (issue #34).
         return WorkerOutcome(
             issue=n, title=title, pr_url=None, status="timeout",
             duration_s=duration, stdout_tail="(timeout)",
             error=f"worker exceeded {timeout_s}s",
-            cost_usd=0.0, usage={}, model="",
+            cost_usd=0.0, usage={}, model=model or "",
         )
 
     assert result is not None
-    model_seen = result.model or ""
+    # ``result.model`` already falls back to the requested model when the
+    # response carried none (see _worker_sdk.run_sdk_session).
+    model_seen = result.model or (model or "")
     cost_usd = result.cost_usd
 
     pr_url = result.pr_url

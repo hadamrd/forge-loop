@@ -709,7 +709,7 @@ def _cmd_pipeline_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_config(_args: argparse.Namespace) -> int:
+def _cmd_config(args: argparse.Namespace) -> int:
     cfg = load()
     out = {
         "repo": str(cfg.repo),
@@ -720,8 +720,40 @@ def _cmd_config(_args: argparse.Namespace) -> int:
         "worker_timeout_s": cfg.worker_timeout_s,
         "state_file": str(cfg.state_file),
         "events_file": str(cfg.events_file),
+        "worker": {"model": cfg.worker.model, "thinking": cfg.worker.thinking},
+        "po": {"model": cfg.po.model, "thinking": cfg.po.thinking},
+        "critic": {"model": cfg.critic.model, "thinking": cfg.critic.thinking},
     }
+    if getattr(args, "json", False):
+        print(json.dumps(out, indent=2))
+        return 0
     print(json.dumps(out, indent=2))
+    return 0
+
+
+def _cmd_config_models(args: argparse.Namespace) -> int:
+    """`forge-loop config models` — print resolved per-role model + thinking.
+
+    Operators set ``LOOP_WORKER_MODEL`` (etc.) and then want a one-shot
+    "did it stick?" view that doesn't require restarting the loop. Per
+    issue #34 the table shape is fixed: one row per role, model + thinking
+    columns. ``--json`` is provided for machine consumers.
+    """
+    cfg = load()
+    rows = [
+        ("worker", cfg.worker.model, cfg.worker.thinking),
+        ("po", cfg.po.model, cfg.po.thinking),
+        ("critic", cfg.critic.model, cfg.critic.thinking),
+    ]
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {role: {"model": m, "thinking": t} for role, m, t in rows},
+            indent=2,
+        ))
+        return 0
+    print(f"{'ROLE':<8} {'MODEL':<22} THINKING")
+    for role, model, thinking in rows:
+        print(f"{role:<8} {model:<22} {thinking}")
     return 0
 
 
@@ -774,7 +806,19 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("pause", help="Touch pause file").set_defaults(func=_cmd_pause)
     sub.add_parser("resume", help="Remove pause file").set_defaults(func=_cmd_resume)
     sub.add_parser("stop", help="Touch stop file").set_defaults(func=_cmd_stop)
-    sub.add_parser("config", help="Print resolved config").set_defaults(func=_cmd_config)
+    p_config = sub.add_parser("config", help="Print resolved config")
+    p_config.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON (default also emits JSON for back-compat)",
+    )
+    p_config.set_defaults(func=_cmd_config)
+    config_sub = p_config.add_subparsers(dest="config_cmd")
+    p_config_models = config_sub.add_parser(
+        "models",
+        help="Print resolved per-role model + thinking-budget (issue #34)",
+    )
+    p_config_models.add_argument("--json", action="store_true")
+    p_config_models.set_defaults(func=_cmd_config_models)
 
     p_pipe = sub.add_parser(
         "pipeline",
