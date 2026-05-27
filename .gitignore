@@ -7,3 +7,22 @@ __pycache__/
 dist/
 build/
 *.pyc
+
+# Operator-local runtime state — the loop writes these when run from
+# this repo's checkout. Committed forge-loop.yaml is the project config;
+# everything below is per-operator and must stay out of git.
+docs/ops/loop-runner.json
+docs/ops/loop-runner-events.jsonl
+docs/ops/loop-runner-summaries.jsonl
+docs/ops/loop-runner.pid
+docs/ops/loop-runner.pause
+docs/ops/loop-runner.stop
+docs/ops/loop-runner.HALT
+docs/ops/loop-runner-logs/
+docs/ops/all-nighter.log
+docs/ops/loop-runner.force-retry.json
+# Per-operator overrides + multi-repo dir + worker-planted settings
+forge-loop.local.yaml
+.forge/
+.claude/settings.json
+.claude/settings.local.json
