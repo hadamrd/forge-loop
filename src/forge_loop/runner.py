@@ -15,6 +15,7 @@ from typing import Any
 
 from forge_loop import attempts as _attempts
 from forge_loop import master_log as _mlog
+from forge_loop import worker as _worker
 from forge_loop.config import Config
 from forge_loop.critic import review_pr as _critic_review
 from forge_loop.deploy import redeploy
@@ -111,6 +112,32 @@ def _check_drift_and_maybe_halt(cfg: Config) -> bool:
         cfg.stop_file.touch()
         return True
     return False
+
+
+def _force_retry_file(cfg: Config) -> Path:
+    return cfg.state_dir / "loop-runner.force-retry.json"
+
+
+def _consume_force_set(cfg: Config) -> set[int]:
+    """Read & clear the force-retry marker. Issues listed here bypass
+    fingerprint guards exactly once. Written by `forge-loop retry --force`.
+    """
+    path = _force_retry_file(cfg)
+    if not path.exists():
+        return set()
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        path.unlink(missing_ok=True)
+        return set()
+    nums: set[int] = set()
+    for n in payload.get("issues") or []:
+        try:
+            nums.add(int(n))
+        except (TypeError, ValueError):
+            continue
+    path.unlink(missing_ok=True)
+    return nums
 
 
 def _consecutive_deploy_fails(cfg: Config) -> int:
@@ -259,16 +286,68 @@ def _tick(cfg: Config, tick: int) -> None:
     append_event(cfg.events_file, "tick_start", tick=tick, issues=[i["number"] for i in issues])
 
     # Per-issue: detect risk-gate + fetch past attempt history (if enabled).
+    # Also apply the fingerprint-based skip guards (in-flight / cooldown) so
+    # a half-finished prior dispatch doesn't get re-done and dupe a PR.
     risk_gate_label = cfg.labels.risk_gate
     workers_meta: list[dict[str, Any]] = []
+    force_set = _consume_force_set(cfg)
+    cooldown_s = _attempts.cooldown_from_env()
+    brief_hash = _worker.brief_template_hash()
+    issues_to_dispatch: list[dict[str, Any]] = []
     for i in issues:
         labels = [lab.get("name", "") for lab in (i.get("labels") or [])]
         gated = bool(risk_gate_label) and risk_gate_label in labels
         past: list[dict[str, Any]] = []
+        corrupt = 0
         if cfg.attempts.enabled:
-            past = _attempts.fetch_history(i["number"], repo=cfg.github_repo)
-            past = past[-cfg.attempts.max_history_in_brief:] if past else []
-        workers_meta.append({"risk_gated": gated, "past_attempts": past})
+            past, corrupt = _attempts.fetch_history_strict(
+                i["number"], repo=cfg.github_repo,
+            )
+            if corrupt:
+                append_event(
+                    cfg.events_file, "attempts_corrupt",
+                    issue=i["number"], rows=corrupt,
+                )
+        fp = _attempts.compute_fingerprint(
+            i["number"], i.get("body") or "", brief_hash,
+        )
+        forced = i["number"] in force_set
+        if cfg.attempts.enabled and not forced:
+            decision = _attempts.classify_skip(
+                past, fp, cooldown_s=cooldown_s,
+            )
+            if decision.kind == "in_flight":
+                append_event(
+                    cfg.events_file, "worker_skip_in_flight",
+                    issue=i["number"], pr_url=decision.pr_url,
+                    fingerprint=fp[:12], matched_ts=decision.matched_ts,
+                )
+                continue
+            if decision.kind == "cooldown":
+                append_event(
+                    cfg.events_file, "worker_skip_cooldown",
+                    issue=i["number"], fingerprint=fp[:12],
+                    cooldown_remaining_s=decision.cooldown_remaining_s,
+                    matched_ts=decision.matched_ts,
+                )
+                continue
+        trimmed = past[-cfg.attempts.max_history_in_brief:] if past else []
+        workers_meta.append({
+            "risk_gated": gated, "past_attempts": trimmed,
+            "brief_fingerprint": fp, "forced": forced,
+        })
+        issues_to_dispatch.append(i)
+    issues = issues_to_dispatch
+
+    if not issues:
+        # All candidates were skipped (in-flight or cooldown). Idle the tick.
+        append_event(cfg.events_file, "tick_all_skipped", tick=tick)
+        write_state(
+            cfg.state_file,
+            {"state": "idle", "tick": tick, "next_check_s": cfg.tick_interval_s},
+        )
+        _short_sleep(cfg.tick_interval_s, cfg)
+        return
 
     # Bus emitter: any thread (runner, watchdog, etc) calls this to push an
     # event into the shared JSONL. Bound to cfg here so workers can wire it
@@ -304,6 +383,10 @@ def _tick(cfg: Config, tick: int) -> None:
                    f"pr={o.pr_url or '-'}")
 
     # Persist this attempt as a GH issue comment (per-issue history grows).
+    fingerprint_by_issue = {
+        i["number"]: meta.get("brief_fingerprint", "")
+        for i, meta in zip(issues, workers_meta, strict=True)
+    }
     if cfg.attempts.enabled:
         for o in outcomes:
             try:
@@ -313,6 +396,7 @@ def _tick(cfg: Config, tick: int) -> None:
                     note=(o.error or "")[:200],
                     event_count=len(o.events or []),
                     repo=cfg.github_repo,
+                    brief_fingerprint=fingerprint_by_issue.get(o.issue, ""),
                 )
             except Exception as ex_:  # don't fail tick on history-write error
                 append_event(cfg.events_file, "attempt_record_failed",
