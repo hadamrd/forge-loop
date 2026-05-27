@@ -129,113 +129,22 @@ def make_brief(
 
     coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
 
-    return f"""You are an autonomous worker in a sprint loop. Fix issue #{n} end-to-end.
+    from forge_loop.briefs import render_brief
 
-WORKTREE (already created): {worktree}
-cd there. Stay there. Don't touch the main checkout.
-
-ISSUE #{n}: {issue['title']}
----
-{body}
----
-{history_section}
-CONTRACT (content-grade — NOT the smallest possible diff):
-1. **Read the spec.** The issue body is the contract. Look for sections like
-   `## Acceptance criteria`, `## Test matrix`, `## Out of scope`, `## File pointers`.
-   If those are missing, best-effort is fine — lean toward COVERAGE OF THE
-   STATED INTENT, not the minimum touch.
-2. **Read the surrounding context BEFORE coding.** Skim your project's
-   contributing/architecture docs, read the surrounding code and tests in
-   your project before changing it, and re-use existing patterns over
-   inventing new ones.
-3. **Write COMPLETE tests, not just the test that lights up your one new line:**
-   - **Happy path** unit test for every new method.
-   - **Adversarial / sad-path** test — bad input, missing config,
-     concurrent calls, partial failure, empty list, null value. AT LEAST ONE.
-   - **Integration test** for changes that cross a module boundary — look
-     for integration tests under the standard location for your stack.
-   - **End-to-end** for any user-facing feature behavior.
-   - Tests must HARD-FAIL when the production code is broken — no tautologies,
-     no swallowed assertions.
-4. **Scope-appropriate size.** If the issue is a feature, ship the feature.
-   Multi-file PRs are fine if the spec calls for it. Don't pad with unrelated
-   refactors, BUT don't underdeliver.
-5. **Discover dependent tests via Lumen semantic search** (between editing
-   files and running tests). Call `mcp__lumen__semantic_search` with a query
-   composed of the issue title + first ~500 chars of the issue body + the
-   list of changed file paths, scoped to `{lumen_test_pattern}`. Take the
-   TOP {lumen_top_k} returned test classes. Then run BOTH the test you authored
-   AND those discovered classes via your project's test runner, one invocation
-   per class (e.g. `--tests 'fully.qualified.MyTest'` or `pytest path::ClassName`).
-
-   **Hard caps & contract:**
-   - Cap at K={lumen_top_k} discovered + 1 authored = {lumen_total} max test-class
-     invocations per sprint. Do NOT run more even if Lumen returns 30 hits.
-   - **Dedup**: if a Lumen result equals the test class you wrote, do not
-     run it twice.
-   - **Graceful degrade**: if `mcp__lumen__semantic_search` is unavailable,
-     times out, errors, or returns empty, SKIP this step with a one-line
-     `echo "lumen: discovery skipped (<reason>)"` and continue. Sprint MUST
-     NOT fail because Lumen is offline. Lumen is a HINT, not a contract.
-   - If a discovered class produces "no tests found matching" from the test
-     runner, surface it as a soft warning and move on — do not fail the sprint.
-   - **Never** fall back to a full-suite test run. Avoid full-module test runs;
-     target the specific tests you touched.
-6. **Run YOUR added tests** (foreground): the specific class you authored +
-   the discovered ones. Avoid full-suite runs; target the specific tests
-   you touched.
-7. Run your project's pre-commit gates (lint, format, type-check).
-8. git add -A; git commit referencing #{n}. {coauthor_line}
-   The commit message MUST have a body (the "why"), not just a one-line title.
-9. git push -u origin <branch>.
-{merge_step_renumbered}
-
-LOOP INFRASTRUCTURE — DO NOT TOUCH:
-- `{worktree}/.claude/settings.json` is loop-planted (read-only). Required
-  for your permissions to work. Do NOT `git clean`, `rm`, or chmod it.
-- Don't run `git clean -fdx` (would delete it). If you must reset, use
-  `git restore <path>` for tracked files only.
-
-WATCHDOG — KEEP YOUR LOG TICKING:
-A liveness watchdog kills you if your own session log goes silent for 15+
-minutes. Long-running commands (gradle, npm, docker) MUST run FOREGROUND
-in Bash so their stdout streams into your log. DO NOT use
-`run_in_background: true` for builds and then `Monitor` the exit file —
-that pattern shows zero log activity until the build finishes and the
-watchdog will kill you. If a command genuinely takes >10min, foreground it
-with an appropriate `timeout` (Bash tool's `timeout` arg goes up to
-600000ms / 10min) and let stdout stream.
-
-COMMIT-BEFORE-QUITTING — non-negotiable:
-If you have made ANY file changes, you MUST `git add -A && git commit && git push -u`
-BEFORE you exit, even if:
-- a test you tried to run silently produced no output,
-- you're uncertain whether a gate will pass,
-- you were going to write "one more test" and ran out of time,
-- you think the work is incomplete.
-A committed-and-pushed branch (even WIP) is recoverable; an uncommitted worktree gets
-nuked at the start of the next tick (`_prep_worktree` force-removes it). If genuinely
-unfinished, open the PR as a DRAFT (`gh pr create --draft`) and comment on the PR with
-the remaining TODOs. Your status is then "open" not "merged" — the loop's critic will
-read your draft and a future tick can finish it. NEVER exit with uncommitted changes.
-
-DEEP-WORK BUDGET — you have time:
-Wall ceiling is 2h; idle-kill is 15min. That gives you room for real
-multi-file features + adversarial tests + a Spotless / spotbugs pass on
-the module you touched. Don't rush a shallow PR to stay under an
-imaginary clock — ship the feature.
-
-EVENT REPORTING: to emit a significant event the master loop should
-see, append a single-line JSON object to `{worktree}/sprint-events.jsonl`:
-    echo '{{"ts":"<iso>","kind":"investigation_blocked","detail":"..."}}' >> {worktree}/sprint-events.jsonl
-Useful kinds: investigation_started, bug_found, test_failed, gate_failed,
-pr_opened, pr_merged, blocked.
-
-FINAL LINE OF YOUR OUTPUT MUST BE A JSON OBJECT (no prose after it):
-{final_status}
-
-If you genuinely cannot ship (blocked), set status="failed" and put the blocker in `note`.
-Do NOT investigate forever — make decisions and ship."""
+    return render_brief(
+        "worker",
+        n=n,
+        worktree=worktree,
+        issue_title=issue["title"],
+        body=body,
+        history_section=history_section,
+        merge_step_renumbered=merge_step_renumbered,
+        lumen_top_k=lumen_top_k,
+        lumen_test_pattern=lumen_test_pattern,
+        lumen_total=lumen_total,
+        coauthor_line=coauthor_line,
+        final_status=final_status,
+    )
 
 
 def brief_template_hash() -> str:
@@ -246,10 +155,13 @@ def brief_template_hash() -> str:
     in-flight/cooldown skip — the next dispatch is for materially different
     work even if the issue body hasn't changed.
 
-    Hashes the source of ``make_brief`` so any code change to the template
-    bumps the digest. Cheap (called once per dispatch).
+    Hashes the source of ``make_brief`` AND the externalised template
+    file/override so any change to either bumps the digest. Cheap
+    (called once per dispatch).
     """
-    src = inspect.getsource(make_brief)
+    from forge_loop.briefs import load_template
+
+    src = inspect.getsource(make_brief) + load_template("worker")
     return hashlib.sha256(src.encode("utf-8")).hexdigest()
 
 

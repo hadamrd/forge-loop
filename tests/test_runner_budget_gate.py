@@ -13,7 +13,6 @@ Exercises:
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Any
 
@@ -308,8 +307,8 @@ def test_full_run_worker_records_ledger_on_success(
 
     # Stub out the SDK session: return a successful merged outcome directly,
     # bypassing the real claude_agent_sdk transport so the test stays hermetic.
-    from forge_loop._worker_sdk import SDKRunResult
     from forge_loop import _worker_sdk as _wsdk
+    from forge_loop._worker_sdk import SDKRunResult
 
     async def _fake_session(prompt: str, **kw: Any) -> SDKRunResult:
         return SDKRunResult(
