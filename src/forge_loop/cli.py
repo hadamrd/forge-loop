@@ -27,6 +27,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     orch = getattr(args, "orchestrator", "sync")
     if orch == "async":
         from forge_loop.runner import run_async as run_async_loop
+
         return run_async_loop(load())
     return run_loop(load())
 
@@ -46,6 +47,7 @@ def _cmd_status(_args: argparse.Namespace) -> int:
         pid_text = cfg.pid_file.read_text().strip()
         try:
             import os as _os
+
             _os.kill(int(pid_text), 0)
             pid_alive = True
         except (OSError, ValueError):
@@ -86,24 +88,37 @@ def _cmd_status(_args: argparse.Namespace) -> int:
                 for n in e.get("merged", []) or []:
                     prs_today.append(n)
             if "fail" in kind or kind == "watchdog_worker_killed":
-                last_failure = {"ts": ts, "kind": kind,
-                                "detail": str(e.get("detail") or e.get("err") or "")[:120]}
+                last_failure = {
+                    "ts": ts,
+                    "kind": kind,
+                    "detail": str(e.get("detail") or e.get("err") or "")[:120],
+                }
         for line in raw[-5:]:
             try:
                 e = json.loads(line)
-                last_5_events.append(f"  {e.get('ts','?')[-9:-1]}  {e.get('kind','?')}")
+                last_5_events.append(f"  {e.get('ts', '?')[-9:-1]}  {e.get('kind', '?')}")
             except json.JSONDecodeError:
                 pass
 
     queue_depth = 0
     try:
         r = subprocess.run(
-            ["gh", "issue", "list",
-             "--repo", cfg.github_repo,
-             "--label", cfg.labels.ready,
-             "--state", "open",
-             "--json", "number"],
-            capture_output=True, text=True, timeout=15,
+            [
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                cfg.github_repo,
+                "--label",
+                cfg.labels.ready,
+                "--state",
+                "open",
+                "--json",
+                "number",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         if r.returncode == 0:
             queue_depth = len(json.loads(r.stdout or "[]"))
@@ -114,12 +129,16 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     print("== forge-loop status ==")
     if halt_reason:
         print(f"  HALTED: {halt_reason}")
-    print(f"  pid       : {pid_text or '(no pidfile)'} {'(alive)' if pid_alive else '(NOT running)'}")
+    print(
+        f"  pid       : {pid_text or '(no pidfile)'} {'(alive)' if pid_alive else '(NOT running)'}"
+    )
     print(f"  state     : {state_blob.get('state', '?')}  tick={state_blob.get('tick', '?')}")
     print(f"  queue     : {queue_depth} issues with label '{cfg.labels.ready}'")
     print(f"  PRs today : {len(prs_today)} ({prs_today})" if prs_today else "  PRs today : 0")
     if last_failure:
-        print(f"  last fail : {last_failure['ts'][-9:-1]}  {last_failure['kind']}  {last_failure['detail']}")
+        print(
+            f"  last fail : {last_failure['ts'][-9:-1]}  {last_failure['kind']}  {last_failure['detail']}"
+        )
     if last_5_events:
         print("  last 5 events:")
         for line in last_5_events:
@@ -159,6 +178,7 @@ def _cmd_stop(_args: argparse.Namespace) -> int:
 
 def _cmd_mcp_serve(_args: argparse.Namespace) -> int:
     from forge_loop.mcp_server import serve_stdio
+
     return serve_stdio()
 
 
@@ -215,9 +235,10 @@ def _cmd_record_session(args: argparse.Namespace) -> int:
         issue = json.loads(Path(args.issue_file).read_text())
     else:
         r = subprocess.run(
-            ["gh", "issue", "view", str(args.issue),
-             "--json", "number,title,body"],
-            capture_output=True, text=True, timeout=30,
+            ["gh", "issue", "view", str(args.issue), "--json", "number,title,body"],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if r.returncode != 0:
             sys.stderr.write(f"gh issue view failed: {r.stderr}\n")
@@ -228,13 +249,18 @@ def _cmd_record_session(args: argparse.Namespace) -> int:
     brief = make_brief(issue, worktree)
     rec = SessionRecorder(issue=issue, worktree=worktree, brief=brief)
     result = rec.record(Path(args.out), timeout_s=args.timeout)
-    print(json.dumps({
-        "fixture": str(result.fixture_path),
-        "events": result.event_count,
-        "duration_s": round(result.duration_s, 2),
-        "pr": result.pr_url,
-        "status": result.status,
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "fixture": str(result.fixture_path),
+                "events": result.event_count,
+                "duration_s": round(result.duration_s, 2),
+                "pr": result.pr_url,
+                "status": result.status,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -272,10 +298,14 @@ def _cmd_budget(args: argparse.Namespace) -> int:
         return 0
     print("== forge-loop budget ==")
     print(f"  today        : ${out['today_usd']:.4f}")
-    print(f"  tick {out['tick'] or '-':>4}    : ${out['tick_usd']:.4f}"
-          f"  (cap ${out['tick_budget_usd']:.2f})")
-    print(f"  ticket cap   : ${out['default_ticket_budget_usd']:.2f}"
-          " (override per-issue with budget:<n> label)")
+    print(
+        f"  tick {out['tick'] or '-':>4}    : ${out['tick_usd']:.4f}"
+        f"  (cap ${out['tick_budget_usd']:.2f})"
+    )
+    print(
+        f"  ticket cap   : ${out['default_ticket_budget_usd']:.2f}"
+        " (override per-issue with budget:<n> label)"
+    )
     if top:
         print("  top 5 issues by spend:")
         for n, c in top:
@@ -306,15 +336,20 @@ def _cmd_retry(args: argparse.Namespace) -> int:
 
     brief_hash = _worker.brief_template_hash()
     fp = _attempts.compute_fingerprint(
-        issue["number"], issue.get("body") or "", brief_hash,
+        issue["number"],
+        issue.get("body") or "",
+        brief_hash,
     )
     history, corrupt = _attempts.fetch_history_strict(
-        issue["number"], repo=cfg.github_repo,
+        issue["number"],
+        repo=cfg.github_repo,
     )
     if corrupt:
         print(f"[retry] warning: {corrupt} corrupt attempt row(s) in history")
     decision = _attempts.classify_skip(
-        history, fp, cooldown_s=_attempts.cooldown_from_env(),
+        history,
+        fp,
+        cooldown_s=_attempts.cooldown_from_env(),
     )
     print(f"[retry] issue #{args.issue} fingerprint={fp[:12]}")
     if decision.kind == "in_flight":
@@ -345,6 +380,80 @@ def _cmd_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_brief(args: argparse.Namespace) -> int:
+    """Render a brief template to stdout.
+
+    Lets operators inspect exactly what the loop tells Claude before a
+    dispatch, with the same env-overridable loader the runtime uses. The
+    rendered output is the literal prompt the subagent would receive.
+    """
+    from pathlib import Path
+
+    from forge_loop.briefs import load_template, render_brief
+
+    kind = args.kind
+
+    if args.raw:
+        sys.stdout.write(load_template(kind))
+        return 0
+
+    issue: dict[str, Any] = {}
+    if args.issue_file:
+        issue = json.loads(Path(args.issue_file).read_text())
+    elif args.issue is not None:
+        try:
+            r = subprocess.run(
+                ["gh", "issue", "view", str(args.issue), "--json", "number,title,body"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode == 0:
+                issue = json.loads(r.stdout)
+            else:
+                sys.stderr.write(
+                    f"[brief] gh issue view failed ({r.returncode}); "
+                    f"falling back to a placeholder issue. stderr={r.stderr.strip()}\n"
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+            sys.stderr.write(f"[brief] gh unavailable ({e}); using placeholder.\n")
+
+    if not issue:
+        issue = {
+            "number": args.issue or 0,
+            "title": "<placeholder title>",
+            "body": "<placeholder body>",
+        }
+
+    if kind == "worker":
+        from forge_loop.worker import make_brief
+
+        worktree = Path(args.worktree).resolve() if args.worktree else Path.cwd().resolve()
+        out = make_brief(issue, worktree, risk_gated=args.risk_gated)
+    elif kind == "po":
+        out = render_brief(
+            "po",
+            issue_number=issue["number"],
+            issue_title=issue.get("title", ""),
+            issue_body=(issue.get("body") or "")[:4000],
+            github_repo=args.repo or "<owner/repo>",
+        )
+    elif kind == "critic":
+        out = render_brief(
+            "critic",
+            pr_url=args.pr or "<pr-url>",
+            issue_number=issue["number"],
+        )
+    else:  # argparse guards this branch
+        sys.stderr.write(f"[brief] unknown kind: {kind}\n")
+        return 2
+
+    sys.stdout.write(out)
+    if not out.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
 def _cmd_config(_args: argparse.Namespace) -> int:
     cfg = load()
     out = {
@@ -370,10 +479,12 @@ def main(argv: list[str] | None = None) -> int:
 
     p_run = sub.add_parser("run", help="Run the loop in the foreground")
     p_run.add_argument(
-        "--orchestrator", choices=("sync", "async"), default="sync",
+        "--orchestrator",
+        choices=("sync", "async"),
+        default="sync",
         help="Pipeline orchestrator. 'sync' (default, stable) ticks PO→workers→critics "
-             "sequentially. 'async' runs three independent asyncio queues so a slow PO "
-             "or critic does not block other tickets (see runner_async.py).",
+        "sequentially. 'async' runs three independent asyncio queues so a slow PO "
+        "or critic does not block other tickets (see runner_async.py).",
     )
     p_run.set_defaults(func=_cmd_run)
     sub.add_parser("status", help="Print current state file").set_defaults(func=_cmd_status)
@@ -391,20 +502,23 @@ def main(argv: list[str] | None = None) -> int:
         "budget",
         help="Show today's token spend, current tick spend, top 5 issues",
     )
-    p_budget.add_argument("--tick", type=int, default=None,
-                          help="Tick number to report (default: current tick from state file)")
-    p_budget.add_argument("--json", action="store_true",
-                          help="Emit JSON instead of human-readable")
+    p_budget.add_argument(
+        "--tick",
+        type=int,
+        default=None,
+        help="Tick number to report (default: current tick from state file)",
+    )
+    p_budget.add_argument("--json", action="store_true", help="Emit JSON instead of human-readable")
     p_budget.set_defaults(func=_cmd_budget)
 
     p_retry = sub.add_parser(
         "retry",
         help="Re-dispatch a worker for an issue (use --force to bypass guards)",
     )
-    p_retry.add_argument("--issue", type=int, required=True,
-                         help="GitHub issue number")
-    p_retry.add_argument("--force", action="store_true",
-                         help="Bypass in-flight and cooldown fingerprint guards")
+    p_retry.add_argument("--issue", type=int, required=True, help="GitHub issue number")
+    p_retry.add_argument(
+        "--force", action="store_true", help="Bypass in-flight and cooldown fingerprint guards"
+    )
     p_retry.set_defaults(func=_cmd_retry)
 
     p_mcp = sub.add_parser("mcp", help="MCP server (expose tools to MCP clients)")
@@ -415,8 +529,9 @@ def main(argv: list[str] | None = None) -> int:
     p_init.add_argument("--target", help="Target directory (default: cwd)")
     p_init.add_argument("--repo", help="GitHub repo owner/name (auto-detected from git remote)")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing files")
-    p_init.add_argument("--create-labels", action="store_true",
-                        help="Also create the loop's GH labels via gh CLI")
+    p_init.add_argument(
+        "--create-labels", action="store_true", help="Also create the loop's GH labels via gh CLI"
+    )
     p_init.set_defaults(func=_cmd_init)
 
     p_rec = sub.add_parser(
@@ -428,9 +543,40 @@ def main(argv: list[str] | None = None) -> int:
     rec_src.add_argument("--issue-file", help="Path to a local JSON file with the issue payload")
     p_rec.add_argument("--out", required=True, help="Output fixture path (JSONL)")
     p_rec.add_argument("--worktree", help="Worktree directory (default: cwd)")
-    p_rec.add_argument("--timeout", type=int, default=900,
-                       help="Subprocess timeout in seconds (default 900)")
+    p_rec.add_argument(
+        "--timeout", type=int, default=900, help="Subprocess timeout in seconds (default 900)"
+    )
     p_rec.set_defaults(func=_cmd_record_session)
+
+    p_brief = sub.add_parser(
+        "brief",
+        help="Render a brief template (worker/po/critic) to stdout",
+    )
+    p_brief.add_argument(
+        "--kind", required=True, choices=("worker", "po", "critic"), help="Which brief to render"
+    )
+    p_brief.add_argument(
+        "--issue", type=int, default=None, help="GitHub issue number (fetched via `gh issue view`)"
+    )
+    p_brief.add_argument(
+        "--issue-file",
+        default=None,
+        help="Local JSON file with the issue payload (overrides --issue)",
+    )
+    p_brief.add_argument(
+        "--worktree", default=None, help="Worktree path to use in the worker brief (default: cwd)"
+    )
+    p_brief.add_argument("--pr", default=None, help="PR URL (critic brief only)")
+    p_brief.add_argument("--repo", default=None, help="GitHub repo owner/name (PO brief only)")
+    p_brief.add_argument(
+        "--risk-gated",
+        action="store_true",
+        help="Render the risk-gated variant of the worker brief",
+    )
+    p_brief.add_argument(
+        "--raw", action="store_true", help="Print the unrendered template (skip substitution)"
+    )
+    p_brief.set_defaults(func=_cmd_brief)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

@@ -42,53 +42,12 @@ from typing import Any
 
 from forge_loop.worker import _subagent_env, ensure_subagent_trusted
 
-DEFAULT_BRIEF = """You are the PO (Product Owner) subagent for the sprint loop.
 
-Your ONE job: rewrite thin issue bodies into feature-grade specs so the
-worker that picks the issue up next ships a feature, not a one-line fix.
+def _default_brief() -> str:
+    """Load the PO brief template — bundled or operator-overridden."""
+    from forge_loop.briefs import load_template
 
-ISSUE TO EXPAND:
-#{issue_number}: {issue_title}
----
-{issue_body}
----
-
-CONTEXT TO READ FIRST:
-Read your project's contributing/architecture docs (e.g. CONTRIBUTING.md,
-ARCHITECTURE.md, docs/), and scan the codebase for similar features or
-existing patterns. Re-use existing conventions over inventing new ones.
-
-THE SPEC BAR (issue body must have ALL):
-  - **## Problem** — what's broken or missing, with one concrete example.
-  - **## Acceptance criteria** — bulleted, falsifiable, testable. ≥3 items.
-  - **## Test matrix** — what unit tests, what integration tests, what e2e
-    tests, including at least one adversarial / sad-path test.
-  - **## Out of scope** — explicit list of things NOT to do (prevents bloat).
-  - **## File pointers** — paths to the files the worker should touch.
-    If unsure, list candidate areas (`src/.../<module>/`, etc.).
-
-ALGORITHM:
-1. Score the current body against the 5 sections above. If 4+ are present
-   and substantive, OUTPUT skipped=true and return — no edit needed.
-2. Otherwise, write the full spec. Preserve the original body text under
-   a `## Original report` section at the bottom so context isn't lost.
-3. End the body with the marker line `<!-- po-spec-expanded -->`.
-4. Apply via:
-   ```
-   gh issue edit {issue_number} --repo {github_repo} --body-file <(printf '%s' "$BODY")
-   ```
-   Then `gh issue edit {issue_number} --repo {github_repo} --add-label "po:expanded"`.
-
-CONSTRAINTS:
-- NEVER change the issue title (worker's branch name depends on stable title).
-- NEVER close issues or change priority labels.
-- NEVER fabricate file paths — if you don't know, write `(investigate)` as
-  the file pointer and let the worker discover.
-- Cap body at 8000 chars. If a referenced design doc is huge, link don't paste.
-
-FINAL OUTPUT (one JSON line, no prose after):
-{{"issue": {issue_number}, "skipped": <bool>, "reason": "<short>", "sections_added": [<list>]}}
-"""
+    return load_template("po")
 
 
 @dataclass
@@ -123,14 +82,14 @@ def expand_thin_specs(
     "acceptance" header text).
     """
     outcomes: list[POOutcome] = []
-    template = brief_template or DEFAULT_BRIEF
+    template = brief_template or _default_brief()
     ensure_subagent_trusted(repo)
     n_expanded = 0
 
     for issue in candidates:
         if n_expanded >= max_to_expand:
             break
-        body = (issue.get("body") or "")
+        body = issue.get("body") or ""
         if _has_expansion_marker(body):
             continue
         if _looks_substantive(body):
@@ -173,11 +132,16 @@ def _run_one(
         with open(log_path, "wb") as logf:
             subprocess.run(
                 [
-                    "claude", "-p", brief,
-                    "--max-turns", "25",
+                    "claude",
+                    "-p",
+                    brief,
+                    "--max-turns",
+                    "25",
                     "--allow-dangerously-skip-permissions",
-                    "--add-dir", str(repo),
-                    "--output-format", "stream-json",
+                    "--add-dir",
+                    str(repo),
+                    "--output-format",
+                    "stream-json",
                     "--verbose",
                 ],
                 cwd=repo,
@@ -188,9 +152,13 @@ def _run_one(
             )
     except subprocess.TimeoutExpired:
         return POOutcome(
-            issue=issue_number, skipped=False, reason="po-timeout",
-            sections_added=[], duration_s=time.time() - started,
-            stdout_tail="(timeout)", error=f"po exceeded {timeout_s}s",
+            issue=issue_number,
+            skipped=False,
+            reason="po-timeout",
+            sections_added=[],
+            duration_s=time.time() - started,
+            stdout_tail="(timeout)",
+            error=f"po exceeded {timeout_s}s",
         )
 
     duration = time.time() - started

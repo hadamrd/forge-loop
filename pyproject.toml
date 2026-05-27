@@ -29,6 +29,14 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/forge_loop"]
 
+# Brief templates are loaded at runtime via importlib.resources; force-include
+# guarantees the .tmpl files ship in the wheel even though hatchling's default
+# packaging rules already pick them up (belt and suspenders).
+[tool.hatch.build.targets.wheel.force-include]
+"src/forge_loop/briefs/worker.md.tmpl" = "forge_loop/briefs/worker.md.tmpl"
+"src/forge_loop/briefs/po.md.tmpl" = "forge_loop/briefs/po.md.tmpl"
+"src/forge_loop/briefs/critic.md.tmpl" = "forge_loop/briefs/critic.md.tmpl"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
