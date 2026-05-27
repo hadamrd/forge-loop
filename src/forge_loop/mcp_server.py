@@ -3,7 +3,7 @@
 Every primary function from the package is registered as an MCP tool so any
 MCP client (Claude Desktop, Cursor, codex-cli, etc) can drive sprints + ops.
 
-Top-level tool: ``dev_sprint_workflow_start`` — runs the full loop with the
+Top-level tool: ``run_sprint_workflow`` — runs the full loop with the
 same env knobs as the CLI's ``run`` subcommand.
 
 Run via:
@@ -176,7 +176,7 @@ def dispatch_worker(issue_number: int, timeout_s: int = 3600) -> dict[str, Any]:
 
 
 @mcp.tool()
-def dev_sprint_workflow_start(
+def run_sprint_workflow(
     parallel: int = 3,
     max_ticks: int = 1,
     query_label: str = "loop:ready",
