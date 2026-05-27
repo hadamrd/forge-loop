@@ -21,7 +21,6 @@ Commands:
     halt    — touch the loop's pause file (loop stops at next tick boundary)
     resume  — remove the pause file
     status  — reply with queue depth + in-flight count
-    budget  — reply with today's spend
 
 Each handled command is logged on the loop event bus as ``integration_event``.
 Unknown commands and 403s are logged too — silent failures here are how
@@ -31,7 +30,6 @@ operators end up debugging "why didn't /forge halt do anything?" at 3am.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,7 +40,7 @@ from . import Channel
 
 log = logging.getLogger(__name__)
 
-KNOWN_COMMANDS = frozenset({"halt", "resume", "status", "budget"})
+KNOWN_COMMANDS = frozenset({"halt", "resume", "status"})
 
 
 @dataclass(frozen=True)
@@ -56,8 +54,6 @@ class CommandContext:
     pause_file: Path
     state_file: Path
     events_file: Path | None = None
-    # Returns today's spend in USD. Injected so tests don't need a ledger.
-    today_spend: Callable[[], float] | None = None
 
 
 @dataclass(frozen=True)
@@ -157,20 +153,9 @@ def handle(
         if ctx.pause_file.exists():
             ctx.pause_file.unlink()
         text = "loop resumed."
-    elif verb == "status":
+    else:  # status
         q, f = _queue_status(ctx)
         text = f"queue depth: {q}  |  in-flight: {f}"
-    else:  # budget
-        if ctx.today_spend is None:
-            text = "today's spend: unavailable (no ledger configured)"
-        else:
-            try:
-                amount = ctx.today_spend()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("today_spend lookup failed: %s", exc)
-                text = "today's spend: unavailable"
-            else:
-                text = f"today's spend: ${amount:.2f}"
 
     if ctx.events_file is not None:
         append_event(

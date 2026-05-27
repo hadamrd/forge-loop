@@ -62,7 +62,7 @@ class WorkerOutcome:
     issue: int
     title: str
     pr_url: str | None
-    status: str  # merged | open | failed | timeout | no_pr | budget_exceeded
+    status: str  # merged | open | failed | timeout | no_pr
     duration_s: float
     stdout_tail: str
     error: str | None = None
@@ -70,7 +70,6 @@ class WorkerOutcome:
     cost_usd: float = 0.0
     usage: dict[str, Any] | None = None
     model: str = ""
-    budget_usd: float = 0.0
 
 
 def make_brief(
@@ -308,8 +307,6 @@ def run_worker(
     lumen_top_k: int = 3,
     lumen_test_pattern: str = "**/*Test.*",
     coauthor: str = "",
-    ticket_budget_usd: float | None = None,
-    spend_ledger: Path | None = None,
     tick: int | None = None,
     model: str | None = None,
     thinking: str | None = None,
@@ -318,18 +315,13 @@ def run_worker(
 
     ``emit(kind, payload)`` is the bus emitter — used for watchdog events.
     Passed in by the runner; if omitted, watchdog events are silently dropped.
-    """
-    from forge_loop.budget import (
-        TicketBudgetTracker,
-        ticket_budget_for,
-    )
 
+    ``model`` / ``thinking`` (issue #34) are threaded through to the SDK so
+    each role can be tuned independently of the Claude Code CLI default.
+    """
     n = issue["number"]
     title = issue["title"]
     branch = _branch_name(n, title)
-    labels = issue.get("labels") or []
-    resolved_budget = ticket_budget_for(labels, default=ticket_budget_usd)
-    tracker = TicketBudgetTracker(ceiling_usd=resolved_budget)
 
     worktree, err = _prep_worktree(repo, n, branch)
     if err is not None:
@@ -355,10 +347,7 @@ def run_worker(
         log_path=log_path,
         brief=brief,
         timeout_s=timeout_s,
-        tracker=tracker,
-        resolved_budget=resolved_budget,
         emit=emit,
-        spend_ledger=spend_ledger,
         tick=tick,
         model=model,
         thinking=thinking,
@@ -372,64 +361,29 @@ def _run_worker_sdk(
     log_path: Path,
     brief: str,
     timeout_s: int,
-    tracker: Any,  # TicketBudgetTracker
-    resolved_budget: float,
     emit: Callable[[str, dict[str, Any]], None] | None,
-    spend_ledger: Path | None,
     tick: int | None,
     model: str | None = None,
     thinking: str | None = None,
 ) -> WorkerOutcome:
     """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
 
-    All subprocess/CLI-parsing concerns are gone: the SDK delivers typed
-    messages, we accumulate per-turn cost via the same TicketBudgetTracker
-    the old log-tailing path used, and a final ResultMessage carries the
+    The SDK delivers typed messages and a final ResultMessage carries the
     grand-total cost + usage. The events.jsonl format (one JSON dict per
     line, ``kind`` + ``ts`` discriminant) is preserved for backward compat
     with anything that tails the worker log.
     """
     from forge_loop._worker_sdk import run_sdk_session
-    from forge_loop.budget import (
-        SpendRecord,
-        append_spend,
-        extract_usage,
-        utc_now_iso,
-    )
 
     n = issue["number"]
     title = issue["title"]
     started = time.time()
-
-    budget_tripped = {"v": False}
 
     with open(log_path, "w", encoding="utf-8") as log_fh:
         def _on_event(ev: dict[str, Any]) -> None:
             with contextlib.suppress(OSError):
                 log_fh.write(json.dumps(ev, default=str) + "\n")
                 log_fh.flush()
-
-        def _budget_should_stop(
-            _cost: float, _usage: dict[str, Any], _model: str | None,
-        ) -> bool:
-            if budget_tripped["v"]:
-                return True
-            fake_event = {
-                "type": "assistant",
-                "message": {"model": _model or "", "usage": _usage or {}},
-            }
-            m, u = extract_usage(fake_event)
-            if u is not None and tracker.add(m, u):
-                budget_tripped["v"] = True
-                if emit is not None:
-                    snap = tracker.snapshot
-                    emit("budget_worker_killed", {
-                        "issue": n,
-                        "cost_usd": round(snap.cost_usd, 4),
-                        "ceiling_usd": round(tracker.ceiling_usd, 4),
-                    })
-                return True
-            return False
 
         async def _drive() -> Any:
             return await run_sdk_session(
@@ -439,7 +393,6 @@ def _run_worker_sdk(
                 add_dirs=[worktree],
                 permission_mode="bypassPermissions",
                 on_event=_on_event,
-                budget_should_stop=_budget_should_stop,
                 model=model,
                 thinking_budget=thinking,
             )
@@ -452,77 +405,22 @@ def _run_worker_sdk(
             timed_out = True
 
     duration = time.time() - started
-    snap = tracker.snapshot
-    usage_summary = {
-        "input_tokens": snap.input_tokens,
-        "output_tokens": snap.output_tokens,
-        "cache_creation_input_tokens": snap.cache_creation_input_tokens,
-        "cache_read_input_tokens": snap.cache_read_input_tokens,
-        "events": snap.events,
-        "fallbacks": snap.fallbacks,
-    }
-
-    def _record_spend(status_for_ledger: str, model: str) -> None:
-        if spend_ledger is None:
-            return
-        append_spend(spend_ledger, SpendRecord(
-            ts=utc_now_iso(),
-            issue=n,
-            cost_usd=snap.cost_usd,
-            input_tokens=snap.input_tokens,
-            output_tokens=snap.output_tokens,
-            cache_creation_input_tokens=snap.cache_creation_input_tokens,
-            cache_read_input_tokens=snap.cache_read_input_tokens,
-            status=status_for_ledger,
-            model=model,
-            tick=tick,
-            fallbacks=snap.fallbacks,
-        ))
-
-    if budget_tripped["v"]:
-        # Prefer the response's reported model, fall back to the *requested*
-        # model so the ledger row carries something meaningful even when the
-        # session aborted before any AssistantMessage arrived (issue #34).
-        observed = (result.model if result is not None else "") or ""
-        ledger_model = observed or (model or "")
-        if emit is not None:
-            emit("budget_exceeded", {
-                "issue": n, "cost_usd": round(snap.cost_usd, 4),
-                "ceiling_usd": round(resolved_budget, 4),
-                "fallbacks": snap.fallbacks,
-            })
-        _record_spend("budget_exceeded", ledger_model)
-        return WorkerOutcome(
-            issue=n, title=title, pr_url=None, status="budget_exceeded",
-            duration_s=duration,
-            stdout_tail=_tail(log_path, 500),
-            error=f"ticket budget ${resolved_budget:.4f} exceeded "
-                  f"(spent ${snap.cost_usd:.4f})",
-            cost_usd=snap.cost_usd, usage=usage_summary, model=ledger_model,
-            budget_usd=resolved_budget,
-        )
 
     if timed_out:
-        # Use the requested model so the ledger row is informative even
-        # when no response ever arrived (issue #34).
-        timeout_model = model or ""
-        _record_spend("timeout", timeout_model)
+        # Record the *requested* model so the audit trail is informative
+        # even when no response ever arrived (issue #34).
         return WorkerOutcome(
             issue=n, title=title, pr_url=None, status="timeout",
             duration_s=duration, stdout_tail="(timeout)",
             error=f"worker exceeded {timeout_s}s",
-            cost_usd=snap.cost_usd, usage=usage_summary, model=timeout_model,
-            budget_usd=resolved_budget,
+            cost_usd=0.0, usage={}, model=model or "",
         )
 
-    assert result is not None  # neither branch above
+    assert result is not None
     # ``result.model`` already falls back to the requested model when the
-    # response carried none (see _worker_sdk.run_sdk_session). We trust it.
+    # response carried none (see _worker_sdk.run_sdk_session).
     model_seen = result.model or (model or "")
-    # Prefer the SDK's authoritative grand-total cost when present
-    # (tracker accumulates per-turn — they should agree to within rounding,
-    # but the result-event total is the source of truth).
-    cost_usd = result.cost_usd if result.cost_usd > 0 else snap.cost_usd
+    cost_usd = result.cost_usd
 
     pr_url = result.pr_url
     status = result.status
@@ -530,13 +428,11 @@ def _run_worker_sdk(
         status = "failed"
 
     events = _read_subagent_events(worktree)
-    _record_spend(status, model_seen)
     return WorkerOutcome(
         issue=n, title=title, pr_url=pr_url, status=status,
         duration_s=duration, stdout_tail=_tail(log_path, 500),
         events=events,
-        cost_usd=cost_usd, usage=usage_summary, model=model_seen,
-        budget_usd=resolved_budget,
+        cost_usd=cost_usd, usage=dict(result.usage or {}), model=model_seen,
         error=result.error,
     )
 
@@ -558,106 +454,6 @@ def _run_with_timeout(coro_factory: Callable[[], Any], timeout_s: int) -> Any:
         return anyio.run(_wrap)
     except TimeoutError:
         raise
-
-
-class _BudgetWatcher:
-    """Tail the worker's stream-json log, accumulate cost, kill on ceiling.
-
-    The Claude Agent SDK emits a ``usage`` block on each ``assistant`` message
-    event and a final ``result`` event with totals. We tail the log file
-    every poll interval, push every new usage event into the TicketBudgetTracker,
-    and SIGTERM the subprocess as soon as the configured ceiling is crossed.
-
-    Belt-and-suspenders against missing-data: the tracker treats malformed
-    usage as worst-case, so a streamer bug cannot silently undercount the
-    budget and let a runaway worker burn through $30.
-    """
-
-    poll_interval_s: float = 5.0
-
-    def __init__(
-        self, *,
-        proc: subprocess.Popen[bytes],
-        log_path: Path,
-        tracker: Any,  # TicketBudgetTracker
-        emit: Callable[[str, dict[str, Any]], None] | None,
-        issue: int,
-    ) -> None:
-        self._proc = proc
-        self._log_path = log_path
-        self._tracker = tracker
-        self._emit = emit
-        self._issue = issue
-        self._stop = False
-        self._thread: Any = None
-        self._read_offset = 0
-        self._buf = b""
-        self.tripped = False
-        self.last_model: str | None = None
-
-    def start(self) -> None:
-        import threading as _t
-        self._thread = _t.Thread(target=self._loop, name=f"budget-{self._issue}", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop = True
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-
-    def _loop(self) -> None:
-        while not self._stop:
-            self.scan_once()
-            if self.tripped:
-                return
-            time.sleep(self.poll_interval_s)
-
-    def scan_once(self) -> None:
-        from forge_loop.budget import extract_usage
-        try:
-            size = self._log_path.stat().st_size
-        except OSError:
-            return
-        if size <= self._read_offset:
-            return
-        try:
-            with open(self._log_path, "rb") as f:
-                f.seek(self._read_offset)
-                chunk = f.read(size - self._read_offset)
-        except OSError:
-            return
-        self._read_offset = size
-        self._buf += chunk
-        # Split on newlines; keep the trailing partial line for the next scan.
-        lines = self._buf.split(b"\n")
-        self._buf = lines[-1]
-        crossed = False
-        for raw in lines[:-1]:
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line.decode("utf-8", errors="replace"))
-            except json.JSONDecodeError:
-                continue
-            model, usage = extract_usage(event)
-            if model:
-                self.last_model = model
-            if usage is None:
-                continue
-            if self._tracker.add(model, usage):
-                crossed = True
-        if crossed and not self.tripped:
-            self.tripped = True
-            if self._emit is not None:
-                snap = self._tracker.snapshot
-                self._emit("budget_worker_killed", {
-                    "issue": self._issue,
-                    "cost_usd": round(snap.cost_usd, 4),
-                    "ceiling_usd": round(self._tracker.ceiling_usd, 4),
-                })
-            with contextlib.suppress(OSError, ProcessLookupError):
-                self._proc.terminate()
 
 
 def _read_subagent_events(worktree: Path) -> list[dict[str, Any]]:

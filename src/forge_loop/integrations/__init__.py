@@ -37,7 +37,6 @@ log = logging.getLogger(__name__)
 KNOWN_EVENTS = frozenset(
     {
         "worker_stuck",
-        "budget_exceeded",
         "critic_blocking",
         "redeploy_failed",
     }

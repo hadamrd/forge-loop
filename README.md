@@ -4,6 +4,15 @@ Autonomous multi-worker dispatcher for Claude Code — picks up GitHub issues
 by label, dispatches parallel Claude workers in git worktrees, watches PRs,
 merges, and redeploys.
 
+> **Billing model: subscription only.** forge-loop assumes the operator runs
+> on a Claude Code subscription (e.g. the Max plan) where billing is flat,
+> not per-token. There is no token-cost accounting and no per-ticket /
+> per-tick USD budget gate; if you need one because you're paying per-call,
+> file a separate issue describing the operator persona and we'll design for
+> it then. (Historical note: a token-budget gate shipped briefly under
+> issue #6 and was removed in issue #38 — it was both off-thesis for the
+> subscription persona and actively buggy.)
+
 ## How it works
 
 ```
