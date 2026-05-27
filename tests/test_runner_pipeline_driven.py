@@ -69,7 +69,10 @@ class _FakeCfg:
         self.lumen_test_pattern = "**/*Test.*"
         self.coauthor = ""
         self.lumen = _Sub(top_k=3)
-        self.worker = _Sub(model="claude-opus-4-7", thinking="off")
+        self.worker = _Sub(
+            model="claude-opus-4-7", thinking="off",
+            allowed_mcp_tools=("forge-loop", "lumen", "github"),
+        )
         self.critic = _Sub(
             enabled=True, timeout_s=60, model="claude-opus-4-7",
             block_on_sev2=False, min_findings_for_approve=0,

@@ -310,6 +310,7 @@ def run_worker(
     tick: int | None = None,
     model: str | None = None,
     thinking: str | None = None,
+    allowed_mcp_servers: tuple[str, ...] | None = None,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -351,6 +352,7 @@ def run_worker(
         tick=tick,
         model=model,
         thinking=thinking,
+        allowed_mcp_servers=allowed_mcp_servers,
     )
 
 
@@ -365,6 +367,7 @@ def _run_worker_sdk(
     tick: int | None,
     model: str | None = None,
     thinking: str | None = None,
+    allowed_mcp_servers: tuple[str, ...] | None = None,
 ) -> WorkerOutcome:
     """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
 
@@ -395,6 +398,7 @@ def _run_worker_sdk(
                 on_event=_on_event,
                 model=model,
                 thinking_budget=thinking,
+                allowed_mcp_servers=allowed_mcp_servers,
             )
 
         timed_out = False

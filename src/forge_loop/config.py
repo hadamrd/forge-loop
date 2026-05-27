@@ -139,6 +139,14 @@ class POConfig:
     thinking: str = "high"
 
 
+# Bundled default of MCP servers the worker is allowed to call (issue #60).
+# Operator-side Claude Code typically connects Gmail, Drive, Calendar, tutor
+# stacks and so on — every one of those bloats the worker init system prompt
+# with tool definitions the worker never uses. Default keeps only the three
+# servers a worker brief actually exercises.
+DEFAULT_ALLOWED_MCP_SERVERS: tuple[str, ...] = ("forge-loop", "lumen", "github")
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
     """Per-role worker model + thinking-budget (issue #34).
@@ -146,9 +154,16 @@ class WorkerConfig:
     Workers do medium-effort implementation: a default of Opus with medium
     thinking is the sweet spot identified by the operators in the issue
     body. Both knobs are independently overridable via env or yaml.
+
+    ``allowed_mcp_tools`` (issue #60) is the server-name allow-list that
+    gates which MCP tool definitions get injected into the SDK init
+    message. Empty values fall back to the bundled default — an empty
+    list would break the worker since it relies on at least the
+    forge-loop server.
     """
     model: str = "claude-opus-4-7"
     thinking: str = "medium"
+    allowed_mcp_tools: tuple[str, ...] = DEFAULT_ALLOWED_MCP_SERVERS
 
 
 @dataclass(frozen=True)
@@ -270,6 +285,41 @@ def _env_str(key: str, fallback: str) -> str:
     return os.environ.get(key, fallback)
 
 
+def _parse_mcp_server_list(raw: Any) -> tuple[str, ...]:
+    """Normalise an allow-list of MCP server names (issue #60).
+
+    Accepts either a Python list (yaml shape) or a comma-separated string
+    (env-var shape). Strips whitespace and drops empty entries. Returns a
+    tuple so it can live on the frozen ``WorkerConfig``.
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",")]
+    elif isinstance(raw, (list, tuple)):
+        parts = [str(p).strip() for p in raw]
+    else:
+        parts = [str(raw).strip()]
+    return tuple(p for p in parts if p)
+
+
+def _resolve_allowed_mcp_tools(worker_block: dict[str, Any]) -> tuple[str, ...]:
+    """Resolve worker.allowed_mcp_tools (env > yaml > bundled default).
+
+    Empty result (env var set to ``""``, yaml set to ``[]``) falls back
+    to the bundled default — an empty allow-list would break the worker
+    since the brief depends on at least the forge-loop server.
+    """
+    raw_env = os.environ.get("LOOP_WORKER_ALLOWED_MCP_TOOLS")
+    if raw_env is not None:
+        parsed = _parse_mcp_server_list(raw_env)
+        return parsed or DEFAULT_ALLOWED_MCP_SERVERS
+    if "allowed_mcp_tools" in worker_block:
+        parsed = _parse_mcp_server_list(worker_block["allowed_mcp_tools"])
+        return parsed or DEFAULT_ALLOWED_MCP_SERVERS
+    return DEFAULT_ALLOWED_MCP_SERVERS
+
+
 def _env_bool(key: str, fallback: bool) -> bool:
     val = os.environ.get(key)
     if val is None:
@@ -321,6 +371,7 @@ def load() -> Config:
         "LOOP_WORKER_MODEL", "LOOP_WORKER_THINKING",
         worker_block, "claude-opus-4-7", "medium",
     )
+    worker_allowed = _resolve_allowed_mcp_tools(worker_block)
     po_model, po_thinking = _resolve_role(
         "LOOP_PO_MODEL", "LOOP_PO_THINKING",
         po_block, "claude-opus-4-7", "high",
@@ -388,6 +439,7 @@ def load() -> Config:
         worker=WorkerConfig(
             model=worker_model,
             thinking=worker_thinking,
+            allowed_mcp_tools=worker_allowed,
         ),
         attempts=AttemptsConfig(
             enabled=bool(attempts_block.get("enabled", True)),

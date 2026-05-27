@@ -318,8 +318,11 @@ def test_sdk_happy_path_extracts_pr_and_merged(patch_sdk_types: None) -> None:
     assert res.model == "claude-sonnet-4-6"
 
     kinds = [e["kind"] for e in captured]
+    # The MCP filter (issue #60) injects a ``worker_mcp_filtered`` event
+    # immediately after ``turn_start``; the original event order is
+    # otherwise preserved.
     assert kinds == [
-        "turn_start", "assistant_text", "tool_use",
+        "turn_start", "worker_mcp_filtered", "assistant_text", "tool_use",
         "tool_result", "assistant_text", "final_result",
     ]
     # seq is monotonic

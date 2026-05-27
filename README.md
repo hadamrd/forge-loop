@@ -175,6 +175,12 @@ export LOOP_CRITIC_THINKING=off
 worker:
   model: claude-opus-4-7
   thinking: medium
+  # MCP tool allow-list (issue #60). Operator-side Claude Code typically
+  # connects Gmail / Drive / Calendar / tutor stacks etc. Every one of
+  # those bloats the worker init system prompt with ~250 tool
+  # definitions the worker never uses. The filter keeps only the servers
+  # below; everything else is dropped at SDK init.
+  allowed_mcp_tools: [forge-loop, lumen, github]
 po:
   model: claude-opus-4-7
   thinking: high
@@ -182,6 +188,22 @@ critic:
   model: claude-sonnet-4-6
   thinking: "off"        # quote — bare ``off`` is YAML's false
 ```
+
+The MCP allow-list is also overridable via env (comma-separated server
+names):
+
+```sh
+export LOOP_WORKER_ALLOWED_MCP_TOOLS="forge-loop,lumen,github"
+```
+
+An empty value (`""` or `[]`) falls back to the bundled default — an
+empty allow-list would strip even the loop's own MCP server and break
+the worker. If the operator-configured allow-list typoes every entry
+(no server actually matches), the worker emits a
+`worker_mcp_filter_no_match` event and falls back to the bundled
+default for that session. A hard cap of
+`ALLOWED_TOOL_HARD_CAP = 60` tools guards against future regressions
+that accidentally re-enable the firehose.
 
 Inspect what's actually resolved at runtime:
 
