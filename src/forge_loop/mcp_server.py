@@ -12,9 +12,12 @@ Run via:
 
 from __future__ import annotations
 
+import functools
+import os
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
 
@@ -35,6 +38,84 @@ from forge_loop.worker import run_worker as _run_worker
 mcp = FastMCP("forge-loop")
 
 
+# ── Rate limiting ──────────────────────────────────────────────────────────
+# Each MCP server process keeps a per-tool call counter. When a tool's count
+# exceeds its cap, subsequent invocations return a structured error and emit
+# a `mcp_tool_rate_limited` event on the configured events bus. Resets every
+# time the MCP server is started (= per-worker-invocation for the loop's own
+# dispatch path).
+#
+# Defaults:
+#   * LOOP_MCP_CAP_DEFAULT (env): default cap for every tool, default 20.
+#   * LOOP_MCP_CAP_<TOOL_NAME_UPPER> (env): per-tool override.
+#
+# Mutating tools (issue/comment/label/dispatch) should be tightened
+# explicitly; pure-read tools can stay at the default.
+
+_TOOL_CALLS: Counter[str] = Counter()
+_DEFAULT_CAP = int(os.environ.get("LOOP_MCP_CAP_DEFAULT", "20"))
+
+
+def _cap_for(tool_name: str) -> int:
+    env_key = f"LOOP_MCP_CAP_{tool_name.upper()}"
+    return int(os.environ.get(env_key, _DEFAULT_CAP))
+
+
+def _emit_rate_limited(tool_name: str, cap: int, count: int) -> None:
+    """Best-effort: write a `mcp_tool_rate_limited` event to the configured
+    events bus. Swallows OSError so a broken bus does not crash a tool call.
+    """
+    try:
+        cfg = load_config()
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        _state.append_event(
+            cfg.events_file,
+            "mcp_tool_rate_limited",
+            tool=tool_name, cap=cap, count=count,
+        )
+    except OSError:
+        pass
+
+
+def rate_limited(tool_name: str | None = None) -> Callable[..., Any]:
+    """Decorator: cap a tool's per-process call count.
+
+    Usage:
+        @mcp.tool()
+        @rate_limited("gh_create_issue")
+        def gh_create_issue(...): ...
+
+    The cap is read at decoration time from env (so tests can override).
+    Returns a structured error dict on exceed; never raises.
+    """
+
+    def _decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        name = tool_name or fn.__name__
+        cap = _cap_for(name)
+
+        @functools.wraps(fn)
+        def _wrapper(*args: Any, **kwargs: Any) -> Any:
+            _TOOL_CALLS[name] += 1
+            count = _TOOL_CALLS[name]
+            if count > cap:
+                _emit_rate_limited(name, cap, count)
+                return {
+                    "ok": False,
+                    "error": "rate_limited",
+                    "tool": name,
+                    "cap": cap,
+                    "count": count,
+                    "hint": f"set LOOP_MCP_CAP_{name.upper()}=N to raise the cap",
+                }
+            return fn(*args, **kwargs)
+
+        return _wrapper
+
+    return _decorate
+
+
 # ── GH tools ────────────────────────────────────────────────────────────────
 
 
@@ -46,6 +127,7 @@ def gh_top_issues(label: str = "loop:ready", limit: int = 3) -> list[dict[str, A
 
 
 @mcp.tool()
+@rate_limited("gh_comment")
 def gh_comment(issue: int, body: str) -> str:
     """Post a comment on an issue. Returns ``ok`` or an error description."""
     cfg = load_config()
@@ -54,6 +136,7 @@ def gh_comment(issue: int, body: str) -> str:
 
 
 @mcp.tool()
+@rate_limited("gh_unlabel")
 def gh_unlabel(issue: int, label: str) -> str:
     """Remove a label from an issue (used to drop ``loop:ready`` after dispatch)."""
     cfg = load_config()
@@ -62,6 +145,7 @@ def gh_unlabel(issue: int, label: str) -> str:
 
 
 @mcp.tool()
+@rate_limited("gh_create_issue")
 def gh_create_issue(title: str, body: str, labels: list[str] | None = None) -> dict[str, Any]:
     """Open a new issue in the configured repo. Returns ``{number}`` or ``{error}``."""
     cfg = load_config()
@@ -70,6 +154,7 @@ def gh_create_issue(title: str, body: str, labels: list[str] | None = None) -> d
 
 
 @mcp.tool()
+@rate_limited("gh_update_issue")
 def gh_update_issue(
     issue: int,
     title: str | None = None,
@@ -84,6 +169,7 @@ def gh_update_issue(
 
 
 @mcp.tool()
+@rate_limited("gh_close_issue")
 def gh_close_issue(
     issue: int, reason: str = "completed", comment_body: str | None = None
 ) -> dict[str, Any]:
@@ -97,6 +183,7 @@ def gh_close_issue(
 
 
 @mcp.tool()
+@rate_limited("groom_backlog")
 def groom_backlog(timeout_s: int = 1800) -> dict[str, Any]:
     """Run one pass of the AI-as-PM backlog-maintenance subagent.
 
@@ -118,6 +205,7 @@ def groom_backlog(timeout_s: int = 1800) -> dict[str, Any]:
 
 
 @mcp.tool()
+@rate_limited("redeploy_project")
 def redeploy_project(task_name: str | None = None) -> dict[str, Any]:
     """Trigger a redeploy via the configured deploy task.
 
@@ -133,6 +221,7 @@ def redeploy_project(task_name: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
+@rate_limited("dispatch_worker")
 def dispatch_worker(issue_number: int, timeout_s: int = 3600) -> dict[str, Any]:
     """Run a single ``claude -p`` worker against one issue (synchronous).
 
@@ -176,6 +265,7 @@ def dispatch_worker(issue_number: int, timeout_s: int = 3600) -> dict[str, Any]:
 
 
 @mcp.tool()
+@rate_limited("run_sprint_workflow")
 def run_sprint_workflow(
     parallel: int = 3,
     max_ticks: int = 1,
