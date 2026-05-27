@@ -684,6 +684,57 @@ def _cmd_repos_enable(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_pipeline_show(args: argparse.Namespace) -> int:
+    """`forge-loop pipeline show` — print the resolved DAG as ASCII art."""
+    from forge_loop.pipeline import (
+        PipelineLoadError,
+        ValidationError,
+        build_dag,
+        load_pipeline,
+    )
+
+    path = Path(args.config) if args.config else Path.cwd() / ".forge" / "pipeline.yaml"
+    if not path.exists():
+        sys.stderr.write(f"[pipeline show] config not found: {path}\n")
+        return 2
+    try:
+        spec = load_pipeline(path)
+        dag = build_dag(spec)
+    except (PipelineLoadError, ValidationError) as e:
+        sys.stderr.write(f"[pipeline show] {e}\n")
+        return 2
+
+    if args.json:
+        out = {
+            "source": str(spec.source_path),
+            "roots": list(dag.roots),
+            "order": list(dag.order),
+            "nodes": {
+                r: {
+                    "parents": list(n.parents),
+                    "children": list(n.children),
+                    "depth": n.depth,
+                    "parallel": n.step.parallel,
+                    "on": n.step.on,
+                    "condition": {
+                        "labels": list(n.step.condition.labels),
+                        "all_approve": n.step.condition.all_approve,
+                    },
+                }
+                for r, n in dag.nodes.items()
+            },
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print(f"# pipeline: {spec.source_path}")
+    print(f"# roots:    {', '.join(dag.roots)}")
+    print(f"# order:    {' → '.join(dag.order)}")
+    print()
+    print(dag.render_ascii())
+    return 0
+
+
 def _cmd_config(_args: argparse.Namespace) -> int:
     cfg = load()
     out = {
@@ -727,6 +778,20 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("resume", help="Remove pause file").set_defaults(func=_cmd_resume)
     sub.add_parser("stop", help="Touch stop file").set_defaults(func=_cmd_stop)
     sub.add_parser("config", help="Print resolved config").set_defaults(func=_cmd_config)
+
+    p_pipe = sub.add_parser(
+        "pipeline",
+        help="Inspect the role-chain pipeline defined in .forge/pipeline.yaml",
+    )
+    pipe_sub = p_pipe.add_subparsers(dest="pipeline_cmd", required=True)
+    p_pipe_show = pipe_sub.add_parser("show", help="Print the resolved DAG as ASCII art")
+    p_pipe_show.add_argument(
+        "--config", default=None,
+        help="Path to pipeline.yaml (default: ./.forge/pipeline.yaml)",
+    )
+    p_pipe_show.add_argument("--json", action="store_true",
+                              help="Emit JSON instead of ASCII art")
+    p_pipe_show.set_defaults(func=_cmd_pipeline_show)
 
     p_repos = sub.add_parser(
         "repos",
