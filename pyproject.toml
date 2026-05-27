@@ -14,6 +14,10 @@ dependencies = [
   "anyio >=4.0",
   "anthropic >=0.40",
   "claude-agent-sdk >=0.2",
+  # Rich powers status/doctor/events output. NO_COLOR aware,
+  # CI-friendly when terminal is dumb. Pulled into the stable surface
+  # because the CLI is the operator's primary interface.
+  "rich >=13.0",
 ]
 
 [project.optional-dependencies]

@@ -72,26 +72,49 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     import shutil
     import subprocess as _sp
 
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
     # Doctor must run even when config is broken — that's the whole
     # point of running it. Fall back to a minimal stub so the checks
     # that don't need a real cfg still execute.
     try:
         cfg = load()
         cfg_ok = True
+        cfg_load_error: str | None = None
     except Exception as exc:  # noqa: BLE001
-        print(f"  ✗ config load failed: {exc}")
         cfg = None
         cfg_ok = False
+        cfg_load_error = str(exc)
     red = not cfg_ok  # config-broken counts as a red signal
+
+    table = Table(
+        title="[bold]forge-loop doctor[/bold]",
+        show_header=True,
+        header_style="bold",
+        title_justify="left",
+        expand=False,
+    )
+    table.add_column("", width=3, no_wrap=True)
+    table.add_column("Check", style="bold")
+    table.add_column("Detail", style="dim", overflow="fold")
+
+    _STATUS_MARKERS = {
+        "green": "[green]✓[/green]",
+        "yellow": "[yellow]~[/yellow]",
+        "red": "[red]✗[/red]",
+    }
 
     def line(status: str, label: str, detail: str = "") -> None:
         nonlocal red
-        marker = {"green": "✓", "yellow": "~", "red": "✗"}[status]
-        print(f"  {marker} {label}" + (f" — {detail}" if detail else ""))
+        table.add_row(_STATUS_MARKERS[status], label, detail)
         if status == "red":
             red = True
 
-    print("forge-loop doctor:")
+    if cfg_load_error:
+        line("red", "config load failed", cfg_load_error)
 
     # 1. Halt markers — should NOT exist on a healthy install
     if cfg_ok:
@@ -171,6 +194,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         "ENABLED (opt-in)" if drift_halt_opt_in else "disabled (default)",
     )
 
+    console.print(table)
     return 1 if red else 0
 
 
@@ -290,9 +314,69 @@ def _cmd_status(_args: argparse.Namespace) -> int:
 
 
 def _cmd_events(args: argparse.Namespace) -> int:
+    """Tail recent events. Rich-formatted by default; --raw skips colour
+    for piping into jq / grep / files.
+    """
     cfg = load()
-    for line in tail_events(cfg.events_file, n=args.n):
-        sys.stdout.write(line)
+
+    if getattr(args, "raw", False):
+        for line in tail_events(cfg.events_file, n=args.n):
+            sys.stdout.write(line)
+        return 0
+
+    from rich.console import Console
+    from rich.syntax import Syntax
+    from rich.text import Text
+
+    # Per-kind colour. Keep the palette small and consistent with doctor.
+    _KIND_STYLE = {
+        "loop_start": "bold green",
+        "loop_stop": "bold red",
+        "tick_start": "cyan",
+        "tick_done": "bold cyan",
+        "tick_idle": "dim",
+        "po_start": "blue",
+        "po_done": "blue",
+        "worker_skip_in_flight": "dim yellow",
+        "worker_skip_cooldown": "dim yellow",
+        "watchdog_started": "dim",
+        "watchdog_stopped": "dim",
+        "worktree_reaped": "dim green",
+        "orphan_worktrees_reaped": "dim green",
+        "redeploy": "magenta",
+        "deploy_drift_warn": "bold yellow",
+        "deploy_drift_halt": "bold red",
+        "loop_drift_halt": "bold red",
+        "critic_done": "green",
+        "critic_failed": "red",
+        "critic_actions_failed": "red",
+        "budget_worker_killed": "bold red",
+        "signal_stop": "bold red",
+        "version_changed_restart": "bold yellow",
+    }
+
+    console = Console()
+    for raw in tail_events(cfg.events_file, n=args.n):
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            console.print(raw.rstrip(), style="dim red")
+            continue
+        ts = ev.get("ts", "?")[11:19] if ev.get("ts") else "?"
+        kind = ev.get("kind", "?")
+        style = _KIND_STYLE.get(kind, "white")
+        rest = {k: v for k, v in ev.items() if k not in ("ts", "kind")}
+        prefix = Text.assemble(
+            (f"{ts} ", "dim"),
+            (f"{kind:<26}", style),
+            (" ", ""),
+        )
+        # JSON-format the payload but cap aggressively so terminal isn't
+        # flooded with megabyte tool-result dumps.
+        body = json.dumps(rest, default=str)
+        if len(body) > 240:
+            body = body[:237] + "..."
+        console.print(prefix, Syntax(body, "json", theme="ansi_dark", word_wrap=False))
     return 0
 
 
@@ -1063,6 +1147,11 @@ def main(argv: list[str] | None = None) -> int:
 
     p_events = sub.add_parser("events", help="Tail the events log")
     p_events.add_argument("-n", type=int, default=30, help="lines to show (default 30)")
+    p_events.add_argument(
+        "--raw",
+        action="store_true",
+        help="Emit raw JSONL (skip Rich colouring) — use when piping into jq/grep/files.",
+    )
     p_events.set_defaults(func=_cmd_events)
 
     sub.add_parser("pause", help="Touch pause file").set_defaults(func=_cmd_pause)
