@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import inspect
 import json
 import os
 import re
@@ -234,6 +236,21 @@ FINAL LINE OF YOUR OUTPUT MUST BE A JSON OBJECT (no prose after it):
 
 If you genuinely cannot ship (blocked), set status="failed" and put the blocker in `note`.
 Do NOT investigate forever — make decisions and ship."""
+
+
+def brief_template_hash() -> str:
+    """Stable digest of the worker brief template.
+
+    Used by ``attempts.compute_fingerprint`` so that a meaningful change to
+    the worker's instructions (e.g. a new contract clause) invalidates the
+    in-flight/cooldown skip — the next dispatch is for materially different
+    work even if the issue body hasn't changed.
+
+    Hashes the source of ``make_brief`` so any code change to the template
+    bumps the digest. Cheap (called once per dispatch).
+    """
+    src = inspect.getsource(make_brief)
+    return hashlib.sha256(src.encode("utf-8")).hexdigest()
 
 
 def _branch_name(n: int, title: str) -> str:

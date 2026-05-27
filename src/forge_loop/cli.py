@@ -286,6 +286,65 @@ def _cmd_budget(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_retry(args: argparse.Namespace) -> int:
+    """Schedule (or force) a re-dispatch for a single issue.
+
+    By default this inspects the fingerprint guards and reports what would
+    happen. With ``--force`` it writes a marker the next runner tick consumes
+    to bypass both the in-flight and cooldown skips for that issue.
+    """
+    from forge_loop import attempts as _attempts
+    from forge_loop import worker as _worker
+    from forge_loop.gh import fetch_issue
+    from forge_loop.runner import _force_retry_file
+
+    cfg = load()
+    issue = fetch_issue(args.issue, repo=cfg.github_repo)
+    if not issue:
+        print(f"[retry] could not fetch issue #{args.issue}", file=sys.stderr)
+        return 2
+
+    brief_hash = _worker.brief_template_hash()
+    fp = _attempts.compute_fingerprint(
+        issue["number"], issue.get("body") or "", brief_hash,
+    )
+    history, corrupt = _attempts.fetch_history_strict(
+        issue["number"], repo=cfg.github_repo,
+    )
+    if corrupt:
+        print(f"[retry] warning: {corrupt} corrupt attempt row(s) in history")
+    decision = _attempts.classify_skip(
+        history, fp, cooldown_s=_attempts.cooldown_from_env(),
+    )
+    print(f"[retry] issue #{args.issue} fingerprint={fp[:12]}")
+    if decision.kind == "in_flight":
+        print(f"[retry] guard: in-flight (PR {decision.pr_url})")
+    elif decision.kind == "cooldown":
+        print(f"[retry] guard: cooldown ({decision.cooldown_remaining_s}s remaining)")
+    else:
+        print("[retry] guard: none — next tick will dispatch normally")
+
+    if not args.force:
+        if decision.kind:
+            print("[retry] pass --force to bypass the guard")
+        return 0
+
+    # Write/merge a force-retry marker the runner consumes on its next tick.
+    marker = _force_retry_file(cfg)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    existing: set[int] = set()
+    if marker.exists():
+        try:
+            blob = json.loads(marker.read_text())
+            existing = {int(n) for n in (blob.get("issues") or [])}
+        except (OSError, ValueError, json.JSONDecodeError):
+            existing = set()
+    existing.add(int(args.issue))
+    marker.write_text(json.dumps({"issues": sorted(existing)}))
+    print(f"[retry] forced: wrote {marker} (issues={sorted(existing)})")
+    return 0
+
+
 def _cmd_config(_args: argparse.Namespace) -> int:
     cfg = load()
     out = {
@@ -337,6 +396,16 @@ def main(argv: list[str] | None = None) -> int:
     p_budget.add_argument("--json", action="store_true",
                           help="Emit JSON instead of human-readable")
     p_budget.set_defaults(func=_cmd_budget)
+
+    p_retry = sub.add_parser(
+        "retry",
+        help="Re-dispatch a worker for an issue (use --force to bypass guards)",
+    )
+    p_retry.add_argument("--issue", type=int, required=True,
+                         help="GitHub issue number")
+    p_retry.add_argument("--force", action="store_true",
+                         help="Bypass in-flight and cooldown fingerprint guards")
+    p_retry.set_defaults(func=_cmd_retry)
 
     p_mcp = sub.add_parser("mcp", help="MCP server (expose tools to MCP clients)")
     mcp_sub = p_mcp.add_subparsers(dest="mcp_cmd", required=True)

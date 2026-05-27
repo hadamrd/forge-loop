@@ -137,6 +137,98 @@ def update_issue(
     return r.returncode == 0
 
 
+def pr_changed_lines(pr: int | str, repo: str | None = None) -> int:
+    """Return additions+deletions for a PR. 0 on failure (caller falls back)."""
+    repo = _require_repo(repo)
+    r = subprocess.run(
+        ["gh", "pr", "view", str(pr), "--repo", repo,
+         "--json", "additions,deletions"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return 0
+    try:
+        obj = json.loads(r.stdout)
+        return int(obj.get("additions", 0)) + int(obj.get("deletions", 0))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return 0
+
+
+def add_pr_label(pr: int | str, labels: list[str], repo: str | None = None) -> bool:
+    """Add labels to a PR. ``pr`` may be a PR number or URL.
+
+    `gh pr edit` shares the issue-edit code path under the hood, but using
+    the PR-specific subcommand avoids ambiguity when issue/PR numbers
+    overlap and makes the intent grep-able.
+    """
+    if not labels:
+        return True
+    repo = _require_repo(repo)
+    cmd = ["gh", "pr", "edit", str(pr), "--repo", repo]
+    for lab in labels:
+        cmd.extend(["--add-label", lab])
+    r = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def disable_pr_auto_merge(pr: int | str, repo: str | None = None) -> bool:
+    """Disable auto-merge on a PR. Best-effort: returns False if the call
+    fails (e.g. auto-merge was never enabled — which is fine)."""
+    repo = _require_repo(repo)
+    r = subprocess.run(
+        ["gh", "pr", "merge", str(pr), "--repo", repo, "--disable-auto"],
+        check=False, capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def post_review_comment(
+    pr: int | str,
+    body: str,
+    file: str | None = None,
+    line: int | None = None,
+    repo: str | None = None,
+) -> bool:
+    """Post a review on a PR. When ``file``+``line`` are provided, post as a
+    single inline comment via the GitHub API (``gh api``). Otherwise post a
+    plain ``--comment`` review with ``body`` as the summary.
+
+    Returns True on success, False on API failure (caller decides whether to
+    fall back to a summary comment).
+    """
+    repo = _require_repo(repo)
+    if file is not None and line is not None:
+        payload = {
+            "body": body,
+            "event": "COMMENT",
+            "comments": [{"path": file, "line": int(line), "body": body}],
+        }
+        r = subprocess.run(
+            [
+                "gh", "api",
+                "--method", "POST",
+                f"repos/{repo}/pulls/{_pr_number(pr)}/reviews",
+                "--input", "-",
+            ],
+            input=json.dumps(payload),
+            text=True, capture_output=True, check=False,
+        )
+        return r.returncode == 0
+    r = subprocess.run(
+        ["gh", "pr", "review", str(pr), "--repo", repo, "--comment", "--body", body],
+        capture_output=True, text=True, check=False,
+    )
+    return r.returncode == 0
+
+
+def _pr_number(pr: int | str) -> str:
+    """Extract a PR number from an int / URL / numeric string."""
+    s = str(pr)
+    if "/" in s:
+        return s.rstrip("/").rsplit("/", 1)[-1]
+    return s
+
+
 def close_issue(
     issue: int,
     reason: str | None = None,

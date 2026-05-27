@@ -55,6 +55,13 @@ class CriticConfig:
     # don't actually exercise the change).
     enabled: bool = True
     timeout_s: int = 600
+    # If True, sev2 findings ALSO block auto-merge (default: only sev1 blocks).
+    block_on_sev2: bool = False
+    # If a PR with > this many changed lines comes back from the critic with
+    # zero findings AND ``overall=approve``, treat it as suspicious: do NOT
+    # let auto-merge proceed, label the PR ``critic:suspicious``, and surface
+    # a ``critic_suspicious_approve`` event for the operator.
+    min_findings_for_approve: int = 50
 
 
 @dataclass(frozen=True)
@@ -190,6 +197,13 @@ def _env_str(key: str, fallback: str) -> str:
     return os.environ.get(key, fallback)
 
 
+def _env_bool(key: str, fallback: bool) -> bool:
+    val = os.environ.get(key)
+    if val is None:
+        return fallback
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def load() -> Config:
     repo = _repo_root()
     y: dict[str, Any] = {}
@@ -243,6 +257,14 @@ def load() -> Config:
         critic=CriticConfig(
             enabled=bool(critic_block.get("enabled", True)),
             timeout_s=int(critic_block.get("timeout_s", 600)),
+            block_on_sev2=_env_bool(
+                "LOOP_CRITIC_BLOCK_ON_SEV2",
+                bool(critic_block.get("block_on_sev2", False)),
+            ),
+            min_findings_for_approve=_env_int(
+                "LOOP_CRITIC_MIN_FINDINGS",
+                int(critic_block.get("min_findings_for_approve", 50)),
+            ),
         ),
         po=POConfig(
             enabled=bool(po_block.get("enabled", True)),
