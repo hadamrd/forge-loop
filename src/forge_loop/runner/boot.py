@@ -20,6 +20,9 @@ from forge_loop.runner._helpers import (
 from forge_loop.runner._helpers import (
     reap_orphan_worktrees as _reap_orphan_worktrees_impl,
 )
+from forge_loop.runner._helpers import (
+    rotate_events_file_at_boot as _rotate_events_file_at_boot,
+)
 from forge_loop.state import append_event, write_state
 
 _RUN = True
@@ -94,6 +97,12 @@ def run(cfg: Config) -> int:
     cfg.events_file.touch()
 
     _install_signal_handlers(cfg)
+
+    # Issue #59 — rotate the events log if it has grown past the threshold
+    # (default 10 MiB, override via LOOP_EVENTS_ROTATE_BYTES). Best-effort:
+    # an OSError here MUST NOT block boot — the helper records a
+    # ``events_rotation_failed`` event and returns.
+    _rotate_events_file_at_boot(cfg.events_file)
 
     # Boot-time orphan worktree cleanup. /tmp/wt-loop-* should never
     # outlive the loop process; if any are on disk now (operator killed
@@ -208,6 +217,8 @@ def run_async(cfg: Config) -> int:
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     cfg.events_file.touch()
     _install_signal_handlers(cfg)
+    # Issue #59 — same boot-time rotation as the sync ``run()`` path.
+    _rotate_events_file_at_boot(cfg.events_file)
 
     pools = AsyncPools.from_env(default_worker=cfg.parallel)
     caps = AsyncQueueCaps()

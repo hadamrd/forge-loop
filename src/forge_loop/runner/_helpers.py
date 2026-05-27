@@ -19,7 +19,25 @@ import json
 import subprocess
 from pathlib import Path
 
-from forge_loop.state import append_event
+from forge_loop.state import append_event, rotate_events_file_if_needed
+
+# ---------------------------------------------------------------------------
+# Events log rotation
+# ---------------------------------------------------------------------------
+
+
+def rotate_events_file_at_boot(events_file: Path) -> dict | None:
+    """Boot-time wrapper around :func:`forge_loop.state.rotate_events_file_if_needed`.
+
+    Centralises the call so the runner ``boot`` module stays a thin facade
+    and tests can patch this single entry point.
+
+    Returns whatever the underlying helper returns (``None`` if no rotation
+    was needed). The helper is best-effort: an OSError never escapes — it
+    is recorded as an ``events_rotation_failed`` event in the events file
+    and reported via the return value.
+    """
+    return rotate_events_file_if_needed(events_file)
 
 
 # ---------------------------------------------------------------------------

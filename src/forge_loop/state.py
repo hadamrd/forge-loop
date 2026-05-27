@@ -2,14 +2,135 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# Default rotation threshold for the events log: 10 MiB. Overridable via the
+# ``LOOP_EVENTS_ROTATE_BYTES`` env var so operators can tune it without a code
+# change. Kept module-level so tests can monkeypatch it directly.
+DEFAULT_ROTATE_BYTES = 10 * 1024 * 1024
+# Number of archive files to keep (events.jsonl.1 .. events.jsonl.MAX_ARCHIVES).
+MAX_ARCHIVES = 3
+
+
+def _rotate_bytes_threshold() -> int:
+    raw = os.environ.get("LOOP_EVENTS_ROTATE_BYTES")
+    if not raw:
+        return DEFAULT_ROTATE_BYTES
+    try:
+        v = int(raw)
+        return v if v > 0 else DEFAULT_ROTATE_BYTES
+    except ValueError:
+        return DEFAULT_ROTATE_BYTES
+
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def rotate_events_file_if_needed(
+    events_path: Path,
+    rotate_bytes: int | None = None,
+    max_archives: int = MAX_ARCHIVES,
+) -> dict[str, Any] | None:
+    """Rotate ``events_path`` if its size meets/exceeds ``rotate_bytes``.
+
+    Rotation scheme is a classic numbered cascade:
+        events.jsonl.<max>  → unlinked
+        events.jsonl.<max-1> → events.jsonl.<max>
+        ...
+        events.jsonl.1      → events.jsonl.2
+        events.jsonl        → events.jsonl.1
+    A fresh empty ``events.jsonl`` is then created and an
+    ``events_file_rotated`` event is appended as its first line.
+
+    On OSError at any step (permission denied, disk full, read-only target,
+    etc.) the helper does NOT raise — it emits an ``events_rotation_failed``
+    event best-effort (which may itself swallow OSError) and returns the
+    failure payload. Callers should treat the return value as informational
+    telemetry only; boot must continue regardless.
+
+    Returns:
+        ``None`` if no rotation was required, otherwise a dict describing
+        the outcome (``rotated``: bool, ``rotated_size``: int,
+        ``archive_count``: int, ``error``: str | None).
+    """
+    if rotate_bytes is None:
+        rotate_bytes = _rotate_bytes_threshold()
+
+    try:
+        if not events_path.exists():
+            return None
+        size = events_path.stat().st_size
+    except OSError as e:
+        # Couldn't even stat — try to record this and bail.
+        _try_append_event(events_path, "events_rotation_failed", error=str(e))
+        return {"rotated": False, "rotated_size": 0, "archive_count": 0, "error": str(e)}
+
+    if size < rotate_bytes:
+        return None
+
+    error: str | None = None
+    archive_count = 0
+    try:
+        # Walk archives from highest down: unlink the oldest that would be
+        # overflowed, then shift each existing archive up by one. Finally,
+        # rename the live file to .1.
+        oldest = events_path.with_suffix(events_path.suffix + f".{max_archives}")
+        if oldest.exists() or oldest.is_symlink():
+            with contextlib.suppress(FileNotFoundError):
+                oldest.unlink()
+
+        for n in range(max_archives - 1, 0, -1):
+            src = events_path.with_suffix(events_path.suffix + f".{n}")
+            dst = events_path.with_suffix(events_path.suffix + f".{n + 1}")
+            if src.exists() or src.is_symlink():
+                src.rename(dst)
+
+        first_archive = events_path.with_suffix(events_path.suffix + ".1")
+        events_path.rename(first_archive)
+
+        # Create a fresh empty events file.
+        events_path.touch()
+
+        # Count surviving archives for the event payload.
+        for n in range(1, max_archives + 1):
+            if events_path.with_suffix(events_path.suffix + f".{n}").exists():
+                archive_count += 1
+    except OSError as e:
+        error = str(e)
+        # Best-effort: try to record the failure.
+        _try_append_event(events_path, "events_rotation_failed", error=error,
+                          attempted_size=size)
+        return {
+            "rotated": False, "rotated_size": size,
+            "archive_count": archive_count, "error": error,
+        }
+
+    # Success path: stamp the first event in the fresh file.
+    _try_append_event(
+        events_path, "events_file_rotated",
+        rotated_size=size, archive_count=archive_count,
+    )
+    return {
+        "rotated": True, "rotated_size": size,
+        "archive_count": archive_count, "error": None,
+    }
+
+
+def _try_append_event(events_path: Path, kind: str, **fields: Any) -> None:
+    """Best-effort append — swallow OSError so rotation never raises.
+
+    If we can't even write the failure event, there's nothing more we can
+    do without aborting boot — which the contract for #59 explicitly
+    forbids.
+    """
+    with contextlib.suppress(OSError):
+        append_event(events_path, kind, **fields)
 
 
 def write_state(path: Path, state: dict[str, Any]) -> None:
