@@ -23,6 +23,7 @@ from forge_loop import controlled_exec as _cx
 from forge_loop import eventdb as _eventdb
 from forge_loop import gh as _gh
 from forge_loop import manual as _manual
+from forge_loop import operator as _operator
 from forge_loop import state as _state
 from forge_loop.config import load as load_config
 from forge_loop.critic import review_pr as _critic_review
@@ -61,9 +62,7 @@ def gh_unlabel(issue: int, label: str) -> str:
 
 
 @mcp.tool()
-def gh_create_issue(
-    title: str, body: str, labels: list[str] | None = None
-) -> dict[str, Any]:
+def gh_create_issue(title: str, body: str, labels: list[str] | None = None) -> dict[str, Any]:
     """Open a new issue in the configured repo. Returns ``{number}`` or ``{error}``."""
     cfg = load_config()
     n = _gh.create_issue(title, body, labels, repo=cfg.github_repo)
@@ -150,10 +149,19 @@ def dispatch_worker(issue_number: int, timeout_s: int = 3600) -> dict[str, Any]:
         import subprocess
 
         r = subprocess.run(
-            ["gh", "issue", "view", str(issue_number),
-             "--repo", cfg.github_repo,
-             "--json", "number,title,body,labels"],
-            capture_output=True, text=True, check=False,
+            [
+                "gh",
+                "issue",
+                "view",
+                str(issue_number),
+                "--repo",
+                cfg.github_repo,
+                "--json",
+                "number,title,body,labels",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if r.returncode != 0:
             return {"status": "failed", "error": f"gh view failed: {r.stderr[:200]}"}
@@ -189,9 +197,16 @@ def dev_sprint_workflow_start(
     import os
 
     # Inject env knobs so config.load() picks them up; restore after.
-    saved = {k: os.environ.get(k) for k in
-             ["LOOP_PARALLEL", "LOOP_MAX_TICKS", "LOOP_QUERY_LABEL",
-              "LOOP_TICK_INTERVAL_S", "LOOP_WORKER_TIMEOUT_S"]}
+    saved = {
+        k: os.environ.get(k)
+        for k in [
+            "LOOP_PARALLEL",
+            "LOOP_MAX_TICKS",
+            "LOOP_QUERY_LABEL",
+            "LOOP_TICK_INTERVAL_S",
+            "LOOP_WORKER_TIMEOUT_S",
+        ]
+    }
     os.environ["LOOP_PARALLEL"] = str(parallel)
     os.environ["LOOP_MAX_TICKS"] = str(max_ticks)
     os.environ["LOOP_QUERY_LABEL"] = query_label
@@ -201,6 +216,7 @@ def dev_sprint_workflow_start(
         cfg = load_config()
         _run_loop(cfg)
         import json
+
         return json.loads(Path(cfg.state_file).read_text()) if cfg.state_file.exists() else {}
     finally:
         for k, v in saved.items():
@@ -312,10 +328,7 @@ def manual_search(query: str, limit: int = 5) -> list[dict[str, str]]:
     """
     cfg = load_config()
     matches = _manual.search(cfg.repo, query, limit=limit)
-    return [
-        {"topic": e.topic, "title": e.title, "snippet": e.body[:300]}
-        for e in matches
-    ]
+    return [{"topic": e.topic, "title": e.title, "snippet": e.body[:300]} for e in matches]
 
 
 # ── Event bus + controlled exec ─────────────────────────────────────────────
@@ -361,8 +374,12 @@ def controlled_exec(
 
     cwd_path = Path(cwd) if cwd else None
     result = _cx.run(
-        cmd, timeout_s=timeout_s, label=label, cwd=cwd_path,
-        on_start=_emit, on_done=_emit,
+        cmd,
+        timeout_s=timeout_s,
+        label=label,
+        cwd=cwd_path,
+        on_start=_emit,
+        on_done=_emit,
     )
     return {
         "cmd": result.cmd,
@@ -372,6 +389,76 @@ def controlled_exec(
         "timed_out": result.timed_out,
         "stdout_tail": result.stdout_tail,
         "stderr_tail": result.stderr_tail,
+    }
+
+
+# ── Operator checkpoint ─────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def ask_operator(
+    question: str,
+    options: list[str],
+    context: str = "",
+    timeout_s: int | None = None,
+) -> dict[str, Any]:
+    """Pause the worker and ask the human operator a question.
+
+    Use this when you hit a HIGH-RISK decision that can't be auto-resolved:
+    deleting data, destructive renames, schema-breaking choices, ambiguous
+    intent. The loop emits an ``operator_question`` event, posts the
+    question via the configured channel(s), and blocks until the operator
+    replies with ``/forge-answer <option>`` on the worker's GitHub issue.
+
+    Channels:
+    - GitHub issue comment (default; needs ``LOOP_OPERATOR_ISSUE``).
+    - Webhook (``LOOP_OPERATOR_WEBHOOK`` set).
+    - Slack incoming webhook (``LOOP_OPERATOR_SLACK_WEBHOOK`` set).
+
+    Timeout (default 30min) is overridable via ``LOOP_OPERATOR_TIMEOUT_S``
+    or the ``timeout_s`` arg. On timeout, returns
+    ``{"status": "timeout", "answer": null}`` — the worker should exit
+    ``operator_no_response`` (no PR).
+    """
+    cfg = load_config()
+    issue = _operator.env_issue()
+    eff_timeout = timeout_s if timeout_s is not None else _operator.env_timeout_s()
+    req = _operator.AskRequest(
+        question=question,
+        options=options,
+        context=context,
+        issue=issue,
+        repo=cfg.github_repo,
+        timeout_s=eff_timeout,
+    )
+
+    def _emit(kind: str, payload: dict[str, Any]) -> None:
+        _state.append_event(cfg.events_file, kind, **payload)
+
+    try:
+        result = _operator.ask(
+            req,
+            emit=_emit,
+            webhook_url=_operator.env_webhook(),
+            slack_url=_operator.env_slack(),
+        )
+    except _operator.OperatorTimeout:
+        return {
+            "status": "timeout",
+            "answer": None,
+            "note": (
+                f"no operator reply within {eff_timeout}s — worker should "
+                "exit operator_no_response (no PR)"
+            ),
+        }
+    except _operator.OperatorError as e:
+        return {"status": "error", "answer": None, "error": str(e)}
+    return {
+        "status": result.status,
+        "answer": result.answer,
+        "raw_reply": result.raw_reply,
+        "elapsed_s": round(result.elapsed_s, 1),
+        "posted_channels": result.posted_channels,
     }
 
 
@@ -402,7 +489,10 @@ def events_recent(
     """Most-recent events, optionally filtered by ``kind`` + time window."""
     cfg = load_config()
     return _eventdb.recent(
-        cfg.events_file, kind=kind, since_minutes=since_minutes, limit=limit,
+        cfg.events_file,
+        kind=kind,
+        since_minutes=since_minutes,
+        limit=limit,
     )
 
 
