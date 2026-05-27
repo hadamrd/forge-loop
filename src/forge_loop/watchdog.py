@@ -27,11 +27,16 @@ from typing import Any
 class WatchdogConfig:
     poll_interval_s: float = 15.0
     # Content-grade work needs room to breathe. A worker running a real
-    # integration test or thinking-through a multi-file feature can sit
-    # quietly for several minutes between log appends. 10/15min strikes
-    # the balance: catches genuine hangs without killing legitimate work.
-    stuck_after_s: float = 600.0   # 10 min of no progress → warn
-    kill_after_s: float = 900.0    # 15 min of no progress → SIGTERM + SIGKILL
+    # integration test, or thinking-through a multi-file feature with
+    # Opus extended thinking, can sit quietly for 10+ minutes between
+    # log appends — especially when the SDK is mid-tool-call against
+    # a slow MCP server (Lumen index rebuild, Playwright bootstrap).
+    # The previous 10/15min thresholds killed legitimate Opus work in
+    # the wild; 15/30min gives real headroom while still catching
+    # wedged-forever cases. Wall-clock fail-safe is `worker_timeout_s`
+    # (default 2h) in Config — that's the upper bound.
+    stuck_after_s: float = 900.0   # 15 min of no progress → warn
+    kill_after_s: float = 1800.0   # 30 min of no progress → SIGTERM + SIGKILL
 
 
 def _last_mtime(path: Path) -> float:
