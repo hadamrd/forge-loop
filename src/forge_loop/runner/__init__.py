@@ -25,21 +25,33 @@ from forge_loop.deploy import redeploy
 from forge_loop.gh import fetch_issue, top_issues
 from forge_loop.maintenance import run_maintenance
 from forge_loop.po import expand_thin_specs as _po_expand
-from forge_loop.state import append_event, consolidate_sprint, write_state
-from forge_loop.worker import WorkerOutcome, run_worker
 
 # Helpers extracted into _helpers.py to keep this orchestrator file
 # manageable. Re-exported under their old underscored names for backward
 # compat with any test or external caller that imported them from here.
 from forge_loop.runner._helpers import (
     consecutive_deploy_fails as _consecutive_deploy_fails_impl,
+)
+from forge_loop.runner._helpers import (
     consume_force_set as _consume_force_set_impl,
+)
+from forge_loop.runner._helpers import (
     error_signature as _error_signature,
+)
+from forge_loop.runner._helpers import (
     force_retry_file as _force_retry_file_impl,
+)
+from forge_loop.runner._helpers import (
     installed_version as _installed_version,
+)
+from forge_loop.runner._helpers import (
     reap_orphan_worktrees as _reap_orphan_worktrees_impl,
+)
+from forge_loop.runner._helpers import (
     reap_worktree as _reap_worktree,
 )
+from forge_loop.state import append_event, consolidate_sprint, write_state
+from forge_loop.worker import WorkerOutcome, run_worker
 
 _RUN = True
 
@@ -321,24 +333,57 @@ def _tick(cfg: Config, tick: int) -> None:
     outcomes: list[WorkerOutcome] = []
     dispatch = list(zip(issues, workers_meta, strict=True))
 
-    with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
-        futures = [
-            ex.submit(
-                run_worker, i, cfg.repo, cfg.logs_dir, cfg.worker_timeout_s,
-                risk_gated=meta["risk_gated"],
-                past_attempts=meta["past_attempts"],
-                emit=_bus_emit,
-                lumen_top_k=cfg.lumen.top_k,
-                lumen_test_pattern=cfg.lumen_test_pattern,
-                coauthor=cfg.coauthor,
-                tick=tick,
-                model=cfg.worker.model,
-                thinking=cfg.worker.thinking,
+    # Issue #49 — pipeline-driven dispatch path. When `.forge/pipeline.yaml`
+    # is present AND the operator opted in via LOOP_PIPELINE_DRIVEN=1, route
+    # the per-issue worker/critic chain through pipeline.executor.run()
+    # instead of the legacy hardcoded ThreadPoolExecutor → critic loop
+    # below. The legacy path remains the default. The pipeline path emits
+    # its own per-step events and applies the critic via the chain itself,
+    # so the post-worker critic block further down is skipped when this
+    # path takes over.
+    from forge_loop.runner._pipeline_driver import (
+        dispatch_via_pipeline as _pipeline_dispatch,
+    )
+    from forge_loop.runner._pipeline_driver import (
+        pipeline_driven_enabled as _pipeline_enabled,
+    )
+    _used_pipeline = False
+    if _pipeline_enabled(cfg):
+        _used_pipeline = True
+        append_event(cfg.events_file, "pipeline_dispatch_start", tick=tick,
+                     issues=[i["number"] for i in issues])
+        try:
+            outcomes = _pipeline_dispatch(
+                cfg, issues, workers_meta, tick,
+                master_log_path=master_log_path,
+                bus_emit=_bus_emit,
             )
-            for i, meta in dispatch
-        ]
-        for fut in futures:
-            outcomes.append(fut.result())
+        except Exception as ex_:  # noqa: BLE001 — must not kill the tick
+            append_event(cfg.events_file, "pipeline_dispatch_failed",
+                         tick=tick, err=str(ex_)[:300])
+            # Fall back to the legacy chain so a broken pipeline.yaml
+            # does not strand the loop.
+            _used_pipeline = False
+
+    if not _used_pipeline:
+        with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
+            futures = [
+                ex.submit(
+                    run_worker, i, cfg.repo, cfg.logs_dir, cfg.worker_timeout_s,
+                    risk_gated=meta["risk_gated"],
+                    past_attempts=meta["past_attempts"],
+                    emit=_bus_emit,
+                    lumen_top_k=cfg.lumen.top_k,
+                    lumen_test_pattern=cfg.lumen_test_pattern,
+                    coauthor=cfg.coauthor,
+                    tick=tick,
+                    model=cfg.worker.model,
+                    thinking=cfg.worker.thinking,
+                )
+                for i, meta in dispatch
+            ]
+            for fut in futures:
+                outcomes.append(fut.result())
 
     for o in outcomes:
         _mlog.info(master_log_path,
@@ -366,7 +411,8 @@ def _tick(cfg: Config, tick: int) -> None:
                              issue=o.issue, err=str(ex_)[:200])
 
     # Critic agent: review PRs the workers opened, before auto-merge fires.
-    if cfg.critic.enabled:
+    # In pipeline-driven mode the critic ran as a chain step already.
+    if cfg.critic.enabled and not _used_pipeline:
         for o in outcomes:
             if o.status in {"open", "merged"} and o.pr_url:
                 try:
