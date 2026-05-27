@@ -757,6 +757,87 @@ def _cmd_config_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_roles_list(args: argparse.Namespace) -> int:
+    """`forge-loop roles list` — print loaded roles + triggers + next firing.
+
+    Reads ``.forge/roles/*.yaml`` under ``--project-dir`` (default cwd) and
+    merges with the built-in defaults. Malformed YAMLs are reported as
+    warnings (with line/col) but do not abort the listing.
+    """
+    from pathlib import Path
+
+    from forge_loop.roles import discover_roles
+
+    project_dir = Path(args.project_dir) if getattr(args, "project_dir", None) else Path.cwd()
+    result = discover_roles(project_dir)
+
+    if getattr(args, "json", False):
+        payload = {
+            "roles": [
+                {
+                    "name": r.name,
+                    "model": r.model,
+                    "timeout_s": r.timeout_s,
+                    "budget_usd": r.budget_usd,
+                    "triggers": [
+                        {"on": t.on, "filter": t.filter} for t in r.triggers
+                    ],
+                    "actions": [
+                        {"mcp_tools": list(a.mcp_tools), "shell": a.shell}
+                        for a in r.actions
+                    ],
+                    "output_schema": r.output_schema,
+                    "source": r.source_path,
+                    "next_firing": _next_firing_label(r),
+                }
+                for r in result.roles
+            ],
+            "errors": [
+                {"source": e.source, "message": e.message} for e in result.errors
+            ],
+        }
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 0
+
+    if not result.roles:
+        sys.stdout.write("(no roles discovered)\n")
+    for r in result.roles:
+        triggers = (
+            ", ".join(
+                t.on + (f"[{','.join(f'{k}={v}' for k, v in t.filter.items())}]" if t.filter else "")
+                for t in r.triggers
+            )
+            or "(none)"
+        )
+        origin = "builtin"
+        if r.source_path and ".forge/roles" in r.source_path:
+            origin = "project"
+        sys.stdout.write(
+            f"- {r.name} ({origin}) model={r.model} timeout={r.timeout_s}s "
+            f"budget={'∞' if r.budget_usd is None else f'${r.budget_usd:.2f}'}\n"
+            f"    triggers: {triggers}\n"
+            f"    next: {_next_firing_label(r)}\n"
+        )
+    for err in result.errors:
+        sys.stderr.write(f"warning: {err}\n")
+    return 0
+
+
+def _next_firing_label(role) -> str:  # type: ignore[no-untyped-def]
+    """Human-readable next-firing hint for the ``roles list`` view.
+
+    The loop is event-driven (no cron), so "next firing" is really
+    "what triggers this role." We render it as the soonest possible
+    event description.
+    """
+    if not role.triggers:
+        return "manual only"
+    on_set = sorted({t.on for t in role.triggers})
+    if "tick" in on_set:
+        return "every loop tick"
+    return "on " + ", ".join(on_set)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="forge-loop",
@@ -964,6 +1045,23 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true", help="Emit JSON instead of human-readable",
     )
     p_replay_diff.set_defaults(func=_cmd_replay_diff)
+
+    p_roles = sub.add_parser(
+        "roles",
+        help="Pluggable roles (.forge/roles/*.yaml) — list, inspect, override built-ins",
+    )
+    roles_sub = p_roles.add_subparsers(dest="roles_cmd", required=True)
+    p_roles_list = roles_sub.add_parser(
+        "list",
+        help="List loaded roles, their triggers, and next firing",
+    )
+    p_roles_list.add_argument(
+        "--project-dir",
+        default=None,
+        help="Project root (default: cwd). Loads .forge/roles/*.yaml from here.",
+    )
+    p_roles_list.add_argument("--json", action="store_true")
+    p_roles_list.set_defaults(func=_cmd_roles_list)
 
     args = parser.parse_args(argv)
     # `replay diff` lands here with replay_cmd="diff"; rewire the func.

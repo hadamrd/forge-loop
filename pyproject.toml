@@ -62,6 +62,9 @@ packages = ["src/forge_loop"]
 "src/forge_loop/briefs/worker.md.tmpl" = "forge_loop/briefs/worker.md.tmpl"
 "src/forge_loop/briefs/po.md.tmpl" = "forge_loop/briefs/po.md.tmpl"
 "src/forge_loop/briefs/critic.md.tmpl" = "forge_loop/briefs/critic.md.tmpl"
+"src/forge_loop/roles/builtin/po.yaml" = "forge_loop/roles/builtin/po.yaml"
+"src/forge_loop/roles/builtin/worker.yaml" = "forge_loop/roles/builtin/worker.yaml"
+"src/forge_loop/roles/builtin/critic.yaml" = "forge_loop/roles/builtin/critic.yaml"
 
 [tool.ruff]
 line-length = 100

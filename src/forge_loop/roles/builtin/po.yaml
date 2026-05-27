@@ -1,0 +1,17 @@
+# Default Product-Owner role (issue #17).
+# Operators override by dropping `.forge/roles/po.yaml` with the same name.
+name: po
+brief_template: forge_loop/briefs/po.md.tmpl
+model: claude-opus-4-7
+timeout_s: 900
+budget_usd: 3.0
+triggers:
+  - "on": tick
+    filter: {}
+actions:
+  - mcp_tools:
+      - gh_issue_read
+      - gh_issue_update
+      - gh_label
+    shell: false
+output_schema: po
