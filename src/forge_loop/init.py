@@ -18,8 +18,12 @@ repo:
 
 deploy:
   # `task` target invoked when a tick lands any merged PR.
-  # Use the deploy entry-point that's canonical for your project.
-  task: deploy:k3s:trunk
+  # LEAVE EMPTY (the default) to skip redeploy entirely — most projects
+  # don't have a `task`-based deploy. Set this only if you actually have a
+  # Taskfile.yml target like `deploy:staging` you want the loop to run
+  # after every merged PR.
+  # Override at runtime with LOOP_DEPLOY_TASK env.
+  task: ""
 
 scheduling:
   parallel: 3
