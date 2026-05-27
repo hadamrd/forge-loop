@@ -1,31 +1,43 @@
 """CLI entry point — `forge-loop <subcommand>` or `python -m forge_loop <subcommand>`.
 
-Subcommands:
-  run       Run the loop in the foreground (the entry the Taskfile detaches via nohup).
-  status    Print the current state file.
-  events    Tail the events JSONL.
-  pause     Touch the pause file.
-  resume    Remove the pause file.
-  stop      Touch the stop file (graceful).
+Typer-based since #55 (replaced the hand-rolled argparse parser). The
+``main(argv)`` signature is preserved so existing tests that pass an
+explicit argv list and assert on the returned exit code keep working;
+both ``--help`` and Typer/Click usage errors still raise ``SystemExit``
+the same way argparse did.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import subprocess
 import sys
 from datetime import UTC
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+import typer
+from click.exceptions import Exit as ClickExit
+from click.exceptions import UsageError
 
 from forge_loop.config import load
 from forge_loop.runner import run as run_loop
 from forge_loop.state import tail_events
 
+# ---------------------------------------------------------------------------
+# Implementation handlers
+#
+# These take a ``SimpleNamespace`` of resolved options/args (same shape as
+# the old ``argparse.Namespace``) and return an int exit code. They are
+# kept as plain functions — separate from the Typer wiring — so they
+# stay easy to unit-test by hand and so the diff for the argparse →
+# Typer migration is mechanical.
+# ---------------------------------------------------------------------------
 
-def _cmd_run(args: argparse.Namespace) -> int:
+
+def _cmd_run(args: SimpleNamespace) -> int:
     import os as _os
 
     # Propagate --queue to the runner via env var so the wiring stays
@@ -44,7 +56,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return run_loop(load())
 
 
-def _cmd_cluster_status(args: argparse.Namespace) -> int:
+def _cmd_cluster_status(args: SimpleNamespace) -> int:
     """Deprecated: multi-host cluster mode was removed in #39.
 
     The subcommand is kept as a stub so old scripts get a clear, actionable
@@ -60,7 +72,7 @@ def _cmd_cluster_status(args: argparse.Namespace) -> int:
     return 2
 
 
-def _cmd_doctor(_args: argparse.Namespace) -> int:
+def _cmd_doctor(_args: SimpleNamespace) -> int:
     """One-shot health check.
 
     Aggregates the checks an operator typically runs by hand after a
@@ -198,7 +210,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     return 1 if red else 0
 
 
-def _cmd_status(_args: argparse.Namespace) -> int:
+def _cmd_status(_args: SimpleNamespace) -> int:
     """Operator-facing health surface — concise + scannable."""
     from datetime import datetime
 
@@ -313,7 +325,7 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_events(args: argparse.Namespace) -> int:
+def _cmd_events(args: SimpleNamespace) -> int:
     """Tail recent events. Rich-formatted by default; --raw skips colour
     for piping into jq / grep / files.
     """
@@ -380,14 +392,14 @@ def _cmd_events(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_pause(_args: argparse.Namespace) -> int:
+def _cmd_pause(_args: SimpleNamespace) -> int:
     cfg = load()
     cfg.pause_file.touch()
     print(f"[pause] touched {cfg.pause_file}")
     return 0
 
 
-def _cmd_resume(_args: argparse.Namespace) -> int:
+def _cmd_resume(_args: SimpleNamespace) -> int:
     cfg = load()
     if cfg.pause_file.exists():
         cfg.pause_file.unlink()
@@ -395,14 +407,14 @@ def _cmd_resume(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_stop(_args: argparse.Namespace) -> int:
+def _cmd_stop(_args: SimpleNamespace) -> int:
     cfg = load()
     cfg.stop_file.touch()
     print(f"[stop] touched {cfg.stop_file}")
     return 0
 
 
-def _cmd_dashboard(args: argparse.Namespace) -> int:
+def _cmd_dashboard(args: SimpleNamespace) -> int:
     """Start the operator dashboard (FastAPI + HTMX).
 
     Defaults to ``127.0.0.1`` to avoid accidentally exposing an unauthed
@@ -432,13 +444,13 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_mcp_serve(_args: argparse.Namespace) -> int:
+def _cmd_mcp_serve(_args: SimpleNamespace) -> int:
     from forge_loop.mcp_server import serve_stdio
 
     return serve_stdio()
 
 
-def _cmd_init(args: argparse.Namespace) -> int:
+def _cmd_init(args: SimpleNamespace) -> int:
     from pathlib import Path
 
     from forge_loop import init as _init_mod
@@ -472,7 +484,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_record_session(args: argparse.Namespace) -> int:
+def _cmd_record_session(args: SimpleNamespace) -> int:
     """Record a real Claude Agent SDK session to a JSONL fixture (test-only).
 
     Operator-driven counterpart to the test-time SessionReplayer: spawns
@@ -520,7 +532,7 @@ def _cmd_record_session(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_retry(args: argparse.Namespace) -> int:
+def _cmd_retry(args: SimpleNamespace) -> int:
     """Schedule (or force) a re-dispatch for a single issue.
 
     By default this inspects the fingerprint guards and reports what would
@@ -584,7 +596,7 @@ def _cmd_retry(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_brief(args: argparse.Namespace) -> int:
+def _cmd_brief(args: SimpleNamespace) -> int:
     """Render a brief template to stdout.
 
     Lets operators inspect exactly what the loop tells Claude before a
@@ -648,7 +660,7 @@ def _cmd_brief(args: argparse.Namespace) -> int:
             pr_url=args.pr or "<pr-url>",
             issue_number=issue["number"],
         )
-    else:  # argparse guards this branch
+    else:  # Typer constrains this via the choice list
         sys.stderr.write(f"[brief] unknown kind: {kind}\n")
         return 2
 
@@ -658,7 +670,7 @@ def _cmd_brief(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_replay(args: argparse.Namespace) -> int:
+def _cmd_replay(args: SimpleNamespace) -> int:
     """`forge-loop replay --tick N --role worker --brief brief.md`
 
     Re-runs every worker that ran in tick N using the brief loaded from
@@ -744,7 +756,7 @@ def _cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_replay_diff(args: argparse.Namespace) -> int:
+def _cmd_replay_diff(args: SimpleNamespace) -> int:
     """`forge-loop replay diff --tick N --replay-tick Nr` — side-by-side report."""
     from forge_loop import replay as _replay
 
@@ -779,7 +791,7 @@ def _default_repos_dir() -> Path:
     return Path(env).expanduser() if env else Path.cwd() / ".forge" / "repos"
 
 
-def _cmd_repos_list(args: argparse.Namespace) -> int:
+def _cmd_repos_list(args: SimpleNamespace) -> int:
     """`forge-loop repos list` — print loaded repos + last tick activity."""
     from forge_loop.multirepo import RepoLoadError, is_disabled, load_repos, validate_checkout
 
@@ -870,7 +882,7 @@ def _cmd_repos_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_repos_disable(args: argparse.Namespace) -> int:
+def _cmd_repos_disable(args: SimpleNamespace) -> int:
     from forge_loop.multirepo import (
         RepoLoadError,
         disable_repo,
@@ -892,7 +904,7 @@ def _cmd_repos_disable(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_repos_enable(args: argparse.Namespace) -> int:
+def _cmd_repos_enable(args: SimpleNamespace) -> int:
     from forge_loop.multirepo import (
         RepoLoadError,
         enable_repo,
@@ -917,7 +929,7 @@ def _cmd_repos_enable(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_pipeline_show(args: argparse.Namespace) -> int:
+def _cmd_pipeline_show(args: SimpleNamespace) -> int:
     """`forge-loop pipeline show` — print the resolved DAG as ASCII art."""
     from forge_loop.pipeline import (
         PipelineLoadError,
@@ -968,7 +980,7 @@ def _cmd_pipeline_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_config(args: argparse.Namespace) -> int:
+def _cmd_config(args: SimpleNamespace) -> int:
     cfg = load()
     out = {
         "repo": str(cfg.repo),
@@ -990,7 +1002,7 @@ def _cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_config_models(args: argparse.Namespace) -> int:
+def _cmd_config_models(args: SimpleNamespace) -> int:
     """`forge-loop config models` — print resolved per-role model + thinking.
 
     Operators set ``LOOP_WORKER_MODEL`` (etc.) and then want a one-shot
@@ -1018,7 +1030,7 @@ def _cmd_config_models(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_roles_list(args: argparse.Namespace) -> int:
+def _cmd_roles_list(args: SimpleNamespace) -> int:
     """`forge-loop roles list` — print loaded roles + triggers + next firing.
 
     Reads ``.forge/roles/*.yaml`` under ``--project-dir`` (default cwd) and
@@ -1099,283 +1111,564 @@ def _next_firing_label(role) -> str:  # type: ignore[no-untyped-def]
     return "on " + ", ".join(on_set)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="forge-loop",
-        description="Titan sprint-loop runner",
-    )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+# ---------------------------------------------------------------------------
+# Typer app — thin shim over the ``_cmd_*`` handlers.
+# ---------------------------------------------------------------------------
 
-    p_run = sub.add_parser("run", help="Run the loop in the foreground")
-    p_run.add_argument(
+app = typer.Typer(
+    name="forge-loop",
+    help="Titan sprint-loop runner",
+    no_args_is_help=True,
+    add_completion=False,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+
+
+def _exit(rc: int) -> None:
+    """Raise ``typer.Exit(rc)`` so both CliRunner and stand-alone CLI
+    invocations honour the handler's return code (Click only respects
+    ``sys.exit``-style exits in ``standalone_mode=True``; a bare
+    ``return`` is silently dropped).
+    """
+    raise typer.Exit(int(rc))
+
+
+@app.command("run", help="Run the loop in the foreground")
+def _typer_run(
+    orchestrator: str = typer.Option(
+        "sync",
         "--orchestrator",
-        choices=("sync", "async"),
-        default="sync",
-        help="Pipeline orchestrator. 'sync' (default, stable) ticks PO→workers→critics "
-        "sequentially. 'async' runs three independent asyncio queues so a slow PO "
-        "or critic does not block other tickets (see runner_async.py).",
-    )
-    p_run.add_argument(
+        help=(
+            "Pipeline orchestrator. 'sync' (default, stable) ticks "
+            "PO→workers→critics sequentially. 'async' runs three "
+            "independent asyncio queues so a slow PO or critic does not "
+            "block other tickets."
+        ),
+    ),
+    queue: str | None = typer.Option(
+        None,
         "--queue",
-        default=None,
-        help="Queue backend URL. Default: in-memory (single host). "
-        "Pass sqlite:///path/to/queue.db for the durable embedded backend.",
-    )
-    p_run.set_defaults(func=_cmd_run)
-    sub.add_parser("status", help="Print current state file").set_defaults(func=_cmd_status)
-    sub.add_parser(
-        "doctor",
-        help="One-shot health check: tmux session, code freshness, orphan worktrees, halt markers",
-    ).set_defaults(func=_cmd_doctor)
+        help=(
+            "Queue backend URL. Default: in-memory (single host). "
+            "Pass sqlite:///path/to/queue.db for the durable embedded backend."
+        ),
+    ),
+) -> int:
+    if orchestrator not in ("sync", "async"):
+        raise UsageError("--orchestrator must be 'sync' or 'async'")
+    _exit(_cmd_run(SimpleNamespace(orchestrator=orchestrator, queue=queue)))
 
-    p_cluster = sub.add_parser(
-        "cluster",
-        help="Cluster-mode commands (multi-host runner coordination)",
-    )
-    cluster_sub = p_cluster.add_subparsers(dest="cluster_cmd", required=True)
-    p_cluster_status = cluster_sub.add_parser(
-        "status",
-        help="List live runners and their current load",
-    )
-    p_cluster_status.add_argument(
-        "--queue",
-        required=True,
-        help="Redis URL (must match the one runners booted with)",
-    )
-    p_cluster_status.add_argument("--json", action="store_true")
-    p_cluster_status.set_defaults(func=_cmd_cluster_status)
 
-    p_events = sub.add_parser("events", help="Tail the events log")
-    p_events.add_argument("-n", type=int, default=30, help="lines to show (default 30)")
-    p_events.add_argument(
+@app.command("status", help="Print current state file")
+def _typer_status() -> int:
+    _exit(_cmd_status(SimpleNamespace()))
+
+
+@app.command(
+    "doctor",
+    help=(
+        "One-shot health check: tmux session, code freshness, orphan "
+        "worktrees, halt markers"
+    ),
+)
+def _typer_doctor() -> int:
+    _exit(_cmd_doctor(SimpleNamespace()))
+
+
+# --- cluster ----------------------------------------------------------------
+
+cluster_app = typer.Typer(
+    name="cluster",
+    help="Cluster-mode commands (multi-host runner coordination)",
+    no_args_is_help=True,
+)
+app.add_typer(cluster_app, name="cluster")
+
+
+@cluster_app.command("status", help="List live runners and their current load")
+def _typer_cluster_status(
+    queue: str = typer.Option(
+        ..., "--queue", help="Redis URL (must match the one runners booted with)"
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> int:
+    _exit(_cmd_cluster_status(SimpleNamespace(queue=queue, json=json_out)))
+
+
+# --- events -----------------------------------------------------------------
+
+
+@app.command("events", help="Tail the events log")
+def _typer_events(
+    n: int = typer.Option(30, "-n", "--n", help="lines to show (default 30)"),
+    raw: bool = typer.Option(
+        False,
         "--raw",
-        action="store_true",
         help="Emit raw JSONL (skip Rich colouring) — use when piping into jq/grep/files.",
-    )
-    p_events.set_defaults(func=_cmd_events)
+    ),
+) -> int:
+    _exit(_cmd_events(SimpleNamespace(n=n, raw=raw)))
 
-    sub.add_parser("pause", help="Touch pause file").set_defaults(func=_cmd_pause)
-    sub.add_parser("resume", help="Remove pause file").set_defaults(func=_cmd_resume)
-    sub.add_parser("stop", help="Touch stop file").set_defaults(func=_cmd_stop)
-    p_config = sub.add_parser("config", help="Print resolved config")
-    p_config.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit JSON (default also emits JSON for back-compat)",
-    )
-    p_config.set_defaults(func=_cmd_config)
-    config_sub = p_config.add_subparsers(dest="config_cmd")
-    p_config_models = config_sub.add_parser(
-        "models",
-        help="Print resolved per-role model + thinking-budget (issue #34)",
-    )
-    p_config_models.add_argument("--json", action="store_true")
-    p_config_models.set_defaults(func=_cmd_config_models)
 
-    p_pipe = sub.add_parser(
-        "pipeline",
-        help="Inspect the role-chain pipeline defined in .forge/pipeline.yaml",
-    )
-    pipe_sub = p_pipe.add_subparsers(dest="pipeline_cmd", required=True)
-    p_pipe_show = pipe_sub.add_parser("show", help="Print the resolved DAG as ASCII art")
-    p_pipe_show.add_argument(
-        "--config",
-        default=None,
-        help="Path to pipeline.yaml (default: ./.forge/pipeline.yaml)",
-    )
-    p_pipe_show.add_argument("--json", action="store_true", help="Emit JSON instead of ASCII art")
-    p_pipe_show.set_defaults(func=_cmd_pipeline_show)
+# --- simple toggle commands -------------------------------------------------
 
-    p_repos = sub.add_parser(
-        "repos",
-        help="Multirepo management: list/enable/disable repos under .forge/repos/",
-    )
-    repos_sub = p_repos.add_subparsers(dest="repos_cmd", required=True)
-    p_repos_list = repos_sub.add_parser("list", help="List loaded repos + last activity")
-    p_repos_list.add_argument(
+
+@app.command("pause", help="Touch pause file")
+def _typer_pause() -> int:
+    _exit(_cmd_pause(SimpleNamespace()))
+
+
+@app.command("resume", help="Remove pause file")
+def _typer_resume() -> int:
+    _exit(_cmd_resume(SimpleNamespace()))
+
+
+@app.command("stop", help="Touch stop file")
+def _typer_stop() -> int:
+    _exit(_cmd_stop(SimpleNamespace()))
+
+
+# --- config (default action + `models` subcommand) --------------------------
+
+config_app = typer.Typer(
+    name="config",
+    help="Print resolved config",
+    invoke_without_command=True,
+)
+app.add_typer(config_app, name="config")
+
+
+@config_app.callback(invoke_without_command=True)
+def _typer_config_root(
+    ctx: typer.Context,
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit JSON (default also emits JSON for back-compat)"
+    ),
+) -> int:
+    if ctx.invoked_subcommand is not None:
+        return 0
+    _exit(_cmd_config(SimpleNamespace(json=json_out)))
+
+
+@config_app.command(
+    "models", help="Print resolved per-role model + thinking-budget (issue #34)"
+)
+def _typer_config_models(
+    json_out: bool = typer.Option(False, "--json"),
+) -> int:
+    _exit(_cmd_config_models(SimpleNamespace(json=json_out)))
+
+
+# --- pipeline ---------------------------------------------------------------
+
+pipeline_app = typer.Typer(
+    name="pipeline",
+    help="Inspect the role-chain pipeline defined in .forge/pipeline.yaml",
+    no_args_is_help=True,
+)
+app.add_typer(pipeline_app, name="pipeline")
+
+
+@pipeline_app.command("show", help="Print the resolved DAG as ASCII art")
+def _typer_pipeline_show(
+    config: str | None = typer.Option(
+        None, "--config", help="Path to pipeline.yaml (default: ./.forge/pipeline.yaml)"
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit JSON instead of ASCII art"
+    ),
+) -> int:
+    _exit(_cmd_pipeline_show(SimpleNamespace(config=config, json=json_out)))
+
+
+# --- repos ------------------------------------------------------------------
+
+repos_app = typer.Typer(
+    name="repos",
+    help="Multirepo management: list/enable/disable repos under .forge/repos/",
+    no_args_is_help=True,
+)
+app.add_typer(repos_app, name="repos")
+
+
+@repos_app.command("list", help="List loaded repos + last activity")
+def _typer_repos_list(
+    repos_dir: str | None = typer.Option(
+        None,
         "--repos-dir",
-        default=None,
         help="Override the .forge/repos directory (default: $LOOP_REPOS_DIR or ./.forge/repos)",
-    )
-    p_repos_list.add_argument("--json", action="store_true")
-    p_repos_list.set_defaults(func=_cmd_repos_list)
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> int:
+    _exit(_cmd_repos_list(SimpleNamespace(repos_dir=repos_dir, json=json_out)))
 
-    p_repos_dis = repos_sub.add_parser("disable", help="Skip a repo until re-enabled")
-    p_repos_dis.add_argument("name", help="Repo name (matches the `name:` field)")
-    p_repos_dis.add_argument("--reason", default=None)
-    p_repos_dis.add_argument("--repos-dir", default=None)
-    p_repos_dis.set_defaults(func=_cmd_repos_disable)
 
-    p_repos_en = repos_sub.add_parser("enable", help="Resume processing a disabled repo")
-    p_repos_en.add_argument("name")
-    p_repos_en.add_argument("--repos-dir", default=None)
-    p_repos_en.set_defaults(func=_cmd_repos_enable)
+@repos_app.command("disable", help="Skip a repo until re-enabled")
+def _typer_repos_disable(
+    name: str = typer.Argument(..., help="Repo name (matches the `name:` field)"),
+    reason: str | None = typer.Option(None, "--reason"),
+    repos_dir: str | None = typer.Option(None, "--repos-dir"),
+) -> int:
+    _exit(_cmd_repos_disable(
+        SimpleNamespace(name=name, reason=reason, repos_dir=repos_dir)
+    ))
 
-    p_retry = sub.add_parser(
-        "retry",
-        help="Re-dispatch a worker for an issue (use --force to bypass guards)",
-    )
-    p_retry.add_argument("--issue", type=int, required=True, help="GitHub issue number")
-    p_retry.add_argument(
-        "--force", action="store_true", help="Bypass in-flight and cooldown fingerprint guards"
-    )
-    p_retry.set_defaults(func=_cmd_retry)
 
-    p_dash = sub.add_parser(
-        "dashboard",
-        help="Run the operator dashboard (HTMX-driven FastAPI app)",
-    )
-    p_dash.add_argument(
+@repos_app.command("enable", help="Resume processing a disabled repo")
+def _typer_repos_enable(
+    name: str = typer.Argument(...),
+    repos_dir: str | None = typer.Option(None, "--repos-dir"),
+) -> int:
+    _exit(_cmd_repos_enable(SimpleNamespace(name=name, repos_dir=repos_dir)))
+
+
+# --- retry ------------------------------------------------------------------
+
+
+@app.command(
+    "retry",
+    help="Re-dispatch a worker for an issue (use --force to bypass guards)",
+)
+def _typer_retry(
+    issue: int = typer.Option(..., "--issue", help="GitHub issue number"),
+    force: bool = typer.Option(
+        False, "--force", help="Bypass in-flight and cooldown fingerprint guards"
+    ),
+) -> int:
+    _exit(_cmd_retry(SimpleNamespace(issue=issue, force=force)))
+
+
+# --- dashboard --------------------------------------------------------------
+
+
+@app.command(
+    "dashboard",
+    help="Run the operator dashboard (HTMX-driven FastAPI app)",
+)
+def _typer_dashboard(
+    host: str | None = typer.Option(
+        None,
         "--host",
-        default=None,
         help="Bind host. Default 127.0.0.1; refuses 0.0.0.0 without LOOP_DASHBOARD_TOKEN.",
-    )
-    p_dash.add_argument(
+    ),
+    port: int | None = typer.Option(
+        None,
         "--port",
-        type=int,
-        default=None,
         help="Bind port (default 8765 or $LOOP_DASHBOARD_PORT)",
-    )
-    p_dash.add_argument(
+    ),
+    roles_dir: str | None = typer.Option(
+        None,
         "--roles-dir",
-        default=None,
         help="Directory holding role yaml files (default: <repo>/roles)",
-    )
-    p_dash.set_defaults(func=_cmd_dashboard)
+    ),
+) -> int:
+    _exit(_cmd_dashboard(
+        SimpleNamespace(host=host, port=port, roles_dir=roles_dir)
+    ))
 
-    p_mcp = sub.add_parser("mcp", help="MCP server (expose tools to MCP clients)")
-    mcp_sub = p_mcp.add_subparsers(dest="mcp_cmd", required=True)
-    mcp_sub.add_parser("serve", help="Run MCP server on stdio").set_defaults(func=_cmd_mcp_serve)
 
-    p_init = sub.add_parser("init", help="Scaffold forge-loop config in a project")
-    p_init.add_argument("--target", help="Target directory (default: cwd)")
-    p_init.add_argument("--repo", help="GitHub repo owner/name (auto-detected from git remote)")
-    p_init.add_argument("--force", action="store_true", help="Overwrite existing files")
-    p_init.add_argument(
-        "--create-labels", action="store_true", help="Also create the loop's GH labels via gh CLI"
-    )
-    p_init.set_defaults(func=_cmd_init)
+# --- mcp --------------------------------------------------------------------
 
-    p_rec = sub.add_parser(
-        "record-session",
-        help="Record a real Claude Agent SDK session to a JSONL fixture (test-only)",
-    )
-    rec_src = p_rec.add_mutually_exclusive_group(required=True)
-    rec_src.add_argument("--issue", type=int, help="GitHub issue number to fetch via `gh`")
-    rec_src.add_argument("--issue-file", help="Path to a local JSON file with the issue payload")
-    p_rec.add_argument("--out", required=True, help="Output fixture path (JSONL)")
-    p_rec.add_argument("--worktree", help="Worktree directory (default: cwd)")
-    p_rec.add_argument(
-        "--timeout", type=int, default=900, help="Subprocess timeout in seconds (default 900)"
-    )
-    p_rec.set_defaults(func=_cmd_record_session)
+mcp_app = typer.Typer(
+    name="mcp",
+    help="MCP server (expose tools to MCP clients)",
+    no_args_is_help=True,
+)
+app.add_typer(mcp_app, name="mcp")
 
-    p_brief = sub.add_parser(
-        "brief",
-        help="Render a brief template (worker/po/critic) to stdout",
-    )
-    p_brief.add_argument(
-        "--kind", required=True, choices=("worker", "po", "critic"), help="Which brief to render"
-    )
-    p_brief.add_argument(
-        "--issue", type=int, default=None, help="GitHub issue number (fetched via `gh issue view`)"
-    )
-    p_brief.add_argument(
+
+@mcp_app.command("serve", help="Run MCP server on stdio")
+def _typer_mcp_serve() -> int:
+    _exit(_cmd_mcp_serve(SimpleNamespace()))
+
+
+# --- init -------------------------------------------------------------------
+
+
+@app.command("init", help="Scaffold forge-loop config in a project")
+def _typer_init(
+    target: str | None = typer.Option(
+        None, "--target", help="Target directory (default: cwd)"
+    ),
+    repo: str | None = typer.Option(
+        None, "--repo", help="GitHub repo owner/name (auto-detected from git remote)"
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Overwrite existing files"
+    ),
+    create_labels: bool = typer.Option(
+        False,
+        "--create-labels",
+        help="Also create the loop's GH labels via gh CLI",
+    ),
+) -> int:
+    _exit(_cmd_init(
+        SimpleNamespace(
+            target=target,
+            repo=repo,
+            force=force,
+            create_labels=create_labels,
+        )
+    ))
+
+
+# --- record-session ---------------------------------------------------------
+
+
+@app.command(
+    "record-session",
+    help="Record a real Claude Agent SDK session to a JSONL fixture (test-only)",
+)
+def _typer_record_session(
+    issue: int | None = typer.Option(
+        None, "--issue", help="GitHub issue number to fetch via `gh`"
+    ),
+    issue_file: str | None = typer.Option(
+        None,
         "--issue-file",
-        default=None,
+        help="Path to a local JSON file with the issue payload",
+    ),
+    out: str = typer.Option(..., "--out", help="Output fixture path (JSONL)"),
+    worktree: str | None = typer.Option(
+        None, "--worktree", help="Worktree directory (default: cwd)"
+    ),
+    timeout: int = typer.Option(
+        900, "--timeout", help="Subprocess timeout in seconds (default 900)"
+    ),
+) -> int:
+    # Mutually exclusive group: exactly one of --issue / --issue-file required.
+    if (issue is None) == (issue_file is None):
+        raise UsageError(
+            "record-session: specify exactly one of --issue or --issue-file"
+        )
+    _exit(_cmd_record_session(
+        SimpleNamespace(
+            issue=issue,
+            issue_file=issue_file,
+            out=out,
+            worktree=worktree,
+            timeout=timeout,
+        )
+    ))
+
+
+# --- brief ------------------------------------------------------------------
+
+
+@app.command(
+    "brief",
+    help="Render a brief template (worker/po/critic) to stdout",
+)
+def _typer_brief(
+    kind: str = typer.Option(
+        ..., "--kind", help="Which brief to render: worker | po | critic"
+    ),
+    issue: int | None = typer.Option(
+        None,
+        "--issue",
+        help="GitHub issue number (fetched via `gh issue view`)",
+    ),
+    issue_file: str | None = typer.Option(
+        None,
+        "--issue-file",
         help="Local JSON file with the issue payload (overrides --issue)",
-    )
-    p_brief.add_argument(
-        "--worktree", default=None, help="Worktree path to use in the worker brief (default: cwd)"
-    )
-    p_brief.add_argument("--pr", default=None, help="PR URL (critic brief only)")
-    p_brief.add_argument("--repo", default=None, help="GitHub repo owner/name (PO brief only)")
-    p_brief.add_argument(
+    ),
+    worktree: str | None = typer.Option(
+        None,
+        "--worktree",
+        help="Worktree path to use in the worker brief (default: cwd)",
+    ),
+    pr: str | None = typer.Option(
+        None, "--pr", help="PR URL (critic brief only)"
+    ),
+    repo: str | None = typer.Option(
+        None, "--repo", help="GitHub repo owner/name (PO brief only)"
+    ),
+    risk_gated: bool = typer.Option(
+        False,
         "--risk-gated",
-        action="store_true",
         help="Render the risk-gated variant of the worker brief",
-    )
-    p_brief.add_argument(
-        "--raw", action="store_true", help="Print the unrendered template (skip substitution)"
-    )
-    p_brief.set_defaults(func=_cmd_brief)
+    ),
+    raw: bool = typer.Option(
+        False, "--raw", help="Print the unrendered template (skip substitution)"
+    ),
+) -> int:
+    if kind not in ("worker", "po", "critic"):
+        raise UsageError("--kind must be one of: worker, po, critic")
+    _exit(_cmd_brief(
+        SimpleNamespace(
+            kind=kind,
+            issue=issue,
+            issue_file=issue_file,
+            worktree=worktree,
+            pr=pr,
+            repo=repo,
+            risk_gated=risk_gated,
+            raw=raw,
+        )
+    ))
 
-    p_replay = sub.add_parser(
-        "replay",
-        help="Time-travel: re-run a past tick with a modified brief (dry-run, no PRs)",
-    )
-    replay_sub = p_replay.add_subparsers(dest="replay_cmd")
-    # Default action (no subcommand): the actual replay run.
-    p_replay.add_argument("--tick", type=int, help="Original tick number to replay")
-    p_replay.add_argument(
+
+# --- replay (default action + `diff` subcommand) ----------------------------
+
+replay_app = typer.Typer(
+    name="replay",
+    help="Time-travel: re-run a past tick with a modified brief (dry-run, no PRs)",
+    invoke_without_command=True,
+)
+app.add_typer(replay_app, name="replay")
+
+
+@replay_app.callback(invoke_without_command=True)
+def _typer_replay_root(
+    ctx: typer.Context,
+    tick: int | None = typer.Option(
+        None, "--tick", help="Original tick number to replay"
+    ),
+    role: str = typer.Option(
+        "worker",
         "--role",
-        default="worker",
-        choices=("worker",),
         help="Which role to replay (only 'worker' supported per #24 scope)",
-    )
-    p_replay.add_argument("--brief", help="Path to the new brief file (.md / .tmpl)")
-    p_replay.add_argument(
+    ),
+    brief: str | None = typer.Option(
+        None, "--brief", help="Path to the new brief file (.md / .tmpl)"
+    ),
+    fixtures_dir: str | None = typer.Option(
+        None,
         "--fixtures-dir",
-        help="Directory of recorded SDK sessions for zero-cost replay "
-        "(expects tick-{N}-issue-{n}.jsonl or issue-{n}.jsonl)",
-    )
-    p_replay.add_argument(
+        help=(
+            "Directory of recorded SDK sessions for zero-cost replay "
+            "(expects tick-{N}-issue-{n}.jsonl or issue-{n}.jsonl)"
+        ),
+    ),
+    suffix: str = typer.Option(
+        "r",
         "--suffix",
-        default="r",
         help="Suffix appended to the original tick id for replay events (default: r)",
-    )
-    p_replay.add_argument(
+    ),
+    dry_plan: bool = typer.Option(
+        False,
         "--dry-plan",
-        action="store_true",
         help="Print the assembled invocations and exit without running anything",
-    )
-    p_replay.set_defaults(func=_cmd_replay)
+    ),
+) -> int:
+    # When a subcommand (currently only `diff`) is invoked, the callback
+    # just records the parent-level options and bails out — the subcommand
+    # handles the work.
+    if ctx.invoked_subcommand is not None:
+        return 0
+    if role not in ("worker",):
+        raise UsageError("--role must be 'worker'")
+    if tick is None or not brief:
+        raise UsageError("replay: --tick and --brief are required (or use `replay diff`)")
+    _exit(_cmd_replay(
+        SimpleNamespace(
+            tick=tick,
+            role=role,
+            brief=brief,
+            fixtures_dir=fixtures_dir,
+            suffix=suffix,
+            dry_plan=dry_plan,
+        )
+    ))
 
-    p_replay_diff = replay_sub.add_parser(
-        "diff",
-        help="Side-by-side per-issue report: original tick vs replay tick",
-    )
-    p_replay_diff.add_argument("--tick", type=int, required=True, help="Original tick")
-    p_replay_diff.add_argument(
-        "--replay-tick",
-        required=True,
-        help="Replay tick id (e.g. '42r')",
-    )
-    p_replay_diff.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit JSON instead of human-readable",
-    )
-    p_replay_diff.set_defaults(func=_cmd_replay_diff)
 
-    p_roles = sub.add_parser(
-        "roles",
-        help="Pluggable roles (.forge/roles/*.yaml) — list, inspect, override built-ins",
-    )
-    roles_sub = p_roles.add_subparsers(dest="roles_cmd", required=True)
-    p_roles_list = roles_sub.add_parser(
-        "list",
-        help="List loaded roles, their triggers, and next firing",
-    )
-    p_roles_list.add_argument(
+@replay_app.command(
+    "diff",
+    help="Side-by-side per-issue report: original tick vs replay tick",
+)
+def _typer_replay_diff(
+    tick: int = typer.Option(..., "--tick", help="Original tick"),
+    replay_tick: str = typer.Option(
+        ..., "--replay-tick", help="Replay tick id (e.g. '42r')"
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit JSON instead of human-readable"
+    ),
+) -> int:
+    _exit(_cmd_replay_diff(
+        SimpleNamespace(tick=tick, replay_tick=replay_tick, json=json_out)
+    ))
+
+
+# --- roles ------------------------------------------------------------------
+
+roles_app = typer.Typer(
+    name="roles",
+    help="Pluggable roles (.forge/roles/*.yaml) — list, inspect, override built-ins",
+    no_args_is_help=True,
+)
+app.add_typer(roles_app, name="roles")
+
+
+@roles_app.command(
+    "list", help="List loaded roles, their triggers, and next firing"
+)
+def _typer_roles_list(
+    project_dir: str | None = typer.Option(
+        None,
         "--project-dir",
-        default=None,
         help="Project root (default: cwd). Loads .forge/roles/*.yaml from here.",
-    )
-    p_roles_list.add_argument("--json", action="store_true")
-    p_roles_list.set_defaults(func=_cmd_roles_list)
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> int:
+    _exit(_cmd_roles_list(
+        SimpleNamespace(project_dir=project_dir, json=json_out)
+    ))
 
-    args = parser.parse_args(argv)
-    # `replay diff` lands here with replay_cmd="diff"; rewire the func.
-    if getattr(args, "cmd", None) == "replay" and getattr(args, "replay_cmd", None) == "diff":
-        args.func = _cmd_replay_diff
-    elif (
-        getattr(args, "cmd", None) == "replay"
-        and getattr(args, "replay_cmd", None) is None
-        and (args.tick is None or not args.brief)
-    ):
-        parser.error("replay: --tick and --brief are required (or use `replay diff`)")
-    return int(args.func(args))
+
+# ---------------------------------------------------------------------------
+# Entry point — kept as ``main(argv) -> int`` so existing callers (tests
+# that pass an explicit argv list and assert on the returned exit code,
+# the ``[project.scripts] forge-loop`` shim) keep working unchanged.
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the Typer app and return an int exit code.
+
+    Behaviour parity with the previous argparse implementation:
+
+    * Successful commands return their handler's int exit code.
+    * ``--help`` and Typer/Click usage errors raise ``SystemExit`` (just
+      like argparse did via ``parser.error`` / ``parser.exit``).
+    """
+    help_flags = {"-h", "--help"}
+    is_help_invocation = bool(argv) and any(a in help_flags for a in argv)
+    try:
+        result = app(
+            args=argv,
+            standalone_mode=False,
+            prog_name="forge-loop",
+        )
+    except ClickExit as exc:
+        # ``ClickExit`` is raised by both (a) ``--help`` (always
+        # exit_code=0) and (b) every command, via ``_exit(rc)``, to
+        # propagate the handler's return code through the Typer
+        # machinery (Click only honours an int return in
+        # ``standalone_mode=True``). For (a) we raise SystemExit to
+        # match the old argparse parser; for (b) we hand the rc back as
+        # an int so test code can assert ``rc == 2`` etc.
+        if is_help_invocation:
+            raise SystemExit(exc.exit_code) from None
+        return int(exc.exit_code)
+    except UsageError as exc:
+        exc.show()
+        raise SystemExit(exc.exit_code or 2) from None
+
+    if is_help_invocation:
+        # When ``--help`` is requested Click/Typer prints help and
+        # returns normally in ``standalone_mode=False``; mimic argparse
+        # by raising ``SystemExit(0)`` so callers (including the
+        # existing ``with pytest.raises(SystemExit): main([..., '--help'])``
+        # tests) see the same shape.
+        raise SystemExit(0)
+    if result is None:
+        return 0
+    try:
+        return int(result)
+    except (TypeError, ValueError):
+        return 0
 
 
 if __name__ == "__main__":

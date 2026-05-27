@@ -18,6 +18,11 @@ dependencies = [
   # CI-friendly when terminal is dumb. Pulled into the stable surface
   # because the CLI is the operator's primary interface.
   "rich >=13.0",
+  # Typer powers the `forge-loop` CLI (issue #55, replacing the
+  # hand-rolled argparse parser). Pulled into the stable surface
+  # because the CLI is the operator's primary interface; depends on
+  # click + rich which are already used elsewhere.
+  "typer >=0.12",
 ]
 
 [project.optional-dependencies]
