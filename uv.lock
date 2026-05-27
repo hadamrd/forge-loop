@@ -561,8 +561,16 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+dashboard = [
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "jinja2" },
+    { name = "python-multipart" },
+    { name = "uvicorn" },
+]
 dev = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "jinja2" },
     { name = "mypy" },
     { name = "opentelemetry-api" },
@@ -571,6 +579,7 @@ dev = [
     { name = "prometheus-client" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "python-multipart" },
     { name = "ruff" },
     { name = "types-pyyaml" },
     { name = "uvicorn" },
@@ -591,8 +600,12 @@ requires-dist = [
     { name = "anyio", specifier = ">=4.0" },
     { name = "claude-agent-sdk", specifier = ">=0.2" },
     { name = "duckdb", specifier = ">=1.0" },
+    { name = "fastapi", marker = "extra == 'dashboard'", specifier = ">=0.110" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.110" },
     { name = "fastapi", marker = "extra == 'experimental'", specifier = ">=0.110" },
+    { name = "httpx", marker = "extra == 'dashboard'", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
+    { name = "jinja2", marker = "extra == 'dashboard'", specifier = ">=3.1" },
     { name = "jinja2", marker = "extra == 'dev'", specifier = ">=3.1" },
     { name = "jinja2", marker = "extra == 'experimental'", specifier = ">=3.1" },
     { name = "mcp", specifier = ">=1.0" },
@@ -607,13 +620,16 @@ requires-dist = [
     { name = "prometheus-client", marker = "extra == 'experimental'", specifier = ">=0.20" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
+    { name = "python-multipart", marker = "extra == 'dashboard'", specifier = ">=0.0.9" },
+    { name = "python-multipart", marker = "extra == 'dev'", specifier = ">=0.0.9" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
+    { name = "uvicorn", marker = "extra == 'dashboard'", specifier = ">=0.30" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.30" },
     { name = "uvicorn", marker = "extra == 'experimental'", specifier = ">=0.30" },
 ]
-provides-extras = ["experimental", "dev"]
+provides-extras = ["experimental", "dashboard", "dev"]
 
 [[package]]
 name = "googleapis-common-protos"
