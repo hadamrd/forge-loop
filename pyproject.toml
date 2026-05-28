@@ -66,6 +66,9 @@ ui = [
 ]
 dev = [
   "pytest >=8.0",
+  # hypothesis powers property-based tests (issue #91) for parsers
+  # (events.jsonl reader, fingerprint compute, brief render). Dev-only.
+  "hypothesis >=6.0",
   "textual >=0.60",
   "pytest-cov >=5.0",
   "ruff >=0.6",
