@@ -16,7 +16,7 @@ from forge_loop import master_log as _mlog
 from forge_loop import worker as _worker
 from forge_loop.config import Config
 from forge_loop.deploy import redeploy
-from forge_loop.gh import fetch_issue, top_issues, unlabel
+from forge_loop.gh import fetch_issue, pr_review_context, prs_by_label, top_issues, unlabel
 from forge_loop.maintenance import run_maintenance
 from forge_loop.po import expand_thin_specs as _po_expand
 from forge_loop.runner._helpers import (
@@ -33,6 +33,7 @@ from forge_loop.runner._helpers import (
 )
 from forge_loop.runner.dispatch import (
     _run_critic_for_outcomes,
+    _run_repair_workers,
     _run_workers,
 )
 from forge_loop.runner.drift import (
@@ -50,6 +51,47 @@ def _force_retry_file(cfg: Config) -> Path:
 
 def _consume_force_set(cfg: Config) -> set[int]:
     return _consume_force_set_impl(cfg.state_dir)
+
+
+def _issue_number_from_pr(pr: dict[str, Any]) -> int | None:
+    import re
+
+    for value in (pr.get("headRefName"), pr.get("body"), pr.get("title")):
+        if not isinstance(value, str):
+            continue
+        match = re.search(r"(?:^|/)loop/(\d+)-", value)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"(?:refs?|closes|fixes|resolves)\s+#(\d+)", value, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _blocking_pr_repairs(cfg: Config) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    for pr in prs_by_label("critic:blocking", cfg.parallel, repo=cfg.github_repo):
+        issue_num = _issue_number_from_pr(pr)
+        if issue_num is None:
+            append_event(
+                cfg.events_file,
+                "repair_pr_skipped",
+                pr=pr.get("url"),
+                reason="source_issue_not_found",
+            )
+            continue
+        issue = fetch_issue(issue_num, repo=cfg.github_repo)
+        if not issue:
+            append_event(
+                cfg.events_file,
+                "repair_pr_skipped",
+                pr=pr.get("url"),
+                issue=issue_num,
+                reason="issue_fetch_failed",
+            )
+            continue
+        repairs.append((issue, pr, pr_review_context(pr["number"], repo=cfg.github_repo)))
+    return repairs
 
 
 _TEST_FILE_GLOBS = (
@@ -92,6 +134,7 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
     Returns the PR URL on success, or None when there's nothing to rescue
     or any subprocess failure. Never raises.
     """
+    import contextlib
     import fnmatch
     import os as _os
     import subprocess as _sp
@@ -129,7 +172,7 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
     # empty = skip). Best-effort: any failure here is NON-fatal.
     fmt_cmd_str = getattr(cfg.worker, "rescue_format_cmd", "") or ""
     if fmt_cmd_str.strip():
-        try:
+        with contextlib.suppress(_sp.SubprocessError):
             _sp.run(
                 fmt_cmd_str,
                 cwd=wt,
@@ -139,8 +182,6 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
                 timeout=300,
                 env={**_os.environ, "JAVA_TOOL_OPTIONS": "-Xmx1500m"},
             )
-        except _sp.SubprocessError:
-            pass  # Format failed — push raw output anyway.
 
     # 2. Stage + commit (bypass operator pre-commit; CI will re-check).
     commit_msg = (
@@ -327,6 +368,64 @@ def _tick(cfg: Config, tick: int) -> None:
         _short_sleep(cfg.tick_interval_s, cfg)
         return
 
+    def _bus_emit(kind: str, payload: dict[str, Any]) -> None:
+        append_event(cfg.events_file, kind, **payload)
+
+    repairs = _blocking_pr_repairs(cfg)
+    if repairs:
+        master_log_path = cfg.logs_dir / "master.log"
+        issue_nums = [issue["number"] for issue, _, _ in repairs]
+        write_state(
+            cfg.state_file,
+            {
+                "state": "repairing",
+                "tick": tick,
+                "dispatched": [
+                    {"issue": issue["number"], "title": issue["title"]}
+                    for issue, _, _ in repairs
+                ],
+            },
+        )
+        append_event(
+            cfg.events_file,
+            "repair_tick_start",
+            tick=tick,
+            issues=issue_nums,
+            prs=[pr.get("url") for _, pr, _ in repairs],
+        )
+        _mlog.info(master_log_path, f"tick {tick} repairing blocked PR(s): {issue_nums}")
+        outcomes = _run_repair_workers(
+            cfg,
+            repairs,
+            tick,
+            master_log_path=master_log_path,
+            bus_emit=_bus_emit,
+        )
+        if cfg.critic.enabled:
+            _run_critic_for_outcomes(cfg, outcomes, _bus_emit)
+        append_event(
+            cfg.events_file,
+            "repair_tick_done",
+            tick=tick,
+            outcomes=[asdict(o) for o in outcomes],
+        )
+        for o in outcomes:
+            if o.status in {"open", "merged"}:
+                _reap_worktree(cfg.repo, o.issue)
+                append_event(cfg.events_file, "worktree_reaped", issue=o.issue, status=o.status)
+        summary = consolidate_sprint(
+            cfg.events_file,
+            cfg.summaries_file,
+            tick,
+            [asdict(o) for o in outcomes],
+        )
+        write_state(
+            cfg.state_file,
+            {"state": "between-ticks", "tick": tick, "last_summary": summary},
+        )
+        _short_sleep(cfg.tick_interval_s, cfg)
+        return
+
     try:
         issues = top_issues(cfg.labels.ready, cfg.parallel, repo=cfg.github_repo)
     except subprocess.CalledProcessError as e:
@@ -486,12 +585,6 @@ def _tick(cfg: Config, tick: int) -> None:
         )
         _short_sleep(cfg.tick_interval_s, cfg)
         return
-
-    # Bus emitter: any thread (runner, watchdog, etc) calls this to push an
-    # event into the shared JSONL. Bound to cfg here so workers can wire it
-    # through without importing module state.
-    def _bus_emit(kind: str, payload: dict[str, Any]) -> None:
-        append_event(cfg.events_file, kind, **payload)
 
     master_log_path = cfg.logs_dir / "master.log"
     _mlog.info(

@@ -17,7 +17,7 @@ from forge_loop.config import Config
 from forge_loop.critic import review_pr as _critic_review
 from forge_loop.critic_actions import apply_critic_report
 from forge_loop.state import append_event
-from forge_loop.worker import WorkerOutcome, run_worker
+from forge_loop.worker import WorkerOutcome, run_repair_worker, run_worker
 
 
 def _sev_counts(outcome: Any) -> dict[str, int]:
@@ -127,6 +127,50 @@ def _run_workers(
     return outcomes, used_pipeline
 
 
+def _run_repair_workers(
+    cfg: Config,
+    repairs: list[tuple[dict[str, Any], dict[str, Any], str]],
+    tick: int,
+    master_log_path: Path,
+    bus_emit: Any,
+) -> list[WorkerOutcome]:
+    """Spawn workers that repair existing PR branches."""
+    outcomes: list[WorkerOutcome] = []
+    with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
+        futures = [
+            ex.submit(
+                run_repair_worker,
+                issue,
+                pr,
+                review_context,
+                cfg.repo,
+                cfg.logs_dir,
+                cfg.worker_timeout_s,
+                emit=bus_emit,
+                lumen_top_k=cfg.lumen.top_k,
+                lumen_test_pattern=cfg.lumen_test_pattern,
+                coauthor=cfg.coauthor,
+                tick=tick,
+                model=cfg.worker.model,
+                thinking=cfg.worker.thinking,
+                provider=getattr(cfg.worker, "provider", "claude"),
+                allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+                load_timeout_ms=cfg.worker.load_timeout_ms,
+                strict_mcp_config=cfg.worker.strict_mcp_config,
+                mcp_servers=cfg.worker.mcp_servers,
+            )
+            for issue, pr, review_context in repairs
+        ]
+        for fut in futures:
+            outcomes.append(fut.result())
+    for o in outcomes:
+        _mlog.info(
+            master_log_path,
+            f"repair worker #{o.issue} {o.status} ({o.duration_s:.0f}s) pr={o.pr_url or '-'}",
+        )
+    return outcomes
+
+
 def _run_critic_for_outcomes(
     cfg: Config,
     outcomes: list[WorkerOutcome],
@@ -160,7 +204,7 @@ def _run_critic_for_outcomes(
                 if critic_outcome.report is not None:
                     try:
                         lines = _gh.pr_changed_lines(o.pr_url, repo=cfg.github_repo)
-                        apply_critic_report(
+                        plan = apply_critic_report(
                             critic_outcome.report,
                             o.pr_url,
                             lines,
@@ -170,6 +214,9 @@ def _run_critic_for_outcomes(
                             repo=cfg.github_repo,
                             emit=bus_emit,
                         )
+                        if not plan.block_merge:
+                            _gh.remove_pr_label(o.pr_url, "critic:blocking", repo=cfg.github_repo)
+                            _gh.remove_pr_label(o.pr_url, "critic:suspicious", repo=cfg.github_repo)
                     except Exception as act_ex:
                         append_event(
                             cfg.events_file,

@@ -22,6 +22,8 @@ from forge_loop.worker import (
     _read_subagent_events,
     _tail,
     make_brief,
+    make_repair_brief,
+    run_repair_worker,
     run_worker,
 )
 
@@ -182,6 +184,73 @@ def test_make_brief_default_keeps_automerge(tmp_path: Path) -> None:
     assert "gh pr merge" in brief
     assert "--auto" in brief
     assert "DO NOT enable auto-merge" not in brief
+
+
+def test_make_repair_brief_keeps_same_pr_contract(tmp_path: Path) -> None:
+    issue = {"number": 42, "title": "fix blocked pr", "body": "Acceptance"}
+    pr = {
+        "number": 7,
+        "url": "https://github.com/o/r/pull/7",
+        "headRefName": "loop/42-fix-blocked-pr",
+    }
+    brief = make_repair_brief(
+        issue,
+        tmp_path / "wt",
+        pr=pr,
+        review_context="[sev1] fix the real consumer",
+    )
+    assert "Repair the EXISTING PR branch" in brief
+    assert "Do not create a new branch" in brief
+    assert "https://github.com/o/r/pull/7" in brief
+    assert "[sev1] fix the real consumer" in brief
+    assert '"pr": "https://github.com/o/r/pull/7"' in brief
+
+
+def test_run_repair_worker_codex_uses_existing_pr_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from forge_loop import agent_backend
+
+    worktree = tmp_path / "repair"
+    worktree.mkdir()
+
+    def fake_prep(_repo: Path, issue: int, branch: str) -> tuple[Path, None]:
+        assert issue == 42
+        assert branch == "loop/42-fix-blocked-pr"
+        return worktree, None
+
+    def fake_codex(**kwargs: Any) -> agent_backend.AgentRunResult:
+        assert kwargs["cwd"] == worktree
+        assert "Do not create a new branch" in kwargs["prompt"]
+        return agent_backend.AgentRunResult(
+            provider="codex",
+            log_path=kwargs["log_path"],
+            last_message=(
+                '{"issue": 42, "pr": "https://github.com/o/r/pull/7", '
+                '"status": "open", "note": "repair pushed"}'
+            ),
+            duration_s=2.0,
+        )
+
+    monkeypatch.setattr("forge_loop.worker._prep_repair_worktree", fake_prep)
+    monkeypatch.setattr(agent_backend, "run_codex_exec", fake_codex)
+
+    out = run_repair_worker(
+        {"number": 42, "title": "fix blocked pr", "body": "Acceptance"},
+        {
+            "number": 7,
+            "url": "https://github.com/o/r/pull/7",
+            "headRefName": "loop/42-fix-blocked-pr",
+        },
+        "[sev1] finding",
+        tmp_path,
+        tmp_path / "logs",
+        30,
+        provider="codex",
+    )
+    assert out.status == "open"
+    assert out.pr_url == "https://github.com/o/r/pull/7"
 
 
 def test_run_worker_codex_provider_maps_final_json(
