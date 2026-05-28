@@ -118,16 +118,19 @@ def run_critic_sdk(
 
         def _capture(event: dict[str, Any]) -> None:
             nonlocal last_text
-            # The worker SDK emits "result"-shaped events at session end with
-            # the assistant's final message text. We accumulate so the
-            # latest wins on disk.
-            if event.get("type") == "result":
-                msg = event.get("result") or event.get("last_message") or ""
+            # forge_loop._worker_sdk emits events with the field name
+            # "kind" (NOT "type") and the session-end kind is
+            # "final_result" (NOT "result"). The original capture used
+            # the wrong field names and silently never saw the assistant
+            # text, leading to empty SDK outputs that broke the critic +
+            # PO + brainstormer paths in production. Dogfood-caught
+            # running the brainstormer against Titan.
+            kind = event.get("kind") or event.get("type")  # tolerate both
+            if kind == "final_result":
+                msg = event.get("text") or event.get("result") or event.get("last_message") or ""
                 if msg:
                     last_text = msg
-            elif event.get("type") == "assistant_text":
-                # Some SDK shapes stream the assistant tokens directly; pick
-                # up the final concatenated text via the same mechanism.
+            elif kind == "assistant_text":
                 msg = event.get("text", "")
                 if msg:
                     last_text = msg
@@ -152,8 +155,15 @@ def run_critic_sdk(
             )
         except asyncio.TimeoutError:
             return last_text, "timeout"
-        # Prefer the SDK's last_message if our capture missed it.
-        final_text = getattr(result, "last_message", "") or last_text
+        # Prefer the SDK's own final-text field if our capture missed it.
+        # SDKRunResult uses ``final_result_text``; legacy paths used
+        # ``last_message``. Check both so this stays correct if the
+        # SDK result shape evolves.
+        final_text = (
+            getattr(result, "final_result_text", "")
+            or getattr(result, "last_message", "")
+            or last_text
+        )
         return final_text, getattr(result, "error", None)
 
     try:
