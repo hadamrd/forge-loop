@@ -240,6 +240,12 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     queue = build_queue(queue_url)
     host_id = default_host_id()
 
+    # Issue #126 — surface the axis filter at startup so an operator
+    # tail'ing events can audit a focused-sprint launch.
+    from forge_loop.axis import parse_filter_env as _parse_axis_filter
+
+    _axes = _parse_axis_filter()
+
     append_event(
         cfg.events_file,
         "loop_start",
@@ -251,7 +257,14 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
         host_id=host_id,
         distributed=False,
         queue_backend=(queue_url or "memory"),
+        axis_filter=_axes,
     )
+    if _axes:
+        import logging as _logging
+
+        _logging.getLogger("forge_loop.runner").info(
+            "axis filter active: %s", ",".join(_axes)
+        )
     write_state(cfg.state_file, {"state": "starting", "tick": 0, "parallel": cfg.parallel})
 
     # Issue #18 — if `.forge/pipeline.yaml` exists, validate it at startup so

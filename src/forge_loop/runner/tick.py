@@ -492,13 +492,40 @@ def _tick(cfg: Config, tick: int) -> None:
         _short_sleep(cfg.tick_interval_s, cfg)
         return
 
+    # Issue #126 — axis-aware dispatch filter. When ``LOOP_AXIS_FILTER``
+    # is set (via ``forge-loop run --axis ...``), the dispatcher pulls a
+    # wider window of ready issues than ``cfg.parallel`` so the filter
+    # has something to chew on, then trims back to ``cfg.parallel`` from
+    # the matched subset. When the env var is empty, behaviour is
+    # byte-identical to today (same call, same limit).
+    from forge_loop.axis import filter_issues_by_axes, parse_filter_env
+
+    axis_filter = parse_filter_env()
+    fetch_limit = max(cfg.parallel, 50) if axis_filter else cfg.parallel
     try:
-        issues = top_issues(cfg.labels.ready, cfg.parallel, repo=cfg.github_repo)
+        issues = top_issues(cfg.labels.ready, fetch_limit, repo=cfg.github_repo)
     except subprocess.CalledProcessError as e:
         append_event(cfg.events_file, "gh_list_failed", err=(e.stderr or "")[:200])
         write_state(cfg.state_file, {"state": "gh_error", "tick": tick})
         _short_sleep(60, cfg)
         return
+
+    if axis_filter:
+        append_event(
+            cfg.events_file,
+            "axis_filter_active",
+            tick=tick,
+            axes=axis_filter,
+            candidates=len(issues),
+        )
+        issues = filter_issues_by_axes(issues, axis_filter)[: cfg.parallel]
+        if not issues:
+            append_event(
+                cfg.events_file,
+                "axis_filter_empty",
+                tick=tick,
+                axes=axis_filter,
+            )
 
     if not issues:
         append_event(cfg.events_file, "tick_idle", tick=tick)
