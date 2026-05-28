@@ -91,7 +91,9 @@ def register_event(cls: type[EventBase]) -> type[EventBase]:
     if kind == "_unset":
         raise ValueError(f"{cls.__name__} must set KIND ClassVar")
     if kind in EVENT_REGISTRY:
-        raise ValueError(f"event kind {kind!r} already registered to {EVENT_REGISTRY[kind].__name__}")
+        raise ValueError(
+            f"event kind {kind!r} already registered to {EVENT_REGISTRY[kind].__name__}"
+        )
     EVENT_REGISTRY[kind] = cls
     return cls
 
@@ -174,6 +176,29 @@ class WorkerSessionRecoveredEvent(EventBase):
 
 
 @register_event
+class WorkerSessionTransitionEvent(EventBase):
+    """One FSM edge in the persistent-worker store (issue #108).
+
+    Emitted on every transition the dispatch loop drives:
+    ``-> DISPATCHED`` (fresh seed), ``DISPATCHED -> RUNNING`` (SDK
+    starting), ``RUNNING -> AWAITING_CRITIC`` (PR opened),
+    ``RUNNING -> ABANDONED`` (worker failed).
+
+    ``prior_state`` is the empty string on the initial seed
+    (``-> DISPATCHED``) because there is no prior state — every other
+    edge carries both endpoints.
+    """
+
+    KIND: ClassVar[str] = "worker_session_transition"
+    session_id: str = ""
+    issue: int = 0
+    prior_state: str = ""
+    new_state: str = ""
+    reason: str = ""
+    pr_url: str | None = None
+
+
+@register_event
 class WorktreeReapedEvent(EventBase):
     """Per-issue worktree cleanup after a worker outcome that doesn't
     need the directory preserved for inspection (merged/open path)."""
@@ -224,9 +249,7 @@ def _log_event(kind: str, rec: dict[str, Any]) -> None:
         logger.info(kind, **payload)
 
 
-def append_event_with_registry_check(
-    events_path: Path, kind: str, **fields: Any
-) -> None:
+def append_event_with_registry_check(events_path: Path, kind: str, **fields: Any) -> None:
     """Loose-shape emission with registry-aware deprecation hinting.
 
     Called by :func:`forge_loop.state.append_event` to keep every legacy
@@ -266,6 +289,7 @@ __all__ = [
     "RedeployEvent",
     "TickStartEvent",
     "WorkerSessionRecoveredEvent",
+    "WorkerSessionTransitionEvent",
     "WorktreeReapedEvent",
     "append_event_with_registry_check",
     "emit",
