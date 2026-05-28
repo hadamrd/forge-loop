@@ -74,6 +74,12 @@ dev = [
   # hypothesis powers property-based tests (issue #91) for parsers
   # (events.jsonl reader, fingerprint compute, brief render). Dev-only.
   "hypothesis >=6.0",
+  # pyright: second type-checker (issue #90). Pydantic / SDK / githubkit
+  # boundaries leak Any past mypy; pyright catches a different overlap.
+  # Runs in CI alongside mypy — both must pass.
+  "pyright >=1.1.380",
+  # pre-commit harness for ruff/mypy/pyright on staged files
+  "pre-commit >=4.0",
   "textual >=0.60",
   "pytest-cov >=5.0",
   "ruff >=0.6",
@@ -141,3 +147,32 @@ warn_unused_ignores = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers"]
+
+# Coverage floor (issue #90). Ratchets only upward — bump this whenever
+# the suite gets meaningfully more thorough. Set conservatively now to
+# the current measured floor; CI fails any PR that drops below.
+# Run with: pytest --cov=src/forge_loop --cov-fail-under=N
+[tool.coverage.run]
+branch = true
+source = ["src/forge_loop"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+]
+
+# Pyright config (issue #90). Strict mode disabled until the existing
+# 60+ errors get a dedicated cleanup pass; basic mode flags new code.
+# Match mypy's exclusions so the two checkers don't disagree on scope.
+[tool.pyright]
+include = ["src/forge_loop"]
+exclude = [
+  "**/__pycache__",
+  "**/node_modules",
+]
+typeCheckingMode = "basic"
+reportMissingImports = "error"
+reportMissingTypeStubs = false
+pythonVersion = "3.11"

@@ -1,0 +1,66 @@
+# forge-loop developer entrypoint (issue #90).
+#
+# CI strategy: NO GitHub Actions. forge-loop is meant to run *on itself*
+# via the same dispatcher operators use for their own repos — so the
+# "CI" for forge-loop is a forge-loop instance running against its own
+# trunk. Operators wire `task ci` into whatever their host platform
+# uses (Jenkins, Drone, forge-loop self-pipeline, etc).
+#
+# Install Task: https://taskfile.dev/installation/
+
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  setup:
+    desc: One-time dev environment bootstrap
+    cmds:
+      - uv sync --all-extras
+      - uv run pre-commit install
+
+  ci:
+    desc: Run every gate the loop is supposed to pass (format, lint, mypy, pyright, tests, coverage)
+    deps: [fmt-check, lint, mypy, pyright, test]
+
+  fmt:
+    desc: Auto-format with ruff
+    cmds:
+      - uv run ruff format src/ tests/
+
+  fmt-check:
+    desc: Verify code is formatted (CI gate)
+    cmds:
+      - uv run ruff format --check src/ tests/
+
+  lint:
+    desc: ruff lint (CI gate)
+    cmds:
+      - uv run ruff check src/ tests/
+
+  mypy:
+    desc: mypy type-check src/ (CI gate)
+    cmds:
+      - uv run mypy src/forge_loop/
+
+  pyright:
+    desc: pyright type-check src/ (CI gate)
+    cmds:
+      - uv run pyright
+
+  test:
+    desc: pytest with coverage floor (CI gate)
+    cmds:
+      - uv run pytest tests/ --cov=src/forge_loop --cov-report=term-missing --cov-fail-under=70 -W ignore::DeprecationWarning
+
+  test-fast:
+    desc: pytest without coverage (faster iteration)
+    cmds:
+      - uv run pytest tests/ -x -W ignore::DeprecationWarning
+
+  precommit-all:
+    desc: Run every pre-commit hook on every file (local-only sanity)
+    cmds:
+      - uv run pre-commit run --all-files
