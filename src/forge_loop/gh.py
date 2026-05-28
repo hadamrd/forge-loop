@@ -84,6 +84,16 @@ def unlabel(issue: int, label: str, repo: str | None = None) -> None:
     )
 
 
+def remove_pr_label(pr: int | str, label: str, repo: str | None = None) -> bool:
+    """Remove a label from a PR. Best-effort: returns False on failure."""
+    repo = _require_repo(repo)
+    r = subprocess.run(
+        ["gh", "pr", "edit", str(pr), "--repo", repo, "--remove-label", label],
+        check=False, capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
 def create_issue(
     title: str,
     body: str,
@@ -152,6 +162,90 @@ def pr_changed_lines(pr: int | str, repo: str | None = None) -> int:
         return int(obj.get("additions", 0)) + int(obj.get("deletions", 0))
     except (json.JSONDecodeError, ValueError, TypeError):
         return 0
+
+
+def prs_by_label(label: str, limit: int, repo: str | None = None) -> list[dict[str, Any]]:
+    """Return open PRs carrying ``label`` (oldest updated first)."""
+    repo = _require_repo(repo)
+    cmd = [
+        "gh", "pr", "list",
+        "--repo", repo,
+        "--state", "open",
+        "--limit", str(limit),
+        "--json", "number,title,body,headRefName,baseRefName,url,labels,updatedAt",
+    ]
+    if label:
+        cmd.extend(["--label", label])
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        return []
+    try:
+        result: list[dict[str, Any]] = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return []
+    return sorted(result, key=lambda p: str(p.get("updatedAt") or ""))
+
+
+def pr_review_context(pr: int | str, repo: str | None = None) -> str:
+    """Fetch review/comment context for a repair worker prompt."""
+    repo = _require_repo(repo)
+    r = subprocess.run(
+        [
+            "gh", "pr", "view", str(pr),
+            "--repo", repo,
+            "--comments",
+            "--json", "number,title,body,comments,reviews,reviewThreads,url,headRefName",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return f"(failed to fetch PR review context: {r.stderr[:300]})"
+    try:
+        obj = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return "(failed to parse PR review context)"
+    return _format_pr_context(obj)
+
+
+def _format_pr_context(obj: dict[str, Any]) -> str:
+    lines = [
+        f"PR #{obj.get('number')}: {obj.get('title') or ''}",
+        f"URL: {obj.get('url') or ''}",
+        f"Head: {obj.get('headRefName') or ''}",
+        "",
+        "PR BODY:",
+        str(obj.get("body") or "").strip() or "(empty)",
+    ]
+    comments = obj.get("comments") or []
+    if comments:
+        lines.extend(["", "TOP-LEVEL COMMENTS:"])
+        for c in comments[-10:]:
+            author = (c.get("author") or {}).get("login") or "unknown"
+            body = str(c.get("body") or "").strip()
+            if body:
+                lines.append(f"- {author}: {body[:1500]}")
+    reviews = obj.get("reviews") or []
+    if reviews:
+        lines.extend(["", "REVIEWS:"])
+        for r in reviews[-10:]:
+            author = (r.get("author") or {}).get("login") or "unknown"
+            body = str(r.get("body") or "").strip()
+            state = r.get("state") or ""
+            if body:
+                lines.append(f"- {author} [{state}]: {body[:1500]}")
+    threads = obj.get("reviewThreads") or []
+    if threads:
+        lines.extend(["", "REVIEW THREADS:"])
+        for t in threads[-20:]:
+            resolved = t.get("isResolved")
+            for c in t.get("comments") or []:
+                author = (c.get("author") or {}).get("login") or "unknown"
+                path = c.get("path") or ""
+                line = c.get("line") or ""
+                body = str(c.get("body") or "").strip()
+                if body:
+                    lines.append(f"- {path}:{line} resolved={resolved} {author}: {body[:1500]}")
+    return "\n".join(lines)[:12000]
 
 
 def add_pr_label(pr: int | str, labels: list[str], repo: str | None = None) -> bool:

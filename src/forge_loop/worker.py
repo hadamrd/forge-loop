@@ -153,6 +153,69 @@ def make_brief(
     return rendered
 
 
+def make_repair_brief(
+    issue: dict[str, Any],
+    worktree: Path,
+    *,
+    pr: dict[str, Any],
+    review_context: str,
+    lumen_top_k: int = 3,
+    lumen_test_pattern: str = "**/*Test.*",
+    coauthor: str = "",
+) -> str:
+    """Render a worker brief for repairing an existing blocked PR."""
+    body = (issue.get("body") or "")[:6000]
+    n = issue["number"]
+    pr_url = pr.get("url") or f"https://github.com/pull/{pr.get('number', '')}"
+    pr_number = pr.get("number", "")
+    head = pr.get("headRefName") or ""
+    final_status = f'{{"issue": {n}, "pr": "{pr_url}", "status": "open", "note": "repair pushed"}}'
+    coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
+    return f"""You are an autonomous repair worker in a sprint loop.
+
+WORKTREE (already created): {worktree}
+cd there. Stay there. Don't touch the main checkout.
+
+SOURCE ISSUE #{n}: {issue.get("title", "")}
+---
+{body}
+---
+
+EXISTING PR TO REPAIR:
+- PR: #{pr_number} {pr_url}
+- Branch: {head}
+
+REVIEW / CRITIC CONTEXT TO ADDRESS:
+---
+{review_context[:12000]}
+---
+
+CONTRACT:
+1. Repair the EXISTING PR branch. Do not create a new branch and do not open a new PR.
+2. Address every sev1/blocking review point with production behavior and tests.
+3. Preserve the original issue scope; do not add unrelated refactors.
+4. Run focused tests that prove the review comments are fixed.
+5. Run formatting/lint gates appropriate for touched files.
+6. Commit with a message referencing #{n}.
+7. Push the current branch with `git push`.
+8. Leave a short PR comment summarizing the repair.
+
+LOOP INFRASTRUCTURE — DO NOT TOUCH:
+- `{worktree}/.claude/settings.json` is loop-planted. Do NOT `git clean`, `rm`, or chmod it.
+- Don't run `git clean -fdx`.
+
+LUMEN TEST DISCOVERY:
+If available, query Lumen with the issue title, review findings, and changed files.
+Cap at K={lumen_top_k} discovered + 1 authored test. If unavailable, echo a one-line skip and continue.
+Test pattern: {lumen_test_pattern}
+
+{coauthor_line}
+
+FINAL LINE OF YOUR OUTPUT MUST BE THIS JSON SHAPE, with no prose after it:
+{final_status}
+"""
+
+
 def brief_template_hash() -> str:
     """Stable digest of the worker brief template.
 
@@ -264,6 +327,33 @@ def _prep_worktree(
         cwd=repo,
         capture_output=True,
         text=True,
+    )
+    if r.returncode != 0:
+        return wt, r.stderr
+    _drop_permissive_settings(wt)
+    return wt, None
+
+
+def _prep_repair_worktree(
+    repo: Path,
+    issue: int,
+    branch: str,
+) -> tuple[Path, str | None]:
+    wt = Path(f"/tmp/wt-loop-{issue}")
+    claude_dir = wt / ".claude"
+    if claude_dir.exists():
+        subprocess.run(["chmod", "-R", "u+w", str(claude_dir)], capture_output=True)
+    subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=repo, capture_output=True)
+    if wt.exists():
+        shutil.rmtree(wt)
+    remote_ref = f"refs/remotes/origin/{branch}"
+    subprocess.run(
+        ["git", "fetch", "--prune", "origin", f"+refs/heads/{branch}:{remote_ref}"],
+        cwd=repo, capture_output=True,
+    )
+    r = subprocess.run(
+        ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{branch}"],
+        cwd=repo, capture_output=True, text=True,
     )
     if r.returncode != 0:
         return wt, r.stderr
@@ -402,6 +492,72 @@ def run_worker(
         tick=tick,
         model=model,
         thinking=thinking,
+        allowed_mcp_servers=allowed_mcp_servers,
+        load_timeout_ms=load_timeout_ms,
+        strict_mcp_config=strict_mcp_config,
+        mcp_servers=mcp_servers,
+    )
+
+
+def run_repair_worker(
+    issue: dict[str, Any],
+    pr: dict[str, Any],
+    review_context: str,
+    repo: Path,
+    logs_dir: Path,
+    timeout_s: int,
+    *,
+    emit: Callable[[str, dict[str, Any]], None] | None = None,
+    lumen_top_k: int = 3,
+    lumen_test_pattern: str = "**/*Test.*",
+    coauthor: str = "",
+    tick: int | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
+    provider: str = "claude",
+    allowed_mcp_servers: tuple[str, ...] | None = None,
+    load_timeout_ms: int | None = None,
+    strict_mcp_config: bool = False,
+    mcp_servers: dict[str, Any] | None = None,
+) -> WorkerOutcome:
+    """Repair an existing blocked PR by pushing to its head branch."""
+    n = issue["number"]
+    title = issue["title"]
+    branch = pr.get("headRefName") or ""
+    pr_url = pr.get("url")
+    if not branch:
+        return WorkerOutcome(
+            issue=n, title=title, pr_url=pr_url, status="failed",
+            duration_s=0.0, stdout_tail="missing PR headRefName",
+            error="repair-missing-branch",
+        )
+    worktree, err = _prep_repair_worktree(repo, n, branch)
+    if err is not None:
+        return WorkerOutcome(
+            issue=n, title=title, pr_url=pr_url, status="failed",
+            duration_s=0.0, stdout_tail=err[-500:],
+            error="repair-worktree-create-failed",
+        )
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"repair-{n}-{int(time.time())}.log"
+    brief = make_repair_brief(
+        issue,
+        worktree,
+        pr=pr,
+        review_context=review_context,
+        lumen_top_k=lumen_top_k,
+        lumen_test_pattern=lumen_test_pattern,
+        coauthor=coauthor,
+    )
+    if provider == "codex":
+        return _run_worker_codex(
+            issue=issue, worktree=worktree, log_path=log_path,
+            brief=brief, timeout_s=timeout_s, model=model,
+        )
+    return _run_worker_sdk(
+        issue=issue, worktree=worktree, log_path=log_path,
+        brief=brief, timeout_s=timeout_s, emit=emit, tick=tick,
+        model=model, thinking=thinking,
         allowed_mcp_servers=allowed_mcp_servers,
         load_timeout_ms=load_timeout_ms,
         strict_mcp_config=strict_mcp_config,
