@@ -188,16 +188,37 @@ def probe_worker_state(
         pass
 
     # 4. Local commits ahead of origin?
-    ahead = 0
+    # First: does origin/<branch> actually exist? If not, the branch
+    # was never pushed and we must NOT fall through to a "0 ahead"
+    # verdict. Before this check the probe misclassified locally-
+    # committed-but-not-pushed branches as PUSHED_NO_PR, driving the
+    # iteration loop into an open_pr brief on a branch GitHub can't
+    # see. Dogfood-caught on forge-loop #125 and #126.
+    origin_exists = False
     try:
-        r = run(
-            ["git", "rev-list", "--count", f"origin/{branch}..HEAD"],
+        r_remote = run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
             worktree,
         )
-        ahead = int(r.stdout.strip() or "0") if r.returncode == 0 else 0
-    except (subprocess.SubprocessError, ValueError, OSError):
-        # Likely no remote-tracking branch yet (push never happened).
-        ahead = -1  # sentinel: branch may not exist on origin
+        origin_exists = r_remote.returncode == 0 and bool(r_remote.stdout.strip())
+    except (subprocess.SubprocessError, OSError):
+        origin_exists = False
+
+    ahead = 0
+    if origin_exists:
+        try:
+            r = run(
+                ["git", "rev-list", "--count", f"origin/{branch}..HEAD"],
+                worktree,
+            )
+            ahead = int(r.stdout.strip() or "0") if r.returncode == 0 else 0
+        except (subprocess.SubprocessError, ValueError, OSError):
+            ahead = -1  # transient git failure — treat as unknown
+    else:
+        # Branch isn't on origin yet — sentinel = -1 routes to the
+        # local-commits-no-upstream fallback further down (which returns
+        # COMMITTED_NOT_PUSHED). PUSHED_NO_PR cannot be reached here.
+        ahead = -1
 
     # 5. With a PR — classify the PR-side state.
     if pr_view and pr_view.get("state") == "OPEN":
@@ -529,6 +550,12 @@ def escalate_to_human(
     Best-effort. Returns True if at least the label landed; the comment is
     cosmetic. Never raises.
     """
+    # Add loop:needs-human AND remove loop:ready in one call so the
+    # dispatcher stops re-picking the issue on the next tick. Before
+    # this, escalated issues kept reappearing in `top_issues` because
+    # only the needs-human label was added — loop:ready survived.
+    # Dogfood-caught on forge-loop #125/#126 (CTO observed loop "not
+    # reliable" — same stuck issue served on every tick).
     label_ok = False
     try:
         r = run(
@@ -541,6 +568,8 @@ def escalate_to_human(
                 repo,
                 "--add-label",
                 "loop:needs-human",
+                "--remove-label",
+                "loop:ready",
             ],
             worktree,
         )
