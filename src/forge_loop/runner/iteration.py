@@ -69,10 +69,20 @@ class WorkerState(StrEnum):
     CLEAN_NOTHING = (
         "clean_nothing"  # worker did nothing (no diff, no commits, no PR) → complete_work
     )
+    CLOSED_PR_ABANDONED = (
+        "closed_pr_abandoned"
+        # A prior attempt for this branch already opened a PR that's been
+        # CLOSED (not merged). Without this terminal short-circuit the
+        # iteration loop spins forever trying to push to a branch whose
+        # output has already been thrown away.
+    )
 
 
 # Terminal: do not dispatch a follow-up worker session.
-TERMINAL_STATES = frozenset({WorkerState.DONE_MERGED})
+TERMINAL_STATES = frozenset({
+    WorkerState.DONE_MERGED,
+    WorkerState.CLOSED_PR_ABANDONED,
+})
 
 # Non-LLM action: probe sets up ``gh pr merge --auto`` and exits without dispatch.
 NON_LLM_STATES = frozenset({WorkerState.PR_OPEN_HEALTHY})
@@ -155,6 +165,19 @@ def probe_worker_state(
         ctx.pr_url = pr_view.get("url")
         if pr_view.get("state") == "MERGED":
             return WorkerState.DONE_MERGED, ctx
+        # A CLOSED-but-not-merged PR is a previously-abandoned attempt:
+        # the operator (or auto-rescue) decided this branch's output
+        # shouldn't ship. Short-circuit so we don't spin forever trying
+        # to push to a branch whose work is already thrown away.
+        if pr_view.get("state") == "CLOSED":
+            return WorkerState.CLOSED_PR_ABANDONED, ctx
+
+    # Refresh origin/<branch> so the ahead-count below isn't measured
+    # against a stale tracking ref. Without this, a prior push that
+    # succeeded server-side still shows as "local commits ahead" on
+    # disk — driving the iteration loop into a push-forever cycle.
+    with contextlib.suppress(subprocess.SubprocessError, OSError):
+        run(["git", "fetch", "--quiet", "origin", branch], worktree)
 
     # 3. Worktree dirty?
     dirty = False
@@ -439,6 +462,13 @@ def run_iteration_loop(
                 "pr_url": ctx.pr_url,
             },
         )
+        if state == WorkerState.CLOSED_PR_ABANDONED:
+            # The branch has a CLOSED-but-not-merged PR — a prior attempt
+            # was thrown away. Label the issue so it doesn't keep popping
+            # back to the dispatcher every tick, and post a diagnostic
+            # comment pointing at the closed PR for operator review.
+            escalate_to_human(issue_n, repo, state, worktree, ctx.pr_url, run=run)
+            return current
         if is_terminal(state):
             return current
         if state in NON_LLM_STATES:
