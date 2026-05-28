@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from forge_loop.brainstormer import (
-    BrainstormReport,
     Brainstormer,
+    BrainstormReport,
     ProposedEpic,
     ProposedTicket,
     _parse_sdk_payload,
@@ -133,6 +133,40 @@ def test_happy_path_two_epics_three_tickets() -> None:
     assert len(report.proposed_tickets) == 3
     assert all(isinstance(e, ProposedEpic) for e in report.proposed_epics)
     assert all(isinstance(t, ProposedTicket) for t in report.proposed_tickets)
+
+
+def test_codex_provider_uses_codex_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    payload = {"proposed_epics": [], "proposed_tickets": []}
+    calls: dict[str, object] = {}
+
+    def fake_codex(**kwargs):
+        from forge_loop.agent_backend import AgentRunResult
+
+        calls.update(kwargs)
+        return AgentRunResult(
+            provider="codex",
+            log_path=kwargs["log_path"],
+            last_message=json.dumps(payload),
+            duration_s=0.01,
+        )
+
+    from forge_loop import agent_backend
+
+    monkeypatch.setattr(agent_backend, "run_codex_exec", fake_codex)
+
+    report = Brainstormer(
+        repo_path=tmp_path,
+        provider="codex",
+        model="gpt-5-codex",
+        timeout_s=17,
+    ).run(_vision())
+
+    assert report.proposed_epics == []
+    assert report.proposed_tickets == []
+    assert calls["cwd"] == tmp_path
+    assert calls["timeout_s"] == 17
+    assert calls["model"] == "gpt-5-codex"
+    assert str(calls["log_path"]).endswith(".jsonl")
 
 
 # ---------------------------------------------------------------------------

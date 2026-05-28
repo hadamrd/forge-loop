@@ -19,9 +19,11 @@ its own refusal contract — defense in depth.
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -239,6 +241,8 @@ class Brainstormer:
         sdk_fn: Injection point for ``run_brainstormer_sdk`` (tests stub
             this to avoid network + SDK install).
         timeout_s: Hard cap on the SDK session.
+        provider: Agent provider for the default backend. ``claude`` uses
+            the Claude SDK shim; ``codex`` uses ``codex exec``.
     """
 
     repo_path: Path = Path(".")
@@ -248,6 +252,7 @@ class Brainstormer:
     sdk_fn: Callable[..., Any] | None = None
     timeout_s: int = 300
     model: str | None = None
+    provider: str = "claude"
 
     def run(self, vision: ProductVision) -> BrainstormReport:
         """Entry point — see module docstring."""
@@ -320,6 +325,23 @@ class Brainstormer:
         )
 
     def _default_sdk_fn(self) -> Callable[..., Any]:
+        if self.provider == "codex":
+            return self._codex_sdk_fn
+        if self.provider != "claude":
+            raise ValueError(f"unknown brainstormer provider: {self.provider!r}")
         from forge_loop._brainstormer_sdk import run_brainstormer_sdk
 
         return run_brainstormer_sdk
+
+    def _codex_sdk_fn(self, prompt: str, *, cwd: Path, timeout_s: int, model: str | None = None) -> Any:
+        from forge_loop.agent_backend import run_codex_exec
+
+        log_dir = Path(cwd) / "docs" / "ops" / "loop-runner-logs"
+        log_path = log_dir / f"brainstormer-{int(time.time())}.jsonl"
+        return run_codex_exec(
+            prompt=prompt,
+            cwd=Path(cwd),
+            log_path=log_path,
+            timeout_s=timeout_s,
+            model=model or None,
+        )

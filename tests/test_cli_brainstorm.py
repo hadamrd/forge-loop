@@ -15,7 +15,6 @@ in a tmp_path and a `MockGhClient` from `forge_loop.gh_client`.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +23,8 @@ import yaml
 from typer.testing import CliRunner
 
 from forge_loop import cli
-from forge_loop import settings as _fl_settings
 from forge_loop.brainstormer import BrainstormReport, ProposedEpic, ProposedTicket
 from forge_loop.gh_client import GhError, MockGhClient
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -148,6 +145,38 @@ def test_brainstorm_dry_run_prints_yaml(
     }
     # No GitHub calls in dry-run mode.
     assert not any(c[0] == "create_issue" for c in gh.calls)
+
+
+def test_brainstorm_factory_receives_po_provider_config(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    report = BrainstormReport(proposed_epics=[], proposed_tickets=[])
+
+    def factory(*args: Any, **kwargs: Any) -> _StubBrainstormer:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _StubBrainstormer(report)
+
+    from types import SimpleNamespace as _NS
+
+    monkeypatch.setattr(
+        cli,
+        "load",
+        lambda: _NS(
+            repo=cwd_repo,
+            github_repo="acme/widgets",
+            po=_NS(provider="codex", model="gpt-5-codex", timeout_s=123),
+        ),
+    )
+    monkeypatch.setattr(cli, "_brainstormer_factory", factory)
+
+    result = runner.invoke(cli.app, ["brainstorm"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert captured["kwargs"]["provider"] == "codex"
+    assert captured["kwargs"]["model"] == "gpt-5-codex"
+    assert captured["kwargs"]["timeout_s"] == 123
 
 
 # ---------------------------------------------------------------------------
