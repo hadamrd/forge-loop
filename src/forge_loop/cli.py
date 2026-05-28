@@ -636,7 +636,15 @@ def _cmd_init(args: SimpleNamespace) -> int:
     return 0
 
 
-def _brainstormer_factory(repo_path: Path, owner: str, repo: str) -> Any:
+def _brainstormer_factory(
+    repo_path: Path,
+    owner: str,
+    repo: str,
+    *,
+    provider: str = "claude",
+    model: str | None = None,
+    timeout_s: int = 300,
+) -> Any:
     """Construct the default Brainstormer. Tests monkeypatch this.
 
     Kept as a module-level callable so ``monkeypatch.setattr(cli,
@@ -645,7 +653,14 @@ def _brainstormer_factory(repo_path: Path, owner: str, repo: str) -> Any:
     """
     from forge_loop.brainstormer import Brainstormer
 
-    return Brainstormer(repo_path=repo_path, owner=owner, repo=repo)
+    return Brainstormer(
+        repo_path=repo_path,
+        owner=owner,
+        repo=repo,
+        provider=provider,
+        model=model,
+        timeout_s=timeout_s,
+    )
 
 
 def _gh_client_factory() -> Any:
@@ -669,12 +684,10 @@ def _cmd_brainstorm(args: SimpleNamespace) -> int:
     import yaml
 
     from forge_loop.brainstormer import (
-        Brainstormer,
         BrainstormReport,
         ProposedEpic,
         ProposedTicket,
     )
-    from forge_loop.gh_client import MockGhClient
     from forge_loop.product_vision import MissingVisionError, discover
 
     # 1. Resolve repo path + GitHub coordinates from the existing config
@@ -682,12 +695,19 @@ def _cmd_brainstorm(args: SimpleNamespace) -> int:
     repo_path = Path.cwd()
     owner = ""
     repo_name = ""
+    provider = "claude"
+    model: str | None = None
+    timeout_s = 300
     try:
         cfg = load()
         repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path
         gh_repo = getattr(cfg, "github_repo", "") or ""
         if "/" in gh_repo:
             owner, repo_name = gh_repo.split("/", 1)
+        po_cfg = getattr(cfg, "po", None)
+        provider = getattr(po_cfg, "provider", provider)
+        model = getattr(po_cfg, "model", model)
+        timeout_s = getattr(po_cfg, "timeout_s", timeout_s)
     except Exception:  # noqa: BLE001 — config-independent: vision discovery still runs
         pass
 
@@ -703,7 +723,14 @@ def _cmd_brainstorm(args: SimpleNamespace) -> int:
 
     # 3. Run the brainstormer. Tests monkeypatch ``cli._brainstormer_factory``
     #    to inject a stub that skips the real SDK session.
-    brainstormer = _brainstormer_factory(repo_path, owner, repo_name)
+    brainstormer = _brainstormer_factory(
+        repo_path,
+        owner,
+        repo_name,
+        provider=provider,
+        model=model,
+        timeout_s=timeout_s,
+    )
     try:
         report: BrainstormReport = brainstormer.run(vision)
     except Exception as exc:  # noqa: BLE001 — propagate as runtime error to operator
