@@ -280,12 +280,64 @@ class MockGhClient:
         return self.pulls.get((owner, repo, number))
 
 
+# ---------------------------------------------------------------------------
+# Backlog helper — used by the brainstormer (issue #123). Lives here so
+# call sites stay out of subprocess / gh-CLI territory.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OpenBacklog:
+    """Open backlog snapshot: epics (label=``epic``) vs. everything else.
+
+    The brainstormer feeds this into its prompt so the SDK session can
+    see what already exists and avoid re-proposing duplicates.
+    """
+
+    epics: list[Issue] = field(default_factory=list)
+    tickets: list[Issue] = field(default_factory=list)
+
+
+def list_open_backlog(
+    client: GhClient,
+    owner: str,
+    repo: str,
+    *,
+    limit: int = 50,
+    epic_label: str = "epic",
+) -> OpenBacklog:
+    """Return open epics + tickets for ``owner/repo``.
+
+    Implementation: one labelled list for epics, one un-labelled list for
+    "everything open" minus those epics. Both are bounded by ``limit`` so
+    a stale repo doesn't blow up the prompt budget.
+
+    We avoid shelling out to ``gh`` directly — the brainstormer should
+    only ever touch GitHub through :class:`GhClient`.
+    """
+    epics = client.issues_by_label(owner, repo, epic_label, limit)
+    epic_numbers = {e.number for e in epics}
+
+    # "Tickets" = open issues that aren't epics. The protocol only exposes
+    # ``issues_by_label`` — we approximate "all open" by listing the empty
+    # label-set; implementations that don't support that gracefully return
+    # [] and the brainstormer simply gets no ticket context.
+    try:
+        all_open = client.issues_by_label(owner, repo, "", limit * 2)
+    except Exception:  # noqa: BLE001 — best-effort context only
+        all_open = []
+    tickets = [i for i in all_open if i.number not in epic_numbers][:limit]
+    return OpenBacklog(epics=epics, tickets=tickets)
+
+
 __all__ = [
     "GhClient",
     "GhError",
     "GithubkitClient",
     "Issue",
     "MockGhClient",
+    "OpenBacklog",
     "PullRequest",
+    "list_open_backlog",
     "resolve_token",
 ]
