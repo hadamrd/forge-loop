@@ -546,6 +546,8 @@ def test_sdk_happy_path_extracts_pr_and_merged(patch_sdk_types: None) -> None:
     # The MCP filter (issue #60) injects a ``worker_mcp_filtered`` event
     # immediately after ``turn_start``; the original event order is
     # otherwise preserved.
+    # Issue #109 (SDK session_id wiring) added `cost_telemetry` after
+    # `final_result`. Original ordering otherwise preserved.
     assert kinds == [
         "turn_start",
         "worker_mcp_filtered",
@@ -554,9 +556,12 @@ def test_sdk_happy_path_extracts_pr_and_merged(patch_sdk_types: None) -> None:
         "tool_result",
         "assistant_text",
         "final_result",
+        "cost_telemetry",
     ]
     # seq is monotonic
-    assert [e["seq"] for e in captured] == list(range(1, len(captured) + 1))
+    assert [e["seq"] for e in captured if "seq" in e] == list(
+        range(1, sum(1 for e in captured if "seq" in e) + 1)
+    )
     # tool_result content survives
     tr = next(e for e in captured if e["kind"] == "tool_result")
     assert tr["content"] == "file contents"
