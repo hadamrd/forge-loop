@@ -55,12 +55,23 @@ mcp = FastMCP("forge-loop")
 # explicitly; pure-read tools can stay at the default.
 
 _TOOL_CALLS: Counter[str] = Counter()
-_DEFAULT_CAP = int(os.environ.get("LOOP_MCP_CAP_DEFAULT", "20"))
+
+
+def _default_cap() -> int:
+    # Settings-driven default (issue #84): was env LOOP_MCP_CAP_DEFAULT,
+    # now misc.mcp_cap_default. The per-tool override below is still
+    # dynamic env (LOOP_MCP_CAP_<TOOL_NAME>) — too many tools to enumerate
+    # in Settings, and operators set those only in extreme cases.
+    try:
+        from forge_loop.settings import Settings
+        return Settings.load().misc.mcp_cap_default
+    except Exception:  # noqa: BLE001
+        return 20
 
 
 def _cap_for(tool_name: str) -> int:
     env_key = f"LOOP_MCP_CAP_{tool_name.upper()}"
-    return int(os.environ.get(env_key, _DEFAULT_CAP))
+    return int(os.environ.get(env_key, _default_cap()))
 
 
 def _emit_rate_limited(tool_name: str, cap: int, count: int) -> None:

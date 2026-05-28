@@ -243,7 +243,11 @@ def _cmd_doctor(_args: SimpleNamespace) -> int:
         except (_sp.SubprocessError, OSError):
             line("yellow", "git probe failed")
 
-    drift_halt_opt_in = os.environ.get("LOOP_DEPLOY_DRIFT_HALT") == "1"
+    from forge_loop.settings import Settings as _Settings  # noqa: PLC0415
+    try:
+        drift_halt_opt_in = _Settings.load().deploy.drift_halt
+    except Exception:  # noqa: BLE001 — doctor must keep running even if cfg fails
+        drift_halt_opt_in = False
     line(
         "yellow" if drift_halt_opt_in else "green",
         "deploy-drift halt",
@@ -509,8 +513,10 @@ def _cmd_dashboard(args: SimpleNamespace) -> int:
     from forge_loop.dashboard.app import serve as _serve
 
     cfg = load()
+    from forge_loop.settings import Settings as _Settings  # noqa: PLC0415
+    _dash = _Settings.load().dashboard
     host = args.host or "127.0.0.1"
-    port = int(args.port or os.environ.get("LOOP_DASHBOARD_PORT") or 8765)
+    port = int(args.port or _dash.port)
     roles_dir = Path(args.roles_dir) if args.roles_dir else cfg.repo / "roles"
     try:
         _serve(
@@ -518,7 +524,7 @@ def _cmd_dashboard(args: SimpleNamespace) -> int:
             port=port,
             state_dir=cfg.state_dir,
             roles_dir=roles_dir,
-            token=os.environ.get("LOOP_DASHBOARD_TOKEN") or None,
+            token=_dash.token or None,
         )
     except DashboardBindError as exc:
         sys.stderr.write(f"dashboard: {exc}\n")
@@ -818,8 +824,15 @@ def _cmd_replay_diff(args: SimpleNamespace) -> int:
 
 
 def _default_repos_dir() -> Path:
-    env = os.environ.get("LOOP_REPOS_DIR")
-    return Path(env).expanduser() if env else Path.cwd() / ".forge" / "repos"
+    # Settings-driven (issue #84): was env LOOP_REPOS_DIR, now repo.repos_dir.
+    try:
+        from forge_loop.settings import Settings as _Settings
+        path = _Settings.load().repo.repos_dir
+        if path is not None:
+            return Path(path).expanduser()
+    except Exception:  # noqa: BLE001
+        pass
+    return Path.cwd() / ".forge" / "repos"
 
 
 def _cmd_repos_list(args: SimpleNamespace) -> int:
@@ -999,36 +1012,48 @@ def _cmd_pipeline_show(args: SimpleNamespace) -> int:
 
 
 def _cmd_config(args: SimpleNamespace) -> int:
-    cfg = load()
-    out = {
-        "repo": str(cfg.repo),
-        "parallel": cfg.parallel,
-        "tick_interval_s": cfg.tick_interval_s,
-        "max_ticks": cfg.max_ticks,
-        "query_label": cfg.labels.ready,
-        "worker_timeout_s": cfg.worker_timeout_s,
-        "state_file": str(cfg.state_file),
-        "events_file": str(cfg.events_file),
-        "worker": {
-            "provider": cfg.worker.provider,
-            "model": cfg.worker.model,
-            "thinking": cfg.worker.thinking,
-        },
-        "po": {
-            "provider": cfg.po.provider,
-            "model": cfg.po.model,
-            "thinking": cfg.po.thinking,
-        },
-        "critic": {
-            "provider": cfg.critic.provider,
-            "model": cfg.critic.model,
-            "thinking": cfg.critic.thinking,
-        },
-    }
-    # Historical surface: ``config`` always emits JSON (the ``--json`` flag
-    # was a no-op kept for back-compat). Preserve that.
-    _ = getattr(args, "json", False)
-    typer.echo(json.dumps(out, indent=2))
+    """Print the resolved Settings tree (issue #84).
+
+    Output format:
+        --yaml (default)  full resolved Settings as YAML — the single
+                          source of truth, round-trippable
+        --json            JSON shape (legacy summary) for back-compat
+                          scripting
+    """
+    from forge_loop.settings import Settings
+
+    s = Settings.load()
+    if getattr(args, "json", False):
+        # Back-compat summary surface — pre-#84 callers that scrape JSON.
+        cfg = load()
+        out = {
+            "repo": str(cfg.repo),
+            "parallel": cfg.parallel,
+            "tick_interval_s": cfg.tick_interval_s,
+            "max_ticks": cfg.max_ticks,
+            "query_label": cfg.labels.ready,
+            "worker_timeout_s": cfg.worker_timeout_s,
+            "state_file": str(cfg.state_file),
+            "events_file": str(cfg.events_file),
+            "worker": {
+                "provider": cfg.worker.provider,
+                "model": cfg.worker.model,
+                "thinking": cfg.worker.thinking,
+            },
+            "po": {
+                "provider": cfg.po.provider,
+                "model": cfg.po.model,
+                "thinking": cfg.po.thinking,
+            },
+            "critic": {
+                "provider": cfg.critic.provider,
+                "model": cfg.critic.model,
+                "thinking": cfg.critic.thinking,
+            },
+        }
+        typer.echo(json.dumps(out, indent=2))
+    else:
+        typer.echo(s.dump_yaml())
     return 0
 
 

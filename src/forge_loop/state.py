@@ -18,13 +18,15 @@ MAX_ARCHIVES = 3
 
 
 def _rotate_bytes_threshold() -> int:
-    raw = os.environ.get("LOOP_EVENTS_ROTATE_BYTES")
-    if not raw:
-        return DEFAULT_ROTATE_BYTES
+    """Resolve via the unified Settings layer (issue #84).
+    Was ``LOOP_EVENTS_ROTATE_BYTES`` env-only; now ``misc.events_rotate_bytes``.
+    """
     try:
-        v = int(raw)
+        from forge_loop.settings import Settings
+
+        v = Settings.load().misc.events_rotate_bytes
         return v if v > 0 else DEFAULT_ROTATE_BYTES
-    except ValueError:
+    except Exception:  # noqa: BLE001
         return DEFAULT_ROTATE_BYTES
 
 

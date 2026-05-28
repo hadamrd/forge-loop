@@ -263,14 +263,16 @@ def classify_skip(
 
 
 def cooldown_from_env(default_s: int = DEFAULT_RETRY_COOLDOWN_S) -> int:
-    """Resolve the cooldown window from ``LOOP_RETRY_COOLDOWN_S``."""
-    import os
-    raw = os.environ.get("LOOP_RETRY_COOLDOWN_S")
-    if raw is None:
-        return default_s
+    """Resolve the cooldown window via the unified Settings layer (issue #84).
+
+    Was ``LOOP_RETRY_COOLDOWN_S`` env-only; now resolves through
+    ``attempts.cooldown_s`` with the usual env > yaml > default precedence.
+    """
     try:
-        return max(0, int(raw))
-    except ValueError:
+        from forge_loop.settings import Settings
+
+        return max(0, Settings.load().attempts.cooldown_s)
+    except Exception:  # noqa: BLE001
         return default_s
 
 

@@ -419,29 +419,34 @@ def _utc_iso() -> str:
 # ── Env helpers — used by the MCP tool ──────────────────────────────────────
 
 
-def env_timeout_s(default: int = DEFAULT_TIMEOUT_S) -> int:
-    raw = os.environ.get("LOOP_OPERATOR_TIMEOUT_S")
-    if not raw:
-        return default
+def _live_operator():
+    """Always read FRESH settings — these helpers are called from MCP tool
+    invocations where env may have changed since boot (e.g. a test
+    monkeypatches LOOP_OPERATOR_TIMEOUT_S between calls). Cost is one
+    yaml read; negligible vs the MCP RPC round-trip cost."""
+    from forge_loop.settings import Settings
+
     try:
-        return max(1, int(raw))
-    except ValueError:
-        return default
+        return Settings.load().operator
+    except Exception:  # noqa: BLE001 — Settings failure shouldn't kill MCP helpers
+        from forge_loop.settings import OperatorSettings
+
+        return OperatorSettings()
+
+
+def env_timeout_s(default: int = DEFAULT_TIMEOUT_S) -> int:
+    """Operator timeout (was LOOP_OPERATOR_TIMEOUT_S, now operator.timeout_s)."""
+    val = _live_operator().timeout_s
+    return max(1, val) if val else default
 
 
 def env_webhook() -> str | None:
-    return os.environ.get("LOOP_OPERATOR_WEBHOOK") or None
+    return _live_operator().webhook or None
 
 
 def env_slack() -> str | None:
-    return os.environ.get("LOOP_OPERATOR_SLACK_WEBHOOK") or None
+    return _live_operator().slack_webhook or None
 
 
 def env_issue() -> int | None:
-    raw = os.environ.get("LOOP_OPERATOR_ISSUE")
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+    return _live_operator().issue

@@ -14,7 +14,7 @@ from forge_loop import config as config_mod
 @pytest.fixture
 def fake_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Pretend the repo root is tmp_path (avoids hitting real git)."""
-    monkeypatch.setattr(config_mod, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr("forge_loop.settings._repo_root", lambda: tmp_path)
     # clear any LOOP_* env vars that may leak from the parent process
     for k in list(os.environ):
         if k.startswith("LOOP_"):
@@ -37,7 +37,7 @@ def test_load_no_yaml_returns_defaults(fake_repo: Path) -> None:
 def test_load_raises_when_no_repo_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(config_mod, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr("forge_loop.settings._repo_root", lambda: tmp_path)
     for k in list(os.environ):
         if k.startswith("LOOP_"):
             monkeypatch.delenv(k, raising=False)
@@ -46,7 +46,7 @@ def test_load_raises_when_no_repo_configured(
 
 
 def test_repo_from_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(config_mod, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr("forge_loop.settings._repo_root", lambda: tmp_path)
     for k in list(os.environ):
         if k.startswith("LOOP_"):
             monkeypatch.delenv(k, raising=False)
@@ -81,7 +81,7 @@ def test_base_branch_env_overrides_yaml(
 
 
 def test_env_overrides_yaml_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(config_mod, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr("forge_loop.settings._repo_root", lambda: tmp_path)
     for k in list(os.environ):
         if k.startswith("LOOP_"):
             monkeypatch.delenv(k, raising=False)

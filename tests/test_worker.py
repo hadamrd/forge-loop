@@ -373,9 +373,14 @@ def test_prep_worktree_quarantines_undeletable_dir(
         ), f"worktree add was not called: {calls!r}"
         # The blocking dir got renamed out of the way.
         assert not blocking.exists(), "blocking dir should have been quarantined"
-        quarantined = list(Path("/tmp").glob("wt-loop-9999.stale-*"))
+        quarantined = sorted(
+            Path("/tmp").glob("wt-loop-9999.stale-*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         assert quarantined, "quarantine dir was not created"
-        # Quarantined dir still holds the original marker (rename, not delete).
+        # Quarantined dir (newest = this run's) still holds the original
+        # marker — rename, not delete. Pre-clean above strips prior runs.
         assert (quarantined[0] / "marker").read_text() == "planted"
     finally:
         for q in Path("/tmp").glob("wt-loop-9999*"):

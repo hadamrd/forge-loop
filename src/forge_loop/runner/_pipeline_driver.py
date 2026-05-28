@@ -62,7 +62,12 @@ def pipeline_driven_enabled(cfg: Config) -> bool:
     stable", so an operator who checked in a pipeline.yaml for the
     validator can still get the legacy flow until they opt in.
     """
-    if os.environ.get("LOOP_PIPELINE_DRIVEN") != "1":
+    # Settings-driven (issue #84): was env LOOP_PIPELINE_DRIVEN, now iteration.pipeline_driven.
+    try:
+        from forge_loop.settings import Settings as _Settings
+        if not _Settings.load().iteration.pipeline_driven:
+            return False
+    except Exception:  # noqa: BLE001
         return False
     return (cfg.repo / ".forge" / "pipeline.yaml").exists()
 
