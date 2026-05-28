@@ -339,6 +339,7 @@ def run_worker(
     strict_mcp_config: bool = False,
     mcp_servers: dict[str, Any] | None = None,
     base_branch: str = "trunk",
+    brief_override: str | None = None,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -372,15 +373,21 @@ def run_worker(
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"worker-{n}-{int(time.time())}.log"
-    brief = make_brief(
-        issue,
-        worktree,
-        risk_gated=risk_gated,
-        past_attempts=past_attempts,
-        lumen_top_k=lumen_top_k,
-        lumen_test_pattern=lumen_test_pattern,
-        coauthor=coauthor,
-    )
+    # Iteration loop (issue #78) passes a focused follow-up brief that
+    # short-circuits ``make_brief`` — the follow-up session reuses the same
+    # worktree + branch and just gets told "your ONLY job is X".
+    if brief_override is not None:
+        brief = brief_override
+    else:
+        brief = make_brief(
+            issue,
+            worktree,
+            risk_gated=risk_gated,
+            past_attempts=past_attempts,
+            lumen_top_k=lumen_top_k,
+            lumen_test_pattern=lumen_test_pattern,
+            coauthor=coauthor,
+        )
 
     if provider == "codex":
         return _run_worker_codex(

@@ -270,6 +270,13 @@ class Config:
     # Lumen-discovery cap for dependent tests (issue #1002)
     lumen: LumenConfig = field(default_factory=LumenConfig)
 
+    # Worker iteration loop (issue #78). After the first worker session exits
+    # with ``status != "merged"``, the runner probes the worktree + PR state
+    # and dispatches up to this many follow-up sessions with focused briefs
+    # (commit, push, open_pr, fix_critic, fix_ci, resolve_conflict). After
+    # this many attempts without merge, the issue gets ``loop:needs-human``.
+    worker_max_iterations: int = 3
+
     @property
     def state_dir(self) -> Path:
         return self.repo / "docs" / "ops"
@@ -543,5 +550,9 @@ def load() -> Config:
         ),
         lumen=LumenConfig(
             top_k=_env_int("LOOP_LUMEN_TOP_K", int(lumen_block.get("top_k", 3))),
+        ),
+        worker_max_iterations=_env_int(
+            "LOOP_WORKER_MAX_ITERATIONS",
+            int((y.get("iteration") or {}).get("max_iterations", 3)),
         ),
     )
