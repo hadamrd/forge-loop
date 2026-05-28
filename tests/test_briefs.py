@@ -68,6 +68,7 @@ def test_render_critic_brief_substitutes_pr_and_issue() -> None:
         "critic",
         pr_url="https://github.com/acme/repo/pull/7",
         issue_number=7,
+        manifestos="(test manifestos block)",
     )
     assert "https://github.com/acme/repo/pull/7" in out
     assert "#7" in out
