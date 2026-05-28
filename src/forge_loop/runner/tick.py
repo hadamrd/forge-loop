@@ -501,6 +501,25 @@ def _tick(cfg: Config, tick: int) -> None:
     from forge_loop.axis import filter_issues_by_axes, parse_filter_env
 
     axis_filter = parse_filter_env()
+    # When .forge/axes.yaml exists, default to filtering by ANY known
+    # axis label so the legacy maintenance LLM (or stray ops) can't
+    # smuggle non-axis-aligned issues onto the dispatch path. Dogfood-
+    # caught: maintenance daemon re-labeled 4 cosmetic Titan tickets as
+    # loop:ready after the brainstormer had explicitly omitted them.
+    # Explicit env override (LOOP_AXIS_FILTER) still wins.
+    if not axis_filter:
+        try:
+            from forge_loop.product_vision import discover as _discover_vision
+            _vision = _discover_vision(cfg.repo)
+            axis_filter = sorted({a.name.lower() for a in _vision.axes})
+            append_event(
+                cfg.events_file,
+                "axis_filter_auto_from_axes_yaml",
+                tick=tick,
+                axes=axis_filter,
+            )
+        except Exception:  # noqa: BLE001 — no axes.yaml or unreadable; preserve legacy
+            axis_filter = []
     fetch_limit = max(cfg.parallel, 50) if axis_filter else cfg.parallel
     try:
         issues = top_issues(cfg.labels.ready, fetch_limit, repo=cfg.github_repo)
