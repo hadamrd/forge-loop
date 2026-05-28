@@ -345,21 +345,44 @@ def _tick(cfg: Config, tick: int) -> None:
     )
 
     # Post-tick: reap EVERY worker's worktree (merged, open, failed, timeout).
-    # Originally only merged worktrees were reaped, on the theory that an
-    # operator might want to spelunk a failed worktree. In practice it never
-    # happens — the per-worker SDK log under docs/ops/loop-runner-logs/ is
-    # the artifact operators actually read, and failed worktrees just pile
-    # up under /tmp/wt-loop-* until the next boot-time reaper finds them.
-    # Reaping unconditionally here keeps the disk clean tick-to-tick.
-    # PRs that are "open" (worker pushed branch but didn't auto-merge —
-    # e.g. risk_gated, critic blocked) still have the branch on origin so
-    # the operator's PR review surface is unaffected.
+    # Reap policy (refined after a real dogfood observation):
+    #   * status == "merged"  → reap. The PR is on origin; the local
+    #     worktree carries no information that isn't already in the
+    #     merge commit + the per-worker SDK log.
+    #   * status == "open"    → reap. The branch is pushed to origin
+    #     and the PR is open for human review; the local worktree has
+    #     nothing the operator can't fetch from origin.
+    #   * status == "failed" / "no_pr" / "timeout" → PRESERVE. The
+    #     worker may have made uncommitted edits the operator wants
+    #     to inspect or recover (a real case observed: a worker on a
+    #     5-deliverable ticket wrote + edited 6 files across 53 turns
+    #     and exited cleanly without committing — the work was lost
+    #     when the tick reaper nuked the worktree unconditionally).
+    #
+    # The boot-time orphan reaper is still the safety net: any
+    # preserved worktree that the operator doesn't pick up before the
+    # next loop boot gets cleaned up automatically. So preservation
+    # is best-effort recovery, not unbounded accumulation.
+    _REAPABLE_STATUSES = frozenset({"merged", "open"})
     for o in outcomes:
-        _reap_worktree(cfg.repo, o.issue)
-        append_event(
-            cfg.events_file, "worktree_reaped",
-            issue=o.issue, status=o.status,
-        )
+        if o.status in _REAPABLE_STATUSES:
+            _reap_worktree(cfg.repo, o.issue)
+            append_event(
+                cfg.events_file, "worktree_reaped",
+                issue=o.issue, status=o.status,
+            )
+        else:
+            # Preserve for operator inspection / work recovery.
+            wt_path = f"/tmp/wt-loop-{o.issue}"
+            append_event(
+                cfg.events_file, "worktree_preserved",
+                issue=o.issue, status=o.status, path=wt_path,
+                hint=(
+                    f"Worker exited with status={o.status!r}; uncommitted "
+                    f"work may live at {wt_path}. Reaped at next loop boot "
+                    "unless you `git worktree remove --force` it sooner."
+                ),
+            )
 
     if merged_nums and cfg.deploy_task:
         ok, log = redeploy(cfg.repo, cfg.deploy_task)
