@@ -54,12 +54,16 @@ def compute_fingerprint(
     (the worker is being asked to do meaningfully different work). Identical
     inputs → identical fingerprint, regardless of when called.
     """
+    # ``errors="surrogatepass"`` keeps the hasher robust against lone-surrogate
+    # codepoints that can sneak into issue bodies via copy-paste of broken
+    # unicode (hypothesis found this — see tests/property/test_fingerprint_property.py).
+    # Without it, ``encode("utf-8")`` raises UnicodeEncodeError mid-tick.
     h = hashlib.sha256()
-    h.update(str(issue_id).encode("utf-8"))
+    h.update(str(issue_id).encode("utf-8", errors="surrogatepass"))
     h.update(b"\x00")
-    h.update((issue_body or "").encode("utf-8"))
+    h.update((issue_body or "").encode("utf-8", errors="surrogatepass"))
     h.update(b"\x00")
-    h.update((brief_template_hash or "").encode("utf-8"))
+    h.update((brief_template_hash or "").encode("utf-8", errors="surrogatepass"))
     return h.hexdigest()
 
 
