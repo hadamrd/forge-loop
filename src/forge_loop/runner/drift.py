@@ -76,7 +76,10 @@ def _maybe_deploy_drift_halt(cfg: Config, ok: bool) -> None:
     if not ok and fails >= 3:
         append_event(cfg.events_file, "deploy_drift_warn",
                      consecutive_fails=fails)
-        if os.environ.get("LOOP_DEPLOY_DRIFT_HALT") == "1":
+        # Settings-driven (issue #84): was env LOOP_DEPLOY_DRIFT_HALT,
+        # now deploy.drift_halt with the unified env > yaml > default precedence.
+        from forge_loop.settings import Settings as _Settings
+        if _Settings.load().deploy.drift_halt:
             append_event(cfg.events_file, "deploy_drift_halt",
                          consecutive_fails=fails)
             with contextlib.suppress(OSError):

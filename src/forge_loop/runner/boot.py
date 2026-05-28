@@ -121,11 +121,11 @@ def run(cfg: Config) -> int:
     # Queue bootstrap. Default = in-memory (zero infra, single host).
     # Set LOOP_QUEUE_URL=sqlite:///path/to/queue.db for the durable
     # embedded backend. Multi-host Redis support was removed in #39.
-    import os as _os
-
     from forge_loop.queue import build_queue, default_host_id
+    from forge_loop.settings import Settings as _Settings
 
-    queue_url = _os.environ.get("LOOP_QUEUE_URL")
+    # Settings-driven (issue #84): was env LOOP_QUEUE_URL, now misc.queue_url.
+    queue_url = _Settings.load().misc.queue_url
     queue = build_queue(queue_url)
     host_id = default_host_id()
 
