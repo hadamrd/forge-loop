@@ -42,7 +42,8 @@ from forge_loop.runner.drift import (
     _maybe_deploy_drift_halt,
 )
 from forge_loop.state import append_event, consolidate_sprint, write_state
-from forge_loop.stuck_sweep import SweepReport, sweep as _stuck_sweep
+from forge_loop.stuck_sweep import SweepReport
+from forge_loop.stuck_sweep import sweep as _stuck_sweep
 from forge_loop.worker import WorkerOutcome
 
 
@@ -70,6 +71,9 @@ def _issue_number_from_pr(pr: dict[str, Any]) -> int | None:
 
 
 def _blocking_pr_repairs(cfg: Config) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    from forge_loop.axis import matches_axes, parse_filter_env
+
+    axis_filter = parse_filter_env()
     repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
     for pr in prs_by_label("critic:blocking", cfg.parallel, repo=cfg.github_repo):
         issue_num = _issue_number_from_pr(pr)
@@ -89,6 +93,16 @@ def _blocking_pr_repairs(cfg: Config) -> list[tuple[dict[str, Any], dict[str, An
                 pr=pr.get("url"),
                 issue=issue_num,
                 reason="issue_fetch_failed",
+            )
+            continue
+        if axis_filter and not matches_axes(issue.get("labels") or [], axis_filter):
+            append_event(
+                cfg.events_file,
+                "repair_pr_skipped",
+                pr=pr.get("url"),
+                issue=issue_num,
+                reason="axis_filter_mismatch",
+                axes=axis_filter,
             )
             continue
         repairs.append((issue, pr, pr_review_context(pr["number"], repo=cfg.github_repo)))
