@@ -196,3 +196,43 @@ def test_unresolved_review_thread_pr_is_selected_for_repair(
     assert pr["repairReasons"] == ["unresolved_review_threads"]
     assert ctx == "thread context"
     assert "repair_pr_selected" in cfg.events_file.read_text()
+
+
+def test_repaired_pr_gets_automerge_after_threads_are_clear(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from forge_loop import gh
+    from forge_loop.config import Config
+    from forge_loop.runner import merge_gate
+    from forge_loop.runner import tick as tick_mod
+    from forge_loop.worker import WorkerOutcome
+
+    cfg = Config(repo=tmp_path, github_repo="acme/widgets")
+    gate_calls: list[str] = []
+    merge_calls: list[str] = []
+    monkeypatch.setattr(
+        merge_gate,
+        "apply_issue_closed_gate",
+        lambda outcomes, **_kwargs: gate_calls.extend(o.pr_url or "" for o in outcomes) or [],
+    )
+    monkeypatch.setattr(gh, "unresolved_review_threads", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        gh,
+        "enable_pr_auto_merge",
+        lambda pr, **_kwargs: merge_calls.append(str(pr)) or True,
+    )
+    outcome = WorkerOutcome(
+        issue=99,
+        title="fix review",
+        pr_url="https://github.com/acme/widgets/pull/10",
+        status="open",
+        duration_s=1.0,
+        stdout_tail="",
+    )
+
+    tick_mod._enable_automerge_for_repaired_prs(cfg, [outcome], lambda *_a, **_k: None)
+
+    assert gate_calls == ["https://github.com/acme/widgets/pull/10"]
+    assert merge_calls == ["https://github.com/acme/widgets/pull/10"]
+    assert outcome.status == "merged"
+    assert "repair_automerge_enabled" in cfg.events_file.read_text()

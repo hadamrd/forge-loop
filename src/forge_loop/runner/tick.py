@@ -116,6 +116,53 @@ def _blocking_pr_repairs(cfg: Config) -> list[tuple[dict[str, Any], dict[str, An
     return repairs
 
 
+def _enable_automerge_for_repaired_prs(
+    cfg: Config,
+    outcomes: list[WorkerOutcome],
+    emit: Any,
+) -> None:
+    """After repair + critic, put fixed PRs back on the merge conveyor."""
+    from forge_loop import gh as _gh
+    from forge_loop.runner.merge_gate import apply_issue_closed_gate
+
+    apply_issue_closed_gate(
+        outcomes,
+        gh=_gh,
+        repo=cfg.github_repo,
+        events_file=cfg.events_file,
+        emit=emit,
+    )
+    for outcome in outcomes:
+        if outcome.status not in {"open", "merged"} or not outcome.pr_url:
+            continue
+        threads = _gh.unresolved_review_threads(outcome.pr_url, repo=cfg.github_repo)
+        if threads:
+            append_event(
+                cfg.events_file,
+                "repair_automerge_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason="unresolved_review_threads",
+                unresolved=len(threads),
+            )
+            continue
+        if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
+            outcome.status = "merged"
+            append_event(
+                cfg.events_file,
+                "repair_automerge_enabled",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+            )
+        else:
+            append_event(
+                cfg.events_file,
+                "repair_automerge_failed",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+            )
+
+
 _TEST_FILE_GLOBS = (
     "**/test/**",
     "**/tests/**",
@@ -490,6 +537,7 @@ def _tick(cfg: Config, tick: int) -> None:
         )
         if cfg.critic.enabled:
             _run_critic_for_outcomes(cfg, outcomes, _bus_emit)
+        _enable_automerge_for_repaired_prs(cfg, outcomes, _bus_emit)
         append_event(
             cfg.events_file,
             "repair_tick_done",
