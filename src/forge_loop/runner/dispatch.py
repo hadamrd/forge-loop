@@ -28,6 +28,38 @@ from forge_loop.worker_state import InvalidTransition, WorkerState
 NEEDS_HUMAN_LABEL = "loop:needs-human"
 
 
+def free_dispatch_slots(store: WorkerSessionStore, parallel: int) -> int:
+    """Return the number of free parallel dispatch slots on this tick.
+
+    This is the headline efficiency win of issue #112 (toward epic #95):
+    the dispatcher reads :meth:`WorkerSessionStore.active_count` — which
+    only counts ``RUNNING`` and ``REVISING`` sessions — instead of an
+    in-memory ``len(self._running_futures)`` that would also count
+    paused ``AWAITING_CRITIC`` sessions against the budget.
+
+    A session sitting in ``AWAITING_CRITIC`` has handed control back to
+    the critic agent; it is not consuming a worker thread. Counting it
+    against ``parallel`` starves the loop of forward progress: with
+    ``parallel=3`` and three AWAITING_CRITIC sessions, the legacy
+    accounting would refuse to dispatch ANY new worker until the
+    critic finished. The store-based accounting frees those slots
+    immediately, so the dispatcher can fill them with fresh work.
+
+    Args:
+        store: the SQLite session store driving the runner.
+        parallel: the configured worker-parallelism cap.
+
+    Returns:
+        ``max(0, parallel - store.active_count())``. The ``max(0, …)``
+        guards against transient over-subscription (e.g. an operator
+        lowering ``parallel`` mid-run with live workers): the dispatcher
+        simply refuses to launch more until the count drains, instead
+        of returning a negative number that downstream callers would
+        have to special-case.
+    """
+    return max(0, parallel - store.active_count())
+
+
 def enforce_critic_iteration_cap(
     *,
     store: WorkerSessionStore,
