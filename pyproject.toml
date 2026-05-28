@@ -22,6 +22,11 @@ dependencies = [
   # formatting when stderr is a TTY, JSON when piped to a file. Replaces
   # the print/_mlog/append_event triplet over time.
   "structlog >=24.0",
+  # githubkit: typed, async-capable GitHub SDK (issue #83). Replaces the
+  # 18 ``subprocess.run(["gh", ...])`` callsites in gh.py with one
+  # client; per-call latency drops from ~50-100ms subprocess spawn to
+  # an HTTP round-trip the SDK can keep-alive.
+  "githubkit >=0.13",
   # Rich powers status/doctor/events output. NO_COLOR aware,
   # CI-friendly when terminal is dumb. Pulled into the stable surface
   # because the CLI is the operator's primary interface.
