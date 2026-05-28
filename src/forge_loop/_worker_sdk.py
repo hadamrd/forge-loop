@@ -88,12 +88,14 @@ def resolve_mcp_filter(
     allow = tuple(dict.fromkeys(str(s).strip() for s in allow_list if str(s).strip()))
     matched = [s for s in allow if s in actual]
     if actual and allow and not matched:
-        emit({
-            "kind": "worker_mcp_filter_no_match",
-            "configured": list(allow),
-            "available": actual,
-            "fallback": list(default),
-        })
+        emit(
+            {
+                "kind": "worker_mcp_filter_no_match",
+                "configured": list(allow),
+                "available": actual,
+                "fallback": list(default),
+            }
+        )
         resolved = tuple(dict.fromkeys(default))
         kept = [s for s in resolved if s in actual]
         dropped = [s for s in actual if s not in resolved]
@@ -101,18 +103,29 @@ def resolve_mcp_filter(
         resolved = allow if allow else tuple(default)
         kept = [s for s in resolved if (not actual) or s in actual]
         dropped = [s for s in actual if s not in resolved]
-    emit({
-        "kind": "worker_mcp_filtered",
-        "kept": list(kept),
-        "dropped": list(dropped),
-        "configured": list(allow),
-    })
+    emit(
+        {
+            "kind": "worker_mcp_filtered",
+            "kept": list(kept),
+            "dropped": list(dropped),
+            "configured": list(allow),
+        }
+    )
     return resolved
 
 
 @dataclass
 class SDKRunResult:
-    """Result of a single Claude Agent SDK session."""
+    """Result of a single Claude Agent SDK session.
+
+    ``sdk_session_id`` is the Claude Agent SDK's own session identifier,
+    captured from either the ``SystemMessage(subtype="init")`` ``data`` blob
+    or the trailing ``ResultMessage`` (whichever surfaces it first — newer
+    SDK builds populate both). Threaded through to
+    :meth:`forge_loop.worker_sessions.WorkerSessionStore.set_sdk_session_id`
+    so a follow-up dispatch can pass ``resume=<id>`` and keep the prompt
+    cache warm across critic ping-pong rounds (issue #109 / epic #95).
+    """
 
     pr_url: str | None
     status: str
@@ -124,6 +137,30 @@ class SDKRunResult:
     events: list[dict[str, Any]] = field(default_factory=list)
     duration_s: float = 0.0
     num_turns: int = 0
+    sdk_session_id: str | None = None
+    cache_hit_ratio: float = 0.0
+
+
+def compute_cache_hit_ratio(usage: dict[str, Any]) -> float:
+    """Return cache_read / (cache_read + input_tokens), clamped to [0, 1].
+
+    Anthropic's usage payload reports cached-read tokens alongside the raw
+    input-token count. The ratio is the headline operator metric for issue
+    #109 — round 2+ of a persistent-worker session should hit >30% because
+    the SDK resumes the prior session and the prompt cache is reused.
+
+    Returns ``0.0`` when the denominator is zero (no usage data at all),
+    rather than raising — telemetry must never crash the runner.
+    """
+    try:
+        cache_read = float(usage.get("cache_read_input_tokens", 0) or 0)
+        plain_input = float(usage.get("input_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    denom = cache_read + plain_input
+    if denom <= 0:
+        return 0.0
+    return max(0.0, min(1.0, cache_read / denom))
 
 
 def _utc_now() -> str:
@@ -238,6 +275,7 @@ async def run_sdk_session(
     load_timeout_ms: int | None = None,
     strict_mcp_config: bool = False,
     mcp_servers: dict[str, Any] | None = None,
+    resume: str | None = None,
 ) -> SDKRunResult:
     """Drive one Claude Agent SDK session and stream typed WorkerEvents.
 
@@ -253,6 +291,7 @@ async def run_sdk_session(
         from claude_agent_sdk import (
             query as _query,
         )
+
         if query_fn is None:
             query_fn = _query
         if options_cls is None:
@@ -277,6 +316,7 @@ async def run_sdk_session(
     is_error = False
     num_turns = 0
     error_str: str | None = None
+    sdk_session_id: str | None = None
 
     def emit(ev: dict[str, Any]) -> None:
         nonlocal seq
@@ -323,11 +363,17 @@ async def run_sdk_session(
     #     operator's Gmail/Drive/Calendar/playwright/persistent-shell etc.
     if load_timeout_ms is not None:
         base_kwargs["load_timeout_ms"] = int(load_timeout_ms)
+    # Resume an existing SDK session (issue #109) — the prompt cache survives
+    # across critic rounds so iteration 2+ is meaningfully cheaper. Degraded
+    # via ``_OPTIONAL_KNOBS`` below if the installed SDK is too old.
+    if resume:
+        base_kwargs["resume"] = str(resume)
     if strict_mcp_config:
         base_kwargs["strict_mcp_config"] = True
         # When strict, an empty `mcp_servers` means "no MCP servers at all".
         # The default below is the operator's explicit allow-list (may be {}).
         base_kwargs["mcp_servers"] = dict(mcp_servers or {})
+
     def _instantiate(**extra: Any) -> Any:
         """Build ClaudeAgentOptions, degrading gracefully on TypeErrors.
 
@@ -342,6 +388,7 @@ async def run_sdk_session(
             "load_timeout_ms",
             "strict_mcp_config",
             "mcp_servers",
+            "resume",
         )
         try:
             return options_cls(**kwargs)
@@ -369,10 +416,20 @@ async def run_sdk_session(
             if isinstance(message, SystemMessage):
                 if getattr(message, "subtype", "") == "init":
                     init_data = dict(getattr(message, "data", {}) or {})
-                    emit({
-                        "kind": "turn_start",
-                        "data": init_data,
-                    })
+                    # Capture the SDK's session id as early as possible —
+                    # the init payload carries it on every supported SDK
+                    # build, so even a session that errors before a
+                    # ResultMessage lands still surfaces an id the runner
+                    # can persist for ``resume=`` on the next attempt.
+                    _sid = init_data.get("session_id")
+                    if isinstance(_sid, str) and _sid:
+                        sdk_session_id = _sid
+                    emit(
+                        {
+                            "kind": "turn_start",
+                            "data": init_data,
+                        }
+                    )
                     # Surface which MCP servers survived the allow-list
                     # filter (issue #60). The init payload's
                     # ``mcp_servers`` is a list of {name, status} dicts in
@@ -398,24 +455,28 @@ async def run_sdk_session(
                     if isinstance(block, TextBlock):
                         emit({"kind": "assistant_text", "text": block.text})
                     elif isinstance(block, ToolUseBlock):
-                        emit({
-                            "kind": "tool_use",
-                            "tool": block.name,
-                            "input": _safe_input(block.input),
-                            "tool_use_id": block.id,
-                        })
+                        emit(
+                            {
+                                "kind": "tool_use",
+                                "tool": block.name,
+                                "input": _safe_input(block.input),
+                                "tool_use_id": block.id,
+                            }
+                        )
                 continue
             if isinstance(message, UserMessage):
                 content = getattr(message, "content", None)
                 blocks = content if isinstance(content, list) else []
                 for block in blocks:
                     if isinstance(block, ToolResultBlock):
-                        emit({
-                            "kind": "tool_result",
-                            "tool_use_id": block.tool_use_id,
-                            "is_error": bool(block.is_error),
-                            "content": _stringify_tool_result(block.content)[:2000],
-                        })
+                        emit(
+                            {
+                                "kind": "tool_result",
+                                "tool_use_id": block.tool_use_id,
+                                "is_error": bool(block.is_error),
+                                "content": _stringify_tool_result(block.content)[:2000],
+                            }
+                        )
                 continue
             if isinstance(message, ResultMessage):
                 final_text = getattr(message, "result", "") or ""
@@ -423,27 +484,61 @@ async def run_sdk_session(
                 usage = dict(getattr(message, "usage", {}) or {})
                 is_error = bool(getattr(message, "is_error", False))
                 num_turns = int(getattr(message, "num_turns", 0) or 0)
-                emit({
-                    "kind": "final_result",
-                    "result": final_text,
-                    "cost_usd": cost_usd,
-                    "usage": usage,
-                    "model": model_seen,
-                    "num_turns": num_turns,
-                    "is_error": is_error,
-                })
+                # Newer SDKs put session_id on ResultMessage too; prefer
+                # it when present (init may have been an older shape).
+                _rsid = getattr(message, "session_id", None)
+                if isinstance(_rsid, str) and _rsid:
+                    sdk_session_id = _rsid
+                cache_ratio = compute_cache_hit_ratio(usage)
+                emit(
+                    {
+                        "kind": "final_result",
+                        "result": final_text,
+                        "cost_usd": cost_usd,
+                        "usage": usage,
+                        "model": model_seen,
+                        "num_turns": num_turns,
+                        "is_error": is_error,
+                        "sdk_session_id": sdk_session_id,
+                    }
+                )
+                # Cost-telemetry event (issue #109 acceptance criterion):
+                # operators see input/output token counts and the
+                # cache-hit ratio so iteration 2+ being meaningfully
+                # cheaper is observable in the event bus, not just the
+                # billing dashboard.
+                emit(
+                    {
+                        "kind": "cost_telemetry",
+                        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                        "cache_read_input_tokens": int(
+                            usage.get("cache_read_input_tokens", 0) or 0
+                        ),
+                        "cache_creation_input_tokens": int(
+                            usage.get("cache_creation_input_tokens", 0) or 0
+                        ),
+                        "cache_hit_ratio": round(cache_ratio, 4),
+                        "cost_usd": cost_usd,
+                        "model": model_seen,
+                        "sdk_session_id": sdk_session_id,
+                        "resumed": bool(resume),
+                    }
+                )
                 continue
     except BaseException as exc:  # noqa: BLE001
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         error_type, hint = _classify_error(exc)
         error_str = f"{error_type}: {exc}"
-        emit({
-            "kind": "error",
-            "error_type": error_type,
-            "message": str(exc)[:500],
-            "retry_hint": hint,
-        })
+        emit(
+            {
+                "kind": "error",
+                "error_type": error_type,
+                "message": str(exc)[:500],
+                "retry_hint": hint,
+            }
+        )
 
     duration = time.time() - started
     pr_url, status = _extract_pr_status(final_text)
@@ -466,4 +561,6 @@ async def run_sdk_session(
         events=events,
         duration_s=duration,
         num_turns=num_turns,
+        sdk_session_id=sdk_session_id,
+        cache_hit_ratio=compute_cache_hit_ratio(usage),
     )
