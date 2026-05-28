@@ -208,13 +208,15 @@ REVIEW / CRITIC CONTEXT TO ADDRESS:
 
 CONTRACT:
 1. Repair the EXISTING PR branch. Do not create a new branch and do not open a new PR.
-2. Address every sev1/blocking review point with production behavior and tests.
-3. Preserve the original issue scope; do not add unrelated refactors.
-4. Run focused tests that prove the review comments are fixed.
-5. Run formatting/lint gates appropriate for touched files.
-6. Commit with a message referencing #{n}.
-7. Push the current branch with `git push`.
-8. Leave a short PR comment summarizing the repair.
+2. Address every unresolved review thread and every sev1/blocking review point with production behavior and tests.
+3. If the branch is behind or conflicted, merge/rebase the current base branch and resolve conflicts in scope.
+4. Preserve the original issue scope; do not add unrelated refactors.
+5. Run focused tests that prove the review comments are fixed.
+6. Run formatting/lint gates appropriate for touched files.
+7. Commit with a message referencing #{n}.
+8. Push the current branch with `git push`.
+9. Resolve review threads after fixing them when the GitHub API/CLI allows it; otherwise reply/comment with the fixed evidence.
+10. Leave a short PR comment summarizing the repair and remaining state.
 
 LOOP INFRASTRUCTURE — DO NOT TOUCH:
 - `{worktree}/.claude/settings.json` is loop-planted. Do NOT `git clean`, `rm`, or chmod it.
@@ -331,10 +333,8 @@ def _prep_worktree(
         capture_output=True,
     )
     if wt.exists():
-        try:
+        with contextlib.suppress(OSError, PermissionError):
             shutil.rmtree(wt)
-        except (OSError, PermissionError):
-            pass
     # If the worker planted files owned by a different uid (subprocess
     # ran under a different namespace), chmod+rmtree above will silently
     # fail and leave the dir behind. Quarantine it so the new worktree
@@ -390,19 +390,20 @@ def _prep_repair_worktree(
         subprocess.run(["chmod", "-R", "u+w", str(claude_dir)], capture_output=True)
     subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=repo, capture_output=True)
     if wt.exists():
-        try:
+        with contextlib.suppress(OSError, PermissionError):
             shutil.rmtree(wt)
-        except (OSError, PermissionError):
-            pass
     _quarantine_if_blocking(wt)
     remote_ref = f"refs/remotes/origin/{branch}"
     subprocess.run(
         ["git", "fetch", "--prune", "origin", f"+refs/heads/{branch}:{remote_ref}"],
-        cwd=repo, capture_output=True,
+        cwd=repo,
+        capture_output=True,
     )
     r = subprocess.run(
         ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{branch}"],
-        cwd=repo, capture_output=True, text=True,
+        cwd=repo,
+        capture_output=True,
+        text=True,
     )
     if r.returncode != 0:
         return wt, r.stderr
@@ -603,15 +604,23 @@ def run_repair_worker(
     pr_url = pr.get("url")
     if not branch:
         return WorkerOutcome(
-            issue=n, title=title, pr_url=pr_url, status="failed",
-            duration_s=0.0, stdout_tail="missing PR headRefName",
+            issue=n,
+            title=title,
+            pr_url=pr_url,
+            status="failed",
+            duration_s=0.0,
+            stdout_tail="missing PR headRefName",
             error="repair-missing-branch",
         )
     worktree, err = _prep_repair_worktree(repo, n, branch)
     if err is not None:
         return WorkerOutcome(
-            issue=n, title=title, pr_url=pr_url, status="failed",
-            duration_s=0.0, stdout_tail=err[-500:],
+            issue=n,
+            title=title,
+            pr_url=pr_url,
+            status="failed",
+            duration_s=0.0,
+            stdout_tail=err[-500:],
             error="repair-worktree-create-failed",
         )
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -627,13 +636,23 @@ def run_repair_worker(
     )
     if provider == "codex":
         return _run_worker_codex(
-            issue=issue, worktree=worktree, log_path=log_path,
-            brief=brief, timeout_s=timeout_s, model=model,
+            issue=issue,
+            worktree=worktree,
+            log_path=log_path,
+            brief=brief,
+            timeout_s=timeout_s,
+            model=model,
         )
     return _run_worker_sdk(
-        issue=issue, worktree=worktree, log_path=log_path,
-        brief=brief, timeout_s=timeout_s, emit=emit, tick=tick,
-        model=model, thinking=thinking,
+        issue=issue,
+        worktree=worktree,
+        log_path=log_path,
+        brief=brief,
+        timeout_s=timeout_s,
+        emit=emit,
+        tick=tick,
+        model=model,
+        thinking=thinking,
         allowed_mcp_servers=allowed_mcp_servers,
         load_timeout_ms=load_timeout_ms,
         strict_mcp_config=strict_mcp_config,

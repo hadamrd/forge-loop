@@ -93,7 +93,7 @@ def test_axis_match_alone_does_not_bypass_ready_gate() -> None:
 
 def test_malformed_axis_label_does_not_crash_and_excludes_under_filter() -> None:
     queue = [
-        _make(1, READY, "axis:"),       # empty slug
+        _make(1, READY, "axis:"),  # empty slug
         _make(2, READY, "axis:dispatch"),
     ]
     picked = filter_issues_by_axes(queue, ["dispatch"])
@@ -140,8 +140,14 @@ def test_blocked_pr_repair_respects_axis_filter(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setenv(AXIS_FILTER_ENV, "dispatch")
     monkeypatch.setattr(
         tick_mod,
-        "prs_by_label",
-        lambda *_a, **_k: [{"number": 10, "url": "https://github.com/acme/widgets/pull/10", "headRefName": "loop/99-old"}],
+        "prs_requiring_repair",
+        lambda *_a, **_k: [
+            {
+                "number": 10,
+                "url": "https://github.com/acme/widgets/pull/10",
+                "headRefName": "loop/99-old",
+            }
+        ],
     )
     monkeypatch.setattr(
         tick_mod,
@@ -158,3 +164,35 @@ def test_blocked_pr_repair_respects_axis_filter(monkeypatch: pytest.MonkeyPatch,
 
     assert repairs == []
     assert "axis_filter_mismatch" in cfg.events_file.read_text()
+
+
+def test_unresolved_review_thread_pr_is_selected_for_repair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from forge_loop.config import Config
+    from forge_loop.runner import tick as tick_mod
+
+    cfg = Config(repo=tmp_path, github_repo="acme/widgets")
+    monkeypatch.setattr(
+        tick_mod,
+        "prs_requiring_repair",
+        lambda *_a, **_k: [
+            {
+                "number": 10,
+                "url": "https://github.com/acme/widgets/pull/10",
+                "headRefName": "loop/99-fix-review",
+                "repairReasons": ["unresolved_review_threads"],
+            }
+        ],
+    )
+    monkeypatch.setattr(tick_mod, "fetch_issue", lambda *_a, **_k: _make(99, READY))
+    monkeypatch.setattr(tick_mod, "pr_review_context", lambda *_a, **_k: "thread context")
+
+    repairs = tick_mod._blocking_pr_repairs(cfg)
+
+    assert len(repairs) == 1
+    issue, pr, ctx = repairs[0]
+    assert issue["number"] == 99
+    assert pr["repairReasons"] == ["unresolved_review_threads"]
+    assert ctx == "thread context"
+    assert "repair_pr_selected" in cfg.events_file.read_text()
