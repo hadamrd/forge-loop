@@ -6,6 +6,7 @@ no behaviour change, no signature change.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,6 +19,113 @@ from forge_loop.critic import review_pr as _critic_review
 from forge_loop.critic_actions import apply_critic_report
 from forge_loop.state import append_event
 from forge_loop.worker import WorkerOutcome, run_repair_worker, run_worker
+from forge_loop.worker_sessions import WorkerSessionStore
+from forge_loop.worker_state import InvalidTransition, WorkerState
+
+# Label applied to PRs whose persistent-worker session has exhausted the
+# critic ping-pong budget. Operators filter on this label to triage stuck
+# work that the loop has decided not to keep grinding on.
+NEEDS_HUMAN_LABEL = "loop:needs-human"
+
+
+def enforce_critic_iteration_cap(
+    *,
+    store: WorkerSessionStore,
+    session_id: str,
+    pr_url: str | None,
+    max_critic_iterations: int,
+    findings_summary: str = "",
+    gh: Any = _gh,
+    repo: str | None = None,
+    emit: Any = None,
+) -> bool:
+    """Handle a REQUEST_CHANGES verdict against the iteration cap.
+
+    Called on every AWAITING_CRITIC -> (REVISING|ABANDONED) decision.
+    Reads ``session.critic_iterations`` and compares against
+    ``settings.iteration.max_critic_iterations``:
+
+    * counter >= cap  -> transition AWAITING_CRITIC -> ABANDONED with
+      ``reason="max_critic_iterations reached: N"``, label the PR
+      ``loop:needs-human``, and post a comment summarising the last
+      critic findings so a human picking this up has the context.
+    * counter <  cap  -> bump the counter, transition to REVISING with
+      ``reason="critic requested changes"`` so the persistent worker
+      session can resume with a warm prompt cache (issue #95).
+
+    Returns ``True`` when the session was abandoned (caller should stop
+    dispatching this issue's revision loop), ``False`` when a revision
+    is in flight.
+
+    Side effects on the GitHub side (label + comment) are best-effort:
+    a transient ``gh`` failure must not prevent the FSM transition from
+    landing, because the FSM is the source of truth — the label/comment
+    are operator UX. Failures are surfaced via ``emit`` so they're
+    observable in the event bus without blocking the loop.
+    """
+    sess = store.get(session_id)
+    if sess is None:
+        raise KeyError(f"unknown session_id: {session_id}")
+    if sess.state != WorkerState.AWAITING_CRITIC:
+        # Caller bug — the cap check belongs on the exact ping-pong edge,
+        # not on arbitrary state transitions. Surface this loudly.
+        raise InvalidTransition(sess.state, WorkerState.REVISING)
+
+    current = sess.critic_iterations
+    if current >= max_critic_iterations:
+        reason = f"max_critic_iterations reached: {current}"
+        store.transition_to(session_id, WorkerState.ABANDONED, reason=reason)
+        if pr_url:
+            try:
+                gh.add_pr_label(pr_url, [NEEDS_HUMAN_LABEL], repo=repo)
+            except Exception as ex_:  # noqa: BLE001 — best-effort
+                if emit is not None:
+                    with contextlib.suppress(Exception):
+                        emit("critic_cap_label_failed", issue=sess.issue, err=str(ex_)[:200])
+            body = (
+                f"Persistent-worker session abandoned after {current} critic "
+                f"iteration(s) (cap = {max_critic_iterations}).\n\n"
+                "Last critic findings:\n\n"
+                f"{findings_summary or '(no findings summary provided)'}"
+            )
+            try:
+                gh.pr_comment(pr_url, body, repo=repo)
+            except Exception as ex_:  # noqa: BLE001 — best-effort
+                if emit is not None:
+                    with contextlib.suppress(Exception):
+                        emit("critic_cap_comment_failed", issue=sess.issue, err=str(ex_)[:200])
+        if emit is not None:
+            with contextlib.suppress(Exception):
+                emit(
+                    "critic_iteration_cap_abandoned",
+                    issue=sess.issue,
+                    session_id=session_id,
+                    iterations=current,
+                    cap=max_critic_iterations,
+                    pr=pr_url,
+                )
+        return True
+
+    # Under the cap — bump counter, move to REVISING. The counter is
+    # bumped BEFORE the transition so a crash between the two leaves
+    # the session in AWAITING_CRITIC with the incremented count; the
+    # next tick re-enters this function and decides correctly.
+    new_count = store.increment_iterations(session_id)
+    store.transition_to(
+        session_id,
+        WorkerState.REVISING,
+        reason="critic requested changes",
+    )
+    if emit is not None:
+        with contextlib.suppress(Exception):
+            emit(
+                "critic_iteration_revising",
+                issue=sess.issue,
+                session_id=session_id,
+                iterations=new_count,
+                cap=max_critic_iterations,
+            )
+    return False
 
 
 def _sev_counts(outcome: Any) -> dict[str, int]:
