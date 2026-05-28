@@ -14,9 +14,58 @@ critic/PO use case: one prompt in, the final assistant text + duration
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Canonical manifesto location. Can be overridden by LOOP_MANIFESTOS_DIR
+# (operator escape hatch — primarily for tests). The default tracks the
+# project layout: ``docs/manifestos/*.md`` at the repo root.
+DEFAULT_MANIFESTOS_SUBDIR = ("docs", "manifestos")
+
+
+def _manifestos_dir(repo: Path) -> Path:
+    override = os.environ.get("LOOP_MANIFESTOS_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path(repo, *DEFAULT_MANIFESTOS_SUBDIR)
+
+
+def load_manifestos_text(repo: Path) -> str:
+    """Load every manifesto file under the canonical manifestos dir and
+    return a single block of text ready to interpolate into the critic
+    prompt.
+
+    Each manifesto is rendered as::
+
+        ## Manifesto: <filename>
+
+        <full body>
+
+    If the directory is missing or empty, returns a short placeholder so
+    the prompt template doesn't end up with a dangling ``{manifestos}``
+    section — the critic will simply have no rules to enforce.
+    """
+    d = _manifestos_dir(repo)
+    if not d.is_dir():
+        return "(no manifestos configured — manifesto compliance check skipped)"
+
+    chunks: list[str] = []
+    for path in sorted(d.iterdir()):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".md", ".markdown", ".txt"}:
+            continue
+        try:
+            body = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        chunks.append(f"## Manifesto: {path.name}\n\n{body.rstrip()}\n")
+
+    if not chunks:
+        return "(no manifestos configured — manifesto compliance check skipped)"
+    return "\n".join(chunks)
 
 
 @dataclass
@@ -145,4 +194,9 @@ def run_po_sdk(*args: Any, **kwargs: Any) -> CriticSdkResult:
     return run_critic_sdk(*args, **kwargs)
 
 
-__all__ = ["CriticSdkResult", "run_critic_sdk", "run_po_sdk"]
+__all__ = [
+    "CriticSdkResult",
+    "load_manifestos_text",
+    "run_critic_sdk",
+    "run_po_sdk",
+]

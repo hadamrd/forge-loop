@@ -41,6 +41,31 @@ VALID_SEVERITY = {"sev1", "sev2", "sev3"}
 VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs", "product"}
 
 
+@dataclass
+class ManifestoViolation:
+    """A specific rule in a project manifesto the PR diff violates.
+
+    Emitted by the critic LLM and parsed by ``_coerce_report``. Any
+    violation with ``severity == "sev1"`` blocks auto-merge (see
+    ``_coerce_report`` and ``critic_actions.plan_actions``).
+    """
+
+    rule_id: str
+    manifesto: str
+    quote: str
+    suggested_fix: str
+    severity: str  # sev1 | sev2 | sev3
+
+    def is_valid(self) -> bool:
+        return (
+            isinstance(self.rule_id, str) and bool(self.rule_id.strip())
+            and isinstance(self.manifesto, str) and bool(self.manifesto.strip())
+            and isinstance(self.quote, str)
+            and isinstance(self.suggested_fix, str)
+            and self.severity in VALID_SEVERITY
+        )
+
+
 def _default_brief() -> str:
     """Load the critic brief template — bundled or operator-overridden."""
     from forge_loop.briefs import load_template
@@ -71,16 +96,26 @@ class Finding:
 class CriticReport:
     overall: str  # approve | request_changes | block
     findings: list[Finding] = field(default_factory=list)
+    manifesto_violations: list[ManifestoViolation] = field(default_factory=list)
     raw: str = ""
 
     def severities(self) -> set[str]:
         return {f.severity for f in self.findings}
 
     def has_sev1(self) -> bool:
-        return any(f.severity == "sev1" for f in self.findings)
+        return (
+            any(f.severity == "sev1" for f in self.findings)
+            or any(v.severity == "sev1" for v in self.manifesto_violations)
+        )
 
     def has_sev2(self) -> bool:
-        return any(f.severity == "sev2" for f in self.findings)
+        return (
+            any(f.severity == "sev2" for f in self.findings)
+            or any(v.severity == "sev2" for v in self.manifesto_violations)
+        )
+
+    def has_sev1_manifesto_violation(self) -> bool:
+        return any(v.severity == "sev1" for v in self.manifesto_violations)
 
 
 @dataclass
@@ -113,7 +148,14 @@ def review_pr(
     no auto-approve — so a human can intervene).
     """
     template = brief_template or _default_brief()
-    brief = template.format(pr_url=pr_url, issue_number=issue_number)
+    from forge_loop._critic_sdk import load_manifestos_text
+
+    manifestos = load_manifestos_text(repo)
+    brief = template.format(
+        pr_url=pr_url,
+        issue_number=issue_number,
+        manifestos=manifestos,
+    )
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     ensure_subagent_trusted(repo)
@@ -361,7 +403,47 @@ def _coerce_report(obj: dict[str, Any], raw: str) -> CriticReport | None:
         )
         if f.is_valid():
             findings.append(f)
-    return CriticReport(overall=overall, findings=findings, raw=raw)
+
+    # Back-compat: missing field is fine, defaults to empty list.
+    raw_violations = obj.get("manifesto_violations") or []
+    if not isinstance(raw_violations, list):
+        raw_violations = []
+    violations: list[ManifestoViolation] = []
+    for item in raw_violations:
+        if not isinstance(item, dict):
+            continue
+        rule_id = item.get("rule_id")
+        manifesto = item.get("manifesto")
+        # Drop entries missing the identifying fields entirely; we won't
+        # fabricate a rule_id for the model.
+        if not isinstance(rule_id, str) or not rule_id.strip():
+            continue
+        if not isinstance(manifesto, str) or not manifesto.strip():
+            continue
+        sev_raw = item.get("severity")
+        # Defensive default: unknown/missing severity → sev3 (non-blocking).
+        severity = sev_raw if sev_raw in VALID_SEVERITY else "sev3"
+        v = ManifestoViolation(
+            rule_id=rule_id,
+            manifesto=manifesto,
+            quote=str(item.get("quote", "")),
+            suggested_fix=str(item.get("suggested_fix", "")),
+            severity=severity,
+        )
+        if v.is_valid():
+            violations.append(v)
+
+    # sev1 manifesto violation forces request_changes even if the model
+    # said "approve" — manifesto compliance is a hard gate.
+    if overall == "approve" and any(v.severity == "sev1" for v in violations):
+        overall = "request_changes"
+
+    return CriticReport(
+        overall=overall,
+        findings=findings,
+        manifesto_violations=violations,
+        raw=raw,
+    )
 
 
 def _tail(path: Path | None, n: int) -> str:
