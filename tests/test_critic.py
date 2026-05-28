@@ -153,80 +153,11 @@ def test_parse_report_malformed_json() -> None:
 # Retry-on-malformed + critic_parse_failed event
 # ---------------------------------------------------------------------------
 
-class _FakeRun:
-    """Stub of subprocess.run that writes a canned log per call."""
-
-    def __init__(self, payloads: list[str]):
-        self.payloads = list(payloads)
-        self.calls = 0
-
-    def __call__(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        # The 1st positional arg is the argv list; stdout kwarg is the file.
-        log_fh = kwargs["stdout"]
-        payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
-        events = [
-            {"type": "system"},
-            {"type": "result", "subtype": "success", "result": payload},
-        ]
-        for e in events:
-            log_fh.write((json.dumps(e) + "\n").encode("utf-8"))
-        log_fh.flush()
-        self.calls += 1
-        # Return a minimal CompletedProcess-shaped object.
-        import subprocess as _sp
-        return _sp.CompletedProcess(args=args, returncode=0, stdout=b"", stderr=b"")
-
-
-def test_review_pr_retries_on_malformed_then_succeeds(tmp_path: Path) -> None:
-    fake = _FakeRun([
-        "this is not json — malformed first try",
-        VALID_REPORT_JSON,
-    ])
-    emits: list[tuple[str, dict]] = []
-
-    def emit(kind: str, payload: dict) -> None:
-        emits.append((kind, payload))
-
-    with patch.object(critic_mod, "subprocess") as sp_mod, \
-            patch.object(critic_mod, "ensure_subagent_trusted", lambda _r: None):
-        sp_mod.run = fake
-        sp_mod.TimeoutExpired = __import__("subprocess").TimeoutExpired
-        out = review_pr(
-            "https://github.com/o/r/pull/1", 5,
-            repo=tmp_path, logs_dir=tmp_path / "logs",
-            timeout_s=10, emit=emit,
-        )
-    assert fake.calls == 2  # one retry consumed
-    assert out.report is not None
-    assert out.report.overall == "request_changes"
-    assert out.verdict == "changes_requested"
-    assert out.parse_retries == 1
-    # No parse-failed event because retry succeeded.
-    assert not any(k == "critic_parse_failed" for k, _ in emits)
-
-
-def test_review_pr_emits_critic_parse_failed_after_retry(tmp_path: Path) -> None:
-    fake = _FakeRun(["garbage one", "garbage two"])
-    emits: list[tuple[str, dict]] = []
-
-    with patch.object(critic_mod, "subprocess") as sp_mod, \
-            patch.object(critic_mod, "ensure_subagent_trusted", lambda _r: None):
-        sp_mod.run = fake
-        sp_mod.TimeoutExpired = __import__("subprocess").TimeoutExpired
-        out = review_pr(
-            "https://github.com/o/r/pull/1", 5,
-            repo=tmp_path, logs_dir=tmp_path / "logs",
-            timeout_s=10, emit=lambda k, p: emits.append((k, p)),
-        )
-    assert fake.calls == 2
-    assert out.report is None
-    assert out.verdict == "error"
-    assert out.parse_retries == 2
-    kinds = [k for k, _ in emits]
-    assert "critic_parse_failed" in kinds
-    payload = next(p for k, p in emits if k == "critic_parse_failed")
-    assert payload["issue"] == 5
-    assert payload["retries"] == 2
+# NOTE: The legacy subprocess-driven retry tests (`_FakeRun` + the two
+# retry tests) were deleted in issue #85 when critic.py migrated to the
+# Claude Agent SDK. Equivalent retry coverage now lives in
+# tests/test_critic_sdk.py::test_review_pr_unparseable_text_retries_then_errors
+# which mocks the SDK boundary instead of subprocess.
 
 
 def test_finding_is_valid_rejects_blank_message() -> None:
