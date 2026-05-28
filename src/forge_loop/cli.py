@@ -636,6 +636,165 @@ def _cmd_init(args: SimpleNamespace) -> int:
     return 0
 
 
+def _brainstormer_factory(repo_path: Path, owner: str, repo: str) -> Any:
+    """Construct the default Brainstormer. Tests monkeypatch this.
+
+    Kept as a module-level callable so ``monkeypatch.setattr(cli,
+    "_brainstormer_factory", lambda *a, **k: fake)`` works in tests
+    without threading args through Typer's option layer.
+    """
+    from forge_loop.brainstormer import Brainstormer
+
+    return Brainstormer(repo_path=repo_path, owner=owner, repo=repo)
+
+
+def _gh_client_factory() -> Any:
+    """Construct the default GhClient. Tests monkeypatch this."""
+    from forge_loop.gh_client import GithubkitClient
+
+    return GithubkitClient()
+
+
+def _cmd_brainstorm(args: SimpleNamespace) -> int:
+    """`forge-loop brainstorm` — dry-run by default, files issues with --apply.
+
+    Contract (issue #124):
+      * Default (no flags): load ProductVision, run Brainstormer, print
+        the BrainstormReport as YAML to stdout. Exit 0. No GitHub calls.
+      * --apply: file each proposed epic first, then each ticket with
+        ``Parent: #<epic-number>`` cross-link in the body.
+      * Missing/invalid vision → exit 2 (no partial state).
+      * Partial failure during --apply → exit 1 with per-title reporting.
+    """
+    import yaml
+
+    from forge_loop.brainstormer import (
+        Brainstormer,
+        BrainstormReport,
+        ProposedEpic,
+        ProposedTicket,
+    )
+    from forge_loop.gh_client import MockGhClient
+    from forge_loop.product_vision import MissingVisionError, discover
+
+    # 1. Resolve repo path + GitHub coordinates from the existing config
+    #    accessor — same pattern as ``_cmd_init`` / ``_cmd_run``.
+    repo_path = Path.cwd()
+    owner = ""
+    repo_name = ""
+    try:
+        cfg = load()
+        repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path
+        gh_repo = getattr(cfg, "github_repo", "") or ""
+        if "/" in gh_repo:
+            owner, repo_name = gh_repo.split("/", 1)
+    except Exception:  # noqa: BLE001 — config-independent: vision discovery still runs
+        pass
+
+    # 2. Discover ProductVision. Missing/invalid is a hard exit-2.
+    try:
+        vision = discover(repo_path)
+    except MissingVisionError as exc:
+        typer.echo(f"brainstorm: {exc}", err=True)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — unexpected validator failure
+        typer.echo(f"brainstorm: failed to load product vision: {exc}", err=True)
+        return 2
+
+    # 3. Run the brainstormer. Tests monkeypatch ``cli._brainstormer_factory``
+    #    to inject a stub that skips the real SDK session.
+    brainstormer = _brainstormer_factory(repo_path, owner, repo_name)
+    try:
+        report: BrainstormReport = brainstormer.run(vision)
+    except Exception as exc:  # noqa: BLE001 — propagate as runtime error to operator
+        typer.echo(f"brainstorm: brainstormer run failed: {exc}", err=True)
+        return 1
+
+    # 4. Dry-run path: YAML-dump the report; never touch GitHub.
+    if not args.apply:
+        payload = report.model_dump(mode="json")
+        typer.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+        return 0
+
+    # 5. --apply path: epics first, then tickets cross-linked to the epic
+    #    that was just filed in *this* run.
+    try:
+        gh_client = _gh_client_factory()
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(
+            f"brainstorm: cannot construct GhClient ({exc}); set GH_TOKEN or monkeypatch _gh_client_factory.",
+            err=True,
+        )
+        return 1
+
+    if not owner or not repo_name:
+        typer.echo(
+            "brainstorm: --apply requires a configured GitHub repo (owner/name).",
+            err=True,
+        )
+        return 2
+
+    if not report.proposed_epics and not report.proposed_tickets:
+        typer.echo("brainstorm: no proposals — nothing to file.")
+        return 0
+
+    epic_axis_to_number: dict[str, int] = {}
+    succeeded: list[tuple[str, int]] = []
+    failed: list[tuple[str, str]] = []
+
+    def _render_epic_body(epic: ProposedEpic) -> str:
+        parts = [epic.body.strip()] if epic.body else []
+        if epic.customer_story:
+            parts.append(f"\n## Customer story\n\n{epic.customer_story.strip()}")
+        return "\n\n".join(p for p in parts if p) or epic.title
+
+    def _render_ticket_body(ticket: ProposedTicket, parent: int | None) -> str:
+        parts: list[str] = []
+        if parent is not None:
+            parts.append(f"Parent: #{parent}")
+        if ticket.body:
+            parts.append(ticket.body.strip())
+        if ticket.customer_story:
+            parts.append(f"\n## Customer story\n\n{ticket.customer_story.strip()}")
+        return "\n\n".join(parts) or ticket.title
+
+    # Epics first — their numbers are threaded into ticket bodies.
+    for epic in report.proposed_epics:
+        labels = [f"axis:{epic.axis}", "epic"]
+        body = _render_epic_body(epic)
+        try:
+            issue = gh_client.create_issue(
+                owner=owner, repo=repo_name, title=epic.title, body=body, labels=labels,
+            )
+            epic_axis_to_number[epic.axis] = issue.number
+            succeeded.append((epic.title, issue.number))
+        except Exception as exc:  # noqa: BLE001
+            failed.append((epic.title, str(exc)))
+
+    # Tickets — cross-link to the same-axis epic that was just filed.
+    for ticket in report.proposed_tickets:
+        labels = [f"axis:{ticket.axis}", "loop:ready"]
+        parent = epic_axis_to_number.get(ticket.axis)
+        body = _render_ticket_body(ticket, parent)
+        try:
+            issue = gh_client.create_issue(
+                owner=owner, repo=repo_name, title=ticket.title, body=body, labels=labels,
+            )
+            succeeded.append((ticket.title, issue.number))
+        except Exception as exc:  # noqa: BLE001
+            failed.append((ticket.title, str(exc)))
+
+    typer.echo("brainstorm: filed:")
+    for title, number in succeeded:
+        typer.echo(f"  + #{number}: {title}")
+    if failed:
+        typer.echo("brainstorm: failed:", err=True)
+        for title, err in failed:
+            typer.echo(f"  ! {title}: {err}", err=True)
+        return 1
+    return 0
+
+
 def _cmd_record_session(args: SimpleNamespace) -> int:
     from forge_loop._testing.recorder import SessionRecorder
     from forge_loop.worker import make_brief
@@ -1323,6 +1482,13 @@ def cmd_init(
             SimpleNamespace(target=target, repo=repo, force=force, create_labels=create_labels)
         )
     )
+
+
+@app.command("brainstorm", help="Propose axis-aligned epics/tickets from product vision (dry-run by default; --apply files them on GitHub).")
+def cmd_brainstorm(
+    apply: bool = typer.Option(False, "--apply", help="Actually file the proposed epics + tickets on GitHub."),
+) -> None:
+    _exit(_cmd_brainstorm(SimpleNamespace(apply=apply)))
 
 
 @app.command("record-session", help="Record a real SDK session to a JSONL fixture.")
