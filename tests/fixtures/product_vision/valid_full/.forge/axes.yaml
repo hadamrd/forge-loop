@@ -1,0 +1,20 @@
+axes:
+  - name: throughput
+    customer: solo operator
+    valuable_means: more issues closed per hour
+    acceptable_work:
+      - implement features
+      - fix bugs
+      - cut flakes
+    rejected_as_cosmetic:
+      - rename variables
+      - reflow whitespace
+    extra_unknown_key: ignored_for_forward_compat
+  - name: reliability
+    customer: downstream consumer
+    valuable_means: fewer rollbacks
+    acceptable_work:
+      - add tests
+      - harden error paths
+    rejected_as_cosmetic:
+      - tweak log levels
