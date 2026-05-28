@@ -194,7 +194,7 @@ def pr_review_context(pr: int | str, repo: str | None = None) -> str:
             "gh", "pr", "view", str(pr),
             "--repo", repo,
             "--comments",
-            "--json", "number,title,body,comments,reviews,reviewThreads,url,headRefName",
+            "--json", "number,title,body,comments,reviews,url,headRefName",
         ],
         capture_output=True, text=True, check=False,
     )
