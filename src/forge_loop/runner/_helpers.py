@@ -18,6 +18,7 @@ import glob
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from forge_loop.state import append_event, rotate_events_file_if_needed
 
@@ -45,11 +46,26 @@ def rotate_events_file_at_boot(events_file: Path) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def reap_worktree(repo: Path, issue: int) -> None:
-    """Force-remove a worker's worktree after success. Best-effort."""
+def reap_worktree(repo: Path, issue: int, container: Any = None) -> None:
+    """Force-remove a worker's worktree after success. Best-effort.
+
+    Migrated to the adapter framework (issue #86): the bespoke
+    ``subprocess.run(["git", "worktree", "remove", ...])`` calls go
+    through ``container.git.worktree_remove``. The chmod still uses
+    ``subprocess.run`` directly — chmod isn't on the FileSystem Protocol
+    in a way that maps cleanly to recursive ``u+w``, so it stays raw.
+
+    ``container=None`` resolves the process-wide default
+    (:func:`forge_loop.container.get_container`) for back-compat with
+    legacy callers; new code passes an explicit Container so tests can
+    substitute fakes.
+    """
     wt = Path(f"/tmp/wt-loop-{issue}")
     if not wt.exists():
         return
+    if container is None:
+        from forge_loop.container import get_container
+        container = get_container()
     # The planted .claude/ is locked read-only (chmod 555). Unlock first.
     claude_dir = wt / ".claude"
     if claude_dir.exists():
@@ -57,10 +73,7 @@ def reap_worktree(repo: Path, issue: int) -> None:
             ["chmod", "-R", "u+w", str(claude_dir)],
             capture_output=True,
         )
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", str(wt)],
-        cwd=repo, capture_output=True,
-    )
+    container.git.worktree_remove(repo, wt, force=True)
 
 
 def reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
@@ -99,11 +112,9 @@ def reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
         append_event(events_file, "orphan_worktrees_reaped", count=reaped)
     # Prune git-internal worktree entries that no longer have a backing
     # dir (accumulate when a worktree is rm -rf'd without `git worktree
-    # remove`).
-    subprocess.run(
-        ["git", "worktree", "prune"],
-        cwd=repo, capture_output=True,
-    )
+    # remove`). Routed through the adapter (issue #86).
+    from forge_loop.container import get_container
+    get_container().git.worktree_prune(repo)
     return reaped
 
 
