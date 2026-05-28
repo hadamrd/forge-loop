@@ -16,7 +16,7 @@ from forge_loop import master_log as _mlog
 from forge_loop import worker as _worker
 from forge_loop.config import Config
 from forge_loop.deploy import redeploy
-from forge_loop.gh import fetch_issue, pr_review_context, prs_by_label, top_issues, unlabel
+from forge_loop.gh import fetch_issue, pr_review_context, prs_requiring_repair, top_issues, unlabel
 from forge_loop.maintenance import run_maintenance
 from forge_loop.po import expand_thin_specs as _po_expand
 from forge_loop.runner._helpers import (
@@ -75,7 +75,7 @@ def _blocking_pr_repairs(cfg: Config) -> list[tuple[dict[str, Any], dict[str, An
 
     axis_filter = parse_filter_env()
     repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
-    for pr in prs_by_label("critic:blocking", cfg.parallel, repo=cfg.github_repo):
+    for pr in prs_requiring_repair(cfg.parallel, repo=cfg.github_repo):
         issue_num = _issue_number_from_pr(pr)
         if issue_num is None:
             append_event(
@@ -105,6 +105,13 @@ def _blocking_pr_repairs(cfg: Config) -> list[tuple[dict[str, Any], dict[str, An
                 axes=axis_filter,
             )
             continue
+        append_event(
+            cfg.events_file,
+            "repair_pr_selected",
+            pr=pr.get("url"),
+            issue=issue_num,
+            reasons=pr.get("repairReasons") or [],
+        )
         repairs.append((issue, pr, pr_review_context(pr["number"], repo=cfg.github_repo)))
     return repairs
 
@@ -360,6 +367,7 @@ def _run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
         # the constructor via the env-token path without importing
         # githubkit when not needed.
         from forge_loop.gh_client import GithubkitClient
+
         client = GithubkitClient()
     except Exception as ex:  # noqa: BLE001
         append_event(
@@ -461,8 +469,7 @@ def _tick(cfg: Config, tick: int) -> None:
                 "state": "repairing",
                 "tick": tick,
                 "dispatched": [
-                    {"issue": issue["number"], "title": issue["title"]}
-                    for issue, _, _ in repairs
+                    {"issue": issue["number"], "title": issue["title"]} for issue, _, _ in repairs
                 ],
             },
         )
@@ -524,6 +531,7 @@ def _tick(cfg: Config, tick: int) -> None:
     if not axis_filter:
         try:
             from forge_loop.product_vision import discover as _discover_vision
+
             _vision = _discover_vision(cfg.repo)
             axis_filter = sorted({a.name.lower() for a in _vision.axes})
             append_event(
