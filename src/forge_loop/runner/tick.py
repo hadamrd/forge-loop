@@ -52,6 +52,116 @@ def _consume_force_set(cfg: Config) -> set[int]:
     return _consume_force_set_impl(cfg.state_dir)
 
 
+def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
+    """Auto-commit + push + open a draft PR for a worker that exited dirty.
+
+    Returns the PR URL on success, or None when there's nothing to rescue
+    (no uncommitted changes, worktree missing, or git/gh subprocess
+    failure). Never raises — recovery is best-effort. The outcome status
+    is mutated by the caller (this fn just returns the PR URL).
+
+    Why this exists: workers consume 50-90 turns writing implementation +
+    tests then exit cleanly without ``git commit``. The work would be
+    lost when the worktree is reaped. Auto-rescue catches this case and
+    surfaces the work as a draft PR labeled ``loop:needs-review``.
+    """
+    from pathlib import Path as _Path
+    import subprocess as _sp
+
+    wt = _Path(f"/tmp/wt-loop-{o.issue}")
+    if not wt.exists():
+        return None
+
+    # Are there uncommitted changes? Both unstaged + staged + untracked.
+    porcelain = _sp.run(
+        ["git", "status", "--porcelain"],
+        cwd=wt, capture_output=True, text=True, timeout=30,
+    )
+    if porcelain.returncode != 0 or not porcelain.stdout.strip():
+        return None  # Clean worktree — nothing to rescue.
+
+    # Determine the branch the worker was on (its loop/<n>-<slug> branch
+    # is already checked out by _prep_worktree, even if the worker never
+    # pushed it).
+    branch_r = _sp.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=wt, capture_output=True, text=True, timeout=10,
+    )
+    branch = branch_r.stdout.strip() if branch_r.returncode == 0 else ""
+    if not branch or branch in ("trunk", "main", "HEAD"):
+        return None  # No safe branch to push to.
+
+    # Stage + commit. Use the operator's identity (the loop is running
+    # under it) so the commit reflects the real author.
+    commit_msg = (
+        f"wip(loop): auto-rescue worker output — closes #{o.issue}\n"
+        "\n"
+        "The worker for this issue did substantial work then exited\n"
+        "its SDK session without committing (a known failure mode\n"
+        "where the agent treats 'implementation complete' as 'done'\n"
+        "without running git commit + push). The loop captured the\n"
+        "uncommitted changes here and opened a DRAFT PR so the operator\n"
+        "can review for completeness before promoting to merge.\n"
+        "\n"
+        f"Worker status: {o.status}\n"
+        f"Worker turns: (see docs/ops/loop-runner-logs/worker-{o.issue}-*.log)\n"
+    )
+    if cfg.coauthor:
+        commit_msg += f"\nCo-Authored-By: {cfg.coauthor}\n"
+
+    add_r = _sp.run(
+        ["git", "add", "-A"],
+        cwd=wt, capture_output=True, text=True, timeout=60,
+    )
+    if add_r.returncode != 0:
+        return None
+    commit_r = _sp.run(
+        ["git", "commit", "-m", commit_msg, "--allow-empty-message"],
+        cwd=wt, capture_output=True, text=True, timeout=60,
+    )
+    if commit_r.returncode != 0:
+        return None
+    push_r = _sp.run(
+        ["git", "push", "-u", "origin", branch],
+        cwd=wt, capture_output=True, text=True, timeout=120,
+    )
+    if push_r.returncode != 0:
+        return None
+
+    pr_title = f"wip(loop): auto-rescue #{o.issue} — worker exited dirty"
+    pr_body = (
+        f"**Auto-rescued by forge-loop** — the worker for issue #{o.issue}\n"
+        "wrote implementation + tests then exited its SDK session without\n"
+        "committing. The loop captured the uncommitted changes here.\n"
+        "\n"
+        "**REVIEW REQUIRED before merge** — the work may be incomplete,\n"
+        "missing tests, or violate ACs. Compare the diff against the\n"
+        "issue's acceptance criteria and either:\n"
+        "  - extend with missing pieces + remove the draft flag, or\n"
+        "  - close this PR + relabel the issue ``loop:ready`` to retry.\n"
+        "\n"
+        f"Worker log: ``docs/ops/loop-runner-logs/worker-{o.issue}-*.log``\n"
+    )
+    pr_r = _sp.run(
+        [
+            "gh", "pr", "create",
+            "--draft",
+            "--repo", cfg.github_repo,
+            "--base", "trunk",
+            "--head", branch,
+            "--title", pr_title,
+            "--body", pr_body,
+            "--label", "loop:needs-review",
+        ],
+        cwd=wt, capture_output=True, text=True, timeout=60,
+    )
+    if pr_r.returncode != 0:
+        return None
+    # gh prints the PR URL on the last line of stdout on success.
+    url = pr_r.stdout.strip().splitlines()[-1] if pr_r.stdout.strip() else ""
+    return url if url.startswith("https://github.com/") else None
+
+
 def _tick(cfg: Config, tick: int) -> None:
     # Imported lazily to avoid an import cycle (boot.py imports tick.py).
     from forge_loop.runner.boot import _short_sleep
@@ -344,27 +454,36 @@ def _tick(cfg: Config, tick: int) -> None:
         },
     )
 
-    # Post-tick: reap EVERY worker's worktree (merged, open, failed, timeout).
-    # Reap policy (refined after a real dogfood observation):
-    #   * status == "merged"  → reap. The PR is on origin; the local
-    #     worktree carries no information that isn't already in the
-    #     merge commit + the per-worker SDK log.
-    #   * status == "open"    → reap. The branch is pushed to origin
-    #     and the PR is open for human review; the local worktree has
-    #     nothing the operator can't fetch from origin.
-    #   * status == "failed" / "no_pr" / "timeout" → PRESERVE. The
-    #     worker may have made uncommitted edits the operator wants
-    #     to inspect or recover (a real case observed: a worker on a
-    #     5-deliverable ticket wrote + edited 6 files across 53 turns
-    #     and exited cleanly without committing — the work was lost
-    #     when the tick reaper nuked the worktree unconditionally).
+    # Post-tick: auto-rescue uncommitted work, then reap.
     #
-    # The boot-time orphan reaper is still the safety net: any
-    # preserved worktree that the operator doesn't pick up before the
-    # next loop boot gets cleaned up automatically. So preservation
-    # is best-effort recovery, not unbounded accumulation.
+    # Real failure mode observed in the Titan dogfood:
+    # workers consume 50-90 turns writing + editing real implementation +
+    # tests, then exit cleanly without ever running ``git commit``.
+    # ``final_result.result == ""`` and there's no PR. With the old reap
+    # policy the worktree was nuked and the work was lost ($16+ wasted in
+    # one night across 3 issues).
+    #
+    # Fix: BEFORE reaping any non-merged worktree, check if it has
+    # uncommitted changes. If yes, the loop AUTO-COMMITS + pushes + opens
+    # a draft PR labelled ``loop:needs-review`` so the operator can pick
+    # up the work. The outcome's pr_url + status get updated to reflect
+    # the rescue. After rescue, the worktree gets reaped normally (the
+    # work is on origin).
     _REAPABLE_STATUSES = frozenset({"merged", "open"})
     for o in outcomes:
+        if o.status not in _REAPABLE_STATUSES:
+            rescued = _rescue_uncommitted_work(o, cfg)
+            if rescued is not None:
+                # Rescue succeeded — outcome was mutated in place.
+                # Treat as "open" so the reap proceeds normally.
+                o.status = "open"
+                o.pr_url = rescued
+                append_event(
+                    cfg.events_file, "worker_work_rescued",
+                    issue=o.issue, pr=rescued,
+                    hint="Worker exited dirty; loop auto-committed + opened draft PR. Review for completeness.",
+                )
+
         if o.status in _REAPABLE_STATUSES:
             _reap_worktree(cfg.repo, o.issue)
             append_event(
@@ -372,15 +491,17 @@ def _tick(cfg: Config, tick: int) -> None:
                 issue=o.issue, status=o.status,
             )
         else:
-            # Preserve for operator inspection / work recovery.
+            # Preserve for operator inspection (rescue declined the work —
+            # e.g. no uncommitted changes, or push failed).
             wt_path = f"/tmp/wt-loop-{o.issue}"
             append_event(
                 cfg.events_file, "worktree_preserved",
                 issue=o.issue, status=o.status, path=wt_path,
                 hint=(
-                    f"Worker exited with status={o.status!r}; uncommitted "
-                    f"work may live at {wt_path}. Reaped at next loop boot "
-                    "unless you `git worktree remove --force` it sooner."
+                    f"Worker exited with status={o.status!r} and auto-rescue "
+                    "either found no dirty changes or couldn't push. Inspect "
+                    f"{wt_path} manually. Reaped at next loop boot unless "
+                    "you `git worktree remove --force` it sooner."
                 ),
             )
 
