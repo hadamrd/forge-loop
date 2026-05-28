@@ -23,9 +23,25 @@ from forge_loop.runner._helpers import (
 from forge_loop.runner._helpers import (
     rotate_events_file_at_boot as _rotate_events_file_at_boot,
 )
+from forge_loop.runner.state import RunnerState, get_default_state
 from forge_loop.state import append_event, write_state
 
-_RUN = True
+
+def _get_run_flag() -> bool:
+    """Back-compat shim — legacy code reads ``boot._RUN``.
+
+    Forwards to the module-level default RunnerState so existing imports
+    + the ``while _RUN:`` shape keep working. New code that wants per-
+    instance isolation passes a :class:`RunnerState` to :func:`run`.
+    """
+    return get_default_state().should_run
+
+
+# Legacy module attribute: kept as a property-like descriptor so external
+# readers (and old test snapshots) still see a ``boolean``-shaped value.
+# Writers (``global _RUN; _RUN = False``) are now routed to ``state.request_stop()``
+# via :func:`_install_signal_handlers`.
+_RUN = True  # superseded by RunnerState; do not write directly — call state.request_stop()
 
 
 def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
@@ -33,8 +49,21 @@ def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
     return _reap_orphan_worktrees_impl(repo, events_file)
 
 
-def _install_signal_handlers(cfg: Config) -> None:
+def _install_signal_handlers(cfg: Config, state: RunnerState | None = None) -> None:
+    """Install SIGTERM/SIGINT/SIGUSR1 handlers bound to ``state``.
+
+    ``state`` defaults to the module singleton so legacy callers (and
+    tests that don't pass a state) keep working. New code constructs a
+    :class:`RunnerState` per Runner instance.
+    """
+    if state is None:
+        state = get_default_state()
+
     def _stop(*_: Any) -> None:
+        state.request_stop()
+        # Mirror the legacy module flag so external code that still
+        # imports ``_RUN`` sees the change. New code shouldn't depend on
+        # this — read ``state.should_run`` instead.
         global _RUN
         _RUN = False
         append_event(cfg.events_file, "signal_stop")
@@ -52,10 +81,14 @@ def _install_signal_handlers(cfg: Config) -> None:
     signal.signal(signal.SIGUSR1, _pause_toggle)
 
 
-def _short_sleep(seconds: int, cfg: Config) -> None:
+def _short_sleep(
+    seconds: int, cfg: Config, state: RunnerState | None = None
+) -> None:
     """Sleep but stay responsive to stop/pause signals + touchfiles."""
+    if state is None:
+        state = get_default_state()
     for _ in range(seconds):
-        if not _RUN or cfg.stop_file.exists() or cfg.pause_file.exists():
+        if not state.should_run or cfg.stop_file.exists() or cfg.pause_file.exists():
             return
         time.sleep(1)
 
@@ -93,14 +126,29 @@ def _validate_pipeline_if_configured(cfg: Config) -> None:
     )
 
 
-def run(cfg: Config) -> int:
+def run(cfg: Config, state: RunnerState | None = None) -> int:
+    """Run the dispatch loop.
+
+    ``state`` defaults to the module-level singleton so legacy
+    ``forge_loop.runner.run(cfg)`` callers keep working. Pass an
+    explicit :class:`RunnerState` (or use :class:`forge_loop.runner.Runner`)
+    when you want per-instance isolation — required to drive concurrent
+    Runners in the same process or to ``stop()`` one without affecting
+    another.
+    """
     from forge_loop.runner.tick import _tick
 
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     cfg.events_file.touch()
 
-    _install_signal_handlers(cfg)
+    if state is None:
+        state = get_default_state()
+    # Clear any prior stop request that may have leaked from a previous run
+    # against the same default state (e.g. tests that run twice).
+    state.stop_event.clear()
+
+    _install_signal_handlers(cfg, state)
 
     # Issue #59 — rotate the events log if it has grown past the threshold
     # (default 10 MiB, override via LOOP_EVENTS_ROTATE_BYTES). Best-effort:
@@ -150,7 +198,7 @@ def run(cfg: Config) -> int:
     _validate_pipeline_if_configured(cfg)
 
     tick = 0
-    while _RUN:
+    while state.should_run:
         if cfg.stop_file.exists():
             append_event(cfg.events_file, "stop_file_seen")
             cfg.stop_file.unlink()
@@ -442,7 +490,8 @@ def run_async(cfg: Config) -> int:
         await asyncio.sleep(cfg.tick_interval_s)
 
     async def _main() -> None:
-        while _RUN:
+        _async_state = get_default_state()
+        while _async_state.should_run:
             if cfg.stop_file.exists():
                 append_event(cfg.events_file, "stop_file_seen")
                 cfg.stop_file.unlink()
