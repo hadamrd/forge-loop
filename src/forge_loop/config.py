@@ -144,6 +144,13 @@ class Config:
 
     worker_max_iterations: int = 3
 
+    # Stuck-issue sweep (issue #129). Minimum consecutive
+    # ``worker_iterations_exhausted`` events before the per-tick sweep
+    # demotes the issue from ``loop:ready`` to ``loop:needs-human``.
+    # Sourced from settings.maintenance.stuck_threshold_attempts.
+    stuck_threshold_attempts: int = 2
+    stuck_tail_events: int = 100
+
     @property
     def state_dir(self) -> Path:
         return self.repo / "docs" / "ops"
@@ -245,6 +252,8 @@ def _from_settings(s: Settings) -> Config:
         ),
         lumen=LumenConfig(top_k=s.lumen.top_k),
         worker_max_iterations=s.iteration.max_iterations,
+        stuck_threshold_attempts=s.maintenance.stuck_threshold_attempts,
+        stuck_tail_events=s.maintenance.stuck_tail_events,
     )
 
 
