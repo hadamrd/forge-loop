@@ -110,6 +110,11 @@ class GhClient(Protocol):
     def get_pull(self, owner: str, repo: str, number: int) -> PullRequest | None:
         ...
 
+    def create_issue(
+        self, owner: str, repo: str, title: str, body: str, labels: list[str]
+    ) -> Issue:
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Auth resolution — small, explicit, documented.
@@ -210,6 +215,22 @@ class GithubkitClient:
             if e.status != 404:
                 raise
 
+    def create_issue(
+        self, owner: str, repo: str, title: str, body: str, labels: list[str]
+    ) -> Issue:
+        resp = self._gh.rest.issues.create(
+            owner=owner, repo=repo, title=title, body=body, labels=list(labels),
+        )
+        self._raise_if_error(f"create_issue({title!r})", resp)
+        item = resp.parsed_data
+        return Issue(
+            number=item.number,
+            title=item.title or "",
+            body=item.body or "",
+            state=str(item.state),
+            labels=[lab.name for lab in (item.labels or []) if hasattr(lab, "name")],
+        )
+
     def get_pull(self, owner: str, repo: str, number: int) -> PullRequest | None:
         try:
             resp = self._gh.rest.pulls.get(owner=owner, repo=repo, pull_number=number)
@@ -251,6 +272,9 @@ class MockGhClient:
     pulls: dict[tuple[str, str, int], PullRequest] = field(default_factory=dict)
     issues_by_label_response: list[Issue] = field(default_factory=list)
     raise_on: dict[str, GhError] = field(default_factory=dict)
+    raise_on_create_titles: dict[str, Exception] = field(default_factory=dict)
+    create_issue_responses: list[int] = field(default_factory=list)
+    next_issue_number: int | None = None
     calls: list[tuple[str, dict]] = field(default_factory=list)
 
     def _record(self, method: str, **kwargs: Any) -> None:
@@ -278,6 +302,34 @@ class MockGhClient:
     def get_pull(self, owner: str, repo: str, number: int) -> PullRequest | None:
         self._record("get_pull", owner=owner, repo=repo, number=number)
         return self.pulls.get((owner, repo, number))
+
+    # ``create_issue`` counters: tests inspect ``next_issue_number`` to
+    # pre-stage numbers (epic-first ordering), and ``create_issue_responses``
+    # can override per-call returns. By default we auto-assign monotonically.
+    def create_issue(
+        self, owner: str, repo: str, title: str, body: str, labels: list[str]
+    ) -> Issue:
+        self._record(
+            "create_issue", owner=owner, repo=repo, title=title, body=body, labels=list(labels),
+        )
+        if title in self.raise_on_create_titles:
+            raise self.raise_on_create_titles[title]
+        responses = self.create_issue_responses
+        if responses:
+            n = responses.pop(0)
+        else:
+            n = self._next_number()
+        issue = Issue(number=n, title=title, body=body, state="open", labels=list(labels))
+        self.issues[(owner, repo, n)] = issue
+        return issue
+
+    def _next_number(self) -> int:
+        existing = [n for (_, _, n) in self.issues.keys()]
+        seed = self.next_issue_number
+        if seed is not None and not existing:
+            self.next_issue_number = seed + 1
+            return seed
+        return (max(existing) if existing else (seed or 1000)) + 1
 
 
 # ---------------------------------------------------------------------------

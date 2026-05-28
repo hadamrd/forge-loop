@@ -56,7 +56,7 @@ def test_help_lists_every_subcommand(runner: CliRunner) -> None:
     assert result.exit_code == 0
     for cmd in (
         "run", "status", "doctor", "events", "pause", "resume", "stop",
-        "retry", "dashboard", "init", "record-session", "brief",
+        "retry", "dashboard", "init", "brainstorm", "record-session", "brief",
         "config", "pipeline", "repos", "mcp", "replay", "roles", "cluster",
     ):
         assert cmd in result.stdout, f"missing {cmd} in help"
