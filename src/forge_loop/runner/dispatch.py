@@ -111,6 +111,7 @@ def _run_workers(
                     load_timeout_ms=cfg.worker.load_timeout_ms,
                     strict_mcp_config=cfg.worker.strict_mcp_config,
                     mcp_servers=cfg.worker.mcp_servers,
+                    base_branch=cfg.base_branch,
                 )
                 for i, meta in dispatch
             ]

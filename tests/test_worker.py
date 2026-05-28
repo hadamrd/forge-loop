@@ -18,6 +18,7 @@ from forge_loop import _worker_sdk
 from forge_loop.worker import (
     _branch_name,
     _extract_outcome,
+    _prep_worktree,
     _read_subagent_events,
     _tail,
     make_brief,
@@ -192,7 +193,7 @@ def test_run_worker_codex_provider_maps_final_json(
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
-    def fake_prep(_repo: Path, _n: int, _branch: str) -> tuple[Path, None]:
+    def fake_prep(_repo: Path, _n: int, _branch: str, **_kwargs: Any) -> tuple[Path, None]:
         return worktree, None
 
     def fake_codex(**kwargs: Any) -> agent_backend.AgentRunResult:
@@ -220,6 +221,37 @@ def test_run_worker_codex_provider_maps_final_json(
     assert out.status == "open"
     assert out.pr_url == "https://github.com/o/r/pull/9"
     assert out.model == "gpt-5-codex"
+
+
+def test_prep_worktree_uses_configured_base_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _Completed:
+        calls.append(cmd)
+        return _Completed()
+
+    monkeypatch.setattr("forge_loop.worker.subprocess.run", fake_run)
+    monkeypatch.setattr("forge_loop.worker._drop_permissive_settings", lambda _wt: None)
+
+    worktree, err = _prep_worktree(tmp_path, 12, "loop/12-demo", base_branch="main")
+
+    assert err is None
+    assert str(worktree).endswith("/tmp/wt-loop-12")
+    assert [
+        "git",
+        "fetch",
+        "--prune",
+        "origin",
+        "+refs/heads/main:refs/remotes/origin/main",
+    ] in calls
+    assert ["git", "worktree", "add", str(worktree), "-B", "loop/12-demo", "origin/main"] in calls
 
 
 # Gradle/WSL-OOM guard tests removed: forge-loop is stack-agnostic; the

@@ -113,6 +113,7 @@ state (events, pid, halt markers) is gitignored.
 # forge-loop.yaml — everything below is optional; env vars override yaml.
 repo:
   github: owner/repo                  # required (or LOOP_GH_REPO env)
+  base_branch: trunk                  # default branch used for worker worktrees
   worktree_root: /tmp                 # /tmp/wt-loop-<N> per worker
 
 deploy:
@@ -333,9 +334,9 @@ runner.tick():
 
   for issue in issues:
       skip if attempts.fingerprint says in-flight or cooldown
-      gh_unlabel(issue, "loop:ready")     # claim it
+      remove loop:ready after PR opens    # keep queue from recycling in-review work
       run_worker(issue) in ThreadPoolExecutor[parallel=N]
-        └─ git worktree add /tmp/wt-loop-<N> -B branch origin/trunk
+        └─ git worktree add /tmp/wt-loop-<N> -B branch origin/<base_branch>
         └─ plant .claude/settings.json (permissive, read-only)
         └─ claude_agent_sdk.query(prompt=worker_brief, options)
              stream typed events:

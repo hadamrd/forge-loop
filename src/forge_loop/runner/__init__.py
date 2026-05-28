@@ -33,6 +33,7 @@ from forge_loop.config import Config as _Config
 from forge_loop.deploy import redeploy as redeploy
 from forge_loop.gh import fetch_issue as fetch_issue
 from forge_loop.gh import top_issues as top_issues
+from forge_loop.gh import unlabel as unlabel
 from forge_loop.runner import boot as _boot
 from forge_loop.runner import dispatch as _dispatch_mod
 from forge_loop.runner import tick as _tick_mod
@@ -120,7 +121,7 @@ def __getattr__(name: str):  # pragma: no cover — thin compat shim
 # patched). New names fall through to plain attribute assignment.
 # ---------------------------------------------------------------------------
 _PROXY_TICK_NAMES = frozenset({
-    "top_issues", "fetch_issue", "_reap_worktree",
+    "top_issues", "fetch_issue", "unlabel", "_reap_worktree",
     "_short_sleep", "redeploy",
 })
 _PROXY_DISPATCH_NAMES = frozenset({"run_worker"})
@@ -165,4 +166,5 @@ __all__ = [
     "run_multirepo",
     "run_worker",
     "top_issues",
+    "unlabel",
 ]
