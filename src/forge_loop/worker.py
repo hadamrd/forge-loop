@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections.abc import Callable
@@ -230,6 +231,8 @@ def _prep_worktree(
         cwd=repo,
         capture_output=True,
     )
+    if wt.exists():
+        shutil.rmtree(wt)
     # If a previous failed attempt left a local branch lying around, delete
     # it so `git worktree add -B` can recreate it cleanly off the freshest
     # origin/<base_branch>. `-B` would overwrite anyway, but we use plain `-b`
