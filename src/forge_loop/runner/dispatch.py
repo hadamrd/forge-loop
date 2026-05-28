@@ -28,6 +28,84 @@ from forge_loop.worker_state import InvalidTransition, WorkerState
 NEEDS_HUMAN_LABEL = "loop:needs-human"
 
 
+def resume_kwargs_for(
+    store: WorkerSessionStore,
+    session_id: str,
+) -> dict[str, str]:
+    """Return ``{"resume": <sdk_id>}`` if this session can warm-resume.
+
+    The SDK preserves its prompt cache across calls when the caller passes
+    ``resume=<prior session_id>`` (issue #109 — the headline efficiency win
+    of epic #95). We resume on RUNNING/REVISING because those are the two
+    states where the FSM signals "the worker is still on the same logical
+    piece of work" (RUNNING = mid-attempt, REVISING = post-critic feedback,
+    same brief). DISPATCHED is a cold start by definition; AWAITING_CRITIC
+    means control is with the critic, so the worker isn't dispatching.
+
+    Returns an empty dict when:
+    - the session doesn't exist (caller bug, but treat defensively),
+    - the session has no ``sdk_session_id`` yet (first dispatch),
+    - the session isn't in a resumable state.
+
+    The empty dict is splat-safe at the call site: just
+    ``await run_sdk_session(..., **resume_kwargs_for(store, sid))``.
+    """
+    sess = store.get(session_id)
+    if sess is None:
+        return {}
+    if not sess.sdk_session_id:
+        return {}
+    if sess.state not in {WorkerState.RUNNING, WorkerState.REVISING}:
+        return {}
+    return {"resume": sess.sdk_session_id}
+
+
+def persist_sdk_result(
+    *,
+    store: WorkerSessionStore,
+    session_id: str,
+    result: Any,
+    emit: Any = None,
+) -> None:
+    """Save the SDK's session id and emit cost telemetry.
+
+    Called once after every ``run_sdk_session(...)`` invocation. Two
+    side effects:
+
+    1. If ``result.sdk_session_id`` is set, write it through
+       :meth:`WorkerSessionStore.set_sdk_session_id` so the next
+       dispatch can pass ``resume=`` and reuse the prompt cache.
+    2. Emit a ``cost_telemetry`` event carrying input/output tokens and
+       a ``cache_hit_ratio`` — operators watch this ratio climb on
+       round 2+ to confirm the persistent-worker epic is paying off.
+
+    ``emit`` may be ``None`` (legacy callers / unit tests); both side
+    effects are best-effort so a telemetry failure never prevents the
+    SDK session id from landing.
+    """
+    sdk_id = getattr(result, "sdk_session_id", None)
+    if isinstance(sdk_id, str) and sdk_id:
+        with contextlib.suppress(Exception):
+            store.set_sdk_session_id(session_id, sdk_id)
+
+    if emit is None:
+        return
+    usage = dict(getattr(result, "usage", {}) or {})
+    with contextlib.suppress(Exception):
+        emit(
+            "cost_telemetry",
+            session_id=session_id,
+            sdk_session_id=sdk_id,
+            input_tokens=int(usage.get("input_tokens", 0) or 0),
+            output_tokens=int(usage.get("output_tokens", 0) or 0),
+            cache_read_input_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
+            cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
+            cache_hit_ratio=round(float(getattr(result, "cache_hit_ratio", 0.0) or 0.0), 4),
+            cost_usd=float(getattr(result, "cost_usd", 0.0) or 0.0),
+            model=getattr(result, "model", "") or "",
+        )
+
+
 def free_dispatch_slots(store: WorkerSessionStore, parallel: int) -> int:
     """Return the number of free parallel dispatch slots on this tick.
 
