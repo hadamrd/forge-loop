@@ -478,6 +478,28 @@ def disable_pr_auto_merge(pr: int | str, repo: str | None = None) -> bool:
     return r.returncode == 0
 
 
+def enable_pr_auto_merge(pr: int | str, repo: str | None = None) -> bool:
+    """Enable squash auto-merge for a PR. Best-effort: returns False on failure."""
+    repo = _require_repo(repo)
+    r = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "merge",
+            str(pr),
+            "--repo",
+            repo,
+            "--squash",
+            "--auto",
+            "--delete-branch",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode == 0
+
+
 def post_review_comment(
     pr: int | str,
     body: str,
