@@ -102,6 +102,20 @@ def _cmd_run(args: SimpleNamespace) -> int:
     if queue_url:
         os.environ["LOOP_QUEUE_URL"] = queue_url
 
+    # Issue #126 — axis-aware dispatch filter. The CLI accepts ``--axis``
+    # repeatedly; we serialise to a comma-separated env var so the tick
+    # loop (which is a separate function in another module) can read it
+    # without us having to thread a new kwarg through ``run_loop`` and
+    # every adjacent caller. Empty list -> env var stays unset, and the
+    # dispatcher takes the pre-#126 fast path verbatim.
+    from forge_loop.axis import AXIS_FILTER_ENV
+
+    axes = [a.strip().lower() for a in (getattr(args, "axis", None) or []) if a and a.strip()]
+    if axes:
+        os.environ[AXIS_FILTER_ENV] = ",".join(axes)
+    else:
+        os.environ.pop(AXIS_FILTER_ENV, None)
+
     orch = getattr(args, "orchestrator", "sync")
     if orch == "async":
         from forge_loop.runner import run_async as run_async_loop
@@ -324,7 +338,11 @@ def _cmd_status(args: SimpleNamespace) -> int:
             except json.JSONDecodeError:
                 pass
 
+    # Issue #126 — fetch labels + title alongside number so we can group
+    # the open ready-queue by ``axis:*`` label below. Cheap: same call,
+    # one additional JSON field.
     queue_depth = 0
+    ready_issues: list[dict[str, Any]] = []
     try:
         r = subprocess.run(
             [
@@ -337,17 +355,40 @@ def _cmd_status(args: SimpleNamespace) -> int:
                 cfg.labels.ready,
                 "--state",
                 "open",
+                "--limit",
+                "200",
                 "--json",
-                "number",
+                "number,title,labels",
             ],
             capture_output=True,
             text=True,
             timeout=15,
         )
         if r.returncode == 0:
-            queue_depth = len(json.loads(r.stdout or "[]"))
+            ready_issues = json.loads(r.stdout or "[]")
+            queue_depth = len(ready_issues)
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
         queue_depth = -1
+
+    # Group the open ready-queue by axis. Axis filter (--axis) narrows
+    # the bucketed view to just the requested slugs — this is the
+    # "sanity check before running" surface called out in the spec.
+    from forge_loop.axis import UNALIGNED_BUCKET, group_by_axis
+
+    axis_filter = [a.strip().lower() for a in (getattr(args, "axis", None) or []) if a and a.strip()]
+    grouped_all, unaligned_count = group_by_axis(ready_issues)
+    if axis_filter:
+        axes_view: dict[str, list[dict[str, Any]]] = {
+            k: v for k, v in grouped_all.items() if k in set(axis_filter)
+        }
+    else:
+        axes_view = grouped_all
+    # Render shape: {axis_slug: [{number, title}], ...} (drop the heavy
+    # ``labels`` blob from the per-issue payload).
+    axes_payload: dict[str, list[dict[str, Any]]] = {
+        k: [{"number": i.get("number"), "title": i.get("title", "")} for i in v]
+        for k, v in axes_view.items()
+    }
 
     payload: dict[str, Any] = {
         "pid": pid_text or None,
@@ -361,6 +402,9 @@ def _cmd_status(args: SimpleNamespace) -> int:
         "last_failure": last_failure,
         "last_events": last_5_events,
         "events_file": str(cfg.events_file),
+        "axes": axes_payload,
+        "unaligned_count": unaligned_count,
+        "axis_filter": axis_filter,
     }
 
     if getattr(args, "json", False):
@@ -407,6 +451,28 @@ def _cmd_status(args: SimpleNamespace) -> int:
             joined.append("\n")
         table.add_row("last 5 events", joined)
     table.add_row("events", str(cfg.events_file))
+
+    # Issue #126 — axis breakdown. Render one row per axis (sorted for
+    # deterministic output) showing the issue count, plus a yellow
+    # "unaligned" warning iff any open ready-issue has no axis label.
+    if axis_filter:
+        table.add_row("axis filter", ", ".join(sorted(set(axis_filter))))
+    if axes_view:
+        axis_lines = Text()
+        for ax in sorted(k for k in axes_view if k != UNALIGNED_BUCKET):
+            nums = ", ".join(f"#{i.get('number')}" for i in axes_view[ax])
+            axis_lines.append(f"  {ax}", style="cyan")
+            axis_lines.append(f" ({len(axes_view[ax])})  {nums}\n")
+        if UNALIGNED_BUCKET in axes_view:
+            unaligned_nums = ", ".join(f"#{i.get('number')}" for i in axes_view[UNALIGNED_BUCKET])
+            axis_lines.append(f"  {UNALIGNED_BUCKET}", style="yellow")
+            axis_lines.append(f" ({len(axes_view[UNALIGNED_BUCKET])})  {unaligned_nums}\n")
+        table.add_row("axes", axis_lines)
+    if unaligned_count > 0 and not axis_filter:
+        table.add_row(
+            "[yellow]warning[/yellow]",
+            f"[yellow]{unaligned_count} open issue(s) carry no axis:* label[/yellow]",
+        )
 
     console.print(Panel(table, title="[bold]forge-loop status[/bold]", title_align="left"))
     return 0
@@ -1163,18 +1229,32 @@ def cmd_run(
         "--queue",
         help="Queue backend URL. Default in-memory; sqlite:///path for durable.",
     ),
+    axis: list[str] = typer.Option(
+        [],
+        "--axis",
+        help=(
+            "Narrow dispatch to issues carrying ``axis:<name>`` labels. "
+            "Repeatable; values are unioned. Omit to preserve pre-#126 "
+            "behaviour (no filter)."
+        ),
+    ),
 ) -> None:
     if orchestrator not in {"sync", "async"}:
         typer.echo(f"run: invalid --orchestrator {orchestrator!r}", err=True)
         raise typer.Exit(code=2)
-    _exit(_cmd_run(SimpleNamespace(orchestrator=orchestrator, queue=queue)))
+    _exit(_cmd_run(SimpleNamespace(orchestrator=orchestrator, queue=queue, axis=axis)))
 
 
 @app.command("status", help="Operator-facing health surface.")
 def cmd_status(
     json_: bool = typer.Option(False, "--json", help="Emit raw JSON for scripts."),
+    axis: list[str] = typer.Option(
+        [],
+        "--axis",
+        help="Narrow the axis-grouped view to these slugs (repeatable).",
+    ),
 ) -> None:
-    _exit(_cmd_status(SimpleNamespace(json=json_)))
+    _exit(_cmd_status(SimpleNamespace(json=json_, axis=axis)))
 
 
 @app.command("doctor", help="One-shot health check (config-independent checks still run).")
