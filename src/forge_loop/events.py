@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -41,7 +41,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 class EventBase(BaseModel):
@@ -149,6 +149,31 @@ class RedeployEvent(EventBase):
 
 
 @register_event
+class WorkerSessionRecoveredEvent(EventBase):
+    """A non-terminal session was rediscovered at runner boot (issue #111).
+
+    Emitted once per session encountered during the crash-recovery walk.
+    ``action`` is one of:
+
+    - ``redispatch``: ``DISPATCHED`` survivor — re-dispatch normally.
+    - ``refire_critic``: ``AWAITING_CRITIC`` survivor — re-run critic.
+    - ``promote_to_awaiting_critic``: ``RUNNING`` / ``REVISING`` survivor
+      whose worktree + PR both still exist; promoted so critic picks up.
+    - ``abandon``: state lost (no worktree, no PR) — moved to ABANDONED.
+    """
+
+    KIND: ClassVar[str] = "worker_session_recovered"
+    session_id: str = ""
+    issue: int = 0
+    prior_state: str = ""
+    action: str = ""
+    new_state: str = ""
+    worktree_present: bool = False
+    pr_present: bool = False
+    reason: str = ""
+
+
+@register_event
 class WorktreeReapedEvent(EventBase):
     """Per-issue worktree cleanup after a worker outcome that doesn't
     need the directory preserved for inspection (merged/open path)."""
@@ -240,6 +265,7 @@ __all__ = [
     "LoopStopEvent",
     "RedeployEvent",
     "TickStartEvent",
+    "WorkerSessionRecoveredEvent",
     "WorktreeReapedEvent",
     "append_event_with_registry_check",
     "emit",

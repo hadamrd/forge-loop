@@ -93,6 +93,69 @@ def _short_sleep(
         time.sleep(1)
 
 
+def _run_crash_recovery(cfg: Config) -> None:
+    """Boot-time crash-recovery walk for persistent-worker sessions (#111).
+
+    No-op unless ``iteration.persistent_worker`` is enabled — until then
+    the session store is dormant and there is nothing to recover. With
+    it on, walks every non-terminal session and applies the per-state
+    recovery decision documented in
+    :mod:`forge_loop.runner.recovery`.
+
+    Best-effort: any failure here is logged via a typed event and
+    swallowed. A broken recovery path MUST NOT keep the runner from
+    starting — the next dispatch tick can still make progress on
+    fresh issues.
+    """
+    from forge_loop.settings import Settings as _Settings
+
+    try:
+        s = _Settings.load()
+    except Exception as ex:  # noqa: BLE001 — boundary
+        append_event(
+            cfg.events_file, "crash_recovery_skipped",
+            reason=f"settings_load_failed: {type(ex).__name__}",
+        )
+        return
+
+    if not getattr(s.iteration, "persistent_worker", False):
+        return
+
+    if not cfg.github_repo or "/" not in cfg.github_repo:
+        append_event(
+            cfg.events_file, "crash_recovery_skipped",
+            reason="github_repo not configured",
+        )
+        return
+    owner, repo = cfg.github_repo.split("/", 1)
+
+    try:
+        from forge_loop.gh_client import GithubkitClient
+        from forge_loop.runner.recovery import recover_sessions
+        from forge_loop.worker_sessions import WorkerSessionStore
+
+        db_path = cfg.state_dir / "worker-sessions.db"
+        store = WorkerSessionStore(db_path)
+        gh = GithubkitClient()
+        decisions = recover_sessions(
+            store,
+            gh_client=gh,
+            owner=owner,
+            repo=repo,
+            events_file=cfg.events_file,
+        )
+        append_event(
+            cfg.events_file, "crash_recovery_done",
+            count=len(decisions),
+            actions={d.action: 1 for d in decisions},  # shape-aware summary
+        )
+    except Exception as ex:  # noqa: BLE001 — boundary
+        append_event(
+            cfg.events_file, "crash_recovery_failed",
+            error=f"{type(ex).__name__}: {ex!s:.200}",
+        )
+
+
 def _validate_pipeline_if_configured(cfg: Config) -> None:
     """Load + validate ``.forge/pipeline.yaml`` at runner startup.
 
@@ -196,6 +259,12 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     # The full chain-driven dispatch is opt-in (see forge_loop.pipeline), so
     # this validation does not change the legacy PO→worker→critic flow.
     _validate_pipeline_if_configured(cfg)
+
+    # Issue #111 — crash recovery: walk non-terminal sessions left over
+    # from a previous (crashed) runner and decide per-state how to
+    # resume. Runs BEFORE the first dispatch tick so the recovery walk
+    # observes the same store the tick will read.
+    _run_crash_recovery(cfg)
 
     tick = 0
     while state.should_run:
