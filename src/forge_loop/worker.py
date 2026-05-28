@@ -71,6 +71,11 @@ class WorkerOutcome:
     cost_usd: float = 0.0
     usage: dict[str, Any] | None = None
     model: str = ""
+    # Issue #132: which manifesto versions were prepended to the worker
+    # system prompt for this run. Always a 2-key dict ({"quality": ...,
+    # "testing": ...}) when at least one side was present; ``None`` when
+    # the repo had no manifestos at all (back-compat baseline).
+    manifesto_sha: dict[str, str | None] | None = None
 
 
 def make_brief(
@@ -83,6 +88,7 @@ def make_brief(
     lumen_test_pattern: str = "**/*Test.*",
     coauthor: str = "",
     dry_run: bool = False,
+    manifesto_bundle: Any | None = None,
 ) -> str:
     """Render the worker brief for an issue.
 
@@ -150,6 +156,16 @@ def make_brief(
         from forge_loop.replay import apply_dry_run_to_brief
 
         rendered = apply_dry_run_to_brief(rendered)
+    # Issue #132 — manifesto injection. The MANIFESTO block goes in FRONT
+    # of every other brief line so the worker reads the house rules before
+    # it sees the issue body, the contract, or the exit checklist. When
+    # the bundle is empty (no manifestos in this repo), inject_into_brief
+    # is a no-op and the rendered brief is byte-identical to the
+    # pre-feature baseline (back-compat acceptance criterion).
+    if manifesto_bundle is not None:
+        from forge_loop.manifestos import inject_into_brief
+
+        rendered = inject_into_brief(rendered, manifesto_bundle)
     return rendered
 
 
@@ -496,11 +512,26 @@ def run_worker(
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"worker-{n}-{int(time.time())}.log"
+    # Issue #132 — discover the active manifestos once at dispatch time.
+    # The bundle threads into BOTH the brief renderer (prepends MANIFESTO
+    # block) AND the outcome telemetry (``manifesto_sha`` audit field).
+    # Discovery sources from the repo checkout, NOT the worktree — the
+    # worktree's .forge/ exists post-branch but the manifestos live on
+    # the canonical checkout that controls house rules.
+    from forge_loop.manifestos import load_manifestos
+
+    manifesto_bundle = load_manifestos(repo)
+    manifesto_sha = manifesto_bundle.sha_payload() if manifesto_bundle.any_present else None
+
     # Iteration loop (issue #78) passes a focused follow-up brief that
     # short-circuits ``make_brief`` — the follow-up session reuses the same
     # worktree + branch and just gets told "your ONLY job is X".
     if brief_override is not None:
-        brief = brief_override
+        # Even on follow-up runs, prepend the manifesto block so iteration 2
+        # is held to the same house rules as iteration 1.
+        from forge_loop.manifestos import inject_into_brief
+
+        brief = inject_into_brief(brief_override, manifesto_bundle)
     else:
         brief = make_brief(
             issue,
@@ -510,10 +541,11 @@ def run_worker(
             lumen_top_k=lumen_top_k,
             lumen_test_pattern=lumen_test_pattern,
             coauthor=coauthor,
+            manifesto_bundle=manifesto_bundle,
         )
 
     if provider == "codex":
-        return _run_worker_codex(
+        outcome = _run_worker_codex(
             issue=issue,
             worktree=worktree,
             log_path=log_path,
@@ -521,8 +553,10 @@ def run_worker(
             timeout_s=timeout_s,
             model=model,
         )
+        outcome.manifesto_sha = manifesto_sha
+        return outcome
 
-    return _run_worker_sdk(
+    outcome = _run_worker_sdk(
         issue=issue,
         worktree=worktree,
         log_path=log_path,
@@ -537,6 +571,8 @@ def run_worker(
         strict_mcp_config=strict_mcp_config,
         mcp_servers=mcp_servers,
     )
+    outcome.manifesto_sha = manifesto_sha
+    return outcome
 
 
 def run_repair_worker(
