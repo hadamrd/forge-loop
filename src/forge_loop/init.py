@@ -41,10 +41,28 @@ labels:
   # Set to "" to disable. Default: risk:high
   risk_gate: "risk:high"
 
+agent:
+  # Default provider for worker / PO / critic. Use `codex` to route roles
+  # through the local Codex CLI.
+  provider: claude
+
+worker:
+  provider: claude
+  model: claude-opus-4-7
+  thinking: medium
+
+po:
+  provider: claude
+  model: claude-opus-4-7
+  thinking: high
+
 # Optional: enable the critic agent. When true, a critic subagent reviews
 # every PR a worker opens BEFORE auto-merge fires (~30-90s per PR).
 critic:
   enabled: false
+  provider: claude
+  model: claude-sonnet-4-6
+  thinking: off
 
 # Optional: per-issue attempt history persisted as GH issue comments.
 # Workers read past attempts before starting; humans see them in the UI.
@@ -128,7 +146,9 @@ def detect_github_repo(target_dir: Path) -> str:
 
     r = subprocess.run(
         ["git", "-C", str(target_dir), "remote", "get-url", "origin"],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if r.returncode != 0:
         return "owner/repo"
@@ -153,9 +173,21 @@ def ensure_labels_via_gh(repo: str, labels: list[tuple[str, str, str]]) -> list[
     created: list[str] = []
     for name, color, desc in labels:
         r = subprocess.run(
-            ["gh", "label", "create", name,
-             "--repo", repo, "--color", color, "--description", desc],
-            capture_output=True, text=True, check=False,
+            [
+                "gh",
+                "label",
+                "create",
+                name,
+                "--repo",
+                repo,
+                "--color",
+                color,
+                "--description",
+                desc,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if r.returncode == 0:
             created.append(name)

@@ -63,25 +63,36 @@ def _tick(cfg: Config, tick: int) -> None:
         write_state(cfg.state_file, {"state": "maintenance", "tick": tick})
         append_event(cfg.events_file, "maintenance_start", tick=tick)
         brief = cfg.briefs.maintenance  # may be None → maintenance.run_maintenance uses default
-        outcome = run_maintenance(
-            cfg.repo, cfg.logs_dir,
-            brief=brief if brief else None,  # type: ignore[arg-type]
-        ) if brief else run_maintenance(cfg.repo, cfg.logs_dir)
+        outcome = (
+            run_maintenance(
+                cfg.repo,
+                cfg.logs_dir,
+                brief=brief if brief else None,  # type: ignore[arg-type]
+            )
+            if brief
+            else run_maintenance(cfg.repo, cfg.logs_dir)
+        )
         append_event(
-            cfg.events_file, "maintenance_done", tick=tick,
+            cfg.events_file,
+            "maintenance_done",
+            tick=tick,
             acted_on=outcome.acted_on,
             added_ready=outcome.added_ready,
             closed_dupes=outcome.closed_dupes,
             retitled=outcome.retitled,
             duration_s=round(outcome.duration_s, 1),
         )
-        write_state(cfg.state_file, {
-            "state": "between-ticks", "tick": tick,
-            "last_maintenance": {
-                "acted_on": outcome.acted_on,
-                "added_ready": outcome.added_ready,
+        write_state(
+            cfg.state_file,
+            {
+                "state": "between-ticks",
+                "tick": tick,
+                "last_maintenance": {
+                    "acted_on": outcome.acted_on,
+                    "added_ready": outcome.added_ready,
+                },
             },
-        })
+        )
         _short_sleep(cfg.tick_interval_s, cfg)
         return
 
@@ -107,25 +118,35 @@ def _tick(cfg: Config, tick: int) -> None:
     # dispatch). Idempotent — issues already expanded carry the marker.
     if cfg.po.enabled:
         write_state(cfg.state_file, {"state": "po_expanding", "tick": tick})
-        append_event(cfg.events_file, "po_start", tick=tick,
-                     issues=[i["number"] for i in issues])
+        append_event(cfg.events_file, "po_start", tick=tick, issues=[i["number"] for i in issues])
         po_outcomes = _po_expand(
-            issues, cfg.repo, cfg.logs_dir,
+            issues,
+            cfg.repo,
+            cfg.logs_dir,
             github_repo=cfg.github_repo,
             timeout_s=cfg.po.timeout_s,
             max_to_expand=cfg.po.max_to_expand_per_tick,
             model=cfg.po.model,
+            provider=getattr(cfg.po, "provider", "claude"),
         )
         expanded_nums = [o.issue for o in po_outcomes if not o.skipped]
         append_event(
-            cfg.events_file, "po_done", tick=tick,
+            cfg.events_file,
+            "po_done",
+            tick=tick,
             expanded=expanded_nums,
             skipped=[o.issue for o in po_outcomes if o.skipped],
-            outcomes=[{"issue": o.issue, "skipped": o.skipped,
-                       "reason": o.reason,
-                       "sections_added": o.sections_added,
-                       "duration_s": round(o.duration_s, 1),
-                       "error": o.error} for o in po_outcomes],
+            outcomes=[
+                {
+                    "issue": o.issue,
+                    "skipped": o.skipped,
+                    "reason": o.reason,
+                    "sections_added": o.sections_added,
+                    "duration_s": round(o.duration_s, 1),
+                    "error": o.error,
+                }
+                for o in po_outcomes
+            ],
         )
         # Re-fetch any issues whose bodies were just rewritten so the workers
         # see the new spec, not the stale snapshot we captured at tick start.
@@ -165,41 +186,57 @@ def _tick(cfg: Config, tick: int) -> None:
         corrupt = 0
         if cfg.attempts.enabled:
             past, corrupt = _attempts.fetch_history_strict(
-                i["number"], repo=cfg.github_repo,
+                i["number"],
+                repo=cfg.github_repo,
             )
             if corrupt:
                 append_event(
-                    cfg.events_file, "attempts_corrupt",
-                    issue=i["number"], rows=corrupt,
+                    cfg.events_file,
+                    "attempts_corrupt",
+                    issue=i["number"],
+                    rows=corrupt,
                 )
         fp = _attempts.compute_fingerprint(
-            i["number"], i.get("body") or "", brief_hash,
+            i["number"],
+            i.get("body") or "",
+            brief_hash,
         )
         forced = i["number"] in force_set
         if cfg.attempts.enabled and not forced:
             decision = _attempts.classify_skip(
-                past, fp, cooldown_s=cooldown_s,
+                past,
+                fp,
+                cooldown_s=cooldown_s,
             )
             if decision.kind == "in_flight":
                 append_event(
-                    cfg.events_file, "worker_skip_in_flight",
-                    issue=i["number"], pr_url=decision.pr_url,
-                    fingerprint=fp[:12], matched_ts=decision.matched_ts,
+                    cfg.events_file,
+                    "worker_skip_in_flight",
+                    issue=i["number"],
+                    pr_url=decision.pr_url,
+                    fingerprint=fp[:12],
+                    matched_ts=decision.matched_ts,
                 )
                 continue
             if decision.kind == "cooldown":
                 append_event(
-                    cfg.events_file, "worker_skip_cooldown",
-                    issue=i["number"], fingerprint=fp[:12],
+                    cfg.events_file,
+                    "worker_skip_cooldown",
+                    issue=i["number"],
+                    fingerprint=fp[:12],
                     cooldown_remaining_s=decision.cooldown_remaining_s,
                     matched_ts=decision.matched_ts,
                 )
                 continue
-        trimmed = past[-cfg.attempts.max_history_in_brief:] if past else []
-        workers_meta.append({
-            "risk_gated": gated, "past_attempts": trimmed,
-            "brief_fingerprint": fp, "forced": forced,
-        })
+        trimmed = past[-cfg.attempts.max_history_in_brief :] if past else []
+        workers_meta.append(
+            {
+                "risk_gated": gated,
+                "past_attempts": trimmed,
+                "brief_fingerprint": fp,
+                "forced": forced,
+            }
+        )
         issues_to_dispatch.append(i)
     issues = issues_to_dispatch
 
@@ -220,9 +257,10 @@ def _tick(cfg: Config, tick: int) -> None:
         append_event(cfg.events_file, kind, **payload)
 
     master_log_path = cfg.logs_dir / "master.log"
-    _mlog.info(master_log_path,
-               f"tick {tick} dispatching {len(issues)} worker(s): "
-               f"{[i['number'] for i in issues]}")
+    _mlog.info(
+        master_log_path,
+        f"tick {tick} dispatching {len(issues)} worker(s): {[i['number'] for i in issues]}",
+    )
 
     # forge-loop assumes Claude Code subscription-mode billing (flat). The
     # per-tick token-cost gate was removed in issue #38: it only made sense
@@ -230,7 +268,10 @@ def _tick(cfg: Config, tick: int) -> None:
     # subscription operator persona we actually support.
     outcomes: list[WorkerOutcome]
     outcomes, _used_pipeline = _run_workers(
-        cfg, issues, workers_meta, tick,
+        cfg,
+        issues,
+        workers_meta,
+        tick,
         master_log_path=master_log_path,
         bus_emit=_bus_emit,
     )
@@ -244,7 +285,9 @@ def _tick(cfg: Config, tick: int) -> None:
         for o in outcomes:
             try:
                 _attempts.record(
-                    o.issue, status=o.status, pr_url=o.pr_url,
+                    o.issue,
+                    status=o.status,
+                    pr_url=o.pr_url,
                     duration_s=o.duration_s,
                     note=(o.error or "")[:200],
                     event_count=len(o.events or []),
@@ -252,8 +295,9 @@ def _tick(cfg: Config, tick: int) -> None:
                     brief_fingerprint=fingerprint_by_issue.get(o.issue, ""),
                 )
             except Exception as ex_:  # don't fail tick on history-write error
-                append_event(cfg.events_file, "attempt_record_failed",
-                             issue=o.issue, err=str(ex_)[:200])
+                append_event(
+                    cfg.events_file, "attempt_record_failed", issue=o.issue, err=str(ex_)[:200]
+                )
 
     # Critic agent: review PRs the workers opened, before auto-merge fires.
     # In pipeline-driven mode the critic ran as a chain step already.
@@ -269,6 +313,7 @@ def _tick(cfg: Config, tick: int) -> None:
     # ticket.
     from forge_loop import gh as _gh
     from forge_loop.runner.merge_gate import apply_issue_closed_gate
+
     refused = apply_issue_closed_gate(
         outcomes,
         gh=_gh,
@@ -324,9 +369,13 @@ def _tick(cfg: Config, tick: int) -> None:
     # Drift detector (gap #3): record outcome signature, halt if 3-in-a-row.
     had_workers = bool(outcomes)
     all_failed = had_workers and all(o.status not in {"merged", "open"} for o in outcomes)
-    sig = "ok" if not all_failed else _error_signature(
-        outcomes[0].error if outcomes else None,
-        outcomes[0].stdout_tail if outcomes else "",
+    sig = (
+        "ok"
+        if not all_failed
+        else _error_signature(
+            outcomes[0].error if outcomes else None,
+            outcomes[0].stdout_tail if outcomes else "",
+        )
     )
     _RECENT_OUTCOMES.append((had_workers, all_failed, sig))
     if _check_drift_and_maybe_halt(cfg):

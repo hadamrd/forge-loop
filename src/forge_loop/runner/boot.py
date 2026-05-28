@@ -73,16 +73,20 @@ def _validate_pipeline_if_configured(cfg: Config) -> None:
         return
     try:
         from forge_loop.pipeline import build_dag, load_pipeline
+
         spec = load_pipeline(pipeline_yaml)
         dag = build_dag(spec)
     except Exception as e:  # noqa: BLE001 — boundary
         append_event(
-            cfg.events_file, "pipeline_invalid",
-            path=str(pipeline_yaml), error=str(e),
+            cfg.events_file,
+            "pipeline_invalid",
+            path=str(pipeline_yaml),
+            error=str(e),
         )
         raise
     append_event(
-        cfg.events_file, "pipeline_loaded",
+        cfg.events_file,
+        "pipeline_loaded",
         path=str(pipeline_yaml),
         roles=list(dag.order),
         roots=list(dag.roots),
@@ -227,40 +231,55 @@ def run_async(cfg: Config) -> int:
         append_event(cfg.events_file, kind, **payload)
 
     append_event(
-        cfg.events_file, "loop_start",
-        parallel=cfg.parallel, tick_interval=cfg.tick_interval_s,
-        max_ticks=cfg.max_ticks, label=cfg.labels.ready,
+        cfg.events_file,
+        "loop_start",
+        parallel=cfg.parallel,
+        tick_interval=cfg.tick_interval_s,
+        max_ticks=cfg.max_ticks,
+        label=cfg.labels.ready,
         orchestrator="async",
         pools={"po": pools.po, "worker": pools.worker, "critic": pools.critic},
     )
-    write_state(cfg.state_file, {
-        "state": "starting", "tick": 0,
-        "orchestrator": "async",
-        "pools": {"po": pools.po, "worker": pools.worker, "critic": pools.critic},
-    })
+    write_state(
+        cfg.state_file,
+        {
+            "state": "starting",
+            "tick": 0,
+            "orchestrator": "async",
+            "pools": {"po": pools.po, "worker": pools.worker, "critic": pools.critic},
+        },
+    )
 
     async def _po_fn(issue: dict[str, Any]) -> dict[str, Any]:
         if not cfg.po.enabled:
             return {"issue": issue["number"], "skipped": True, "reason": "po_disabled"}
         outs = await asyncio.to_thread(
-            _po_expand, [issue], cfg.repo, cfg.logs_dir,
+            _po_expand,
+            [issue],
+            cfg.repo,
+            cfg.logs_dir,
             github_repo=cfg.github_repo,
             timeout_s=cfg.po.timeout_s,
             max_to_expand=1,
             model=cfg.po.model,
+            provider=getattr(cfg.po, "provider", "claude"),
         )
         if not outs:
             return {"issue": issue["number"], "skipped": True, "reason": "po_no_op"}
         o = outs[0]
         return {
-            "issue": o.issue, "skipped": o.skipped, "reason": o.reason,
+            "issue": o.issue,
+            "skipped": o.skipped,
+            "reason": o.reason,
             "sections_added": o.sections_added,
         }
 
     async def _worker_fn(issue: dict[str, Any], _po: dict[str, Any]) -> dict[str, Any]:
         if not _po.get("skipped"):
             fresh = await asyncio.to_thread(
-                fetch_issue, issue["number"], cfg.github_repo,
+                fetch_issue,
+                issue["number"],
+                cfg.github_repo,
             )
             if fresh:
                 issue = fresh
@@ -269,54 +288,85 @@ def run_async(cfg: Config) -> int:
         past: list[dict[str, Any]] = []
         if cfg.attempts.enabled:
             past = await asyncio.to_thread(
-                _attempts.fetch_history, issue["number"], cfg.github_repo,
+                _attempts.fetch_history,
+                issue["number"],
+                cfg.github_repo,
             )
-            past = past[-cfg.attempts.max_history_in_brief:] if past else []
+            past = past[-cfg.attempts.max_history_in_brief :] if past else []
         o = await asyncio.to_thread(
-            run_worker, issue, cfg.repo, cfg.logs_dir, cfg.worker_timeout_s,
-            risk_gated=gated, past_attempts=past, emit=_bus_emit,
+            run_worker,
+            issue,
+            cfg.repo,
+            cfg.logs_dir,
+            cfg.worker_timeout_s,
+            risk_gated=gated,
+            past_attempts=past,
+            emit=_bus_emit,
             lumen_top_k=cfg.lumen.top_k,
             lumen_test_pattern=cfg.lumen_test_pattern,
             coauthor=cfg.coauthor,
             model=cfg.worker.model,
             thinking=cfg.worker.thinking,
+            provider=getattr(cfg.worker, "provider", "claude"),
             allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
             load_timeout_ms=cfg.worker.load_timeout_ms,
             strict_mcp_config=cfg.worker.strict_mcp_config,
             mcp_servers=cfg.worker.mcp_servers,
         )
         return {
-            "issue": o.issue, "title": o.title,
-            "pr_url": o.pr_url, "status": o.status,
-            "duration_s": o.duration_s, "error": o.error,
+            "issue": o.issue,
+            "title": o.title,
+            "pr_url": o.pr_url,
+            "status": o.status,
+            "duration_s": o.duration_s,
+            "error": o.error,
         }
 
     async def _critic_fn(wr: dict[str, Any]) -> dict[str, Any]:
         if not cfg.critic.enabled or not wr.get("pr_url"):
             return {"issue": wr.get("issue"), "verdict": "skipped", "reasons": []}
         c = await asyncio.to_thread(
-            _critic_review, wr["pr_url"], wr["issue"],
-            cfg.repo, cfg.logs_dir, cfg.critic.timeout_s, None, _bus_emit,
+            _critic_review,
+            wr["pr_url"],
+            wr["issue"],
+            cfg.repo,
+            cfg.logs_dir,
+            cfg.critic.timeout_s,
+            None,
+            _bus_emit,
             cfg.critic.model,
+            getattr(cfg.critic, "provider", "claude"),
         )
         if c.report is not None:
             try:
                 lines = await asyncio.to_thread(
-                    _gh.pr_changed_lines, wr["pr_url"], cfg.github_repo,
+                    _gh.pr_changed_lines,
+                    wr["pr_url"],
+                    cfg.github_repo,
                 )
                 await asyncio.to_thread(
                     apply_critic_report,
-                    c.report, wr["pr_url"], lines,
+                    c.report,
+                    wr["pr_url"],
+                    lines,
                     cfg.critic.block_on_sev2,
                     cfg.critic.min_findings_for_approve,
-                    _gh, cfg.github_repo, _bus_emit,
+                    _gh,
+                    cfg.github_repo,
+                    _bus_emit,
                 )
             except Exception as act_ex:
-                append_event(cfg.events_file, "critic_actions_failed",
-                             issue=wr.get("issue"), err=str(act_ex)[:200])
+                append_event(
+                    cfg.events_file,
+                    "critic_actions_failed",
+                    issue=wr.get("issue"),
+                    err=str(act_ex)[:200],
+                )
         return {
-            "issue": wr.get("issue"), "verdict": c.verdict,
-            "reasons": c.reasons, "duration_s": c.duration_s,
+            "issue": wr.get("issue"),
+            "verdict": c.verdict,
+            "reasons": c.reasons,
+            "duration_s": c.duration_s,
             "sev_counts": _sev_counts(c),
             "parse_retries": c.parse_retries,
         }
@@ -328,7 +378,10 @@ def run_async(cfg: Config) -> int:
         tick += 1
         try:
             issues = await asyncio.to_thread(
-                top_issues, cfg.labels.ready, cfg.parallel, cfg.github_repo,
+                top_issues,
+                cfg.labels.ready,
+                cfg.parallel,
+                cfg.github_repo,
             )
         except subprocess.CalledProcessError as e:
             append_event(cfg.events_file, "gh_list_failed", err=(e.stderr or "")[:200])
@@ -340,35 +393,51 @@ def run_async(cfg: Config) -> int:
             await asyncio.sleep(cfg.tick_interval_s)
             return
 
-        append_event(cfg.events_file, "tick_start", tick=tick,
-                     issues=[i["number"] for i in issues], orchestrator="async")
-        write_state(cfg.state_file, {
-            "state": "running", "tick": tick,
-            "dispatched": [{"issue": i["number"], "title": i["title"]} for i in issues],
-        })
+        append_event(
+            cfg.events_file,
+            "tick_start",
+            tick=tick,
+            issues=[i["number"] for i in issues],
+            orchestrator="async",
+        )
+        write_state(
+            cfg.state_file,
+            {
+                "state": "running",
+                "tick": tick,
+                "dispatched": [{"issue": i["number"], "title": i["title"]} for i in issues],
+            },
+        )
         results, stats = await run_async_tick(
-            issues, pools=pools, caps=caps,
-            po_fn=_po_fn, worker_fn=_worker_fn, critic_fn=_critic_fn,
+            issues,
+            pools=pools,
+            caps=caps,
+            po_fn=_po_fn,
+            worker_fn=_worker_fn,
+            critic_fn=_critic_fn,
             emit=_bus_emit,
             po_timeout_s=float(cfg.po.timeout_s),
             worker_timeout_s=float(cfg.worker_timeout_s),
             critic_timeout_s=float(cfg.critic.timeout_s),
         )
-        merged = [r["issue"] for r in results
-                  if (r.get("worker") or {}).get("status") == "merged"]
-        append_event(cfg.events_file, "tick_done", tick=tick,
-                     merged=merged, results=results,
-                     stats={
-                         "po": stats.po.__dict__,
-                         "worker": stats.worker.__dict__,
-                         "critic": stats.critic.__dict__,
-                     })
+        merged = [r["issue"] for r in results if (r.get("worker") or {}).get("status") == "merged"]
+        append_event(
+            cfg.events_file,
+            "tick_done",
+            tick=tick,
+            merged=merged,
+            results=results,
+            stats={
+                "po": stats.po.__dict__,
+                "worker": stats.worker.__dict__,
+                "critic": stats.critic.__dict__,
+            },
+        )
         for issue_num in merged:
             _reap_worktree(cfg.repo, issue_num)
         if merged and cfg.deploy_task:
             ok, log = await asyncio.to_thread(redeploy, cfg.repo, cfg.deploy_task)
-            append_event(cfg.events_file, "redeploy",
-                         task=cfg.deploy_task, ok=ok, detail=log)
+            append_event(cfg.events_file, "redeploy", task=cfg.deploy_task, ok=ok, detail=log)
         write_state(cfg.state_file, {"state": "between-ticks", "tick": tick})
         await asyncio.sleep(cfg.tick_interval_s)
 

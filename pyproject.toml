@@ -1,7 +1,7 @@
 [project]
 name = "forge-loop"
 version = "0.1.0"
-description = "Autonomous multi-worker dispatcher for Claude Code — picks up GitHub issues by label, dispatches parallel workers in git worktrees, watches PRs, merges, and redeploys."
+description = "Autonomous multi-worker dispatcher for Claude Code and Codex — picks up GitHub issues by label, dispatches parallel workers in git worktrees, watches PRs, merges, and redeploys."
 readme = "README.md"
 requires-python = ">=3.11"
 # STABLE surface only (issue #39). Anything heavier — fastapi, uvicorn,
