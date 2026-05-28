@@ -211,7 +211,13 @@ def _drop_permissive_settings(worktree: Path) -> None:
     cdir.chmod(0o555)
 
 
-def _prep_worktree(repo: Path, n: int, branch: str) -> tuple[Path, str | None]:
+def _prep_worktree(
+    repo: Path,
+    n: int,
+    branch: str,
+    *,
+    base_branch: str = "trunk",
+) -> tuple[Path, str | None]:
     wt = Path(f"/tmp/wt-loop-{n}")
     # chmod the planted .claude/ back to writable so worktree remove can
     # delete it (we set it read-only at the end of last run to prevent worker
@@ -226,24 +232,32 @@ def _prep_worktree(repo: Path, n: int, branch: str) -> tuple[Path, str | None]:
     )
     # If a previous failed attempt left a local branch lying around, delete
     # it so `git worktree add -B` can recreate it cleanly off the freshest
-    # origin/trunk. `-B` would overwrite anyway, but we use plain `-b` after
-    # an explicit delete to fail loudly if the branch is still in use.
+    # origin/<base_branch>. `-B` would overwrite anyway, but we use plain `-b`
+    # after an explicit delete to fail loudly if the branch is still in use.
     subprocess.run(
         ["git", "branch", "-D", branch],
         cwd=repo,
         capture_output=True,
     )
-    # Force-update origin/trunk so the worktree always starts at the freshest
-    # commit, even if many PRs landed during the prior tick. `+refs/heads/...`
-    # makes the fetch force the ref update (defensive — non-FF should never
-    # happen for trunk, but if it does we want the upstream view).
+    # Force-update the configured upstream branch so the worktree always starts
+    # at the freshest commit, even if many PRs landed during the prior tick.
+    # `+refs/heads/...` makes the fetch force the ref update (defensive —
+    # non-FF should never happen for protected branches, but if it does we want
+    # the upstream view).
+    remote_ref = f"refs/remotes/origin/{base_branch}"
     subprocess.run(
-        ["git", "fetch", "--prune", "origin", "+refs/heads/trunk:refs/remotes/origin/trunk"],
+        [
+            "git",
+            "fetch",
+            "--prune",
+            "origin",
+            f"+refs/heads/{base_branch}:{remote_ref}",
+        ],
         cwd=repo,
         capture_output=True,
     )
     r = subprocess.run(
-        ["git", "worktree", "add", str(wt), "-B", branch, "origin/trunk"],
+        ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{base_branch}"],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -321,6 +335,7 @@ def run_worker(
     load_timeout_ms: int | None = None,
     strict_mcp_config: bool = False,
     mcp_servers: dict[str, Any] | None = None,
+    base_branch: str = "trunk",
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -340,7 +355,7 @@ def run_worker(
     title = issue["title"]
     branch = _branch_name(n, title)
 
-    worktree, err = _prep_worktree(repo, n, branch)
+    worktree, err = _prep_worktree(repo, n, branch, base_branch=base_branch)
     if err is not None:
         return WorkerOutcome(
             issue=n,

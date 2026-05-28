@@ -16,7 +16,7 @@ from forge_loop import master_log as _mlog
 from forge_loop import worker as _worker
 from forge_loop.config import Config
 from forge_loop.deploy import redeploy
-from forge_loop.gh import fetch_issue, top_issues
+from forge_loop.gh import fetch_issue, top_issues, unlabel
 from forge_loop.maintenance import run_maintenance
 from forge_loop.po import expand_thin_specs as _po_expand
 from forge_loop.runner._helpers import (
@@ -162,7 +162,7 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
 
     # 3. Detect test files in the diff to decide DRAFT vs READY.
     diff_r = _sp.run(
-        ["git", "diff", "--name-only", "origin/trunk"],
+        ["git", "diff", "--name-only", f"origin/{cfg.base_branch}"],
         cwd=wt, capture_output=True, text=True, timeout=30,
     )
     changed_files = diff_r.stdout.strip().splitlines() if diff_r.returncode == 0 else []
@@ -174,7 +174,7 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
     pr_args = [
         "gh", "pr", "create",
         "--repo", cfg.github_repo,
-        "--base", "trunk",
+        "--base", cfg.base_branch,
         "--head", branch,
         "--title", f"feat(loop): auto-shipped #{o.issue} — worker session captured",
         "--body", (
@@ -219,6 +219,32 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
         # request live for whenever CI completes.
 
     return url
+
+
+def _remove_ready_label(
+    cfg: Config,
+    issue: int,
+    *,
+    status: str,
+    pr_url: str | None = None,
+) -> None:
+    try:
+        unlabel(issue, cfg.labels.ready, repo=cfg.github_repo)
+        append_event(
+            cfg.events_file,
+            "issue_ready_label_removed",
+            issue=issue,
+            status=status,
+            pr_url=pr_url,
+            label=cfg.labels.ready,
+        )
+    except Exception as ex_:  # do not fail the tick on label hygiene
+        append_event(
+            cfg.events_file,
+            "issue_ready_label_remove_failed",
+            issue=issue,
+            err=str(ex_)[:200],
+        )
 
 
 def _tick(cfg: Config, tick: int) -> None:
@@ -386,6 +412,12 @@ def _tick(cfg: Config, tick: int) -> None:
                     fingerprint=fp[:12],
                     matched_ts=decision.matched_ts,
                 )
+                _remove_ready_label(
+                    cfg,
+                    i["number"],
+                    status="in_flight",
+                    pr_url=decision.pr_url,
+                )
                 continue
             if decision.kind == "cooldown":
                 append_event(
@@ -472,6 +504,10 @@ def _tick(cfg: Config, tick: int) -> None:
     # In pipeline-driven mode the critic ran as a chain step already.
     if cfg.critic.enabled and not _used_pipeline:
         _run_critic_for_outcomes(cfg, outcomes, _bus_emit)
+
+    for o in outcomes:
+        if o.status in {"open", "merged"} and o.pr_url:
+            _remove_ready_label(cfg, o.issue, status=o.status, pr_url=o.pr_url)
 
     # Issue #65 — pre-merge gate. AFTER the critic has had its say but
     # BEFORE we declare any outcome "merged", re-check that the source

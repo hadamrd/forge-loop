@@ -55,6 +55,31 @@ def test_repo_from_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert cfg.github_repo == "foo/bar"
 
 
+def test_base_branch_from_yaml(fake_repo: Path) -> None:
+    (fake_repo / "forge-loop.yaml").write_text(
+        dedent("""
+        repo:
+          base_branch: main
+    """)
+    )
+    cfg = config_mod.load()
+    assert cfg.base_branch == "main"
+
+
+def test_base_branch_env_overrides_yaml(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (fake_repo / "forge-loop.yaml").write_text(
+        dedent("""
+        repo:
+          base_branch: trunk
+    """)
+    )
+    monkeypatch.setenv("LOOP_BASE_BRANCH", "release")
+    cfg = config_mod.load()
+    assert cfg.base_branch == "release"
+
+
 def test_env_overrides_yaml_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config_mod, "_repo_root", lambda: tmp_path)
     for k in list(os.environ):
