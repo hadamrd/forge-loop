@@ -18,6 +18,10 @@ dependencies = [
   # (issue #84). Replaces the 35-call-site `os.environ.get(...)` sprawl
   # with one typed Settings model. Precedence: env > yaml > defaults.
   "pydantic-settings >=2.0",
+  # structlog powers the unified logging surface (issue #89). Rich
+  # formatting when stderr is a TTY, JSON when piped to a file. Replaces
+  # the print/_mlog/append_event triplet over time.
+  "structlog >=24.0",
   # Rich powers status/doctor/events output. NO_COLOR aware,
   # CI-friendly when terminal is dumb. Pulled into the stable surface
   # because the CLI is the operator's primary interface.

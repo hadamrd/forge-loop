@@ -165,10 +165,15 @@ class WorktreeReapedEvent(EventBase):
 
 
 def emit(events_path: Path, event: EventBase) -> None:
-    """Append a typed event to the events log.
+    """Append a typed event to the events log AND mirror it to structlog.
 
     Validates the event at construction (Pydantic) and at write time
     (this function) so a malformed payload can't reach disk.
+
+    Logging level heuristic (issue #89): events whose KIND includes
+    ``fail``/``error``/``halt``/``drift``/``refused`` emit at WARNING;
+    everything else is INFO. This gives operators a useful default
+    on the live log stream without per-kind classification.
     """
     if not isinstance(event, EventBase):
         raise TypeError(f"emit expected EventBase, got {type(event).__name__}")
@@ -176,6 +181,22 @@ def emit(events_path: Path, event: EventBase) -> None:
     rec = event.to_record()
     with open(events_path, "a") as f:
         f.write(json.dumps(rec, default=str) + "\n")
+    _log_event(event.KIND, rec)
+
+
+def _log_event(kind: str, rec: dict[str, Any]) -> None:
+    """Mirror an event to structlog at the appropriate level."""
+    from forge_loop.log import get_logger
+
+    logger = get_logger()
+    # Drop the timestamp + kind from the payload — structlog stamps its own
+    # timestamp, and ``kind`` is the message.
+    payload = {k: v for k, v in rec.items() if k not in ("ts", "kind")}
+    severity_markers = ("fail", "error", "halt", "drift", "refused", "stop")
+    if any(m in kind.lower() for m in severity_markers):
+        logger.warning(kind, **payload)
+    else:
+        logger.info(kind, **payload)
 
 
 def append_event_with_registry_check(
@@ -209,6 +230,7 @@ def append_event_with_registry_check(
     rec = {"ts": _now_iso(), "kind": kind, **fields}
     with open(events_path, "a") as f:
         f.write(json.dumps(rec, default=str) + "\n")
+    _log_event(kind, rec)
 
 
 __all__ = [
