@@ -116,7 +116,7 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
     if add_r.returncode != 0:
         return None
     commit_r = _sp.run(
-        ["git", "commit", "-m", commit_msg, "--allow-empty-message"],
+        ["git", "commit", "--no-verify", "-m", commit_msg, "--allow-empty-message"],
         cwd=wt, capture_output=True, text=True, timeout=60,
     )
     if commit_r.returncode != 0:
