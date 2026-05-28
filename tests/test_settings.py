@@ -236,6 +236,12 @@ def test_allowed_mcp_tools_csv_env_parses(
 
 
 _ALLOWED_LEGACY_SITES = {
+    # log.py reads FORGE_LOOP_LOG_JSON at every TTY-check (called from
+    # configure_logging which runs once at process boot). Could be moved
+    # into Settings but the override is exactly one bool and the call
+    # sits before Settings is loadable (Settings imports trigger logging),
+    # so the dependency would invert. Justified standalone.
+    "src/forge_loop/log.py",
     # Dynamic env-var name (computed at call time, not a fixed knob).
     "src/forge_loop/briefs/__init__.py",
     "src/forge_loop/mcp_server.py",  # per-tool LOOP_MCP_CAP_<TOOL> + ENV pass-through
