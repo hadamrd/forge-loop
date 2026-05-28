@@ -199,6 +199,9 @@ def test_committed_not_pushed(worktree: Path) -> None:
     run = _make_fake_run(
         {
             ("gh", "pr", "list"): _completed("[]"),
+            # origin/<branch> exists (new probe added by the pushed_no_pr
+            # misclassification hot-fix); rev-list returns 2 ahead.
+            ("git", "rev-parse", "--verify"): _completed("abc123\n"),
             ("git", "status", "--porcelain"): _completed(""),
             ("git", "rev-list", "--count"): _completed("2\n"),
         }
@@ -211,6 +214,8 @@ def test_pushed_no_pr(worktree: Path) -> None:
     run = _make_fake_run(
         {
             ("gh", "pr", "list"): _completed("[]"),
+            # origin/<branch> exists AND local matches it (ahead=0).
+            ("git", "rev-parse", "--verify"): _completed("abc123\n"),
             ("git", "status", "--porcelain"): _completed(""),
             ("git", "rev-list", "--count"): _completed("0\n"),
         }
@@ -228,7 +233,13 @@ def test_clean_nothing_when_worktree_missing(tmp_path: Path) -> None:
 
 
 def test_gh_failure_degrades_gracefully(worktree: Path) -> None:
-    """Adversarial: gh subprocess errors → fall through, don't crash."""
+    """Adversarial: gh subprocess errors → fall through, don't crash.
+
+    After the pushed_no_pr hot-fix, the probe is more conservative when
+    origin/<branch> can't be verified. With no PR seen AND no proof of
+    a remote ref AND no local commits, we return CLEAN_NOTHING. This
+    is SAFER than the old "guess PUSHED_NO_PR" verdict — the worker
+    won't try to open a PR on a branch that doesn't exist remotely."""
 
     def _run(args, _cwd):
         if args[0] == "gh":
@@ -240,8 +251,7 @@ def test_gh_failure_degrades_gracefully(worktree: Path) -> None:
         return _completed("")
 
     state, _ = probe_worker_state(worktree, "b", "owner/r", 10, run=_run)
-    # gh died → no PR seen → fall through to pushed_no_pr (ahead == 0).
-    assert state == WorkerState.PUSHED_NO_PR
+    assert state == WorkerState.CLEAN_NOTHING
 
 
 # ---------------------------------------------------------------------------

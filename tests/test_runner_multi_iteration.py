@@ -93,7 +93,15 @@ class Scripted:
                 self.automerge_calls.append(args[3])
                 return _cp("", 0)
             if args[0] == "gh" and args[1] == "issue" and args[2] == "edit":
-                self.label_calls.append((int(args[3]), args[-1]))
+                # The escalation hot-fix calls `--add-label X --remove-label Y`
+                # in a single invocation. Capture the ADDED label (the one
+                # the test cares about) by scanning for --add-label.
+                added = ""
+                for i, a in enumerate(args):
+                    if a == "--add-label" and i + 1 < len(args):
+                        added = args[i + 1]
+                        break
+                self.label_calls.append((int(args[3]), added or args[-1]))
                 return _cp("", 0)
             if args[0] == "git" and args[1] == "rev-parse":
                 return _cp("loop/78-x\n", 0)
