@@ -35,6 +35,15 @@ ALGORITHM:
    ```
    Then `gh issue edit {issue_number} --repo {github_repo} --add-label "po:expanded"`.
 
+UNDER-COMMITTING RISK FLAG:
+When the AC is broad (>5 bullets, or crosses >3 modules, or asks for both a
+feature AND a migration AND tests in one shot), add a `## Worker note` section
+at the bottom warning: "AC is wide — worker, you are at high risk of running
+out of turns before pushing. Apply COMMIT DISCIPLINE (wip-commit every 20
+turns / 5 file-edits) aggressively from the start, and run the EXIT CHECKLIST
+even if implementation feels incomplete." This protects the operator from
+silent dry-exits on big-scope tickets.
+
 CONSTRAINTS:
 - NEVER change the issue title (worker's branch name depends on stable title).
 - NEVER close issues or change priority labels.
