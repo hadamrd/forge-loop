@@ -339,6 +339,16 @@ class IterationSettings(BaseSettings):
     max_iterations: int = 3
     # Legacy LOOP_PIPELINE_DRIVEN — experimental DAG-driven tick path.
     pipeline_driven: bool = False
+    # Persistent worker session (issue #95). When True, the runner
+    # routes every dispatch through forge_loop.worker_sessions and keeps
+    # the SDK session_id alive across critic round-trips. Defaults off
+    # in this PR — the FSM + session store ship as foundation; runner
+    # integration is the follow-up gated by this flag.
+    persistent_worker: bool = False
+    # Cap on critic ping-pong rounds (issue #95). After N revisions
+    # with the critic still asking for changes, the session is abandoned
+    # with ``loop:needs-human``.
+    max_critic_iterations: int = 3
 
 
 class MiscSettings(BaseSettings):
@@ -522,6 +532,8 @@ ENV_MAP: tuple[tuple[str, str, Any], ...] = (
     # Iteration
     ("LOOP_WORKER_MAX_ITERATIONS", "iteration.max_iterations", int),
     ("LOOP_PIPELINE_DRIVEN", "iteration.pipeline_driven", _coerce_bool),
+    ("LOOP_PERSISTENT_WORKER", "iteration.persistent_worker", _coerce_bool),
+    ("LOOP_MAX_CRITIC_ITERATIONS", "iteration.max_critic_iterations", int),
     # Operator
     ("LOOP_OPERATOR_TIMEOUT_S", "operator.timeout_s", int),
     ("LOOP_OPERATOR_WEBHOOK", "operator.webhook", str),
