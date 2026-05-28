@@ -94,8 +94,8 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
     """
     import fnmatch
     import os as _os
-    from pathlib import Path as _Path
     import subprocess as _sp
+    from pathlib import Path as _Path
 
     wt = _Path(f"/tmp/wt-loop-{o.issue}")
     if not wt.exists():
@@ -104,7 +104,10 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
     # Uncommitted changes?
     porcelain = _sp.run(
         ["git", "status", "--porcelain"],
-        cwd=wt, capture_output=True, text=True, timeout=30,
+        cwd=wt,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if porcelain.returncode != 0 or not porcelain.stdout.strip():
         return None
@@ -112,7 +115,10 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
     # Determine branch.
     branch_r = _sp.run(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=wt, capture_output=True, text=True, timeout=10,
+        cwd=wt,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     branch = branch_r.stdout.strip() if branch_r.returncode == 0 else ""
     if not branch or branch in ("trunk", "main", "HEAD"):
@@ -126,8 +132,12 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
         try:
             _sp.run(
                 fmt_cmd_str,
-                cwd=wt, shell=True, capture_output=True, text=True,
-                timeout=300, env={**_os.environ, "JAVA_TOOL_OPTIONS": "-Xmx1500m"},
+                cwd=wt,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env={**_os.environ, "JAVA_TOOL_OPTIONS": "-Xmx1500m"},
             )
         except _sp.SubprocessError:
             pass  # Format failed — push raw output anyway.
@@ -149,35 +159,53 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
 
     if _sp.run(["git", "add", "-A"], cwd=wt, capture_output=True, timeout=60).returncode != 0:
         return None
-    if _sp.run(
-        ["git", "commit", "--no-verify", "-m", commit_msg, "--allow-empty-message"],
-        cwd=wt, capture_output=True, timeout=60,
-    ).returncode != 0:
+    if (
+        _sp.run(
+            ["git", "commit", "--no-verify", "-m", commit_msg, "--allow-empty-message"],
+            cwd=wt,
+            capture_output=True,
+            timeout=60,
+        ).returncode
+        != 0
+    ):
         return None
-    if _sp.run(
-        ["git", "push", "-u", "origin", branch],
-        cwd=wt, capture_output=True, timeout=120,
-    ).returncode != 0:
+    if (
+        _sp.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=wt,
+            capture_output=True,
+            timeout=120,
+        ).returncode
+        != 0
+    ):
         return None
 
     # 3. Detect test files in the diff to decide DRAFT vs READY.
     diff_r = _sp.run(
         ["git", "diff", "--name-only", f"origin/{cfg.base_branch}"],
-        cwd=wt, capture_output=True, text=True, timeout=30,
+        cwd=wt,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     changed_files = diff_r.stdout.strip().splitlines() if diff_r.returncode == 0 else []
-    has_tests = any(
-        fnmatch.fnmatch(f, g) for f in changed_files for g in _TEST_FILE_GLOBS
-    )
+    has_tests = any(fnmatch.fnmatch(f, g) for f in changed_files for g in _TEST_FILE_GLOBS)
 
     # 4. Open PR. With tests → READY (loop trusts the work). Without → DRAFT.
     pr_args = [
-        "gh", "pr", "create",
-        "--repo", cfg.github_repo,
-        "--base", cfg.base_branch,
-        "--head", branch,
-        "--title", f"feat(loop): auto-shipped #{o.issue} — worker session captured",
-        "--body", (
+        "gh",
+        "pr",
+        "create",
+        "--repo",
+        cfg.github_repo,
+        "--base",
+        cfg.base_branch,
+        "--head",
+        branch,
+        "--title",
+        f"feat(loop): auto-shipped #{o.issue} — worker session captured",
+        "--body",
+        (
             f"**Auto-shipped by forge-loop** — worker for #{o.issue} exited its\n"
             "SDK session without committing. The loop captured + formatted +\n"
             "pushed the output. Auto-merge is enabled.\n"
@@ -188,7 +216,8 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
             "\n"
             "Merge gate: CI must pass + critic must not block on sev1.\n"
         ),
-        "--label", "loop:auto-rescued",
+        "--label",
+        "loop:auto-rescued",
     ]
     if not has_tests:
         # No tests → mark as needing human review and leave draft.
@@ -206,10 +235,17 @@ def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
     if has_tests:
         _sp.run(
             [
-                "gh", "pr", "merge", url,
-                "--squash", "--auto", "--delete-branch",
+                "gh",
+                "pr",
+                "merge",
+                url,
+                "--squash",
+                "--auto",
+                "--delete-branch",
             ],
-            cwd=wt, capture_output=True, timeout=60,
+            cwd=wt,
+            capture_output=True,
+            timeout=60,
         )
         # If --auto isn't available on this repo (branch protection
         # required), fall back to an immediate admin merge so the work
@@ -477,6 +513,73 @@ def _tick(cfg: Config, tick: int) -> None:
         bus_emit=_bus_emit,
     )
 
+    # Issue #78 — worker iteration loop. For each outcome that didn't reach
+    # ``merged`` on attempt 1, probe the worker state (DIRTY_NO_COMMIT,
+    # COMMITTED_NOT_PUSHED, PUSHED_NO_PR, PR_OPEN_BLOCKED, PR_OPEN_CI_FAILED,
+    # PR_OPEN_CONFLICT, PR_OPEN_HEALTHY, CLEAN_NOTHING) and dispatch a
+    # focused follow-up worker session — up to ``cfg.worker_max_iterations``
+    # attempts. After N attempts without merge, the issue gets labeled
+    # ``loop:needs-human``.
+    if cfg.worker_max_iterations > 1 and outcomes:
+        from forge_loop.runner.iteration import run_iteration_loop
+
+        issue_by_n = {i["number"]: i for i in issues}
+        for idx, o in enumerate(list(outcomes)):
+            if o.status == "merged":
+                continue
+            issue = issue_by_n.get(o.issue)
+            if issue is None:
+                continue
+            wt = Path(f"/tmp/wt-loop-{o.issue}")
+
+            def _dispatch_follow_up(_issue: dict[str, Any], brief: str) -> WorkerOutcome:
+                """Dispatch one follow-up worker session reusing the worktree."""
+                from forge_loop.worker import run_worker
+
+                return run_worker(
+                    _issue,
+                    cfg.repo,
+                    cfg.logs_dir,
+                    cfg.worker_timeout_s,
+                    risk_gated=False,
+                    past_attempts=[],
+                    emit=_bus_emit,
+                    lumen_top_k=cfg.lumen.top_k,
+                    lumen_test_pattern=cfg.lumen_test_pattern,
+                    coauthor=cfg.coauthor,
+                    tick=tick,
+                    model=cfg.worker.model,
+                    thinking=cfg.worker.thinking,
+                    provider=getattr(cfg.worker, "provider", "claude"),
+                    allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+                    load_timeout_ms=cfg.worker.load_timeout_ms,
+                    strict_mcp_config=cfg.worker.strict_mcp_config,
+                    mcp_servers=cfg.worker.mcp_servers,
+                    base_branch=cfg.base_branch,
+                    brief_override=brief,
+                )
+
+            try:
+                new_outcome = run_iteration_loop(
+                    o,
+                    issue,
+                    repo=cfg.github_repo or "",
+                    base_branch=cfg.base_branch,
+                    worktree=wt,
+                    max_iterations=cfg.worker_max_iterations,
+                    dispatch_worker=_dispatch_follow_up,
+                    emit=_bus_emit,
+                    coauthor=cfg.coauthor,
+                )
+                outcomes[idx] = new_outcome
+            except Exception as ex_:  # never fail the tick on iteration loop bugs
+                append_event(
+                    cfg.events_file,
+                    "worker_iteration_failed",
+                    issue=o.issue,
+                    err=str(ex_)[:200],
+                )
+
     # Persist this attempt as a GH issue comment (per-issue history grows).
     fingerprint_by_issue = {
         i["number"]: meta.get("brief_fingerprint", "")
@@ -574,24 +677,31 @@ def _tick(cfg: Config, tick: int) -> None:
                 o.status = "open"
                 o.pr_url = rescued
                 append_event(
-                    cfg.events_file, "worker_work_rescued",
-                    issue=o.issue, pr=rescued,
+                    cfg.events_file,
+                    "worker_work_rescued",
+                    issue=o.issue,
+                    pr=rescued,
                     hint="Worker exited dirty; loop auto-committed + opened draft PR. Review for completeness.",
                 )
 
         if o.status in _REAPABLE_STATUSES:
             _reap_worktree(cfg.repo, o.issue)
             append_event(
-                cfg.events_file, "worktree_reaped",
-                issue=o.issue, status=o.status,
+                cfg.events_file,
+                "worktree_reaped",
+                issue=o.issue,
+                status=o.status,
             )
         else:
             # Preserve for operator inspection (rescue declined the work —
             # e.g. no uncommitted changes, or push failed).
             wt_path = f"/tmp/wt-loop-{o.issue}"
             append_event(
-                cfg.events_file, "worktree_preserved",
-                issue=o.issue, status=o.status, path=wt_path,
+                cfg.events_file,
+                "worktree_preserved",
+                issue=o.issue,
+                status=o.status,
+                path=wt_path,
                 hint=(
                     f"Worker exited with status={o.status!r} and auto-rescue "
                     "either found no dirty changes or couldn't push. Inspect "
