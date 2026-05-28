@@ -28,14 +28,13 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from forge_loop.worker import _subagent_env, ensure_subagent_trusted
+from forge_loop.worker import ensure_subagent_trusted
 
 VALID_OVERALL = {"approve", "request_changes", "block"}
 VALID_SEVERITY = {"sev1", "sev2", "sev3"}
@@ -93,30 +92,6 @@ class CriticOutcome:
     report: CriticReport | None = None
     error: str | None = None
     parse_retries: int = 0
-
-
-def _build_critic_argv(brief: str, repo: Path, model: str | None) -> list[str]:
-    """Assemble the ``claude -p`` argv for the critic subagent.
-
-    Split out so unit tests can assert on the argv directly. ``--model``
-    is threaded through when ``model`` is set (issue #34).
-    """
-    argv = [
-        "claude",
-        "-p",
-        brief,
-        "--max-turns",
-        "20",
-        "--allow-dangerously-skip-permissions",
-        "--add-dir",
-        str(repo),
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ]
-    if model:
-        argv.extend(["--model", model])
-    return argv
 
 
 def review_pr(
@@ -199,20 +174,32 @@ def review_pr(
             report=report,
         )
 
+    # SDK path (issue #85): replaces the legacy ``claude -p`` subprocess
+    # call. We still write the assistant's final text to a per-attempt
+    # log file for operator postmortems, but the parse path now uses
+    # ``parse_report_from_text`` directly (no stream-json detour). The
+    # ``_subagent_env`` env-wiring is no longer needed — the SDK handles
+    # auth itself.
+    from forge_loop._critic_sdk import run_critic_sdk
+
     for attempt in range(2):  # initial + 1 retry
         log_path = logs_dir / f"critic-{issue_number}-{int(time.time())}-{attempt}.log"
         last_log_path = log_path
+        sdk_result = run_critic_sdk(
+            prompt=brief,
+            cwd=repo,
+            timeout_s=timeout_s,
+            model=model,
+            add_dirs=(repo,),
+        )
+        # Mirror the final assistant text to disk so the existing
+        # _tail(log_path, 500) read for stdout_tail keeps working and
+        # operators can grep critic-*.log as before.
         try:
-            with open(log_path, "wb") as logf:
-                subprocess.run(
-                    _build_critic_argv(brief, repo, model),
-                    cwd=repo,
-                    stdout=logf,
-                    stderr=subprocess.STDOUT,
-                    timeout=timeout_s,
-                    env=_subagent_env(),
-                )
-        except subprocess.TimeoutExpired:
+            log_path.write_text(sdk_result.last_message or "")
+        except OSError:
+            pass
+        if sdk_result.timed_out:
             return CriticOutcome(
                 verdict="error",
                 reasons=[],
@@ -221,8 +208,19 @@ def review_pr(
                 error=f"critic exceeded {timeout_s}s",
                 parse_retries=retries,
             )
+        if sdk_result.error:
+            # An SDK-side failure (auth, transport) — surface as error
+            # verdict so the runner doesn't auto-approve.
+            return CriticOutcome(
+                verdict="error",
+                reasons=[],
+                duration_s=time.time() - started,
+                stdout_tail=sdk_result.error[:500],
+                error=sdk_result.error,
+                parse_retries=retries,
+            )
 
-        report, parse_error = parse_report_from_log(log_path)
+        report, parse_error = parse_report_from_text(sdk_result.last_message)
         if report is not None:
             break
         retries = attempt + 1  # we just consumed one parse attempt
