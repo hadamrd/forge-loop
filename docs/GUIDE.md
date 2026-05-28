@@ -182,7 +182,85 @@ You can run the loop overnight and wake up to either (a) merged PRs, or
 
 ---
 
-## 4. The brief is your contract
+## 4. Manifestos: drive what gets built (not just how)
+
+Out of the box, the loop will ship whatever ticket you label `loop:ready`. That's fine for a hobbyist run — but it's also how backlogs drift toward cosmetic features (sparklines, ETag headers, theme polish) that ship effortlessly and add zero customer value.
+
+Manifestos are how you tell the loop **what should exist**, not just how to build it.
+
+### The four files
+
+Drop these in your repo at `.forge/`:
+
+| File | Owns |
+|---|---|
+| `product-vision.md` | Prose: who you serve, the golden path, the wedge, what's NOT valuable |
+| `axes.yaml` | Structured: 4-6 value axes with customer, acceptable_work, rejected_as_cosmetic |
+| `quality-manifesto.md` | Hard rules: how code MUST be written. **Critic enforces — sev1 blocks auto-merge.** |
+| `testing-manifesto.md` | Hard rules: how tests MUST be written. Worker reads after impl, before push. |
+
+Every shipped ticket cites its axis. Every PR is gated by the manifestos.
+
+### Bootstrapping a project
+
+```bash
+# 1. Author the four files (steal from the seed examples in this repo)
+$EDITOR .forge/product-vision.md
+$EDITOR .forge/axes.yaml
+$EDITOR .forge/quality-manifesto.md
+$EDITOR .forge/testing-manifesto.md
+
+# 2. Dry-run the brainstormer — it proposes axis-aligned epics + tickets
+GH_TOKEN=$(gh auth token) forge-loop brainstorm
+
+# 3. Apply: file them on GitHub with axis labels + customer-story citations
+forge-loop brainstorm --apply
+
+# 4. Dispatch — the loop only picks tickets that carry an axis label
+forge-loop run
+```
+
+The brainstormer **refuses** to file a ticket that doesn't move an axis or that matches a `rejected_as_cosmetic` pattern. Example output:
+
+```
+brainstorm: filed:
+  + #1114: EPIC: Real RBAC — role model, per-action gates, SSO mapping, audit
+  + #1116: test(e2e): adversarial golden-path fixtures — failed step, secret-needing, OOM
+  + #1117: feat(scm): Bitbucket Cloud — PR-comment status + line-level review parity
+  + #1118: feat(scm): webhook reconcile loop — catch missed events on transient SCM outage
+  + #1119: feat(pdl): real-shaped fixture — Node app with lint+test+build+deploy
+  + #1121: feat(rbac): permission check helper + enforce on /api/v1/builds re-run (smallest enforceable slice)
+```
+
+Notice the brainstormer split RBAC into an epic plus a "smallest enforceable slice" — it knows multi-day work is unshippable in one tick.
+
+### The feedback loop
+
+Every bug → manifesto update → permanent gate.
+
+```bash
+# A bug shipped and got fixed in PR #N.
+# Propose what manifesto rule would have prevented it:
+forge-loop manifesto suggest --from-pr <N>
+
+# Review the proposal, commit if good. The critic enforces it from
+# the next worker run.
+```
+
+Real example: PR #147 hot-fixed a stringly-typed event-boundary bug (a four-PR train of identical-shape bugs preceded it). The quality manifesto gained `No stringly-typed cross-module discriminators — sev1`. Any future PR that compares `event["kind"] == "literal"` across module boundaries now gets auto-blocked by the critic.
+
+### What the worker sees
+
+Before writing code, every worker dispatch loads:
+- The product vision (so the worker writes value-aligned commits + PR descriptions)
+- The quality manifesto (so the impl follows project conventions)
+- The testing manifesto (consulted POST-implementation, BEFORE push)
+
+The critic loads the same set + the proposed diff. Sev1 manifesto violations are blocking review comments, not nits.
+
+---
+
+## 5. The brief is your contract
 
 Out of the box, the worker brief tells Claude to:
 
@@ -205,7 +283,7 @@ Same for `.forge-loop/briefs/po.md.tmpl`. A Titan-grade PO brief looks like
 
 ---
 
-## 5. Cost and economics
+## 6. Cost and economics
 
 Observed on Opus 4.7 with subscription billing (Max plan, no per-token charge):
 
@@ -227,7 +305,7 @@ discipline (close obvious duplicates as soon as you see them) matters.
 
 ---
 
-## 6. When things go wrong
+## 7. When things go wrong
 
 ### Loop self-halted with a `loop:halt` issue
 
@@ -281,7 +359,7 @@ path. Manual close is the firm path when the worker doesn't notice.
 
 ---
 
-## 7. Patterns observed across many runs
+## 8. Patterns observed across many runs
 
 These come from dogfooding the loop on its own codebase + on the Titan
 engine. They are real, not theoretical.
@@ -311,7 +389,7 @@ worker's branch name is derived from the issue title at dispatch time.
 
 ---
 
-## 8. Going further
+## 9. Going further
 
 - [README.md](../README.md) — the reference
 - `forge-loop --help` — every subcommand
@@ -326,7 +404,7 @@ worker's branch name is derived from the issue title at dispatch time.
 
 ---
 
-## 9. Final piece of advice
+## 10. Final piece of advice
 
 The loop is patient. It will tick idle for hours waiting for work.
 There is no rush to "use up" your subscription quota or fill the queue.
