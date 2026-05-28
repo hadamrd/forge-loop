@@ -19,12 +19,13 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-KINDS = ("worker", "po", "critic")
+KINDS = ("worker", "po", "critic", "brainstormer")
 
 _ENV_OVERRIDES = {
     "worker": "LOOP_WORKER_BRIEF",
     "po": "LOOP_PO_BRIEF",
     "critic": "LOOP_CRITIC_BRIEF",
+    "brainstormer": "LOOP_BRAINSTORMER_BRIEF",
 }
 
 
