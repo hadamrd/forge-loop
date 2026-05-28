@@ -17,6 +17,13 @@ from forge_loop import master_log as _mlog
 from forge_loop.config import Config
 from forge_loop.critic import review_pr as _critic_review
 from forge_loop.critic_actions import apply_critic_report
+from forge_loop.runner.persistent_dispatch import (
+    get_or_resume_session,
+    mark_running,
+    open_default_store,
+    persistent_worker_enabled,
+    record_outcome,
+)
 from forge_loop.state import append_event
 from forge_loop.worker import WorkerOutcome, run_repair_worker, run_worker
 from forge_loop.worker_sessions import WorkerSessionStore
@@ -172,6 +179,136 @@ def _sev_counts(outcome: Any) -> dict[str, int]:
     return counts
 
 
+def _branch_for_issue(issue: dict[str, Any]) -> str:
+    """Recompute the branch the worker subprocess will use.
+
+    We need this BEFORE spawning the worker so the WorkerSessionStore
+    row carries the canonical branch name. ``run_worker`` derives the
+    same value internally — we deliberately import the helper rather
+    than re-implementing the slug logic so a future tweak to one updates
+    the other.
+    """
+    from forge_loop.worker import _branch_name
+
+    return _branch_name(issue["number"], issue["title"])
+
+
+def _dispatch_one_worker(
+    cfg: Config,
+    issue: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    tick: int,
+    bus_emit: Any,
+    store: WorkerSessionStore | None,
+) -> WorkerOutcome:
+    """Run one worker, threading the persistent-worker FSM if enabled.
+
+    With ``store=None`` this is a pure passthrough to ``run_worker`` —
+    the legacy ``persistent_worker=False`` contract: no rows touched.
+
+    With ``store`` set:
+
+    1. Resolve a non-terminal session for the issue via
+       :func:`get_or_resume_session` (or seed a fresh DISPATCHED row).
+    2. Transition DISPATCHED → RUNNING immediately before invoking the
+       SDK.
+    3. Invoke ``run_worker`` (unchanged).
+    4. Apply the outcome edge via :func:`record_outcome` —
+       AWAITING_CRITIC + ``pr_url`` on success, ABANDONED on failure.
+
+    Exceptions escaping ``run_worker`` are caught and converted into an
+    ``ABANDONED`` transition so the store can never be left holding a
+    RUNNING row whose subprocess died. The original exception is then
+    re-raised so the ThreadPoolExecutor surfaces it to the caller.
+    """
+    if store is None:
+        return run_worker(
+            issue,
+            cfg.repo,
+            cfg.logs_dir,
+            cfg.worker_timeout_s,
+            risk_gated=meta["risk_gated"],
+            past_attempts=meta["past_attempts"],
+            emit=bus_emit,
+            lumen_top_k=cfg.lumen.top_k,
+            lumen_test_pattern=cfg.lumen_test_pattern,
+            coauthor=cfg.coauthor,
+            tick=tick,
+            model=cfg.worker.model,
+            thinking=cfg.worker.thinking,
+            provider=getattr(cfg.worker, "provider", "claude"),
+            allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+            load_timeout_ms=cfg.worker.load_timeout_ms,
+            strict_mcp_config=cfg.worker.strict_mcp_config,
+            mcp_servers=cfg.worker.mcp_servers,
+            base_branch=cfg.base_branch,
+        )
+
+    branch = _branch_for_issue(issue)
+    worktree_path = f"/tmp/wt-loop-{issue['number']}"
+    sess, _resumed = get_or_resume_session(
+        store,
+        issue=issue["number"],
+        branch=branch,
+        worktree_path=worktree_path,
+        events_file=cfg.events_file,
+    )
+    sess = mark_running(store, session=sess, events_file=cfg.events_file)
+
+    try:
+        outcome = run_worker(
+            issue,
+            cfg.repo,
+            cfg.logs_dir,
+            cfg.worker_timeout_s,
+            risk_gated=meta["risk_gated"],
+            past_attempts=meta["past_attempts"],
+            emit=bus_emit,
+            lumen_top_k=cfg.lumen.top_k,
+            lumen_test_pattern=cfg.lumen_test_pattern,
+            coauthor=cfg.coauthor,
+            tick=tick,
+            model=cfg.worker.model,
+            thinking=cfg.worker.thinking,
+            provider=getattr(cfg.worker, "provider", "claude"),
+            allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+            load_timeout_ms=cfg.worker.load_timeout_ms,
+            strict_mcp_config=cfg.worker.strict_mcp_config,
+            mcp_servers=cfg.worker.mcp_servers,
+            base_branch=cfg.base_branch,
+        )
+    except BaseException as ex_:
+        # The subprocess crashed before producing a WorkerOutcome. We
+        # MUST close out the FSM row — otherwise a recovery walk would
+        # treat this as a still-RUNNING session and try to resume it.
+        synthetic = WorkerOutcome(
+            issue=issue["number"],
+            title=issue.get("title", ""),
+            pr_url=None,
+            status="failed",
+            duration_s=0.0,
+            stdout_tail="",
+            error=f"{type(ex_).__name__}: {ex_!s:.200}",
+        )
+        with contextlib.suppress(Exception):
+            record_outcome(
+                store,
+                session=sess,
+                outcome=synthetic,
+                events_file=cfg.events_file,
+            )
+        raise
+
+    record_outcome(
+        store,
+        session=sess,
+        outcome=outcome,
+        events_file=cfg.events_file,
+    )
+    return outcome
+
+
 def _run_workers(
     cfg: Config,
     issues: list[dict[str, Any]],
@@ -229,29 +366,35 @@ def _run_workers(
             used_pipeline = False
 
     if not used_pipeline:
+        # Issue #108: route every dispatch through WorkerSessionStore
+        # when ``settings.iteration.persistent_worker`` is enabled. The
+        # store is the source of truth for what's in flight; the FSM
+        # edges (DISPATCHED → RUNNING → AWAITING_CRITIC|ABANDONED) are
+        # driven by ``persistent_dispatch.{mark_running,record_outcome}``.
+        # With the flag OFF, ``store`` stays ``None`` and zero rows are
+        # touched — the legacy fire-and-forget path is preserved.
+        store: WorkerSessionStore | None = None
+        if persistent_worker_enabled():
+            try:
+                store = open_default_store(cfg.state_dir)
+            except Exception as ex_:  # noqa: BLE001 — never fail dispatch
+                append_event(
+                    cfg.events_file,
+                    "persistent_dispatch_store_open_failed",
+                    err=str(ex_)[:200],
+                )
+                store = None
+
         with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
             futures = [
                 ex.submit(
-                    run_worker,
+                    _dispatch_one_worker,
+                    cfg,
                     i,
-                    cfg.repo,
-                    cfg.logs_dir,
-                    cfg.worker_timeout_s,
-                    risk_gated=meta["risk_gated"],
-                    past_attempts=meta["past_attempts"],
-                    emit=bus_emit,
-                    lumen_top_k=cfg.lumen.top_k,
-                    lumen_test_pattern=cfg.lumen_test_pattern,
-                    coauthor=cfg.coauthor,
+                    meta,
                     tick=tick,
-                    model=cfg.worker.model,
-                    thinking=cfg.worker.thinking,
-                    provider=getattr(cfg.worker, "provider", "claude"),
-                    allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
-                    load_timeout_ms=cfg.worker.load_timeout_ms,
-                    strict_mcp_config=cfg.worker.strict_mcp_config,
-                    mcp_servers=cfg.worker.mcp_servers,
-                    base_branch=cfg.base_branch,
+                    bus_emit=bus_emit,
+                    store=store,
                 )
                 for i, meta in dispatch
             ]
