@@ -9,7 +9,12 @@ uv run pre-commit install
 
 ## The four CI gates
 
-Every PR runs these gates (see `.github/workflows/ci.yml`):
+CI strategy: **no GitHub Actions**. forge-loop is the dispatcher operators use for their own repos — so its CI is a forge-loop instance running against its own trunk. The four gates live in `Taskfile.yml` and operators wire them into whatever they use (Jenkins, Drone, forge-loop self-pipeline).
+
+Run the full gate locally:
+```bash
+task ci
+```
 
 | Gate | Tool | What it catches |
 |---|---|---|
