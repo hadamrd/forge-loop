@@ -260,6 +260,11 @@ def test_brief_kind_for_maps_every_non_terminal_state() -> None:
             assert kind is not None and kind, f"missing brief kind for {s}"
 
 
-def test_terminal_set_includes_done_merged_only() -> None:
+def test_terminal_set_includes_done_merged_and_closed_pr_abandoned() -> None:
+    """Terminal members: DONE_MERGED (happy path) + CLOSED_PR_ABANDONED
+    (prior attempt thrown away — added with the iteration push-forever
+    fix). CLEAN_NOTHING is NOT terminal because it must allow re-attempt
+    when the worker exited without producing any state."""
     assert WorkerState.DONE_MERGED in TERMINAL_STATES
-    assert WorkerState.CLEAN_NOTHING not in TERMINAL_STATES  # must allow re-attempt
+    assert WorkerState.CLOSED_PR_ABANDONED in TERMINAL_STATES
+    assert WorkerState.CLEAN_NOTHING not in TERMINAL_STATES
