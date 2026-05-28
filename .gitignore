@@ -24,5 +24,8 @@ docs/ops/loop-runner.force-retry.json
 # Per-operator overrides + multi-repo dir + worker-planted settings
 forge-loop.local.yaml
 .forge/
+# ...except the seed manifestos, which ARE committed (dogfood, #135).
+!.forge/quality-manifesto.md
+!.forge/testing-manifesto.md
 .claude/settings.json
 .claude/settings.local.json
