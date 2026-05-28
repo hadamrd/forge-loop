@@ -185,6 +185,13 @@ class WorkerConfig:
     thinking: str = "medium"
     provider: str = "claude"
     allowed_mcp_tools: tuple[str, ...] = DEFAULT_ALLOWED_MCP_SERVERS
+    # Auto-rescue format command — run in the worktree before the rescue
+    # commit so project pre-commit gates (Spotless, prettier, ruff)
+    # don't bounce the PR at CI time. Empty = skip. Examples:
+    #   "./gradlew spotlessApply --no-daemon -Xmx1500m"
+    #   "pnpm format && pnpm lint --fix"
+    #   "task lint:fix"
+    rescue_format_cmd: str = ""
     # SDK init knobs. 180000 ms = 3 min handshake budget; the SDK's
     # ~60s default times out on operators whose global Claude config
     # has many MCP servers (Gmail/Drive/Calendar/playwright/persistent-shell)
@@ -523,6 +530,10 @@ def load() -> Config:
                 bool(worker_block.get("strict_mcp_config", True)),
             ),
             mcp_servers=dict(worker_block.get("mcp_servers") or {}),
+            rescue_format_cmd=_env_str(
+                "LOOP_WORKER_RESCUE_FORMAT_CMD",
+                str(worker_block.get("rescue_format_cmd", "")),
+            ),
         ),
         attempts=AttemptsConfig(
             enabled=bool(attempts_block.get("enabled", True)),
