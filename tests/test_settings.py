@@ -236,6 +236,11 @@ def test_allowed_mcp_tools_csv_env_parses(
 
 
 _ALLOWED_LEGACY_SITES = {
+    # gh_client.py reads GH_TOKEN / GITHUB_TOKEN — those are the GitHub
+    # auth env-var conventions, not LOOP_* knobs. The token is a secret;
+    # routing it through Settings would force operators to put credentials
+    # in yaml. Standalone is justified.
+    "src/forge_loop/gh_client.py",
     # log.py reads FORGE_LOOP_LOG_JSON at every TTY-check (called from
     # configure_logging which runs once at process boot). Could be moved
     # into Settings but the override is exactly one bool and the call
