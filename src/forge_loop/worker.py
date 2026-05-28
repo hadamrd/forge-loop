@@ -275,6 +275,26 @@ def _drop_permissive_settings(worktree: Path) -> None:
     cdir.chmod(0o555)
 
 
+def _quarantine_if_blocking(wt: Path) -> Path | None:
+    """If `wt` still exists after normal cleanup (e.g. worker-planted files
+    owned by a different uid that we can't chmod/rm), rename it out of the
+    way so `git worktree add` can proceed. Returns the quarantined path,
+    or None if the dir is already gone.
+
+    Quarantined dirs use the suffix ``.stale-<unix-ts>`` so the boot
+    reaper + operator can find + sweep them later without risk of colliding
+    with the live path.
+    """
+    if not wt.exists():
+        return None
+    quarantine = wt.with_name(f"{wt.name}.stale-{int(time.time())}")
+    try:
+        wt.rename(quarantine)
+    except OSError:
+        return None
+    return quarantine
+
+
 def _prep_worktree(
     repo: Path,
     n: int,
@@ -295,7 +315,16 @@ def _prep_worktree(
         capture_output=True,
     )
     if wt.exists():
-        shutil.rmtree(wt)
+        try:
+            shutil.rmtree(wt)
+        except (OSError, PermissionError):
+            pass
+    # If the worker planted files owned by a different uid (subprocess
+    # ran under a different namespace), chmod+rmtree above will silently
+    # fail and leave the dir behind. Quarantine it so the new worktree
+    # add doesn't collide. Without this, every retry of this issue hits
+    # `worktree-create-failed` → infinite loop until operator intervenes.
+    _quarantine_if_blocking(wt)
     # If a previous failed attempt left a local branch lying around, delete
     # it so `git worktree add -B` can recreate it cleanly off the freshest
     # origin/<base_branch>. `-B` would overwrite anyway, but we use plain `-b`
@@ -345,7 +374,11 @@ def _prep_repair_worktree(
         subprocess.run(["chmod", "-R", "u+w", str(claude_dir)], capture_output=True)
     subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=repo, capture_output=True)
     if wt.exists():
-        shutil.rmtree(wt)
+        try:
+            shutil.rmtree(wt)
+        except (OSError, PermissionError):
+            pass
+    _quarantine_if_blocking(wt)
     remote_ref = f"refs/remotes/origin/{branch}"
     subprocess.run(
         ["git", "fetch", "--prune", "origin", f"+refs/heads/{branch}:{remote_ref}"],

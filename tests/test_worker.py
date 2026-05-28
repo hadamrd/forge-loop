@@ -323,6 +323,65 @@ def test_prep_worktree_uses_configured_base_branch(
     assert ["git", "worktree", "add", str(worktree), "-B", "loop/12-demo", "origin/main"] in calls
 
 
+def test_prep_worktree_quarantines_undeletable_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a prior worker planted files we can't chmod/rm (uid mismatch),
+    the dir is renamed out of the way so the new `git worktree add`
+    doesn't collide. Without this, every retry of the same issue hits
+    `worktree-create-failed` and the loop spins forever.
+
+    Repro: simulate `shutil.rmtree` raising PermissionError, then
+    verify (a) `worktree add` still gets called, and (b) a quarantine
+    dir matching `wt-loop-<N>.stale-<ts>` exists.
+    """
+    import shutil as _real_shutil
+
+    real_rmtree = _real_shutil.rmtree  # capture before monkeypatch
+
+    blocking = Path("/tmp/wt-loop-9999")
+    # Pre-clean from any prior failed run before we monkeypatch rmtree.
+    for q in Path("/tmp").glob("wt-loop-9999*"):
+        real_rmtree(q, ignore_errors=True)
+    blocking.mkdir(exist_ok=True)
+    (blocking / "marker").write_text("planted")
+
+    class _Completed:
+        returncode = 0
+        stderr = ""
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _Completed:
+        calls.append(cmd)
+        return _Completed()
+
+    def boom_rmtree(_path: str | Path) -> None:
+        raise PermissionError("simulated: planted by another uid")
+
+    monkeypatch.setattr("forge_loop.worker.subprocess.run", fake_run)
+    monkeypatch.setattr("forge_loop.worker.shutil.rmtree", boom_rmtree)
+    monkeypatch.setattr("forge_loop.worker._drop_permissive_settings", lambda _wt: None)
+
+    try:
+        worktree, err = _prep_worktree(tmp_path, 9999, "loop/9999-demo")
+        assert err is None
+        # `git worktree add` MUST still get called — quarantine unblocked it.
+        assert any(
+            cmd[:3] == ["git", "worktree", "add"] for cmd in calls
+        ), f"worktree add was not called: {calls!r}"
+        # The blocking dir got renamed out of the way.
+        assert not blocking.exists(), "blocking dir should have been quarantined"
+        quarantined = list(Path("/tmp").glob("wt-loop-9999.stale-*"))
+        assert quarantined, "quarantine dir was not created"
+        # Quarantined dir still holds the original marker (rename, not delete).
+        assert (quarantined[0] / "marker").read_text() == "planted"
+    finally:
+        for q in Path("/tmp").glob("wt-loop-9999*"):
+            real_rmtree(q, ignore_errors=True)
+
+
 # Gradle/WSL-OOM guard tests removed: forge-loop is stack-agnostic; the
 # generic brief now says "avoid full-suite runs" without project-specific
 # JVM flag pinning. Operators add their own gates via project tooling.

@@ -72,8 +72,21 @@ def reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
     """
     reaped = 0
     for path in sorted(glob.glob("/tmp/wt-loop-*")):
+        name = Path(path).name
+        # Quarantined dirs (wt-loop-<N>.stale-<ts>) from failed cleanups —
+        # try to rm them at boot. If still un-removable due to uid
+        # mismatch, leave them; operator sweep can take over.
+        if ".stale-" in name:
+            try:
+                import shutil
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception:  # noqa: BLE001 — best-effort boot cleanup
+                pass
+            if not Path(path).exists():
+                reaped += 1
+            continue
         try:
-            issue = int(Path(path).name.removeprefix("wt-loop-").split("-")[0])
+            issue = int(name.removeprefix("wt-loop-").split("-")[0])
         except ValueError:
             # Defensive: skip non-numeric suffixes without crashing the
             # boot path. A future operator tool might leave a marker dir
