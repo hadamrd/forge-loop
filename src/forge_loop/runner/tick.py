@@ -42,6 +42,7 @@ from forge_loop.runner.drift import (
     _maybe_deploy_drift_halt,
 )
 from forge_loop.state import append_event, consolidate_sprint, write_state
+from forge_loop.stuck_sweep import SweepReport, sweep as _stuck_sweep
 from forge_loop.worker import WorkerOutcome
 
 
@@ -324,6 +325,66 @@ def _remove_ready_label(
         )
 
 
+def _run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
+    """Per-tick stuck-issue sweep (issue #129).
+
+    Runs after the iteration loop (which may have written
+    ``worker_iterations_exhausted`` for issues whose escalation didn't
+    land) and before the next dispatch batch — so an issue that was
+    supposed to be demoted but wasn't gets caught here, before
+    ``top_issues`` re-picks it.
+
+    Fully best-effort: any failure (gh client init, sweep crash) is
+    swallowed with a single event. The tick itself must never fail
+    because of a maintenance sweep.
+    """
+    if cfg.github_repo is None or "/" not in cfg.github_repo:
+        return None
+    owner, repo = cfg.github_repo.split("/", 1)
+    try:
+        # Lazy import — keeps the tick startup fast and lets tests stub
+        # the constructor via the env-token path without importing
+        # githubkit when not needed.
+        from forge_loop.gh_client import GithubkitClient
+        client = GithubkitClient()
+    except Exception as ex:  # noqa: BLE001
+        append_event(
+            cfg.events_file,
+            "stuck_sweep_skipped",
+            tick=tick,
+            reason=f"gh_client_init: {ex}"[:200],
+        )
+        return None
+    try:
+        report = _stuck_sweep(
+            cfg.events_file,
+            client,
+            owner=owner,
+            repo=repo,
+            threshold=cfg.stuck_threshold_attempts,
+            ready_label=cfg.labels.ready,
+            tail=cfg.stuck_tail_events,
+        )
+    except Exception as ex:  # noqa: BLE001 — sweep promises not to raise, belt-and-braces
+        append_event(
+            cfg.events_file,
+            "stuck_sweep_crashed",
+            tick=tick,
+            err=str(ex)[:200],
+        )
+        return None
+    if report.demotions:
+        append_event(
+            cfg.events_file,
+            "stuck_sweep_done",
+            tick=tick,
+            demoted=[d.issue for d in report.demotions if d.ok],
+            failed=list(report.errors),
+            scanned=report.scanned,
+        )
+    return report
+
+
 def _tick(cfg: Config, tick: int) -> None:
     # Imported lazily to avoid an import cycle (boot.py imports tick.py).
     from forge_loop.runner.boot import _short_sleep
@@ -370,6 +431,11 @@ def _tick(cfg: Config, tick: int) -> None:
 
     def _bus_emit(kind: str, payload: dict[str, Any]) -> None:
         append_event(cfg.events_file, kind, **payload)
+
+    # Stuck-issue sweep (issue #129) — fires before the next dispatch
+    # so any issue the iteration loop gave up on but failed to demote
+    # gets caught here, not re-picked by top_issues below.
+    _run_stuck_sweep(cfg, tick)
 
     repairs = _blocking_pr_repairs(cfg)
     if repairs:

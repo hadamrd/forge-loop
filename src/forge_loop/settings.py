@@ -351,6 +351,22 @@ class IterationSettings(BaseSettings):
     max_critic_iterations: int = 3
 
 
+class MaintenanceSettings(BaseSettings):
+    """Knobs for the maintenance-tier sweeps that run alongside the LLM
+    groomer (issue #129).
+
+    ``stuck_threshold_attempts`` gates the stuck-issue sweep — an issue
+    needs at least this many ``worker_iterations_exhausted`` events
+    (without a recovery in between) before we demote it from
+    ``loop:ready`` to ``loop:needs-human``. Default 2: one bad run is
+    forgivable, two is a pattern.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+    stuck_threshold_attempts: int = 2
+    stuck_tail_events: int = 100
+
+
 class MiscSettings(BaseSettings):
     """Misc knobs that don't fit a logical group cleanly."""
 
@@ -393,6 +409,7 @@ class Settings(BaseSettings):
     operator: OperatorSettings = Field(default_factory=OperatorSettings)
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
     iteration: IterationSettings = Field(default_factory=IterationSettings)
+    maintenance: MaintenanceSettings = Field(default_factory=MaintenanceSettings)
     misc: MiscSettings = Field(default_factory=MiscSettings)
 
     # The repo path itself is resolved at load time (git toplevel or env
@@ -429,6 +446,7 @@ class Settings(BaseSettings):
             "operator": {**(y.get("operator") or {})},
             "dashboard": {**(y.get("dashboard") or {})},
             "iteration": {**(y.get("iteration") or {})},
+            "maintenance": {**(y.get("maintenance") or {})},
             "misc": {**(y.get("misc") or {})},
         }
 

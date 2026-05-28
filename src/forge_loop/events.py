@@ -208,6 +208,28 @@ class WorktreeReapedEvent(EventBase):
     status: str = ""
 
 
+@register_event
+class StuckSweepDemotedEvent(EventBase):
+    """A per-tick stuck-sweep decision (issue #129).
+
+    Emitted by ``forge_loop.stuck_sweep.sweep`` whenever it touches an
+    issue — successful demotions carry ``ok=True``; gh API failures
+    carry ``ok=False`` plus a ``reason`` so the operator can see what
+    blew up without grepping structlog.
+
+    Idempotency skips (issue already lost ``loop:ready``) are NOT
+    emitted — there's nothing operationally interesting about them.
+    """
+
+    KIND: ClassVar[str] = "stuck_sweep_demoted"
+    issue: int = Field(ge=1)
+    attempts: int = Field(ge=1)
+    last_state: str = ""
+    pr_url: str | None = None
+    ok: bool = True
+    reason: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Emit + back-compat shim. ``emit`` is the typed path; ``append_event_with_
 # registry_check`` is the back-compat wrapper called by state.append_event.
@@ -287,6 +309,7 @@ __all__ = [
     "LoopStartEvent",
     "LoopStopEvent",
     "RedeployEvent",
+    "StuckSweepDemotedEvent",
     "TickStartEvent",
     "WorkerSessionRecoveredEvent",
     "WorkerSessionTransitionEvent",
