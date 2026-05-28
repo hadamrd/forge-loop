@@ -65,6 +65,38 @@ SDK, #105 GhClient).
 (#128), eat structured errors, and make tests painful (you end up
 mocking argv strings instead of method calls).
 
+## Rule: No stringly-typed cross-module event boundaries
+
+**Rule.** If module A emits an event consumed by module B, the event KIND
+(or state name, or outcome label, or any cross-module discriminator) must
+be an enum (e.g. ``class FooKind(str, Enum)``) imported from a shared
+module. String literal comparisons on dynamic dict values are sev1.
+
+**Rationale.** A 4-PR train of bugs in this codebase had the SAME shape:
+a discriminator was a string literal on one side and a different string
+literal on the other side, the type checker had nothing to say, a typo
+silently broke production.
+
+- ``#147`` — ``_critic_sdk`` checked ``event["type"] == "result"`` but
+  ``_worker_sdk`` emits ``event["kind"] == "final_result"``. Two-
+  field-name mismatch. Symptom: brainstormer/critic/PO returned empty
+  output for an unknown duration.
+- ``#128`` — iteration state ``"PUSHED_NO_PR"`` returned via a
+  fallthrough default instead of an explicit edge.
+- ``#120`` — PR state ``"CLOSED"`` not handled because the dispatcher
+  matched ``"MERGED"`` only.
+- ``#97`` — worker outcome ``"failed"`` vs ``"no_pr"`` distinguished by
+  substring matching.
+
+Any of these would have been a 1-line type error with proper enums.
+
+**How to apply.** When adding a new event KIND, state name, outcome
+label, brief KIND, severity, or any cross-module discriminator: declare
+it as a ``str`` Enum in a shared module; import the enum on both sides;
+compare with ``is`` not ``==``. The critic flags string-literal
+comparisons of dynamic dict values as sev1 — fix by extracting the
+discriminator into an enum + updating both call sites in the same PR.
+
 ## How to apply this manifesto
 
 * When reviewing a forge-loop PR, scan the diff for each rule. A
