@@ -97,6 +97,14 @@ compare with ``is`` not ``==``. The critic flags string-literal
 comparisons of dynamic dict values as sev1 — fix by extracting the
 discriminator into an enum + updating both call sites in the same PR.
 
+## Rule: state-based rules need a state-based gate
+
+**Rule.** A manifesto rule that can only be checked by looking at codebase **state** (file size, module count, deprecated-pattern count, test coverage, dead-code count) MUST register a probe in the codebase auditor (#156). Per-PR critic catches **deltas**; the auditor catches **accumulation**.
+
+**Rationale.** `src/forge_loop/cli.py` is 1705 LOC. The Python soft-cap is 500. The critic never flagged it because cli.py grew 50-100 LOC per PR over many merges. Each individual increment was a reasonable diff; the cumulative state-violation slipped past every per-PR review. Classic boiling-frog.
+
+**How to apply.** When you add a rule like "no module > N LOC" or "no Any-typed param" or "no `subprocess.run(['gh', ...])` in production code": the same PR that adds the rule MUST add an audit probe under ``src/forge_loop/audit_probes/``. Rule and gate ship together; otherwise the rule is decoration.
+
 ## How to apply this manifesto
 
 * When reviewing a forge-loop PR, scan the diff for each rule. A
