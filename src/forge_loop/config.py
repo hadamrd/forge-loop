@@ -209,6 +209,7 @@ class LumenConfig:
 class Config:
     repo: Path
     github_repo: str | None = None
+    base_branch: str = "trunk"
     coauthor: str = ""
     lumen_test_pattern: str = "**/*Test.*"
     worktree_root: Path = field(default_factory=lambda: Path("/tmp"))
@@ -447,6 +448,7 @@ def load() -> Config:
     return Config(
         repo=repo,
         github_repo=github_repo,
+        base_branch=_env_str("LOOP_BASE_BRANCH", repo_block.get("base_branch", "trunk")),
         coauthor=os.environ.get("LOOP_COAUTHOR", ""),
         lumen_test_pattern=lumen_block.get("test_pattern", "**/*Test.*"),
         worktree_root=Path(repo_block.get("worktree_root", "/tmp")),

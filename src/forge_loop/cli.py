@@ -218,28 +218,28 @@ def _cmd_doctor(_args: SimpleNamespace) -> int:
                 timeout=5,
             ).stdout.strip()
             _sp.run(
-                ["git", "fetch", "origin", "trunk", "--quiet"],
+                ["git", "fetch", "origin", cfg.base_branch, "--quiet"],
                 cwd=cfg.repo,
                 capture_output=True,
                 timeout=10,
             )
             remote = _sp.run(
-                ["git", "rev-parse", "origin/trunk"],
+                ["git", "rev-parse", f"origin/{cfg.base_branch}"],
                 cwd=cfg.repo,
                 capture_output=True,
                 text=True,
                 timeout=5,
             ).stdout.strip()
             if local and remote and local == remote:
-                line("green", f"code matches origin/trunk @ {local[:8]}")
+                line("green", f"code matches origin/{cfg.base_branch} @ {local[:8]}")
             elif local and remote:
                 line(
                     "yellow",
-                    "local trunk behind origin",
+                    f"local {cfg.base_branch} behind origin",
                     f"local={local[:8]} origin={remote[:8]}",
                 )
             else:
-                line("yellow", "could not compare to origin/trunk")
+                line("yellow", f"could not compare to origin/{cfg.base_branch}")
         except (_sp.SubprocessError, OSError):
             line("yellow", "git probe failed")
 
@@ -1002,6 +1002,7 @@ def _cmd_config(args: SimpleNamespace) -> int:
     cfg = load()
     out = {
         "repo": str(cfg.repo),
+        "base_branch": cfg.base_branch,
         "parallel": cfg.parallel,
         "tick_interval_s": cfg.tick_interval_s,
         "max_ticks": cfg.max_ticks,

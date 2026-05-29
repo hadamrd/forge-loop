@@ -192,7 +192,9 @@ def test_run_worker_codex_provider_maps_final_json(
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
-    def fake_prep(_repo: Path, _n: int, _branch: str) -> tuple[Path, None]:
+    def fake_prep(
+        _repo: Path, _n: int, _branch: str, _base_branch: str = "trunk"
+    ) -> tuple[Path, None]:
         return worktree, None
 
     def fake_codex(**kwargs: Any) -> agent_backend.AgentRunResult:
