@@ -890,6 +890,132 @@ def _cmd_brainstorm(args: SimpleNamespace) -> int:
     return 0
 
 
+def _cmd_audit(args: SimpleNamespace) -> int:
+    """`forge-loop audit` — codebase-state audit (issue #156).
+
+    Contract:
+      * Default (no flags): walk the repo, run every default probe,
+        print a human-readable summary, exit 0. NO GitHub calls.
+      * --apply: file one ticket per violation (idempotent — existing
+        open tickets for the same probe+target are skipped).
+      * --json: emit the report as JSON for scripting / dashboards.
+
+    Errors:
+      * No probe failure can cause exit != 0 on the dry-run path —
+        ``audit.errors`` is surfaced as a warning but isn't a gate.
+      * ``--apply`` exits 1 if ANY ticket-create call raised.
+    """
+    import json as _json
+
+    from forge_loop.codebase_audit import audit, file_violations
+
+    repo_path = Path.cwd()
+    owner = ""
+    repo_name = ""
+    extra_labels: tuple[str, ...] = ()
+    try:
+        cfg = load()
+        repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path
+        gh_repo = getattr(cfg, "github_repo", "") or ""
+        if "/" in gh_repo:
+            owner, repo_name = gh_repo.split("/", 1)
+    except Exception:  # noqa: BLE001 — audit must work even without a config
+        pass
+
+    report = audit(repo_path)
+
+    if getattr(args, "json", False):
+        payload = {
+            "probes_run": report.probes_run,
+            "violations": [
+                {
+                    "probe": v.probe,
+                    "target": v.target,
+                    "severity": v.severity,
+                    "title": v.title,
+                    "metrics": v.metrics,
+                }
+                for v in report.violations
+            ],
+            "errors": report.errors,
+        }
+        typer.echo(_json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        typer.echo(
+            f"audit: probes_run={report.probes_run} "
+            f"violations={len(report.violations)} errors={list(report.errors)}"
+        )
+        for v in report.violations:
+            typer.echo(f"  [P{v.severity}] {v.probe}: {v.target}")
+            typer.echo(f"        {v.title}")
+        for probe_name, err in report.errors.items():
+            typer.echo(f"  ! probe {probe_name} crashed: {err}", err=True)
+
+    if not getattr(args, "apply", False):
+        return 0
+
+    if not owner or not repo_name:
+        typer.echo(
+            "audit: --apply requires github_repo configured (owner/repo)",
+            err=True,
+        )
+        return 2
+
+    if report.is_clean:
+        typer.echo("audit: clean — nothing to file.")
+        return 0
+
+    try:
+        gh_client = _gh_client_factory()
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"audit: gh client init failed: {exc}", err=True)
+        return 1
+
+    # Wire events file from the resolved config (best-effort).
+    events_file: Path | None = None
+    try:
+        events_file = cfg.events_file  # type: ignore[name-defined]
+    except Exception:  # noqa: BLE001
+        events_file = None
+
+    def _emit_filed(v, number):  # noqa: ANN001 — internal
+        if events_file is None:
+            return
+        try:
+            from forge_loop.events import AuditViolationFiledEvent, emit
+
+            emit(
+                events_file,
+                AuditViolationFiledEvent(
+                    probe=v.probe,
+                    target=v.target,
+                    severity=v.severity,
+                    issue_number=number,
+                    title=v.title,
+                ),
+            )
+        except Exception:  # noqa: BLE001 — never let event emit kill --apply
+            pass
+
+    outcome = file_violations(
+        report,
+        gh_client,
+        owner=owner,
+        repo=repo_name,
+        extra_labels=extra_labels,
+        emit_filed=_emit_filed,
+    )
+    for v, number in outcome.filed:
+        typer.echo(f"audit: filed #{number}: {v.title}")
+    for v in outcome.skipped:
+        typer.echo(f"audit: skipped (already filed): {v.probe}:{v.target}")
+    if outcome.errors:
+        for key, err in outcome.errors.items():
+            typer.echo(f"audit: ERROR filing {key}: {err}", err=True)
+        return 1
+    return 0
+
+
 def _cmd_record_session(args: SimpleNamespace) -> int:
     from forge_loop._testing.recorder import SessionRecorder
     from forge_loop.worker import make_brief
@@ -1595,6 +1721,21 @@ def cmd_brainstorm(
     ),
 ) -> None:
     _exit(_cmd_brainstorm(SimpleNamespace(apply=apply)))
+
+
+@app.command(
+    "audit",
+    help="Codebase-state audit (issue #156). Dry-run by default; --apply files tickets.",
+)
+def cmd_audit(
+    apply: bool = typer.Option(
+        False, "--apply", help="File one ticket per violation (idempotent)."
+    ),
+    json_: bool = typer.Option(
+        False, "--json", help="Emit the report as JSON (for scripts/dashboards)."
+    ),
+) -> None:
+    _exit(_cmd_audit(SimpleNamespace(apply=apply, json=json_)))
 
 
 @app.command("record-session", help="Record a real SDK session to a JSONL fixture.")
