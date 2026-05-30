@@ -68,6 +68,7 @@ def test_make_brief_risk_gated_disables_automerge(tmp_path: Path) -> None:
     brief = make_brief(issue, tmp_path / "w", risk_gated=True)
     assert "DO NOT enable auto-merge" in brief
     assert "ready for human review" in brief
+    assert "Fixes #942" in brief
     assert '"status": "open"' in brief
 
 
@@ -77,6 +78,7 @@ def test_make_brief_default_stops_before_automerge(tmp_path: Path) -> None:
     assert "DO NOT enable auto-merge" in brief
     assert "DO NOT merge the PR" in brief
     assert "owns merge after critic approval" in brief
+    assert "Fixes #942" in brief
     assert '"status": "open|failed"' in brief
 
 

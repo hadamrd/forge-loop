@@ -34,7 +34,9 @@ from forge_loop.config import (
     LumenConfig,
     POConfig,
 )
+from forge_loop.runner import dispatch as _dispatch_mod
 from forge_loop.runner import tick as _tick_mod
+from forge_loop.worker import WorkerOutcome
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -312,6 +314,55 @@ def test_body_change_invalidates_in_flight_skip(fake_world) -> None:
     }]
     _runner._tick(cfg, tick=1)
     assert state.dispatched == [99]
+
+
+def test_ready_issue_existing_open_pr_repairs_instead_of_redispatch(
+    fake_world, monkeypatch
+) -> None:
+    state, cfg, _ = fake_world
+    state.history[99] = [{
+        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+        "status": "open",
+        "pr_url": "https://github.com/o/r/pull/777",
+        "brief_fingerprint": "stale",
+    }]
+    repair_calls: list[tuple[int, int, str]] = []
+    pr_url = "https://github.com/o/r/pull/777"
+
+    monkeypatch.setattr(
+        _tick_mod,
+        "prs_by_label",
+        lambda *_a, **_k: [{
+            "number": 777,
+            "url": pr_url,
+            "headRefName": "loop/99-retarget-existing-pr",
+        }],
+    )
+    monkeypatch.setattr(_tick_mod, "pr_review_context", lambda *_a, **_k: "review context")
+    monkeypatch.setattr(_gh, "unresolved_review_threads", lambda *_a, **_k: [])
+
+    def fake_run_repair_worker(issue, pr, review_context, *_args, **_kwargs):
+        repair_calls.append((issue["number"], pr["number"], review_context))
+        return WorkerOutcome(
+            issue=issue["number"],
+            title=issue["title"],
+            pr_url=pr_url,
+            status="open",
+            duration_s=1.0,
+            stdout_tail="",
+            events=[],
+        )
+
+    monkeypatch.setattr(_dispatch_mod, "run_repair_worker", fake_run_repair_worker)
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.dispatched == []
+    assert repair_calls == [(99, 777, "review context")]
+    assert state.unlabeled == [(99, "loop:ready", "o/r")]
+    events = _read_events(cfg)
+    assert "ready_issue_open_pr_repair_tick_start" in _kinds(events)
+    assert "ready_issue_open_pr_selected" in _kinds(events)
 
 
 def test_blocking_comment_invalidates_cooldown_and_reaches_worker(fake_world, monkeypatch) -> None:

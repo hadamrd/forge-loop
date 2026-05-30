@@ -13,6 +13,8 @@ from typing import Any, Protocol
 
 from forge_loop.critic import CriticReport, Finding
 
+MIN_SUSPICIOUS_APPROVE_LINES = 100
+
 
 class GhClient(Protocol):
     """The slice of forge_loop.gh that we need. Allows tests to inject a
@@ -55,9 +57,10 @@ def plan_actions(
     - ``block_on_sev2`` AND any sev2 finding → also block + label
       ``critic:blocking``.
     - sev2/sev3 findings → inline comment if file+line, else summary.
-    - ``overall == "approve"`` with zero findings AND
-      ``pr_changed_lines > min_findings_for_approve`` → suspicious:
-      block merge + label ``critic:suspicious``.
+    - ``overall == "approve"`` with zero findings AND a large diff →
+      suspicious: block merge + label ``critic:suspicious``. The size floor
+      prevents tiny/docs-style PRs from being blocked only because the critic
+      had no findings.
     """
     plan = CriticActionPlan()
     reasons: list[str] = []
@@ -85,7 +88,7 @@ def plan_actions(
     if (
         report.overall == "approve"
         and not report.findings
-        and pr_changed_lines > min_findings_for_approve
+        and pr_changed_lines > max(min_findings_for_approve, MIN_SUSPICIOUS_APPROVE_LINES)
     ):
         plan.suspicious_approve = True
         plan.block_merge = True

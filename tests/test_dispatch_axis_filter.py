@@ -198,6 +198,38 @@ def test_unresolved_review_thread_pr_is_selected_for_repair(
     assert "repair_pr_selected" in cfg.events_file.read_text()
 
 
+def test_ready_issue_with_existing_open_pr_is_selected_for_repair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from forge_loop.config import Config
+    from forge_loop.runner import tick as tick_mod
+
+    cfg = Config(repo=tmp_path, github_repo="acme/widgets")
+    ready_issue = _make(99, READY, "axis:dispatch")
+    monkeypatch.setattr(
+        tick_mod,
+        "prs_by_label",
+        lambda *_a, **_k: [
+            {
+                "number": 10,
+                "url": "https://github.com/acme/widgets/pull/10",
+                "headRefName": "loop/99-retarget-open-pr",
+                "repairReasons": [],
+            }
+        ],
+    )
+    monkeypatch.setattr(tick_mod, "pr_review_context", lambda *_a, **_k: "open-pr context")
+
+    repairs = tick_mod._ready_issue_open_pr_repairs(cfg, [ready_issue])
+
+    assert len(repairs) == 1
+    issue, pr, ctx = repairs[0]
+    assert issue["number"] == 99
+    assert pr["repairReasons"] == ["ready_issue_has_open_pr"]
+    assert ctx == "open-pr context"
+    assert "ready_issue_open_pr_selected" in cfg.events_file.read_text()
+
+
 def test_repaired_pr_gets_automerge_after_threads_are_clear(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:

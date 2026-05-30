@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from forge_loop.config import Config
-from forge_loop.gh import fetch_issue, pr_review_context, prs_requiring_repair
+from forge_loop.gh import fetch_issue, pr_review_context, prs_by_label, prs_requiring_repair
 from forge_loop.state import append_event
 from forge_loop.worker import WorkerOutcome
 
@@ -73,6 +73,65 @@ def blocking_pr_repairs(
             reasons=pr.get("repairReasons") or [],
         )
         repairs.append((issue, pr, pr_review_context_fn(pr["number"], repo=cfg.github_repo)))
+    return repairs
+
+
+def ready_issue_open_pr_repairs(
+    cfg: Config,
+    ready_issues: list[dict[str, Any]],
+    *,
+    open_prs_fn: Any = prs_by_label,
+    pr_review_context_fn: Any = pr_review_context,
+) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    """Select existing open PRs for ready issues before new dispatch.
+
+    ``loop:ready`` means "the operator wants the loop to act". If the issue
+    already has an open ``loop/<issue>-...`` PR, acting means repairing that
+    PR branch, not spawning a second worker from ``main``. This catches the
+    common dogfood path where an operator edits an issue body to retarget the
+    work while the first PR is still open.
+    """
+    ready_by_number = {int(issue["number"]): issue for issue in ready_issues}
+    if not ready_by_number:
+        return []
+
+    repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    seen_issues: set[int] = set()
+    limit = max(cfg.parallel, 50)
+    for pr in open_prs_fn("", limit, repo=cfg.github_repo):
+        issue_num = issue_number_from_pr(pr)
+        if issue_num is None or issue_num not in ready_by_number:
+            continue
+        if issue_num in seen_issues:
+            append_event(
+                cfg.events_file,
+                "ready_issue_open_pr_skipped",
+                issue=issue_num,
+                pr=pr.get("url"),
+                reason="issue_already_selected",
+            )
+            continue
+
+        seen_issues.add(issue_num)
+        enriched = dict(pr)
+        reasons = list(enriched.get("repairReasons") or [])
+        if "ready_issue_has_open_pr" not in reasons:
+            reasons.append("ready_issue_has_open_pr")
+        enriched["repairReasons"] = reasons
+        append_event(
+            cfg.events_file,
+            "ready_issue_open_pr_selected",
+            issue=issue_num,
+            pr=enriched.get("url"),
+            reasons=reasons,
+        )
+        repairs.append(
+            (
+                ready_by_number[issue_num],
+                enriched,
+                pr_review_context_fn(enriched["number"], repo=cfg.github_repo),
+            )
+        )
     return repairs
 
 

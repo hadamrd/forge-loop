@@ -18,7 +18,14 @@ from forge_loop import master_log as _mlog
 from forge_loop import worker as _worker
 from forge_loop.config import Config
 from forge_loop.deploy import redeploy
-from forge_loop.gh import fetch_issue, pr_review_context, prs_requiring_repair, top_issues, unlabel
+from forge_loop.gh import (
+    fetch_issue,
+    pr_review_context,
+    prs_by_label,
+    prs_requiring_repair,
+    top_issues,
+    unlabel,
+)
 from forge_loop.po import expand_thin_specs as _po_expand
 from forge_loop.runner._helpers import consume_force_set as _consume_force_set_impl
 from forge_loop.runner._helpers import error_signature as _error_signature
@@ -37,6 +44,7 @@ from forge_loop.runner.drift import (
 from forge_loop.runner.label_hygiene import remove_ready_label as _remove_ready_label_impl
 from forge_loop.runner.repairs import blocking_pr_repairs as _blocking_pr_repairs_impl
 from forge_loop.runner.repairs import enable_automerge_for_repaired_prs as _enable_automerge_for_repaired_prs
+from forge_loop.runner.repairs import ready_issue_open_pr_repairs as _ready_issue_open_pr_repairs_impl
 from forge_loop.runner.rescue import rescue_uncommitted_work as _rescue_uncommitted_work
 from forge_loop.runner.tick_checks import run_codebase_audit as _run_codebase_audit
 from forge_loop.runner.tick_checks import run_maintenance_tick as _run_maintenance_tick
@@ -64,6 +72,18 @@ def _blocking_pr_repairs(cfg: Config) -> list[tuple[dict[str, Any], dict[str, An
         cfg,
         prs_requiring_repair_fn=prs_requiring_repair,
         fetch_issue_fn=fetch_issue,
+        pr_review_context_fn=pr_review_context,
+    )
+
+
+def _ready_issue_open_pr_repairs(
+    cfg: Config,
+    ready_issues: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    return _ready_issue_open_pr_repairs_impl(
+        cfg,
+        ready_issues,
+        open_prs_fn=prs_by_label,
         pr_review_context_fn=pr_review_context,
     )
 
@@ -112,6 +132,73 @@ def _enable_automerge_for_reviewed_outcomes(
             )
 
 
+def _run_repair_tick(
+    cfg: Config,
+    tick: int,
+    repairs: list[tuple[dict[str, Any], dict[str, Any], str]],
+    *,
+    bus_emit: Any,
+    short_sleep: Any,
+    start_event: str,
+    done_event: str,
+    log_action: str,
+    remove_ready: bool,
+) -> None:
+    master_log_path = cfg.logs_dir / "master.log"
+    issue_nums = [issue["number"] for issue, _, _ in repairs]
+    write_state(
+        cfg.state_file,
+        {
+            "state": "repairing",
+            "tick": tick,
+            "dispatched": [
+                {"issue": issue["number"], "title": issue["title"]} for issue, _, _ in repairs
+            ],
+        },
+    )
+    append_event(
+        cfg.events_file,
+        start_event,
+        tick=tick,
+        issues=issue_nums,
+        prs=[pr.get("url") for _, pr, _ in repairs],
+    )
+    _mlog.info(master_log_path, f"tick {tick} {log_action}: {issue_nums}")
+    outcomes = _run_repair_workers(
+        cfg,
+        repairs,
+        tick,
+        master_log_path=master_log_path,
+        bus_emit=bus_emit,
+    )
+    if cfg.critic.enabled:
+        _run_critic_for_outcomes(cfg, outcomes, bus_emit)
+    _enable_automerge_for_repaired_prs(cfg, outcomes, bus_emit)
+    append_event(
+        cfg.events_file,
+        done_event,
+        tick=tick,
+        outcomes=[asdict(o) for o in outcomes],
+    )
+    for o in outcomes:
+        if o.status in {"open", "merged"}:
+            if remove_ready:
+                _remove_ready_label(cfg, o.issue, status=o.status, pr_url=o.pr_url)
+            _reap_worktree(cfg.repo, o.issue)
+            append_event(cfg.events_file, "worktree_reaped", issue=o.issue, status=o.status)
+    summary = consolidate_sprint(
+        cfg.events_file,
+        cfg.summaries_file,
+        tick,
+        [asdict(o) for o in outcomes],
+    )
+    write_state(
+        cfg.state_file,
+        {"state": "between-ticks", "tick": tick, "last_summary": summary},
+    )
+    short_sleep(cfg.tick_interval_s, cfg)
+
+
 def _tick(cfg: Config, tick: int) -> None:
     # Imported lazily to avoid an import cycle (boot.py imports tick.py).
     from forge_loop.runner.boot import _short_sleep
@@ -137,57 +224,17 @@ def _tick(cfg: Config, tick: int) -> None:
 
     repairs = _blocking_pr_repairs(cfg)
     if repairs:
-        master_log_path = cfg.logs_dir / "master.log"
-        issue_nums = [issue["number"] for issue, _, _ in repairs]
-        write_state(
-            cfg.state_file,
-            {
-                "state": "repairing",
-                "tick": tick,
-                "dispatched": [
-                    {"issue": issue["number"], "title": issue["title"]} for issue, _, _ in repairs
-                ],
-            },
-        )
-        append_event(
-            cfg.events_file,
-            "repair_tick_start",
-            tick=tick,
-            issues=issue_nums,
-            prs=[pr.get("url") for _, pr, _ in repairs],
-        )
-        _mlog.info(master_log_path, f"tick {tick} repairing blocked PR(s): {issue_nums}")
-        outcomes = _run_repair_workers(
+        _run_repair_tick(
             cfg,
+            tick,
             repairs,
-            tick,
-            master_log_path=master_log_path,
             bus_emit=_bus_emit,
+            short_sleep=_short_sleep,
+            start_event="repair_tick_start",
+            done_event="repair_tick_done",
+            log_action="repairing blocked PR(s)",
+            remove_ready=False,
         )
-        if cfg.critic.enabled:
-            _run_critic_for_outcomes(cfg, outcomes, _bus_emit)
-        _enable_automerge_for_repaired_prs(cfg, outcomes, _bus_emit)
-        append_event(
-            cfg.events_file,
-            "repair_tick_done",
-            tick=tick,
-            outcomes=[asdict(o) for o in outcomes],
-        )
-        for o in outcomes:
-            if o.status in {"open", "merged"}:
-                _reap_worktree(cfg.repo, o.issue)
-                append_event(cfg.events_file, "worktree_reaped", issue=o.issue, status=o.status)
-        summary = consolidate_sprint(
-            cfg.events_file,
-            cfg.summaries_file,
-            tick,
-            [asdict(o) for o in outcomes],
-        )
-        write_state(
-            cfg.state_file,
-            {"state": "between-ticks", "tick": tick, "last_summary": summary},
-        )
-        _short_sleep(cfg.tick_interval_s, cfg)
         return
 
     # Issue #126 — axis-aware dispatch filter. When ``LOOP_AXIS_FILTER``
@@ -300,6 +347,21 @@ def _tick(cfg: Config, tick: int) -> None:
                 else:
                     refreshed.append(issue)
             issues = refreshed
+
+    open_pr_repairs = _ready_issue_open_pr_repairs(cfg, issues)
+    if open_pr_repairs:
+        _run_repair_tick(
+            cfg,
+            tick,
+            open_pr_repairs,
+            bus_emit=_bus_emit,
+            short_sleep=_short_sleep,
+            start_event="ready_issue_open_pr_repair_tick_start",
+            done_event="ready_issue_open_pr_repair_tick_done",
+            log_action="repairing open PR(s)",
+            remove_ready=True,
+        )
+        return
 
     write_state(
         cfg.state_file,

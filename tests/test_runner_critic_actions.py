@@ -100,6 +100,15 @@ def test_zero_findings_small_pr_is_not_suspicious() -> None:
     assert plan.labels_to_add == []
 
 
+def test_zero_findings_tiny_pr_does_not_block_even_if_config_threshold_is_low() -> None:
+    rep = _report("approve", [])
+    plan = plan_actions(rep, pr_changed_lines=37,
+                        block_on_sev2=False, min_findings_for_approve=30)
+    assert plan.suspicious_approve is False
+    assert plan.block_merge is False
+    assert plan.labels_to_add == []
+
+
 def test_summary_vs_inline_split() -> None:
     rep = _report("request_changes", [
         Finding("sev2", "correctness", "a.py", 5, "with loc"),

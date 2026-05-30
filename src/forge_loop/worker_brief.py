@@ -53,12 +53,14 @@ def make_brief(
 
     merge_step_renumbered = (
         "10. `gh pr create` with a clear title + body, then\n"
+        f"    the body MUST include `Fixes #{n}` so GitHub closes the issue\n"
+        "    after the PR is merged.\n"
         "    STOP. DO NOT enable auto-merge. The `risk:high` label on this issue\n"
         "    means a human must review. Post a comment on the PR: 'Risk-gated;\n"
         "    ready for human review.' Your status is `open` (not `merged`)."
         if risk_gated
         else "10. `gh pr create` with a clear title + body (the body should restate\n"
-        "    the acceptance criteria and how they're tested).\n"
+        f"    the acceptance criteria and how they're tested, and MUST include `Fixes #{n}`).\n"
         "11. STOP. DO NOT enable auto-merge and DO NOT merge the PR. The runner\n"
         "    owns merge after critic approval and merge gates. Your status is `open`."
     )
