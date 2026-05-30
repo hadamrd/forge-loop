@@ -22,7 +22,6 @@ def test_reap_orphan_worktrees_handles_missing_dir(tmp_path) -> None:
 
 def test_reap_orphan_worktrees_skips_non_numeric_paths(tmp_path) -> None:
     """A /tmp/wt-loop-* path whose suffix isn't an int must be skipped silently."""
-    import os
     from forge_loop.runner import _reap_orphan_worktrees
     events = tmp_path / "events.jsonl"
     events.touch()
@@ -33,3 +32,15 @@ def test_reap_orphan_worktrees_skips_non_numeric_paths(tmp_path) -> None:
     # names don't blow up the boot path.
     reaped = _reap_orphan_worktrees(tmp_path, events)
     assert reaped == 0
+
+
+def test_issue_number_from_pr_prefers_loop_branch() -> None:
+    from forge_loop.runner.tick import _issue_number_from_pr
+
+    assert _issue_number_from_pr({"headRefName": "loop/123-fix-the-thing"}) == 123
+
+
+def test_issue_number_from_pr_falls_back_to_body_reference() -> None:
+    from forge_loop.runner.tick import _issue_number_from_pr
+
+    assert _issue_number_from_pr({"body": "Fixes #456"}) == 456

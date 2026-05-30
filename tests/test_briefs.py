@@ -68,6 +68,7 @@ def test_render_critic_brief_substitutes_pr_and_issue() -> None:
         "critic",
         pr_url="https://github.com/acme/repo/pull/7",
         issue_number=7,
+        manifestos="(test manifestos block)",
     )
     assert "https://github.com/acme/repo/pull/7" in out
     assert "#7" in out
@@ -244,6 +245,116 @@ def test_missing_render_kwarg_for_bundled_template_raises_keyerror() -> None:
 # ---------------------------------------------------------------------------
 # CLI surface
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Issue #79: COMMIT DISCIPLINE + EXIT CHECKLIST sections
+# ---------------------------------------------------------------------------
+
+
+# Verbatim phrases from the issue AC that MUST appear in the rendered worker
+# brief — these are the contract the operator is paying for.
+_WORKER_DISCIPLINE_PHRASES = (
+    "COMMIT DISCIPLINE — HARD RULE",
+    "Every 20 turns of editing OR every 5 file edits",
+    'git add -A && git commit -m "wip:',
+    "Before any tool call after turn 40",
+    "git commit, git push, gh pr create, gh pr merge --auto",
+    "EXIT CHECKLIST",
+    "git log origin/trunk..HEAD --oneline",
+    "git push -u origin <branch>",
+    "gh pr view <branch> --json url",
+    "gh pr merge <N> --squash --auto --delete-branch",
+)
+
+
+@pytest.mark.parametrize("phrase", _WORKER_DISCIPLINE_PHRASES)
+def test_worker_brief_contains_commit_discipline_phrase(phrase: str) -> None:
+    """Rendered worker brief must include each contract phrase verbatim (#79)."""
+    from forge_loop.worker import make_brief
+
+    issue = {"number": 42, "title": "Fix the thing", "body": "details"}
+    out = make_brief(issue, Path("/tmp/wt-42"))
+    assert phrase in out, f"missing required phrase: {phrase!r}"
+
+
+def test_worker_brief_exit_checklist_ordering() -> None:
+    """The 4 EXIT CHECKLIST steps must appear in the documented order so a
+    worker reading top-to-bottom can't accidentally push before committing."""
+    from forge_loop.worker import make_brief
+
+    out = make_brief({"number": 1, "title": "t", "body": "b"}, Path("/tmp/wt-1"))
+    idx_header = out.index("EXIT CHECKLIST")
+    idx_log = out.index("git log origin/trunk..HEAD", idx_header)
+    idx_push = out.index("git push -u origin <branch>", idx_log)
+    idx_view = out.index("gh pr view <branch>", idx_push)
+    idx_merge = out.index("gh pr merge <N>", idx_view)
+    # All four found, and they are strictly increasing — that's the assertion.
+    assert idx_header < idx_log < idx_push < idx_view < idx_merge
+
+
+def test_worker_brief_fallback_commit_on_checklist_failure() -> None:
+    """If any checklist item fails, the brief must instruct a commit+push
+    fallback so the per-tick reaper from #77 isn't the only safety net."""
+    from forge_loop.worker import make_brief
+
+    out = make_brief({"number": 1, "title": "t", "body": "b"}, Path("/tmp/wt-1"))
+    # Both halves of the rule are present.
+    assert "If ANY checklist item fails" in out
+    assert "git add -A && git commit" in out
+    assert "git push -u origin HEAD" in out
+
+
+def test_po_brief_warns_about_under_committing_risk() -> None:
+    """PO template must teach the PO to flag broad ACs as under-commit risks."""
+    out = render_brief(
+        "po",
+        issue_number=1,
+        issue_title="t",
+        issue_body="b",
+        github_repo="o/r",
+    )
+    assert "UNDER-COMMITTING RISK FLAG" in out
+    assert "COMMIT DISCIPLINE" in out
+    assert "EXIT CHECKLIST" in out
+    # The PO must be told to add a *Worker note* section to the issue body.
+    assert "Worker note" in out
+
+
+def test_cli_brief_worker_emits_commit_discipline_sections(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance criterion: `forge-loop brief --kind worker --issue 42` output
+    contains the COMMIT DISCIPLINE + EXIT CHECKLIST sections verbatim.
+
+    We call ``_cmd_brief`` directly with a ``SimpleNamespace`` (the same
+    dispatch contract the Typer wrappers use) to avoid relying on Typer's
+    standalone-mode ``SystemExit`` behaviour, which differs across click /
+    typer versions in CI.
+    """
+    monkeypatch.setenv("PATH", "/nonexistent")  # force placeholder, no gh
+    from types import SimpleNamespace
+
+    from forge_loop.cli import _cmd_brief
+
+    rc = _cmd_brief(
+        SimpleNamespace(
+            kind="worker",
+            issue=42,
+            issue_file=None,
+            raw=False,
+            worktree=None,
+            risk_gated=False,
+            repo=None,
+            pr=None,
+        )
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "COMMIT DISCIPLINE — HARD RULE" in out
+    assert "EXIT CHECKLIST" in out
+    assert "gh pr merge <N> --squash --auto --delete-branch" in out
 
 
 def test_cli_brief_renders_worker_with_placeholder_when_no_gh(

@@ -33,8 +33,10 @@ from forge_loop.config import Config as _Config
 from forge_loop.deploy import redeploy as redeploy
 from forge_loop.gh import fetch_issue as fetch_issue
 from forge_loop.gh import top_issues as top_issues
+from forge_loop.gh import unlabel as unlabel
 from forge_loop.runner import boot as _boot
 from forge_loop.runner import dispatch as _dispatch_mod
+from forge_loop.runner import iteration as iteration
 from forge_loop.runner import tick as _tick_mod
 from forge_loop.runner._helpers import (
     consecutive_deploy_fails as _consecutive_deploy_fails_impl,
@@ -120,7 +122,7 @@ def __getattr__(name: str):  # pragma: no cover — thin compat shim
 # patched). New names fall through to plain attribute assignment.
 # ---------------------------------------------------------------------------
 _PROXY_TICK_NAMES = frozenset({
-    "top_issues", "fetch_issue", "_reap_worktree",
+    "top_issues", "fetch_issue", "unlabel", "_reap_worktree",
     "_short_sleep", "redeploy",
 })
 _PROXY_DISPATCH_NAMES = frozenset({"run_worker"})
@@ -138,6 +140,59 @@ class _RunnerFacadeModule(_types.ModuleType):
 
 
 _sys.modules[__name__].__class__ = _RunnerFacadeModule
+
+
+# ---------------------------------------------------------------------------
+# Runner class (issue #87) — instance-owned lifecycle replacing the module
+# globals (_RUN, _RECENT_OUTCOMES). The legacy ``run(cfg)`` / ``run_async(cfg)``
+# functions still work for back-compat and route through this class via the
+# default :class:`RunnerState` singleton.
+# ---------------------------------------------------------------------------
+
+from forge_loop.runner.state import RunnerState as RunnerState
+
+
+class Runner:
+    """Lifecycle owner for a single dispatch loop.
+
+    Pre-#87 the loop shared mutable state via module globals (boot._RUN,
+    drift._RECENT_OUTCOMES). Two Runner instances in the same process
+    trampled each other; signal handlers leaked across re-execs; tests
+    couldn't drive concurrent loops without module monkey-patching.
+
+    Now each Runner owns its :class:`RunnerState` (stop flag, drift
+    outcomes buffer) and binds its signal handlers to that state.
+
+    Usage::
+
+        runner = Runner(cfg)
+        runner.run()           # blocks until SIGTERM / stop_file / max_ticks
+        # ── from another thread:
+        runner.stop()          # equivalent to SIGTERM
+
+    The legacy ``forge_loop.runner.run(cfg)`` top-level function is
+    unchanged: it constructs an implicit Runner against the module
+    singleton state, identical to the pre-#87 behaviour.
+    """
+
+    def __init__(self, cfg: _Config, state: RunnerState | None = None) -> None:
+        self.cfg = cfg
+        self.state = state if state is not None else RunnerState()
+
+    def stop(self) -> None:
+        """Request a clean shutdown — exits the next iteration of the dispatch loop."""
+        self.state.request_stop()
+
+    def run(self) -> int:
+        """Run the synchronous dispatch loop.
+
+        Delegates to :func:`boot.run` but passes our :class:`RunnerState`
+        so the stop flag + drift outcomes are isolated from any other
+        Runner in the same process. Tests can construct two Runner
+        instances on separate tmp dirs and ``stop()`` one without
+        affecting the other.
+        """
+        return _boot.run(self.cfg, state=self.state)
 
 
 __all__ = [
@@ -165,4 +220,5 @@ __all__ = [
     "run_multirepo",
     "run_worker",
     "top_issues",
+    "unlabel",
 ]

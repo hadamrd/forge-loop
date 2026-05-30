@@ -113,6 +113,7 @@ state (events, pid, halt markers) is gitignored.
 # forge-loop.yaml — everything below is optional; env vars override yaml.
 repo:
   github: owner/repo                  # required (or LOOP_GH_REPO env)
+  base_branch: trunk                  # default branch used for worker worktrees
   worktree_root: /tmp                 # /tmp/wt-loop-<N> per worker
 
 deploy:
@@ -221,6 +222,74 @@ Placeholders the loader fills: `{n}`, `{issue_title}`, `{body}`, `{worktree}`,
 
 ---
 
+## Manifestos & the brainstormer (axis-aligned tickets)
+
+`forge-loop` does NOT just ship whatever you label. To produce *valuable* work the loop reads four customer-owned manifestos under `.forge/` and refuses cosmetic tickets.
+
+### The four files you own
+
+```
+.forge/
+├── product-vision.md     # free-form prose: who you serve, the wedge, what's NOT valuable
+├── axes.yaml             # structured: the 4-6 value axes the loop must move
+├── quality-manifesto.md  # how code MUST be written (critic enforces, sev1 blocks merge)
+└── testing-manifesto.md  # how tests MUST be written (consulted by worker post-impl)
+```
+
+Every shipped ticket cites the axis it serves; every PR is gated by the quality + testing manifestos via the critic.
+
+### Example `axes.yaml`
+
+```yaml
+axes:
+  - name: golden-path-e2e
+    customer: "SRE running their first pipeline on day zero"
+    valuable_means: "Playwright tests driving the real rig — golden path survives every release"
+    acceptable_work:
+      - "Customer-shaped pipeline fixtures (Node, Java, polyglot)"
+      - "Adversarial paths: failed step, OOM step, secret-needing step"
+    rejected_as_cosmetic:
+      - "304 responses to polls customers don't notice"
+      - "Pretty timestamps, sparklines, theme polish"
+
+  - name: scm-depth
+    customer: "Team migrating from GitLab self-hosted / Bitbucket Cloud"
+    ...
+```
+
+### Brainstormer workflow
+
+```bash
+# 1. Drop manifestos in .forge/ (see above)
+
+# 2. Dry-run — propose axis-aligned epics + tickets, print them
+GH_TOKEN=$(gh auth token) forge-loop brainstorm
+
+# 3. Apply — file them on GitHub with axis labels
+forge-loop brainstorm --apply
+
+# 4. The loop dispatches on the new loop:ready tickets normally
+forge-loop run
+```
+
+Each filed ticket carries `axis:<name>` + `loop:ready` (or `epic` for parent rollups), plus a customer-story quote pulled from your vision.
+
+### The feedback loop
+
+Every bug → quality manifesto update → permanent gate.
+
+```bash
+# 1. A bug ships and gets fixed in PR #N
+# 2. Generate a manifesto delta proposal based on the failure shape
+forge-loop manifesto suggest --from-pr <N>
+
+# 3. Review + commit. From the next worker run, the critic enforces it.
+```
+
+Real example: PR #147 hot-fixed a stringly-typed event-boundary bug. The quality manifesto gained a `No stringly-typed cross-module discriminators` rule. The critic now blocks any future PR that compares `event["kind"] == "literal"` across module boundaries.
+
+---
+
 ## CLI reference
 
 ```
@@ -235,6 +304,9 @@ forge-loop record-session    # capture a real SDK session as a test fixture
 forge-loop replay --tick N   # dry-run replay of a past tick
 forge-loop brief --kind worker --issue 42   # render the brief the loop would send
 forge-loop config [models]   # print resolved config (or per-role model table)
+forge-loop brainstorm        # propose axis-aligned epics + tickets (dry-run)
+forge-loop brainstorm --apply # file the proposed tickets on GitHub
+forge-loop manifesto suggest --from-pr N  # propose manifesto deltas from a bug fix
 forge-loop pipeline show     # render the .forge/pipeline.yaml DAG
 forge-loop repos list/disable/enable  # multirepo state
 forge-loop roles list        # pluggable role definitions
@@ -333,9 +405,9 @@ runner.tick():
 
   for issue in issues:
       skip if attempts.fingerprint says in-flight or cooldown
-      gh_unlabel(issue, "loop:ready")     # claim it
+      remove loop:ready after PR opens    # keep queue from recycling in-review work
       run_worker(issue) in ThreadPoolExecutor[parallel=N]
-        └─ git worktree add /tmp/wt-loop-<N> -B branch origin/trunk
+        └─ git worktree add /tmp/wt-loop-<N> -B branch origin/<base_branch>
         └─ plant .claude/settings.json (permissive, read-only)
         └─ claude_agent_sdk.query(prompt=worker_brief, options)
              stream typed events:

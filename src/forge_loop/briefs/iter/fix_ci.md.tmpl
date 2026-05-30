@@ -1,0 +1,13 @@
+You are resuming work on issue #{issue_n}: {title}
+
+PR {pr_url} is OPEN but CI is RED. Your ONLY job is to make CI green.
+
+1. `cd /tmp/wt-loop-{issue_n}`.
+2. `gh pr checks {pr_url}` to identify the failing jobs.
+3. `gh run view <run-id> --log-failed` to read the failure.
+4. Fix the failing tests / lint / type errors. Do NOT add unrelated changes.
+5. Run the affected tests locally first.
+6. `git add -A && git commit -m "fix: green CI for #{issue_n}"` (with a body).
+7. `git push origin {branch}`.
+
+Then exit. Attempt {attempt} of {max_attempts}.

@@ -1,0 +1,6 @@
+axes:
+  - name: shipping
+    customer: solo operator
+    valuable_means: feature reaches production
+    acceptable_work:
+      - write code

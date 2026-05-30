@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections.abc import Callable
@@ -70,6 +71,11 @@ class WorkerOutcome:
     cost_usd: float = 0.0
     usage: dict[str, Any] | None = None
     model: str = ""
+    # Issue #132: which manifesto versions were prepended to the worker
+    # system prompt for this run. Always a 2-key dict ({"quality": ...,
+    # "testing": ...}) when at least one side was present; ``None`` when
+    # the repo had no manifestos at all (back-compat baseline).
+    manifesto_sha: dict[str, str | None] | None = None
 
 
 def make_brief(
@@ -82,6 +88,7 @@ def make_brief(
     lumen_test_pattern: str = "**/*Test.*",
     coauthor: str = "",
     dry_run: bool = False,
+    manifesto_bundle: Any | None = None,
 ) -> str:
     """Render the worker brief for an issue.
 
@@ -149,7 +156,82 @@ def make_brief(
         from forge_loop.replay import apply_dry_run_to_brief
 
         rendered = apply_dry_run_to_brief(rendered)
+    # Issue #132 — manifesto injection. The MANIFESTO block goes in FRONT
+    # of every other brief line so the worker reads the house rules before
+    # it sees the issue body, the contract, or the exit checklist. When
+    # the bundle is empty (no manifestos in this repo), inject_into_brief
+    # is a no-op and the rendered brief is byte-identical to the
+    # pre-feature baseline (back-compat acceptance criterion).
+    if manifesto_bundle is not None:
+        from forge_loop.manifestos import inject_into_brief
+
+        rendered = inject_into_brief(rendered, manifesto_bundle)
     return rendered
+
+
+def make_repair_brief(
+    issue: dict[str, Any],
+    worktree: Path,
+    *,
+    pr: dict[str, Any],
+    review_context: str,
+    lumen_top_k: int = 3,
+    lumen_test_pattern: str = "**/*Test.*",
+    coauthor: str = "",
+) -> str:
+    """Render a worker brief for repairing an existing blocked PR."""
+    body = (issue.get("body") or "")[:6000]
+    n = issue["number"]
+    pr_url = pr.get("url") or f"https://github.com/pull/{pr.get('number', '')}"
+    pr_number = pr.get("number", "")
+    head = pr.get("headRefName") or ""
+    final_status = f'{{"issue": {n}, "pr": "{pr_url}", "status": "open", "note": "repair pushed"}}'
+    coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
+    return f"""You are an autonomous repair worker in a sprint loop.
+
+WORKTREE (already created): {worktree}
+cd there. Stay there. Don't touch the main checkout.
+
+SOURCE ISSUE #{n}: {issue.get("title", "")}
+---
+{body}
+---
+
+EXISTING PR TO REPAIR:
+- PR: #{pr_number} {pr_url}
+- Branch: {head}
+
+REVIEW / CRITIC CONTEXT TO ADDRESS:
+---
+{review_context[:12000]}
+---
+
+CONTRACT:
+1. Repair the EXISTING PR branch. Do not create a new branch and do not open a new PR.
+2. Address every unresolved review thread and every sev1/blocking review point with production behavior and tests.
+3. If the branch is behind or conflicted, merge/rebase the current base branch and resolve conflicts in scope.
+4. Preserve the original issue scope; do not add unrelated refactors.
+5. Run focused tests that prove the review comments are fixed.
+6. Run formatting/lint gates appropriate for touched files.
+7. Commit with a message referencing #{n}.
+8. Push the current branch with `git push`.
+9. Resolve review threads after fixing them when the GitHub API/CLI allows it; otherwise reply/comment with the fixed evidence.
+10. Leave a short PR comment summarizing the repair and remaining state.
+
+LOOP INFRASTRUCTURE — DO NOT TOUCH:
+- `{worktree}/.claude/settings.json` is loop-planted. Do NOT `git clean`, `rm`, or chmod it.
+- Don't run `git clean -fdx`.
+
+LUMEN TEST DISCOVERY:
+If available, query Lumen with the issue title, review findings, and changed files.
+Cap at K={lumen_top_k} discovered + 1 authored test. If unavailable, echo a one-line skip and continue.
+Test pattern: {lumen_test_pattern}
+
+{coauthor_line}
+
+FINAL LINE OF YOUR OUTPUT MUST BE THIS JSON SHAPE, with no prose after it:
+{final_status}
+"""
 
 
 def brief_template_hash() -> str:
@@ -211,8 +293,32 @@ def _drop_permissive_settings(worktree: Path) -> None:
     cdir.chmod(0o555)
 
 
+def _quarantine_if_blocking(wt: Path) -> Path | None:
+    """If `wt` still exists after normal cleanup (e.g. worker-planted files
+    owned by a different uid that we can't chmod/rm), rename it out of the
+    way so `git worktree add` can proceed. Returns the quarantined path,
+    or None if the dir is already gone.
+
+    Quarantined dirs use the suffix ``.stale-<unix-ts>`` so the boot
+    reaper + operator can find + sweep them later without risk of colliding
+    with the live path.
+    """
+    if not wt.exists():
+        return None
+    quarantine = wt.with_name(f"{wt.name}.stale-{int(time.time())}")
+    try:
+        wt.rename(quarantine)
+    except OSError:
+        return None
+    return quarantine
+
+
 def _prep_worktree(
-    repo: Path, n: int, branch: str, base_branch: str = "trunk"
+    repo: Path,
+    n: int,
+    branch: str,
+    *,
+    base_branch: str = "trunk",
 ) -> tuple[Path, str | None]:
     wt = Path(f"/tmp/wt-loop-{n}")
     # chmod the planted .claude/ back to writable so worktree remove can
@@ -226,26 +332,37 @@ def _prep_worktree(
         cwd=repo,
         capture_output=True,
     )
+    if wt.exists():
+        with contextlib.suppress(OSError, PermissionError):
+            shutil.rmtree(wt)
+    # If the worker planted files owned by a different uid (subprocess
+    # ran under a different namespace), chmod+rmtree above will silently
+    # fail and leave the dir behind. Quarantine it so the new worktree
+    # add doesn't collide. Without this, every retry of this issue hits
+    # `worktree-create-failed` → infinite loop until operator intervenes.
+    _quarantine_if_blocking(wt)
     # If a previous failed attempt left a local branch lying around, delete
     # it so `git worktree add -B` can recreate it cleanly off the freshest
-    # remote base branch. `-B` would overwrite anyway, but we use plain `-b` after
-    # an explicit delete to fail loudly if the branch is still in use.
+    # origin/<base_branch>. `-B` would overwrite anyway, but we use plain `-b`
+    # after an explicit delete to fail loudly if the branch is still in use.
     subprocess.run(
         ["git", "branch", "-D", branch],
         cwd=repo,
         capture_output=True,
     )
-    # Force-update the remote base branch so the worktree always starts at the freshest
-    # commit, even if many PRs landed during the prior tick. `+refs/heads/...`
-    # makes the fetch force the ref update (defensive — non-FF should never
-    # happen for trunk, but if it does we want the upstream view).
+    # Force-update the configured upstream branch so the worktree always starts
+    # at the freshest commit, even if many PRs landed during the prior tick.
+    # `+refs/heads/...` makes the fetch force the ref update (defensive —
+    # non-FF should never happen for protected branches, but if it does we want
+    # the upstream view).
+    remote_ref = f"refs/remotes/origin/{base_branch}"
     subprocess.run(
         [
             "git",
             "fetch",
             "--prune",
             "origin",
-            f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}",
+            f"+refs/heads/{base_branch}:{remote_ref}",
         ],
         cwd=repo,
         capture_output=True,
@@ -258,7 +375,41 @@ def _prep_worktree(
     )
     if r.returncode != 0:
         return wt, r.stderr
-    _drop_permissive_settings(wt)
+    if wt.exists():
+        _drop_permissive_settings(wt)
+    return wt, None
+
+
+def _prep_repair_worktree(
+    repo: Path,
+    issue: int,
+    branch: str,
+) -> tuple[Path, str | None]:
+    wt = Path(f"/tmp/wt-loop-{issue}")
+    claude_dir = wt / ".claude"
+    if claude_dir.exists():
+        subprocess.run(["chmod", "-R", "u+w", str(claude_dir)], capture_output=True)
+    subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=repo, capture_output=True)
+    if wt.exists():
+        with contextlib.suppress(OSError, PermissionError):
+            shutil.rmtree(wt)
+    _quarantine_if_blocking(wt)
+    remote_ref = f"refs/remotes/origin/{branch}"
+    subprocess.run(
+        ["git", "fetch", "--prune", "origin", f"+refs/heads/{branch}:{remote_ref}"],
+        cwd=repo,
+        capture_output=True,
+    )
+    r = subprocess.run(
+        ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{branch}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return wt, r.stderr
+    if wt.exists():
+        _drop_permissive_settings(wt)
     return wt, None
 
 
@@ -326,7 +477,11 @@ def run_worker(
     thinking: str | None = None,
     provider: str = "claude",
     allowed_mcp_servers: tuple[str, ...] | None = None,
+    load_timeout_ms: int | None = None,
+    strict_mcp_config: bool = False,
+    mcp_servers: dict[str, Any] | None = None,
     base_branch: str = "trunk",
+    brief_override: str | None = None,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -335,12 +490,18 @@ def run_worker(
 
     ``model`` / ``thinking`` (issue #34) are threaded through to the SDK so
     each role can be tuned independently of the Claude Code CLI default.
+
+    ``load_timeout_ms`` / ``strict_mcp_config`` / ``mcp_servers`` defend the
+    worker session against operator-global MCP config slowness (~250 tools
+    enumerated at init can blow the SDK's default 60s timeout). Operators
+    set these via ``worker.load_timeout_ms`` / ``worker.strict_mcp_config`` /
+    ``worker.mcp_servers`` in forge-loop.yaml or the matching env vars.
     """
     n = issue["number"]
     title = issue["title"]
     branch = _branch_name(n, title)
 
-    worktree, err = _prep_worktree(repo, n, branch, base_branch)
+    worktree, err = _prep_worktree(repo, n, branch, base_branch=base_branch)
     if err is not None:
         return WorkerOutcome(
             issue=n,
@@ -354,16 +515,127 @@ def run_worker(
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"worker-{n}-{int(time.time())}.log"
-    brief = make_brief(
+    # Issue #132 — discover the active manifestos once at dispatch time.
+    # The bundle threads into BOTH the brief renderer (prepends MANIFESTO
+    # block) AND the outcome telemetry (``manifesto_sha`` audit field).
+    # Discovery sources from the repo checkout, NOT the worktree — the
+    # worktree's .forge/ exists post-branch but the manifestos live on
+    # the canonical checkout that controls house rules.
+    from forge_loop.manifestos import load_manifestos
+
+    manifesto_bundle = load_manifestos(repo)
+    manifesto_sha = manifesto_bundle.sha_payload() if manifesto_bundle.any_present else None
+
+    # Iteration loop (issue #78) passes a focused follow-up brief that
+    # short-circuits ``make_brief`` — the follow-up session reuses the same
+    # worktree + branch and just gets told "your ONLY job is X".
+    if brief_override is not None:
+        # Even on follow-up runs, prepend the manifesto block so iteration 2
+        # is held to the same house rules as iteration 1.
+        from forge_loop.manifestos import inject_into_brief
+
+        brief = inject_into_brief(brief_override, manifesto_bundle)
+    else:
+        brief = make_brief(
+            issue,
+            worktree,
+            risk_gated=risk_gated,
+            past_attempts=past_attempts,
+            lumen_top_k=lumen_top_k,
+            lumen_test_pattern=lumen_test_pattern,
+            coauthor=coauthor,
+            manifesto_bundle=manifesto_bundle,
+        )
+
+    if provider == "codex":
+        outcome = _run_worker_codex(
+            issue=issue,
+            worktree=worktree,
+            log_path=log_path,
+            brief=brief,
+            timeout_s=timeout_s,
+            model=model,
+        )
+        outcome.manifesto_sha = manifesto_sha
+        return outcome
+
+    outcome = _run_worker_sdk(
+        issue=issue,
+        worktree=worktree,
+        log_path=log_path,
+        brief=brief,
+        timeout_s=timeout_s,
+        emit=emit,
+        tick=tick,
+        model=model,
+        thinking=thinking,
+        allowed_mcp_servers=allowed_mcp_servers,
+        load_timeout_ms=load_timeout_ms,
+        strict_mcp_config=strict_mcp_config,
+        mcp_servers=mcp_servers,
+    )
+    outcome.manifesto_sha = manifesto_sha
+    return outcome
+
+
+def run_repair_worker(
+    issue: dict[str, Any],
+    pr: dict[str, Any],
+    review_context: str,
+    repo: Path,
+    logs_dir: Path,
+    timeout_s: int,
+    *,
+    emit: Callable[[str, dict[str, Any]], None] | None = None,
+    lumen_top_k: int = 3,
+    lumen_test_pattern: str = "**/*Test.*",
+    coauthor: str = "",
+    tick: int | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
+    provider: str = "claude",
+    allowed_mcp_servers: tuple[str, ...] | None = None,
+    load_timeout_ms: int | None = None,
+    strict_mcp_config: bool = False,
+    mcp_servers: dict[str, Any] | None = None,
+) -> WorkerOutcome:
+    """Repair an existing blocked PR by pushing to its head branch."""
+    n = issue["number"]
+    title = issue["title"]
+    branch = pr.get("headRefName") or ""
+    pr_url = pr.get("url")
+    if not branch:
+        return WorkerOutcome(
+            issue=n,
+            title=title,
+            pr_url=pr_url,
+            status="failed",
+            duration_s=0.0,
+            stdout_tail="missing PR headRefName",
+            error="repair-missing-branch",
+        )
+    worktree, err = _prep_repair_worktree(repo, n, branch)
+    if err is not None:
+        return WorkerOutcome(
+            issue=n,
+            title=title,
+            pr_url=pr_url,
+            status="failed",
+            duration_s=0.0,
+            stdout_tail=err[-500:],
+            error="repair-worktree-create-failed",
+        )
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"repair-{n}-{int(time.time())}.log"
+    brief = make_repair_brief(
         issue,
         worktree,
-        risk_gated=risk_gated,
-        past_attempts=past_attempts,
+        pr=pr,
+        review_context=review_context,
         lumen_top_k=lumen_top_k,
         lumen_test_pattern=lumen_test_pattern,
         coauthor=coauthor,
     )
-
     if provider == "codex":
         return _run_worker_codex(
             issue=issue,
@@ -373,7 +645,6 @@ def run_worker(
             timeout_s=timeout_s,
             model=model,
         )
-
     return _run_worker_sdk(
         issue=issue,
         worktree=worktree,
@@ -385,6 +656,9 @@ def run_worker(
         model=model,
         thinking=thinking,
         allowed_mcp_servers=allowed_mcp_servers,
+        load_timeout_ms=load_timeout_ms,
+        strict_mcp_config=strict_mcp_config,
+        mcp_servers=mcp_servers,
     )
 
 
@@ -462,6 +736,9 @@ def _run_worker_sdk(
     model: str | None = None,
     thinking: str | None = None,
     allowed_mcp_servers: tuple[str, ...] | None = None,
+    load_timeout_ms: int | None = None,
+    strict_mcp_config: bool = False,
+    mcp_servers: dict[str, Any] | None = None,
 ) -> WorkerOutcome:
     """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
 
@@ -494,6 +771,9 @@ def _run_worker_sdk(
                 model=model,
                 thinking_budget=thinking,
                 allowed_mcp_servers=allowed_mcp_servers,
+                load_timeout_ms=load_timeout_ms,
+                strict_mcp_config=strict_mcp_config,
+                mcp_servers=mcp_servers,
             )
 
         timed_out = False

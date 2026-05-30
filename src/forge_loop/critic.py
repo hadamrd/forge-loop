@@ -28,18 +28,42 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from forge_loop.worker import _subagent_env, ensure_subagent_trusted
+from forge_loop.worker import ensure_subagent_trusted
 
 VALID_OVERALL = {"approve", "request_changes", "block"}
 VALID_SEVERITY = {"sev1", "sev2", "sev3"}
 VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs", "product"}
+
+
+@dataclass
+class ManifestoViolation:
+    """A specific rule in a project manifesto the PR diff violates.
+
+    Emitted by the critic LLM and parsed by ``_coerce_report``. Any
+    violation with ``severity == "sev1"`` blocks auto-merge (see
+    ``_coerce_report`` and ``critic_actions.plan_actions``).
+    """
+
+    rule_id: str
+    manifesto: str
+    quote: str
+    suggested_fix: str
+    severity: str  # sev1 | sev2 | sev3
+
+    def is_valid(self) -> bool:
+        return (
+            isinstance(self.rule_id, str) and bool(self.rule_id.strip())
+            and isinstance(self.manifesto, str) and bool(self.manifesto.strip())
+            and isinstance(self.quote, str)
+            and isinstance(self.suggested_fix, str)
+            and self.severity in VALID_SEVERITY
+        )
 
 
 def _default_brief() -> str:
@@ -72,16 +96,26 @@ class Finding:
 class CriticReport:
     overall: str  # approve | request_changes | block
     findings: list[Finding] = field(default_factory=list)
+    manifesto_violations: list[ManifestoViolation] = field(default_factory=list)
     raw: str = ""
 
     def severities(self) -> set[str]:
         return {f.severity for f in self.findings}
 
     def has_sev1(self) -> bool:
-        return any(f.severity == "sev1" for f in self.findings)
+        return (
+            any(f.severity == "sev1" for f in self.findings)
+            or any(v.severity == "sev1" for v in self.manifesto_violations)
+        )
 
     def has_sev2(self) -> bool:
-        return any(f.severity == "sev2" for f in self.findings)
+        return (
+            any(f.severity == "sev2" for f in self.findings)
+            or any(v.severity == "sev2" for v in self.manifesto_violations)
+        )
+
+    def has_sev1_manifesto_violation(self) -> bool:
+        return any(v.severity == "sev1" for v in self.manifesto_violations)
 
 
 @dataclass
@@ -93,30 +127,6 @@ class CriticOutcome:
     report: CriticReport | None = None
     error: str | None = None
     parse_retries: int = 0
-
-
-def _build_critic_argv(brief: str, repo: Path, model: str | None) -> list[str]:
-    """Assemble the ``claude -p`` argv for the critic subagent.
-
-    Split out so unit tests can assert on the argv directly. ``--model``
-    is threaded through when ``model`` is set (issue #34).
-    """
-    argv = [
-        "claude",
-        "-p",
-        brief,
-        "--max-turns",
-        "20",
-        "--allow-dangerously-skip-permissions",
-        "--add-dir",
-        str(repo),
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ]
-    if model:
-        argv.extend(["--model", model])
-    return argv
 
 
 def review_pr(
@@ -138,7 +148,14 @@ def review_pr(
     no auto-approve — so a human can intervene).
     """
     template = brief_template or _default_brief()
-    brief = template.format(pr_url=pr_url, issue_number=issue_number)
+    from forge_loop._critic_sdk import load_manifestos_text
+
+    manifestos = load_manifestos_text(repo)
+    brief = template.format(
+        pr_url=pr_url,
+        issue_number=issue_number,
+        manifestos=manifestos,
+    )
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     ensure_subagent_trusted(repo)
@@ -199,20 +216,32 @@ def review_pr(
             report=report,
         )
 
+    # SDK path (issue #85): replaces the legacy ``claude -p`` subprocess
+    # call. We still write the assistant's final text to a per-attempt
+    # log file for operator postmortems, but the parse path now uses
+    # ``parse_report_from_text`` directly (no stream-json detour). The
+    # ``_subagent_env`` env-wiring is no longer needed — the SDK handles
+    # auth itself.
+    from forge_loop._critic_sdk import run_critic_sdk
+
     for attempt in range(2):  # initial + 1 retry
         log_path = logs_dir / f"critic-{issue_number}-{int(time.time())}-{attempt}.log"
         last_log_path = log_path
+        sdk_result = run_critic_sdk(
+            prompt=brief,
+            cwd=repo,
+            timeout_s=timeout_s,
+            model=model,
+            add_dirs=(repo,),
+        )
+        # Mirror the final assistant text to disk so the existing
+        # _tail(log_path, 500) read for stdout_tail keeps working and
+        # operators can grep critic-*.log as before.
         try:
-            with open(log_path, "wb") as logf:
-                subprocess.run(
-                    _build_critic_argv(brief, repo, model),
-                    cwd=repo,
-                    stdout=logf,
-                    stderr=subprocess.STDOUT,
-                    timeout=timeout_s,
-                    env=_subagent_env(),
-                )
-        except subprocess.TimeoutExpired:
+            log_path.write_text(sdk_result.last_message or "")
+        except OSError:
+            pass
+        if sdk_result.timed_out:
             return CriticOutcome(
                 verdict="error",
                 reasons=[],
@@ -221,8 +250,19 @@ def review_pr(
                 error=f"critic exceeded {timeout_s}s",
                 parse_retries=retries,
             )
+        if sdk_result.error:
+            # An SDK-side failure (auth, transport) — surface as error
+            # verdict so the runner doesn't auto-approve.
+            return CriticOutcome(
+                verdict="error",
+                reasons=[],
+                duration_s=time.time() - started,
+                stdout_tail=sdk_result.error[:500],
+                error=sdk_result.error,
+                parse_retries=retries,
+            )
 
-        report, parse_error = parse_report_from_log(log_path)
+        report, parse_error = parse_report_from_text(sdk_result.last_message)
         if report is not None:
             break
         retries = attempt + 1  # we just consumed one parse attempt
@@ -363,7 +403,47 @@ def _coerce_report(obj: dict[str, Any], raw: str) -> CriticReport | None:
         )
         if f.is_valid():
             findings.append(f)
-    return CriticReport(overall=overall, findings=findings, raw=raw)
+
+    # Back-compat: missing field is fine, defaults to empty list.
+    raw_violations = obj.get("manifesto_violations") or []
+    if not isinstance(raw_violations, list):
+        raw_violations = []
+    violations: list[ManifestoViolation] = []
+    for item in raw_violations:
+        if not isinstance(item, dict):
+            continue
+        rule_id = item.get("rule_id")
+        manifesto = item.get("manifesto")
+        # Drop entries missing the identifying fields entirely; we won't
+        # fabricate a rule_id for the model.
+        if not isinstance(rule_id, str) or not rule_id.strip():
+            continue
+        if not isinstance(manifesto, str) or not manifesto.strip():
+            continue
+        sev_raw = item.get("severity")
+        # Defensive default: unknown/missing severity → sev3 (non-blocking).
+        severity = sev_raw if sev_raw in VALID_SEVERITY else "sev3"
+        v = ManifestoViolation(
+            rule_id=rule_id,
+            manifesto=manifesto,
+            quote=str(item.get("quote", "")),
+            suggested_fix=str(item.get("suggested_fix", "")),
+            severity=severity,
+        )
+        if v.is_valid():
+            violations.append(v)
+
+    # sev1 manifesto violation forces request_changes even if the model
+    # said "approve" — manifesto compliance is a hard gate.
+    if overall == "approve" and any(v.severity == "sev1" for v in violations):
+        overall = "request_changes"
+
+    return CriticReport(
+        overall=overall,
+        findings=findings,
+        manifesto_violations=violations,
+        raw=raw,
+    )
 
 
 def _tail(path: Path | None, n: int) -> str:

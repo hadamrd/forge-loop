@@ -43,13 +43,14 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
+# subprocess imports removed in #85 — PO now drives the Claude Agent SDK
+# via _critic_sdk.run_po_sdk(). Codex provider still uses agent_backend.
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from forge_loop.worker import _subagent_env, ensure_subagent_trusted
+from forge_loop.worker import ensure_subagent_trusted
 
 
 def _default_brief() -> str:
@@ -138,31 +139,6 @@ def _looks_substantive(body: str) -> bool:
     return sum([has_acceptance, has_tests, has_scope]) >= 2
 
 
-def _build_po_argv(brief: str, repo: Path, model: str | None) -> list[str]:
-    """Assemble the ``claude -p`` argv for the PO subagent.
-
-    Split out so unit tests can assert on the argv directly without
-    monkey-patching subprocess.run gymnastics. ``--model`` is threaded
-    through when ``model`` is set (issue #34).
-    """
-    argv = [
-        "claude",
-        "-p",
-        brief,
-        "--max-turns",
-        "25",
-        "--allow-dangerously-skip-permissions",
-        "--add-dir",
-        str(repo),
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ]
-    if model:
-        argv.extend(["--model", model])
-    return argv
-
-
 def _run_one(
     issue_number: int,
     brief: str,
@@ -175,7 +151,6 @@ def _run_one(
 ) -> POOutcome:
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"po-{issue_number}-{int(time.time())}.log"
-    started = time.time()
 
     if provider == "codex":
         from forge_loop.agent_backend import extract_last_json_object, run_codex_exec
@@ -212,29 +187,59 @@ def _run_one(
             error=result.error,
         )
 
+    # SDK path (issue #85): replaces ``claude -p`` subprocess. The PO
+    # final message text gets written to log_path so _extract_outcome
+    # (which scans the log) keeps working without rewrite.
+    from forge_loop._critic_sdk import run_po_sdk
+
+    sdk_result = run_po_sdk(
+        prompt=brief,
+        cwd=repo,
+        timeout_s=timeout_s,
+        model=model,
+        add_dirs=(repo,),
+    )
     try:
-        with open(log_path, "wb") as logf:
-            subprocess.run(
-                _build_po_argv(brief, repo, model),
-                cwd=repo,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                timeout=timeout_s,
-                env=_subagent_env(),
-            )
-    except subprocess.TimeoutExpired:
+        log_path.write_text(sdk_result.last_message or "")
+    except OSError:
+        pass
+    if sdk_result.timed_out:
         return POOutcome(
             issue=issue_number,
             skipped=False,
             reason="po-timeout",
             sections_added=[],
-            duration_s=time.time() - started,
+            duration_s=sdk_result.duration_s,
             stdout_tail="(timeout)",
             error=f"po exceeded {timeout_s}s",
         )
+    if sdk_result.error:
+        return POOutcome(
+            issue=issue_number,
+            skipped=False,
+            reason="po-sdk-error",
+            sections_added=[],
+            duration_s=sdk_result.duration_s,
+            stdout_tail=sdk_result.error[:500],
+            error=sdk_result.error,
+        )
 
-    duration = time.time() - started
-    parsed = _extract_outcome(log_path)
+    duration = sdk_result.duration_s
+    # Parse the assistant's final text directly — SDK path doesn't write
+    # stream-json so the legacy log-walker (_extract_outcome) finds
+    # nothing. The agent's contract is "last line of last message is
+    # a JSON object with skipped/reason/sections_added".
+    parsed: dict[str, Any] = {}
+    for chunk in reversed((sdk_result.last_message or "").strip().splitlines()):
+        chunk = chunk.strip()
+        if chunk.startswith("{") and chunk.endswith("}"):
+            try:
+                parsed = json.loads(chunk)
+                break
+            except json.JSONDecodeError:
+                continue
+    if not parsed:
+        parsed = {"skipped": False, "reason": "no-final-json"}
     return POOutcome(
         issue=issue_number,
         skipped=bool(parsed.get("skipped", False)),

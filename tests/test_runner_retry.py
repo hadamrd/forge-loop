@@ -81,6 +81,7 @@ class _State:
         self.scripted_status: str = "failed"
         self.scripted_pr: str | None = None
         self.scripted_error: str | None = "boom"
+        self.unlabeled: list[tuple[int, str, str | None]] = []
 
 
 @pytest.fixture
@@ -126,6 +127,9 @@ def fake_world(monkeypatch, tmp_path: Path):
             error=state.scripted_error, events=[],
         )
 
+    def fake_unlabel(num: int, label: str, repo: str | None = None) -> None:
+        state.unlabeled.append((num, label, repo))
+
     # Patch points: top_issues + attempts.fetch_history_strict +
     # attempts.record + ThreadPoolExecutor's task (run_worker is captured by
     # name in runner via `from forge_loop.worker import run_worker`).
@@ -133,6 +137,7 @@ def fake_world(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(_attempts, "fetch_history_strict", fake_fetch_history_strict)
     monkeypatch.setattr(_attempts, "record", fake_record)
     monkeypatch.setattr(_runner, "run_worker", fake_run_worker)
+    monkeypatch.setattr(_runner, "unlabel", fake_unlabel)
     # Defang side effects:
     monkeypatch.setattr(_runner, "_reap_worktree", lambda *a, **k: None)
     monkeypatch.setattr(_runner, "redeploy", lambda *a, **k: (True, "ok"))
@@ -156,6 +161,22 @@ def test_first_tick_dispatches_and_records_fingerprint(fake_world) -> None:
     # History gained one record carrying a non-empty fingerprint
     assert len(state.history[99]) == 1
     assert len(state.history[99][0]["brief_fingerprint"]) == 64
+
+
+def test_open_pr_removes_ready_label(fake_world) -> None:
+    state, cfg, _ = fake_world
+    state.scripted_status = "open"
+    state.scripted_pr = "https://github.com/o/r/pull/100"
+    state.scripted_error = None
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.unlabeled == [(99, "loop:ready", "o/r")]
+    events = _read_events(cfg)
+    removed = next(e for e in events if e["kind"] == "issue_ready_label_removed")
+    assert removed["issue"] == 99
+    assert removed["status"] == "open"
+    assert removed["pr_url"] == "https://github.com/o/r/pull/100"
 
 
 def test_failure_then_cooldown_skip_then_release(fake_world, monkeypatch) -> None:
@@ -205,6 +226,11 @@ def test_in_flight_skip_emits_pr_url(fake_world) -> None:
     skip = next(e for e in events if e["kind"] == "worker_skip_in_flight")
     assert skip["issue"] == 99
     assert skip["pr_url"] == "https://github.com/o/r/pull/777"
+    assert state.unlabeled == [(99, "loop:ready", "o/r")]
+    removed = next(e for e in events if e["kind"] == "issue_ready_label_removed")
+    assert removed["issue"] == 99
+    assert removed["status"] == "in_flight"
+    assert removed["pr_url"] == "https://github.com/o/r/pull/777"
 
 
 def test_body_change_invalidates_in_flight_skip(fake_world) -> None:

@@ -18,9 +18,12 @@ from forge_loop import _worker_sdk
 from forge_loop.worker import (
     _branch_name,
     _extract_outcome,
+    _prep_worktree,
     _read_subagent_events,
     _tail,
     make_brief,
+    make_repair_brief,
+    run_repair_worker,
     run_worker,
 )
 
@@ -183,6 +186,73 @@ def test_make_brief_default_keeps_automerge(tmp_path: Path) -> None:
     assert "DO NOT enable auto-merge" not in brief
 
 
+def test_make_repair_brief_keeps_same_pr_contract(tmp_path: Path) -> None:
+    issue = {"number": 42, "title": "fix blocked pr", "body": "Acceptance"}
+    pr = {
+        "number": 7,
+        "url": "https://github.com/o/r/pull/7",
+        "headRefName": "loop/42-fix-blocked-pr",
+    }
+    brief = make_repair_brief(
+        issue,
+        tmp_path / "wt",
+        pr=pr,
+        review_context="[sev1] fix the real consumer",
+    )
+    assert "Repair the EXISTING PR branch" in brief
+    assert "Do not create a new branch" in brief
+    assert "https://github.com/o/r/pull/7" in brief
+    assert "[sev1] fix the real consumer" in brief
+    assert '"pr": "https://github.com/o/r/pull/7"' in brief
+
+
+def test_run_repair_worker_codex_uses_existing_pr_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from forge_loop import agent_backend
+
+    worktree = tmp_path / "repair"
+    worktree.mkdir()
+
+    def fake_prep(_repo: Path, issue: int, branch: str) -> tuple[Path, None]:
+        assert issue == 42
+        assert branch == "loop/42-fix-blocked-pr"
+        return worktree, None
+
+    def fake_codex(**kwargs: Any) -> agent_backend.AgentRunResult:
+        assert kwargs["cwd"] == worktree
+        assert "Do not create a new branch" in kwargs["prompt"]
+        return agent_backend.AgentRunResult(
+            provider="codex",
+            log_path=kwargs["log_path"],
+            last_message=(
+                '{"issue": 42, "pr": "https://github.com/o/r/pull/7", '
+                '"status": "open", "note": "repair pushed"}'
+            ),
+            duration_s=2.0,
+        )
+
+    monkeypatch.setattr("forge_loop.worker._prep_repair_worktree", fake_prep)
+    monkeypatch.setattr(agent_backend, "run_codex_exec", fake_codex)
+
+    out = run_repair_worker(
+        {"number": 42, "title": "fix blocked pr", "body": "Acceptance"},
+        {
+            "number": 7,
+            "url": "https://github.com/o/r/pull/7",
+            "headRefName": "loop/42-fix-blocked-pr",
+        },
+        "[sev1] finding",
+        tmp_path,
+        tmp_path / "logs",
+        30,
+        provider="codex",
+    )
+    assert out.status == "open"
+    assert out.pr_url == "https://github.com/o/r/pull/7"
+
+
 def test_run_worker_codex_provider_maps_final_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -192,9 +262,7 @@ def test_run_worker_codex_provider_maps_final_json(
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
-    def fake_prep(
-        _repo: Path, _n: int, _branch: str, _base_branch: str = "trunk"
-    ) -> tuple[Path, None]:
+    def fake_prep(_repo: Path, _n: int, _branch: str, **_kwargs: Any) -> tuple[Path, None]:
         return worktree, None
 
     def fake_codex(**kwargs: Any) -> agent_backend.AgentRunResult:
@@ -222,6 +290,101 @@ def test_run_worker_codex_provider_maps_final_json(
     assert out.status == "open"
     assert out.pr_url == "https://github.com/o/r/pull/9"
     assert out.model == "gpt-5-codex"
+
+
+def test_prep_worktree_uses_configured_base_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _Completed:
+        calls.append(cmd)
+        return _Completed()
+
+    monkeypatch.setattr("forge_loop.worker.subprocess.run", fake_run)
+    monkeypatch.setattr("forge_loop.worker._drop_permissive_settings", lambda _wt: None)
+
+    worktree, err = _prep_worktree(tmp_path, 12, "loop/12-demo", base_branch="main")
+
+    assert err is None
+    assert str(worktree).endswith("/tmp/wt-loop-12")
+    assert [
+        "git",
+        "fetch",
+        "--prune",
+        "origin",
+        "+refs/heads/main:refs/remotes/origin/main",
+    ] in calls
+    assert ["git", "worktree", "add", str(worktree), "-B", "loop/12-demo", "origin/main"] in calls
+
+
+def test_prep_worktree_quarantines_undeletable_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a prior worker planted files we can't chmod/rm (uid mismatch),
+    the dir is renamed out of the way so the new `git worktree add`
+    doesn't collide. Without this, every retry of the same issue hits
+    `worktree-create-failed` and the loop spins forever.
+
+    Repro: simulate `shutil.rmtree` raising PermissionError, then
+    verify (a) `worktree add` still gets called, and (b) a quarantine
+    dir matching `wt-loop-<N>.stale-<ts>` exists.
+    """
+    import shutil as _real_shutil
+
+    real_rmtree = _real_shutil.rmtree  # capture before monkeypatch
+
+    blocking = Path("/tmp/wt-loop-9999")
+    # Pre-clean from any prior failed run before we monkeypatch rmtree.
+    for q in Path("/tmp").glob("wt-loop-9999*"):
+        real_rmtree(q, ignore_errors=True)
+    blocking.mkdir(exist_ok=True)
+    (blocking / "marker").write_text("planted")
+
+    class _Completed:
+        returncode = 0
+        stderr = ""
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _Completed:
+        calls.append(cmd)
+        return _Completed()
+
+    def boom_rmtree(_path: str | Path) -> None:
+        raise PermissionError("simulated: planted by another uid")
+
+    monkeypatch.setattr("forge_loop.worker.subprocess.run", fake_run)
+    monkeypatch.setattr("forge_loop.worker.shutil.rmtree", boom_rmtree)
+    monkeypatch.setattr("forge_loop.worker._drop_permissive_settings", lambda _wt: None)
+
+    try:
+        worktree, err = _prep_worktree(tmp_path, 9999, "loop/9999-demo")
+        assert err is None
+        # `git worktree add` MUST still get called — quarantine unblocked it.
+        assert any(
+            cmd[:3] == ["git", "worktree", "add"] for cmd in calls
+        ), f"worktree add was not called: {calls!r}"
+        # The blocking dir got renamed out of the way.
+        assert not blocking.exists(), "blocking dir should have been quarantined"
+        quarantined = sorted(
+            Path("/tmp").glob("wt-loop-9999.stale-*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        assert quarantined, "quarantine dir was not created"
+        # Quarantined dir (newest = this run's) still holds the original
+        # marker — rename, not delete. Pre-clean above strips prior runs.
+        assert (quarantined[0] / "marker").read_text() == "planted"
+    finally:
+        for q in Path("/tmp").glob("wt-loop-9999*"):
+            real_rmtree(q, ignore_errors=True)
 
 
 # Gradle/WSL-OOM guard tests removed: forge-loop is stack-agnostic; the
@@ -383,6 +546,8 @@ def test_sdk_happy_path_extracts_pr_and_merged(patch_sdk_types: None) -> None:
     # The MCP filter (issue #60) injects a ``worker_mcp_filtered`` event
     # immediately after ``turn_start``; the original event order is
     # otherwise preserved.
+    # Issue #109 (SDK session_id wiring) added `cost_telemetry` after
+    # `final_result`. Original ordering otherwise preserved.
     assert kinds == [
         "turn_start",
         "worker_mcp_filtered",
@@ -391,9 +556,12 @@ def test_sdk_happy_path_extracts_pr_and_merged(patch_sdk_types: None) -> None:
         "tool_result",
         "assistant_text",
         "final_result",
+        "cost_telemetry",
     ]
     # seq is monotonic
-    assert [e["seq"] for e in captured] == list(range(1, len(captured) + 1))
+    assert [e["seq"] for e in captured if "seq" in e] == list(
+        range(1, sum(1 for e in captured if "seq" in e) + 1)
+    )
     # tool_result content survives
     tr = next(e for e in captured if e["kind"] == "tool_result")
     assert tr["content"] == "file contents"

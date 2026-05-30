@@ -455,7 +455,12 @@ def serve(
     ``build_handler`` for the older Prometheus test; ``serve`` itself now
     runs the FastAPI app via uvicorn so the operator gets the full UI.
     """
-    token = token if token is not None else os.environ.get("LOOP_DASHBOARD_TOKEN") or None
+    if token is None:
+        try:
+            from forge_loop.settings import Settings
+            token = Settings.load().dashboard.token or None
+        except Exception:  # noqa: BLE001 — dashboard must not crash on cfg errors
+            token = None
     # Safety: refuse to expose a no-auth dashboard to the world.
     if host in {"0.0.0.0", "::", "*"} and not token:  # noqa: S104
         raise DashboardBindError(

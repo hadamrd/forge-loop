@@ -1,0 +1,5 @@
+axes:
+  - name: empty-work
+    customer: c
+    valuable_means: v
+    acceptable_work: []

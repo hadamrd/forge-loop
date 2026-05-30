@@ -23,9 +23,25 @@ from forge_loop.runner._helpers import (
 from forge_loop.runner._helpers import (
     rotate_events_file_at_boot as _rotate_events_file_at_boot,
 )
+from forge_loop.runner.state import RunnerState, get_default_state
 from forge_loop.state import append_event, write_state
 
-_RUN = True
+
+def _get_run_flag() -> bool:
+    """Back-compat shim — legacy code reads ``boot._RUN``.
+
+    Forwards to the module-level default RunnerState so existing imports
+    + the ``while _RUN:`` shape keep working. New code that wants per-
+    instance isolation passes a :class:`RunnerState` to :func:`run`.
+    """
+    return get_default_state().should_run
+
+
+# Legacy module attribute: kept as a property-like descriptor so external
+# readers (and old test snapshots) still see a ``boolean``-shaped value.
+# Writers (``global _RUN; _RUN = False``) are now routed to ``state.request_stop()``
+# via :func:`_install_signal_handlers`.
+_RUN = True  # superseded by RunnerState; do not write directly — call state.request_stop()
 
 
 def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
@@ -33,8 +49,21 @@ def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
     return _reap_orphan_worktrees_impl(repo, events_file)
 
 
-def _install_signal_handlers(cfg: Config) -> None:
+def _install_signal_handlers(cfg: Config, state: RunnerState | None = None) -> None:
+    """Install SIGTERM/SIGINT/SIGUSR1 handlers bound to ``state``.
+
+    ``state`` defaults to the module singleton so legacy callers (and
+    tests that don't pass a state) keep working. New code constructs a
+    :class:`RunnerState` per Runner instance.
+    """
+    if state is None:
+        state = get_default_state()
+
     def _stop(*_: Any) -> None:
+        state.request_stop()
+        # Mirror the legacy module flag so external code that still
+        # imports ``_RUN`` sees the change. New code shouldn't depend on
+        # this — read ``state.should_run`` instead.
         global _RUN
         _RUN = False
         append_event(cfg.events_file, "signal_stop")
@@ -52,12 +81,79 @@ def _install_signal_handlers(cfg: Config) -> None:
     signal.signal(signal.SIGUSR1, _pause_toggle)
 
 
-def _short_sleep(seconds: int, cfg: Config) -> None:
+def _short_sleep(
+    seconds: int, cfg: Config, state: RunnerState | None = None
+) -> None:
     """Sleep but stay responsive to stop/pause signals + touchfiles."""
+    if state is None:
+        state = get_default_state()
     for _ in range(seconds):
-        if not _RUN or cfg.stop_file.exists() or cfg.pause_file.exists():
+        if not state.should_run or cfg.stop_file.exists() or cfg.pause_file.exists():
             return
         time.sleep(1)
+
+
+def _run_crash_recovery(cfg: Config) -> None:
+    """Boot-time crash-recovery walk for persistent-worker sessions (#111).
+
+    No-op unless ``iteration.persistent_worker`` is enabled — until then
+    the session store is dormant and there is nothing to recover. With
+    it on, walks every non-terminal session and applies the per-state
+    recovery decision documented in
+    :mod:`forge_loop.runner.recovery`.
+
+    Best-effort: any failure here is logged via a typed event and
+    swallowed. A broken recovery path MUST NOT keep the runner from
+    starting — the next dispatch tick can still make progress on
+    fresh issues.
+    """
+    from forge_loop.settings import Settings as _Settings
+
+    try:
+        s = _Settings.load()
+    except Exception as ex:  # noqa: BLE001 — boundary
+        append_event(
+            cfg.events_file, "crash_recovery_skipped",
+            reason=f"settings_load_failed: {type(ex).__name__}",
+        )
+        return
+
+    if not getattr(s.iteration, "persistent_worker", False):
+        return
+
+    if not cfg.github_repo or "/" not in cfg.github_repo:
+        append_event(
+            cfg.events_file, "crash_recovery_skipped",
+            reason="github_repo not configured",
+        )
+        return
+    owner, repo = cfg.github_repo.split("/", 1)
+
+    try:
+        from forge_loop.gh_client import GithubkitClient
+        from forge_loop.runner.recovery import recover_sessions
+        from forge_loop.worker_sessions import WorkerSessionStore
+
+        db_path = cfg.state_dir / "worker-sessions.db"
+        store = WorkerSessionStore(db_path)
+        gh = GithubkitClient()
+        decisions = recover_sessions(
+            store,
+            gh_client=gh,
+            owner=owner,
+            repo=repo,
+            events_file=cfg.events_file,
+        )
+        append_event(
+            cfg.events_file, "crash_recovery_done",
+            count=len(decisions),
+            actions={d.action: 1 for d in decisions},  # shape-aware summary
+        )
+    except Exception as ex:  # noqa: BLE001 — boundary
+        append_event(
+            cfg.events_file, "crash_recovery_failed",
+            error=f"{type(ex).__name__}: {ex!s:.200}",
+        )
 
 
 def _validate_pipeline_if_configured(cfg: Config) -> None:
@@ -93,14 +189,29 @@ def _validate_pipeline_if_configured(cfg: Config) -> None:
     )
 
 
-def run(cfg: Config) -> int:
+def run(cfg: Config, state: RunnerState | None = None) -> int:
+    """Run the dispatch loop.
+
+    ``state`` defaults to the module-level singleton so legacy
+    ``forge_loop.runner.run(cfg)`` callers keep working. Pass an
+    explicit :class:`RunnerState` (or use :class:`forge_loop.runner.Runner`)
+    when you want per-instance isolation — required to drive concurrent
+    Runners in the same process or to ``stop()`` one without affecting
+    another.
+    """
     from forge_loop.runner.tick import _tick
 
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     cfg.events_file.touch()
 
-    _install_signal_handlers(cfg)
+    if state is None:
+        state = get_default_state()
+    # Clear any prior stop request that may have leaked from a previous run
+    # against the same default state (e.g. tests that run twice).
+    state.stop_event.clear()
+
+    _install_signal_handlers(cfg, state)
 
     # Issue #59 — rotate the events log if it has grown past the threshold
     # (default 10 MiB, override via LOOP_EVENTS_ROTATE_BYTES). Best-effort:
@@ -121,13 +232,19 @@ def run(cfg: Config) -> int:
     # Queue bootstrap. Default = in-memory (zero infra, single host).
     # Set LOOP_QUEUE_URL=sqlite:///path/to/queue.db for the durable
     # embedded backend. Multi-host Redis support was removed in #39.
-    import os as _os
-
     from forge_loop.queue import build_queue, default_host_id
+    from forge_loop.settings import Settings as _Settings
 
-    queue_url = _os.environ.get("LOOP_QUEUE_URL")
+    # Settings-driven (issue #84): was env LOOP_QUEUE_URL, now misc.queue_url.
+    queue_url = _Settings.load().misc.queue_url
     queue = build_queue(queue_url)
     host_id = default_host_id()
+
+    # Issue #126 — surface the axis filter at startup so an operator
+    # tail'ing events can audit a focused-sprint launch.
+    from forge_loop.axis import parse_filter_env as _parse_axis_filter
+
+    _axes = _parse_axis_filter()
 
     append_event(
         cfg.events_file,
@@ -140,7 +257,14 @@ def run(cfg: Config) -> int:
         host_id=host_id,
         distributed=False,
         queue_backend=(queue_url or "memory"),
+        axis_filter=_axes,
     )
+    if _axes:
+        import logging as _logging
+
+        _logging.getLogger("forge_loop.runner").info(
+            "axis filter active: %s", ",".join(_axes)
+        )
     write_state(cfg.state_file, {"state": "starting", "tick": 0, "parallel": cfg.parallel})
 
     # Issue #18 — if `.forge/pipeline.yaml` exists, validate it at startup so
@@ -149,8 +273,14 @@ def run(cfg: Config) -> int:
     # this validation does not change the legacy PO→worker→critic flow.
     _validate_pipeline_if_configured(cfg)
 
+    # Issue #111 — crash recovery: walk non-terminal sessions left over
+    # from a previous (crashed) runner and decide per-state how to
+    # resume. Runs BEFORE the first dispatch tick so the recovery walk
+    # observes the same store the tick will read.
+    _run_crash_recovery(cfg)
+
     tick = 0
-    while _RUN:
+    while state.should_run:
         if cfg.stop_file.exists():
             append_event(cfg.events_file, "stop_file_seen")
             cfg.stop_file.unlink()
@@ -309,7 +439,9 @@ def run_async(cfg: Config) -> int:
             thinking=cfg.worker.thinking,
             provider=getattr(cfg.worker, "provider", "claude"),
             allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
-            base_branch=cfg.base_branch,
+            load_timeout_ms=cfg.worker.load_timeout_ms,
+            strict_mcp_config=cfg.worker.strict_mcp_config,
+            mcp_servers=cfg.worker.mcp_servers,
         )
         return {
             "issue": o.issue,
@@ -440,7 +572,8 @@ def run_async(cfg: Config) -> int:
         await asyncio.sleep(cfg.tick_interval_s)
 
     async def _main() -> None:
-        while _RUN:
+        _async_state = get_default_state()
+        while _async_state.should_run:
             if cfg.stop_file.exists():
                 append_event(cfg.events_file, "stop_file_seen")
                 cfg.stop_file.unlink()

@@ -4,6 +4,10 @@ Your job: review it and emit a structured JSON CriticReport.
 PR URL: {pr_url}
 Linked issue: #{issue_number}
 
+MANIFESTOS (canonical project rules — violations are first-class findings):
+{manifestos}
+END MANIFESTOS
+
 DO:
 1. Read the issue via `gh issue view {issue_number} --comments` to learn the
    acceptance criteria. Note any "Acceptance" or "Out of scope" sections.
@@ -34,6 +38,19 @@ DO NOT:
 - comment on formatting (the formatter does that).
 - post review comments yourself — the runner does that from your report.
 
+MANIFESTO COMPLIANCE CHECK:
+   For every manifesto above, scan the PR diff for rule violations and
+   emit one entry in ``manifesto_violations`` per violation. Each entry:
+     - rule_id: the rule's identifier as it appears in the manifesto
+       (e.g. ``EH-001``).
+     - manifesto: the manifesto filename (e.g. ``error-handling.md``).
+     - quote: the offending snippet, verbatim, from the PR diff.
+     - suggested_fix: a concrete, minimal change that would resolve it.
+     - severity: sev1 | sev2 | sev3 — use the severity declared in the
+       manifesto. Default to sev3 only if the manifesto is silent.
+   ANY sev1 manifesto violation forces ``overall = "request_changes"``
+   regardless of other findings — manifesto compliance is a hard gate.
+
 FINAL OUTPUT (one JSON line, no prose after it, no markdown fence):
 {{"overall": "approve|request_changes|block",
   "findings": [
@@ -42,6 +59,13 @@ FINAL OUTPUT (one JSON line, no prose after it, no markdown fence):
       "file": "path/to/file" or null,
       "line": 42 or null,
       "message": "what's wrong and what to do"}}
+  ],
+  "manifesto_violations": [
+    {{"rule_id": "EH-001",
+      "manifesto": "error-handling.md",
+      "quote": "except Exception: pass",
+      "suggested_fix": "catch the specific exception and log it",
+      "severity": "sev1|sev2|sev3"}}
   ],
   "issue": {issue_number}}}
 

@@ -1,0 +1,18 @@
+You are resuming work on issue #{issue_n}: {title}
+
+PR {pr_url} is OPEN but BLOCKED by the critic. Below is the critic's report.
+
+Critic findings:
+{critic_report}
+
+Your ONLY job is to address the sev1/sev2 findings above. Do NOT add features.
+Do NOT touch unrelated code.
+
+1. `cd /tmp/wt-loop-{issue_n}`.
+2. Edit ONLY the files the critic flagged.
+3. Run the relevant tests to confirm.
+4. `git add -A && git commit -m "fix: address critic on #{issue_n}"` (with a body).
+5. `git push origin {branch}`.
+
+The auto-merge label stays — the next critic pass decides.
+Then exit. Attempt {attempt} of {max_attempts}.

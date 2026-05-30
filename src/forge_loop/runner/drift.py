@@ -16,30 +16,42 @@ from forge_loop.config import Config
 from forge_loop.runner._helpers import (
     consecutive_deploy_fails as _consecutive_deploy_fails_impl,
 )
+from forge_loop.runner.state import RunnerState, get_default_state
 from forge_loop.state import append_event
 
-# Drift detector — keep last 3 tick outcomes' summary tuples.
-# Each entry: (had_workers: bool, all_failed: bool, error_signature: str)
-_RECENT_OUTCOMES: deque[tuple[bool, bool, str]] = deque(maxlen=3)
+# Back-compat alias for legacy imports (``from forge_loop.runner.drift
+# import _RECENT_OUTCOMES``). Aliasing the deque object — mutations via
+# either name affect the same instance.
+_RECENT_OUTCOMES = get_default_state().recent_outcomes
 
 
-def _check_drift_and_maybe_halt(cfg: Config) -> bool:
-    """Returns True if the loop should halt due to drift."""
-    if len(_RECENT_OUTCOMES) < 3:
+def _check_drift_and_maybe_halt(
+    cfg: Config, state: RunnerState | None = None
+) -> bool:
+    """Returns True if the loop should halt due to drift.
+
+    ``state`` defaults to the legacy module-level singleton so existing
+    callers keep working unchanged. New code passes its Runner's state
+    explicitly to enable concurrent-Runner isolation (issue #87).
+    """
+    if state is None:
+        state = get_default_state()
+    outcomes = state.recent_outcomes
+    if len(outcomes) < 3:
         return False
     # All 3 must be worker-bearing AND all 3 must have failed AND same signature
-    sigs = {sig for had_w, all_failed, sig in _RECENT_OUTCOMES if had_w and all_failed}
-    if len(sigs) == 1 and all(had_w and all_failed for had_w, all_failed, _ in _RECENT_OUTCOMES):
+    sigs = {sig for had_w, all_failed, sig in outcomes if had_w and all_failed}
+    if len(sigs) == 1 and all(had_w and all_failed for had_w, all_failed, _ in outcomes):
         sig = next(iter(sigs))
         append_event(cfg.events_file, "loop_drift_halt", signature=sig,
-                     last_3=list(_RECENT_OUTCOMES))
+                     last_3=list(outcomes))
         # File a loop:halt issue so the operator wakes up to a clear signal.
         title = f"loop: drift halt — 3 ticks in a row failed ({sig})"
         body = (
             f"The sprint loop self-halted at {time.strftime('%Y-%m-%dT%H:%M:%S%z')} "
             f"after 3 consecutive ticks failed with the same signature: `{sig}`.\n\n"
             f"Last 3 outcomes (had_workers, all_failed, signature):\n"
-            + "\n".join(f"- {o}" for o in _RECENT_OUTCOMES)
+            + "\n".join(f"- {o}" for o in outcomes)
             + "\n\nSee `docs/ops/loop-runner-events.jsonl` for the full trail. "
             "Resolve the root cause and remove the `docs/ops/loop-runner.stop` "
             "file to resume."
@@ -76,7 +88,10 @@ def _maybe_deploy_drift_halt(cfg: Config, ok: bool) -> None:
     if not ok and fails >= 3:
         append_event(cfg.events_file, "deploy_drift_warn",
                      consecutive_fails=fails)
-        if os.environ.get("LOOP_DEPLOY_DRIFT_HALT") == "1":
+        # Settings-driven (issue #84): was env LOOP_DEPLOY_DRIFT_HALT,
+        # now deploy.drift_halt with the unified env > yaml > default precedence.
+        from forge_loop.settings import Settings as _Settings
+        if _Settings.load().deploy.drift_halt:
             append_event(cfg.events_file, "deploy_drift_halt",
                          consecutive_fails=fails)
             with contextlib.suppress(OSError):

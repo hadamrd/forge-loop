@@ -1,0 +1,5 @@
+axes:
+  - name: missing-customer
+    valuable_means: x
+    acceptable_work:
+      - y

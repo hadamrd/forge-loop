@@ -6,6 +6,7 @@ no behaviour change, no signature change.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -16,8 +17,431 @@ from forge_loop import master_log as _mlog
 from forge_loop.config import Config
 from forge_loop.critic import review_pr as _critic_review
 from forge_loop.critic_actions import apply_critic_report
+from forge_loop.runner.persistent_dispatch import (
+    get_or_resume_session,
+    mark_running,
+    open_default_store,
+    persistent_worker_enabled,
+    record_outcome,
+)
 from forge_loop.state import append_event
-from forge_loop.worker import WorkerOutcome, run_worker
+from forge_loop.worker import WorkerOutcome, run_repair_worker, run_worker
+from forge_loop.worker_sessions import WorkerSessionStore
+from forge_loop.worker_state import InvalidTransition, WorkerState
+
+# Label applied to PRs whose persistent-worker session has exhausted the
+# critic ping-pong budget. Operators filter on this label to triage stuck
+# work that the loop has decided not to keep grinding on.
+NEEDS_HUMAN_LABEL = "loop:needs-human"
+
+# Label applied to PRs whose critic returned a BLOCK (sev1) verdict during
+# the ping-pong protocol (issue #110). Distinct from NEEDS_HUMAN_LABEL,
+# which fires on iteration-cap exhaustion (#111). Operators reading the
+# PR list can tell the two failure modes apart at a glance.
+NEEDS_REVIEW_LABEL = "loop:needs-review"
+
+
+def resume_kwargs_for(
+    store: WorkerSessionStore,
+    session_id: str,
+) -> dict[str, str]:
+    """Return ``{"resume": <sdk_id>}`` if this session can warm-resume.
+
+    The SDK preserves its prompt cache across calls when the caller passes
+    ``resume=<prior session_id>`` (issue #109 — the headline efficiency win
+    of epic #95). We resume on RUNNING/REVISING because those are the two
+    states where the FSM signals "the worker is still on the same logical
+    piece of work" (RUNNING = mid-attempt, REVISING = post-critic feedback,
+    same brief). DISPATCHED is a cold start by definition; AWAITING_CRITIC
+    means control is with the critic, so the worker isn't dispatching.
+
+    Returns an empty dict when:
+    - the session doesn't exist (caller bug, but treat defensively),
+    - the session has no ``sdk_session_id`` yet (first dispatch),
+    - the session isn't in a resumable state.
+
+    The empty dict is splat-safe at the call site: just
+    ``await run_sdk_session(..., **resume_kwargs_for(store, sid))``.
+    """
+    sess = store.get(session_id)
+    if sess is None:
+        return {}
+    if not sess.sdk_session_id:
+        return {}
+    if sess.state not in {WorkerState.RUNNING, WorkerState.REVISING}:
+        return {}
+    return {"resume": sess.sdk_session_id}
+
+
+def persist_sdk_result(
+    *,
+    store: WorkerSessionStore,
+    session_id: str,
+    result: Any,
+    emit: Any = None,
+) -> None:
+    """Save the SDK's session id and emit cost telemetry.
+
+    Called once after every ``run_sdk_session(...)`` invocation. Two
+    side effects:
+
+    1. If ``result.sdk_session_id`` is set, write it through
+       :meth:`WorkerSessionStore.set_sdk_session_id` so the next
+       dispatch can pass ``resume=`` and reuse the prompt cache.
+    2. Emit a ``cost_telemetry`` event carrying input/output tokens and
+       a ``cache_hit_ratio`` — operators watch this ratio climb on
+       round 2+ to confirm the persistent-worker epic is paying off.
+
+    ``emit`` may be ``None`` (legacy callers / unit tests); both side
+    effects are best-effort so a telemetry failure never prevents the
+    SDK session id from landing.
+    """
+    sdk_id = getattr(result, "sdk_session_id", None)
+    if isinstance(sdk_id, str) and sdk_id:
+        with contextlib.suppress(Exception):
+            store.set_sdk_session_id(session_id, sdk_id)
+
+    if emit is None:
+        return
+    usage = dict(getattr(result, "usage", {}) or {})
+    with contextlib.suppress(Exception):
+        emit(
+            "cost_telemetry",
+            session_id=session_id,
+            sdk_session_id=sdk_id,
+            input_tokens=int(usage.get("input_tokens", 0) or 0),
+            output_tokens=int(usage.get("output_tokens", 0) or 0),
+            cache_read_input_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
+            cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
+            cache_hit_ratio=round(float(getattr(result, "cache_hit_ratio", 0.0) or 0.0), 4),
+            cost_usd=float(getattr(result, "cost_usd", 0.0) or 0.0),
+            model=getattr(result, "model", "") or "",
+        )
+
+
+def free_dispatch_slots(store: WorkerSessionStore, parallel: int) -> int:
+    """Return the number of free parallel dispatch slots on this tick.
+
+    This is the headline efficiency win of issue #112 (toward epic #95):
+    the dispatcher reads :meth:`WorkerSessionStore.active_count` — which
+    only counts ``RUNNING`` and ``REVISING`` sessions — instead of an
+    in-memory ``len(self._running_futures)`` that would also count
+    paused ``AWAITING_CRITIC`` sessions against the budget.
+
+    A session sitting in ``AWAITING_CRITIC`` has handed control back to
+    the critic agent; it is not consuming a worker thread. Counting it
+    against ``parallel`` starves the loop of forward progress: with
+    ``parallel=3`` and three AWAITING_CRITIC sessions, the legacy
+    accounting would refuse to dispatch ANY new worker until the
+    critic finished. The store-based accounting frees those slots
+    immediately, so the dispatcher can fill them with fresh work.
+
+    Args:
+        store: the SQLite session store driving the runner.
+        parallel: the configured worker-parallelism cap.
+
+    Returns:
+        ``max(0, parallel - store.active_count())``. The ``max(0, …)``
+        guards against transient over-subscription (e.g. an operator
+        lowering ``parallel`` mid-run with live workers): the dispatcher
+        simply refuses to launch more until the count drains, instead
+        of returning a negative number that downstream callers would
+        have to special-case.
+    """
+    return max(0, parallel - store.active_count())
+
+
+def enforce_critic_iteration_cap(
+    *,
+    store: WorkerSessionStore,
+    session_id: str,
+    pr_url: str | None,
+    max_critic_iterations: int,
+    findings_summary: str = "",
+    gh: Any = _gh,
+    repo: str | None = None,
+    emit: Any = None,
+) -> bool:
+    """Handle a REQUEST_CHANGES verdict against the iteration cap.
+
+    Called on every AWAITING_CRITIC -> (REVISING|ABANDONED) decision.
+    Reads ``session.critic_iterations`` and compares against
+    ``settings.iteration.max_critic_iterations``:
+
+    * counter >= cap  -> transition AWAITING_CRITIC -> ABANDONED with
+      ``reason="max_critic_iterations reached: N"``, label the PR
+      ``loop:needs-human``, and post a comment summarising the last
+      critic findings so a human picking this up has the context.
+    * counter <  cap  -> bump the counter, transition to REVISING with
+      ``reason="critic requested changes"`` so the persistent worker
+      session can resume with a warm prompt cache (issue #95).
+
+    Returns ``True`` when the session was abandoned (caller should stop
+    dispatching this issue's revision loop), ``False`` when a revision
+    is in flight.
+
+    Side effects on the GitHub side (label + comment) are best-effort:
+    a transient ``gh`` failure must not prevent the FSM transition from
+    landing, because the FSM is the source of truth — the label/comment
+    are operator UX. Failures are surfaced via ``emit`` so they're
+    observable in the event bus without blocking the loop.
+    """
+    sess = store.get(session_id)
+    if sess is None:
+        raise KeyError(f"unknown session_id: {session_id}")
+    if sess.state != WorkerState.AWAITING_CRITIC:
+        # Caller bug — the cap check belongs on the exact ping-pong edge,
+        # not on arbitrary state transitions. Surface this loudly.
+        raise InvalidTransition(sess.state, WorkerState.REVISING)
+
+    current = sess.critic_iterations
+    if current >= max_critic_iterations:
+        reason = f"max_critic_iterations reached: {current}"
+        store.transition_to(session_id, WorkerState.ABANDONED, reason=reason)
+        if pr_url:
+            try:
+                gh.add_pr_label(pr_url, [NEEDS_HUMAN_LABEL], repo=repo)
+            except Exception as ex_:  # noqa: BLE001 — best-effort
+                if emit is not None:
+                    with contextlib.suppress(Exception):
+                        emit("critic_cap_label_failed", issue=sess.issue, err=str(ex_)[:200])
+            body = (
+                f"Persistent-worker session abandoned after {current} critic "
+                f"iteration(s) (cap = {max_critic_iterations}).\n\n"
+                "Last critic findings:\n\n"
+                f"{findings_summary or '(no findings summary provided)'}"
+            )
+            try:
+                gh.pr_comment(pr_url, body, repo=repo)
+            except Exception as ex_:  # noqa: BLE001 — best-effort
+                if emit is not None:
+                    with contextlib.suppress(Exception):
+                        emit("critic_cap_comment_failed", issue=sess.issue, err=str(ex_)[:200])
+        if emit is not None:
+            with contextlib.suppress(Exception):
+                emit(
+                    "critic_iteration_cap_abandoned",
+                    issue=sess.issue,
+                    session_id=session_id,
+                    iterations=current,
+                    cap=max_critic_iterations,
+                    pr=pr_url,
+                )
+        return True
+
+    # Under the cap — bump counter, move to REVISING. The counter is
+    # bumped BEFORE the transition so a crash between the two leaves
+    # the session in AWAITING_CRITIC with the incremented count; the
+    # next tick re-enters this function and decides correctly.
+    new_count = store.increment_iterations(session_id)
+    store.transition_to(
+        session_id,
+        WorkerState.REVISING,
+        reason="critic requested changes",
+    )
+    if emit is not None:
+        with contextlib.suppress(Exception):
+            emit(
+                "critic_iteration_revising",
+                issue=sess.issue,
+                session_id=session_id,
+                iterations=new_count,
+                cap=max_critic_iterations,
+            )
+    return False
+
+
+def format_critic_followup_prompt(report: Any) -> str:
+    """Serialise critic findings into the next worker prompt VERBATIM.
+
+    Issue #110 contract: "The critic's comments get serialised into the
+    next worker prompt verbatim — no summarisation." So we render every
+    finding's full message + file/line + severity/category tag with NO
+    truncation, NO paraphrase, NO re-ordering. The worker sees exactly
+    what the critic wrote.
+
+    The leading instruction line tells the resumed SDK session that
+    these are the changes-requested findings to address. Because the
+    session resumes via ``resume=<sdk_session_id>``, the model already
+    has the prior worker context loaded (warm prompt cache) — we only
+    need to deliver the new feedback.
+    """
+    findings = list(getattr(report, "findings", []) or [])
+    header = (
+        "The critic returned REQUEST_CHANGES on your PR. "
+        "Address every finding below verbatim, then push a follow-up commit."
+    )
+    if not findings:
+        # Defensive: a REQUEST_CHANGES with zero findings is unusual but
+        # legal. Pass the raw report text through so the worker sees the
+        # critic's own words rather than an empty prompt.
+        raw = str(getattr(report, "raw", "")).strip()
+        body = raw or "(critic provided no findings text)"
+        return f"{header}\n\nCritic report:\n{body}"
+
+    lines: list[str] = [header, "", "Critic findings:"]
+    for f in findings:
+        loc = ""
+        if getattr(f, "file", None):
+            loc = f.file
+            if getattr(f, "line", None):
+                loc = f"{loc}:{f.line}"
+            loc = f" ({loc})"
+        lines.append(f"- [{f.severity}/{f.category}]{loc} {f.message}")
+    return "\n".join(lines)
+
+
+def handle_critic_verdict(
+    *,
+    store: WorkerSessionStore,
+    session_id: str,
+    report: Any,
+    pr_url: str | None,
+    gh: Any = _gh,
+    repo: str | None = None,
+    emit: Any = None,
+    dispatch_revision: Any = None,
+) -> str:
+    """Apply a critic verdict to the persistent-worker FSM (issue #110).
+
+    Routing table (matches the issue's acceptance criteria):
+
+    * ``approve`` → AWAITING_CRITIC → MERGED. Auto-merge has already
+      been queued by the gh layer; the FSM edge records that the loop
+      considers this session complete. Returns ``"merged"``.
+
+    * ``request_changes`` → AWAITING_CRITIC → REVISING. Bumps
+      ``critic_iterations`` via ``store.increment_iterations`` (counter
+      first so a crash between bump-and-transition still observes the
+      intended attempt count), then dispatches a follow-up worker via
+      the ``dispatch_revision`` callback. The callback is given the
+      resumed-session kwargs (``resume=<sdk_session_id>``) and the
+      verbatim critic-comments prompt — NO summarisation per the
+      ticket. ``dispatch_revision=None`` skips the dispatch step (used
+      by unit tests that only want to verify the FSM edge + bump).
+      Returns ``"revising"``.
+
+    * ``block`` → AWAITING_CRITIC → ABANDONED. The session is over;
+      a human takes it from here. Labels the PR ``loop:needs-review``
+      so operators can triage. Returns ``"abandoned"``.
+
+    * any other verdict (error / unknown) → no-op, returns ``"noop"``.
+      The caller MUST be able to keep the session in AWAITING_CRITIC
+      so the next tick can re-run the critic on a fresh log.
+
+    Pre-condition: ``session.state == AWAITING_CRITIC``. Any other
+    state raises :class:`InvalidTransition` so caller bugs surface
+    loudly instead of silently corrupting the FSM.
+
+    Iteration-cap enforcement (the >= max_critic_iterations gate) is
+    NOT handled here — that's issue #111 / :func:`enforce_critic_iteration_cap`.
+    This function is the verdict→state router; the cap is a separate
+    policy layer the runner stacks on top.
+    """
+    sess = store.get(session_id)
+    if sess is None:
+        raise KeyError(f"unknown session_id: {session_id}")
+    if sess.state != WorkerState.AWAITING_CRITIC:
+        raise InvalidTransition(sess.state, WorkerState.REVISING)
+
+    overall = str(getattr(report, "overall", "")).lower()
+
+    if overall == "approve":
+        store.transition_to(
+            session_id,
+            WorkerState.MERGED,
+            reason="critic approved",
+        )
+        if emit is not None:
+            with contextlib.suppress(Exception):
+                emit(
+                    "critic_verdict_merged",
+                    issue=sess.issue,
+                    session_id=session_id,
+                    pr=pr_url,
+                )
+        return "merged"
+
+    if overall == "block":
+        reason = "critic blocked (sev1)"
+        store.transition_to(session_id, WorkerState.ABANDONED, reason=reason)
+        if pr_url:
+            try:
+                gh.add_pr_label(pr_url, [NEEDS_REVIEW_LABEL], repo=repo)
+            except Exception as ex_:  # noqa: BLE001 — best-effort
+                if emit is not None:
+                    with contextlib.suppress(Exception):
+                        emit(
+                            "critic_block_label_failed",
+                            issue=sess.issue,
+                            err=str(ex_)[:200],
+                        )
+        if emit is not None:
+            with contextlib.suppress(Exception):
+                emit(
+                    "critic_verdict_blocked",
+                    issue=sess.issue,
+                    session_id=session_id,
+                    pr=pr_url,
+                )
+        return "abandoned"
+
+    if overall == "request_changes":
+        # Bump BEFORE transitioning so a crash mid-edge leaves the row
+        # in AWAITING_CRITIC with the new count — the next tick will
+        # re-route correctly.
+        new_count = store.increment_iterations(session_id)
+        store.transition_to(
+            session_id,
+            WorkerState.REVISING,
+            reason="critic requested changes",
+        )
+        # Build the verbatim follow-up prompt. This is what the spec
+        # calls "the critic's comments serialised into the next worker
+        # prompt verbatim".
+        followup_prompt = format_critic_followup_prompt(report)
+        resume_kw = resume_kwargs_for(store, session_id)
+        if emit is not None:
+            with contextlib.suppress(Exception):
+                emit(
+                    "critic_verdict_revising",
+                    issue=sess.issue,
+                    session_id=session_id,
+                    iterations=new_count,
+                    pr=pr_url,
+                    resumed=bool(resume_kw),
+                )
+        if dispatch_revision is not None:
+            # Best-effort — a dispatch failure must not undo the FSM
+            # edge. The next tick can re-attempt from REVISING.
+            try:
+                dispatch_revision(
+                    session=store.get(session_id),
+                    prompt=followup_prompt,
+                    resume_kwargs=resume_kw,
+                )
+            except Exception as ex_:  # noqa: BLE001 — boundary
+                if emit is not None:
+                    with contextlib.suppress(Exception):
+                        emit(
+                            "critic_revision_dispatch_failed",
+                            issue=sess.issue,
+                            session_id=session_id,
+                            err=str(ex_)[:300],
+                        )
+        return "revising"
+
+    # Unknown / error verdict — leave the row in AWAITING_CRITIC so
+    # the next tick can retry the critic on a fresh log.
+    if emit is not None:
+        with contextlib.suppress(Exception):
+            emit(
+                "critic_verdict_unknown",
+                issue=sess.issue,
+                session_id=session_id,
+                overall=overall,
+            )
+    return "noop"
 
 
 def _sev_counts(outcome: Any) -> dict[str, int]:
@@ -30,6 +454,136 @@ def _sev_counts(outcome: Any) -> dict[str, int]:
         if f.severity in counts:
             counts[f.severity] += 1
     return counts
+
+
+def _branch_for_issue(issue: dict[str, Any]) -> str:
+    """Recompute the branch the worker subprocess will use.
+
+    We need this BEFORE spawning the worker so the WorkerSessionStore
+    row carries the canonical branch name. ``run_worker`` derives the
+    same value internally — we deliberately import the helper rather
+    than re-implementing the slug logic so a future tweak to one updates
+    the other.
+    """
+    from forge_loop.worker import _branch_name
+
+    return _branch_name(issue["number"], issue["title"])
+
+
+def _dispatch_one_worker(
+    cfg: Config,
+    issue: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    tick: int,
+    bus_emit: Any,
+    store: WorkerSessionStore | None,
+) -> WorkerOutcome:
+    """Run one worker, threading the persistent-worker FSM if enabled.
+
+    With ``store=None`` this is a pure passthrough to ``run_worker`` —
+    the legacy ``persistent_worker=False`` contract: no rows touched.
+
+    With ``store`` set:
+
+    1. Resolve a non-terminal session for the issue via
+       :func:`get_or_resume_session` (or seed a fresh DISPATCHED row).
+    2. Transition DISPATCHED → RUNNING immediately before invoking the
+       SDK.
+    3. Invoke ``run_worker`` (unchanged).
+    4. Apply the outcome edge via :func:`record_outcome` —
+       AWAITING_CRITIC + ``pr_url`` on success, ABANDONED on failure.
+
+    Exceptions escaping ``run_worker`` are caught and converted into an
+    ``ABANDONED`` transition so the store can never be left holding a
+    RUNNING row whose subprocess died. The original exception is then
+    re-raised so the ThreadPoolExecutor surfaces it to the caller.
+    """
+    if store is None:
+        return run_worker(
+            issue,
+            cfg.repo,
+            cfg.logs_dir,
+            cfg.worker_timeout_s,
+            risk_gated=meta["risk_gated"],
+            past_attempts=meta["past_attempts"],
+            emit=bus_emit,
+            lumen_top_k=cfg.lumen.top_k,
+            lumen_test_pattern=cfg.lumen_test_pattern,
+            coauthor=cfg.coauthor,
+            tick=tick,
+            model=cfg.worker.model,
+            thinking=cfg.worker.thinking,
+            provider=getattr(cfg.worker, "provider", "claude"),
+            allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+            load_timeout_ms=cfg.worker.load_timeout_ms,
+            strict_mcp_config=cfg.worker.strict_mcp_config,
+            mcp_servers=cfg.worker.mcp_servers,
+            base_branch=cfg.base_branch,
+        )
+
+    branch = _branch_for_issue(issue)
+    worktree_path = f"/tmp/wt-loop-{issue['number']}"
+    sess, _resumed = get_or_resume_session(
+        store,
+        issue=issue["number"],
+        branch=branch,
+        worktree_path=worktree_path,
+        events_file=cfg.events_file,
+    )
+    sess = mark_running(store, session=sess, events_file=cfg.events_file)
+
+    try:
+        outcome = run_worker(
+            issue,
+            cfg.repo,
+            cfg.logs_dir,
+            cfg.worker_timeout_s,
+            risk_gated=meta["risk_gated"],
+            past_attempts=meta["past_attempts"],
+            emit=bus_emit,
+            lumen_top_k=cfg.lumen.top_k,
+            lumen_test_pattern=cfg.lumen_test_pattern,
+            coauthor=cfg.coauthor,
+            tick=tick,
+            model=cfg.worker.model,
+            thinking=cfg.worker.thinking,
+            provider=getattr(cfg.worker, "provider", "claude"),
+            allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+            load_timeout_ms=cfg.worker.load_timeout_ms,
+            strict_mcp_config=cfg.worker.strict_mcp_config,
+            mcp_servers=cfg.worker.mcp_servers,
+            base_branch=cfg.base_branch,
+        )
+    except BaseException as ex_:
+        # The subprocess crashed before producing a WorkerOutcome. We
+        # MUST close out the FSM row — otherwise a recovery walk would
+        # treat this as a still-RUNNING session and try to resume it.
+        synthetic = WorkerOutcome(
+            issue=issue["number"],
+            title=issue.get("title", ""),
+            pr_url=None,
+            status="failed",
+            duration_s=0.0,
+            stdout_tail="",
+            error=f"{type(ex_).__name__}: {ex_!s:.200}",
+        )
+        with contextlib.suppress(Exception):
+            record_outcome(
+                store,
+                session=sess,
+                outcome=synthetic,
+                events_file=cfg.events_file,
+            )
+        raise
+
+    record_outcome(
+        store,
+        session=sess,
+        outcome=outcome,
+        events_file=cfg.events_file,
+    )
+    return outcome
 
 
 def _run_workers(
@@ -89,26 +643,35 @@ def _run_workers(
             used_pipeline = False
 
     if not used_pipeline:
+        # Issue #108: route every dispatch through WorkerSessionStore
+        # when ``settings.iteration.persistent_worker`` is enabled. The
+        # store is the source of truth for what's in flight; the FSM
+        # edges (DISPATCHED → RUNNING → AWAITING_CRITIC|ABANDONED) are
+        # driven by ``persistent_dispatch.{mark_running,record_outcome}``.
+        # With the flag OFF, ``store`` stays ``None`` and zero rows are
+        # touched — the legacy fire-and-forget path is preserved.
+        store: WorkerSessionStore | None = None
+        if persistent_worker_enabled():
+            try:
+                store = open_default_store(cfg.state_dir)
+            except Exception as ex_:  # noqa: BLE001 — never fail dispatch
+                append_event(
+                    cfg.events_file,
+                    "persistent_dispatch_store_open_failed",
+                    err=str(ex_)[:200],
+                )
+                store = None
+
         with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
             futures = [
                 ex.submit(
-                    run_worker,
+                    _dispatch_one_worker,
+                    cfg,
                     i,
-                    cfg.repo,
-                    cfg.logs_dir,
-                    cfg.worker_timeout_s,
-                    risk_gated=meta["risk_gated"],
-                    past_attempts=meta["past_attempts"],
-                    emit=bus_emit,
-                    lumen_top_k=cfg.lumen.top_k,
-                    lumen_test_pattern=cfg.lumen_test_pattern,
-                    coauthor=cfg.coauthor,
+                    meta,
                     tick=tick,
-                    model=cfg.worker.model,
-                    thinking=cfg.worker.thinking,
-                    provider=getattr(cfg.worker, "provider", "claude"),
-                    allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
-                    base_branch=cfg.base_branch,
+                    bus_emit=bus_emit,
+                    store=store,
                 )
                 for i, meta in dispatch
             ]
@@ -122,6 +685,50 @@ def _run_workers(
         )
 
     return outcomes, used_pipeline
+
+
+def _run_repair_workers(
+    cfg: Config,
+    repairs: list[tuple[dict[str, Any], dict[str, Any], str]],
+    tick: int,
+    master_log_path: Path,
+    bus_emit: Any,
+) -> list[WorkerOutcome]:
+    """Spawn workers that repair existing PR branches."""
+    outcomes: list[WorkerOutcome] = []
+    with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
+        futures = [
+            ex.submit(
+                run_repair_worker,
+                issue,
+                pr,
+                review_context,
+                cfg.repo,
+                cfg.logs_dir,
+                cfg.worker_timeout_s,
+                emit=bus_emit,
+                lumen_top_k=cfg.lumen.top_k,
+                lumen_test_pattern=cfg.lumen_test_pattern,
+                coauthor=cfg.coauthor,
+                tick=tick,
+                model=cfg.worker.model,
+                thinking=cfg.worker.thinking,
+                provider=getattr(cfg.worker, "provider", "claude"),
+                allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+                load_timeout_ms=cfg.worker.load_timeout_ms,
+                strict_mcp_config=cfg.worker.strict_mcp_config,
+                mcp_servers=cfg.worker.mcp_servers,
+            )
+            for issue, pr, review_context in repairs
+        ]
+        for fut in futures:
+            outcomes.append(fut.result())
+    for o in outcomes:
+        _mlog.info(
+            master_log_path,
+            f"repair worker #{o.issue} {o.status} ({o.duration_s:.0f}s) pr={o.pr_url or '-'}",
+        )
+    return outcomes
 
 
 def _run_critic_for_outcomes(
@@ -157,7 +764,7 @@ def _run_critic_for_outcomes(
                 if critic_outcome.report is not None:
                     try:
                         lines = _gh.pr_changed_lines(o.pr_url, repo=cfg.github_repo)
-                        apply_critic_report(
+                        plan = apply_critic_report(
                             critic_outcome.report,
                             o.pr_url,
                             lines,
@@ -167,6 +774,9 @@ def _run_critic_for_outcomes(
                             repo=cfg.github_repo,
                             emit=bus_emit,
                         )
+                        if not plan.block_merge:
+                            _gh.remove_pr_label(o.pr_url, "critic:blocking", repo=cfg.github_repo)
+                            _gh.remove_pr_label(o.pr_url, "critic:suspicious", repo=cfg.github_repo)
                     except Exception as act_ex:
                         append_event(
                             cfg.events_file,

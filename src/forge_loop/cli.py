@@ -51,6 +51,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import click
 import typer
 
 from forge_loop.config import load
@@ -102,12 +103,35 @@ def _cmd_run(args: SimpleNamespace) -> int:
     if queue_url:
         os.environ["LOOP_QUEUE_URL"] = queue_url
 
-    orch = getattr(args, "orchestrator", "sync")
-    if orch == "async":
-        from forge_loop.runner import run_async as run_async_loop
+    # Issue #126 — axis-aware dispatch filter. The CLI accepts ``--axis``
+    # repeatedly; we serialise to a comma-separated env var so the tick
+    # loop (which is a separate function in another module) can read it
+    # without us having to thread a new kwarg through ``run_loop`` and
+    # every adjacent caller. Empty list -> env var stays unset, and the
+    # dispatcher takes the pre-#126 fast path verbatim.
+    from forge_loop.axis import AXIS_FILTER_ENV
 
-        return run_async_loop(load())
-    return run_loop(load())
+    axes = [a.strip().lower() for a in (getattr(args, "axis", None) or []) if a and a.strip()]
+    previous_axis_filter = os.environ[AXIS_FILTER_ENV] if AXIS_FILTER_ENV in os.environ else None
+    if axes:
+        os.environ[AXIS_FILTER_ENV] = ",".join(axes)
+    else:
+        os.environ.pop(AXIS_FILTER_ENV, None)
+
+    try:
+        orch = getattr(args, "orchestrator", "sync")
+        if orch == "async":
+            from forge_loop.runner import run_async as run_async_loop
+
+            return run_async_loop(load())
+        return run_loop(load())
+    finally:
+        if not axes:
+            os.environ.pop(AXIS_FILTER_ENV, None)
+        elif previous_axis_filter is None:
+            os.environ.pop(AXIS_FILTER_ENV, None)
+        else:
+            os.environ[AXIS_FILTER_ENV] = previous_axis_filter
 
 
 def _cmd_cluster_status(args: SimpleNamespace) -> int:
@@ -218,32 +242,36 @@ def _cmd_doctor(_args: SimpleNamespace) -> int:
                 timeout=5,
             ).stdout.strip()
             _sp.run(
-                ["git", "fetch", "origin", cfg.base_branch, "--quiet"],
+                ["git", "fetch", "origin", "trunk", "--quiet"],
                 cwd=cfg.repo,
                 capture_output=True,
                 timeout=10,
             )
             remote = _sp.run(
-                ["git", "rev-parse", f"origin/{cfg.base_branch}"],
+                ["git", "rev-parse", "origin/trunk"],
                 cwd=cfg.repo,
                 capture_output=True,
                 text=True,
                 timeout=5,
             ).stdout.strip()
             if local and remote and local == remote:
-                line("green", f"code matches origin/{cfg.base_branch} @ {local[:8]}")
+                line("green", f"code matches origin/trunk @ {local[:8]}")
             elif local and remote:
                 line(
                     "yellow",
-                    f"local {cfg.base_branch} behind origin",
+                    "local trunk behind origin",
                     f"local={local[:8]} origin={remote[:8]}",
                 )
             else:
-                line("yellow", f"could not compare to origin/{cfg.base_branch}")
+                line("yellow", "could not compare to origin/trunk")
         except (_sp.SubprocessError, OSError):
             line("yellow", "git probe failed")
 
-    drift_halt_opt_in = os.environ.get("LOOP_DEPLOY_DRIFT_HALT") == "1"
+    from forge_loop.settings import Settings as _Settings  # noqa: PLC0415
+    try:
+        drift_halt_opt_in = _Settings.load().deploy.drift_halt
+    except Exception:  # noqa: BLE001 — doctor must keep running even if cfg fails
+        drift_halt_opt_in = False
     line(
         "yellow" if drift_halt_opt_in else "green",
         "deploy-drift halt",
@@ -320,7 +348,11 @@ def _cmd_status(args: SimpleNamespace) -> int:
             except json.JSONDecodeError:
                 pass
 
+    # Issue #126 — fetch labels + title alongside number so we can group
+    # the open ready-queue by ``axis:*`` label below. Cheap: same call,
+    # one additional JSON field.
     queue_depth = 0
+    ready_issues: list[dict[str, Any]] = []
     try:
         r = subprocess.run(
             [
@@ -333,17 +365,40 @@ def _cmd_status(args: SimpleNamespace) -> int:
                 cfg.labels.ready,
                 "--state",
                 "open",
+                "--limit",
+                "200",
                 "--json",
-                "number",
+                "number,title,labels",
             ],
             capture_output=True,
             text=True,
             timeout=15,
         )
         if r.returncode == 0:
-            queue_depth = len(json.loads(r.stdout or "[]"))
+            ready_issues = json.loads(r.stdout or "[]")
+            queue_depth = len(ready_issues)
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
         queue_depth = -1
+
+    # Group the open ready-queue by axis. Axis filter (--axis) narrows
+    # the bucketed view to just the requested slugs — this is the
+    # "sanity check before running" surface called out in the spec.
+    from forge_loop.axis import UNALIGNED_BUCKET, group_by_axis
+
+    axis_filter = [a.strip().lower() for a in (getattr(args, "axis", None) or []) if a and a.strip()]
+    grouped_all, unaligned_count = group_by_axis(ready_issues)
+    if axis_filter:
+        axes_view: dict[str, list[dict[str, Any]]] = {
+            k: v for k, v in grouped_all.items() if k in set(axis_filter)
+        }
+    else:
+        axes_view = grouped_all
+    # Render shape: {axis_slug: [{number, title}], ...} (drop the heavy
+    # ``labels`` blob from the per-issue payload).
+    axes_payload: dict[str, list[dict[str, Any]]] = {
+        k: [{"number": i.get("number"), "title": i.get("title", "")} for i in v]
+        for k, v in axes_view.items()
+    }
 
     payload: dict[str, Any] = {
         "pid": pid_text or None,
@@ -357,6 +412,9 @@ def _cmd_status(args: SimpleNamespace) -> int:
         "last_failure": last_failure,
         "last_events": last_5_events,
         "events_file": str(cfg.events_file),
+        "axes": axes_payload,
+        "unaligned_count": unaligned_count,
+        "axis_filter": axis_filter,
     }
 
     if getattr(args, "json", False):
@@ -403,6 +461,28 @@ def _cmd_status(args: SimpleNamespace) -> int:
             joined.append("\n")
         table.add_row("last 5 events", joined)
     table.add_row("events", str(cfg.events_file))
+
+    # Issue #126 — axis breakdown. Render one row per axis (sorted for
+    # deterministic output) showing the issue count, plus a yellow
+    # "unaligned" warning iff any open ready-issue has no axis label.
+    if axis_filter:
+        table.add_row("axis filter", ", ".join(sorted(set(axis_filter))))
+    if axes_view:
+        axis_lines = Text()
+        for ax in sorted(k for k in axes_view if k != UNALIGNED_BUCKET):
+            nums = ", ".join(f"#{i.get('number')}" for i in axes_view[ax])
+            axis_lines.append(f"  {ax}", style="cyan")
+            axis_lines.append(f" ({len(axes_view[ax])})  {nums}\n")
+        if UNALIGNED_BUCKET in axes_view:
+            unaligned_nums = ", ".join(f"#{i.get('number')}" for i in axes_view[UNALIGNED_BUCKET])
+            axis_lines.append(f"  {UNALIGNED_BUCKET}", style="yellow")
+            axis_lines.append(f" ({len(axes_view[UNALIGNED_BUCKET])})  {unaligned_nums}\n")
+        table.add_row("axes", axis_lines)
+    if unaligned_count > 0 and not axis_filter:
+        table.add_row(
+            "[yellow]warning[/yellow]",
+            f"[yellow]{unaligned_count} open issue(s) carry no axis:* label[/yellow]",
+        )
 
     console.print(Panel(table, title="[bold]forge-loop status[/bold]", title_align="left"))
     return 0
@@ -509,8 +589,10 @@ def _cmd_dashboard(args: SimpleNamespace) -> int:
     from forge_loop.dashboard.app import serve as _serve
 
     cfg = load()
+    from forge_loop.settings import Settings as _Settings  # noqa: PLC0415
+    _dash = _Settings.load().dashboard
     host = args.host or "127.0.0.1"
-    port = int(args.port or os.environ.get("LOOP_DASHBOARD_PORT") or 8765)
+    port = int(args.port or _dash.port)
     roles_dir = Path(args.roles_dir) if args.roles_dir else cfg.repo / "roles"
     try:
         _serve(
@@ -518,7 +600,7 @@ def _cmd_dashboard(args: SimpleNamespace) -> int:
             port=port,
             state_dir=cfg.state_dir,
             roles_dir=roles_dir,
-            token=os.environ.get("LOOP_DASHBOARD_TOKEN") or None,
+            token=_dash.token or None,
         )
     except DashboardBindError as exc:
         sys.stderr.write(f"dashboard: {exc}\n")
@@ -561,6 +643,192 @@ def _cmd_init(args: SimpleNamespace) -> int:
     typer.echo("  2. Add manual entries under manual/")
     typer.echo("  3. Label issues with `loop:ready` for the loop to attack")
     typer.echo("  4. Run:  forge-loop run        (or: task loop:start)")
+    return 0
+
+
+def _brainstormer_factory(
+    repo_path: Path,
+    owner: str,
+    repo: str,
+    *,
+    provider: str = "claude",
+    model: str | None = None,
+    timeout_s: int = 300,
+) -> Any:
+    """Construct the default Brainstormer. Tests monkeypatch this.
+
+    Kept as a module-level callable so ``monkeypatch.setattr(cli,
+    "_brainstormer_factory", lambda *a, **k: fake)`` works in tests
+    without threading args through Typer's option layer.
+    """
+    from forge_loop.brainstormer import Brainstormer
+
+    return Brainstormer(
+        repo_path=repo_path,
+        owner=owner,
+        repo=repo,
+        provider=provider,
+        model=model,
+        timeout_s=timeout_s,
+    )
+
+
+def _gh_client_factory() -> Any:
+    """Construct the default GhClient. Tests monkeypatch this."""
+    from forge_loop.gh_client import GithubkitClient
+
+    return GithubkitClient()
+
+
+def _cmd_brainstorm(args: SimpleNamespace) -> int:
+    """`forge-loop brainstorm` — dry-run by default, files issues with --apply.
+
+    Contract (issue #124):
+      * Default (no flags): load ProductVision, run Brainstormer, print
+        the BrainstormReport as YAML to stdout. Exit 0. No GitHub calls.
+      * --apply: file each proposed epic first, then each ticket with
+        ``Parent: #<epic-number>`` cross-link in the body.
+      * Missing/invalid vision → exit 2 (no partial state).
+      * Partial failure during --apply → exit 1 with per-title reporting.
+    """
+    import yaml
+
+    from forge_loop.brainstormer import (
+        BrainstormReport,
+        ProposedEpic,
+        ProposedTicket,
+    )
+    from forge_loop.product_vision import MissingVisionError, discover
+
+    # 1. Resolve repo path + GitHub coordinates from the existing config
+    #    accessor — same pattern as ``_cmd_init`` / ``_cmd_run``.
+    repo_path = Path.cwd()
+    owner = ""
+    repo_name = ""
+    provider = "claude"
+    model: str | None = None
+    timeout_s = 300
+    try:
+        cfg = load()
+        repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path
+        gh_repo = getattr(cfg, "github_repo", "") or ""
+        if "/" in gh_repo:
+            owner, repo_name = gh_repo.split("/", 1)
+        po_cfg = getattr(cfg, "po", None)
+        provider = getattr(po_cfg, "provider", provider)
+        model = getattr(po_cfg, "model", model)
+        timeout_s = getattr(po_cfg, "timeout_s", timeout_s)
+    except Exception:  # noqa: BLE001 — config-independent: vision discovery still runs
+        pass
+
+    # 2. Discover ProductVision. Missing/invalid is a hard exit-2.
+    try:
+        vision = discover(repo_path)
+    except MissingVisionError as exc:
+        typer.echo(f"brainstorm: {exc}", err=True)
+        return 2
+    except Exception as exc:  # noqa: BLE001 — unexpected validator failure
+        typer.echo(f"brainstorm: failed to load product vision: {exc}", err=True)
+        return 2
+
+    # 3. Run the brainstormer. Tests monkeypatch ``cli._brainstormer_factory``
+    #    to inject a stub that skips the real SDK session.
+    brainstormer = _brainstormer_factory(
+        repo_path,
+        owner,
+        repo_name,
+        provider=provider,
+        model=model,
+        timeout_s=timeout_s,
+    )
+    try:
+        report: BrainstormReport = brainstormer.run(vision)
+    except Exception as exc:  # noqa: BLE001 — propagate as runtime error to operator
+        typer.echo(f"brainstorm: brainstormer run failed: {exc}", err=True)
+        return 1
+
+    # 4. Dry-run path: YAML-dump the report; never touch GitHub.
+    if not args.apply:
+        payload = report.model_dump(mode="json")
+        typer.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+        return 0
+
+    # 5. --apply path: epics first, then tickets cross-linked to the epic
+    #    that was just filed in *this* run.
+    try:
+        gh_client = _gh_client_factory()
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(
+            f"brainstorm: cannot construct GhClient ({exc}); set GH_TOKEN or monkeypatch _gh_client_factory.",
+            err=True,
+        )
+        return 1
+
+    if not owner or not repo_name:
+        typer.echo(
+            "brainstorm: --apply requires a configured GitHub repo (owner/name).",
+            err=True,
+        )
+        return 2
+
+    if not report.proposed_epics and not report.proposed_tickets:
+        typer.echo("brainstorm: no proposals — nothing to file.")
+        return 0
+
+    epic_axis_to_number: dict[str, int] = {}
+    succeeded: list[tuple[str, int]] = []
+    failed: list[tuple[str, str]] = []
+
+    def _render_epic_body(epic: ProposedEpic) -> str:
+        parts = [epic.body.strip()] if epic.body else []
+        if epic.customer_story:
+            parts.append(f"\n## Customer story\n\n{epic.customer_story.strip()}")
+        return "\n\n".join(p for p in parts if p) or epic.title
+
+    def _render_ticket_body(ticket: ProposedTicket, parent: int | None) -> str:
+        parts: list[str] = []
+        if parent is not None:
+            parts.append(f"Parent: #{parent}")
+        if ticket.body:
+            parts.append(ticket.body.strip())
+        if ticket.customer_story:
+            parts.append(f"\n## Customer story\n\n{ticket.customer_story.strip()}")
+        return "\n\n".join(parts) or ticket.title
+
+    # Epics first — their numbers are threaded into ticket bodies.
+    for epic in report.proposed_epics:
+        labels = [f"axis:{epic.axis}", "epic"]
+        body = _render_epic_body(epic)
+        try:
+            issue = gh_client.create_issue(
+                owner=owner, repo=repo_name, title=epic.title, body=body, labels=labels,
+            )
+            epic_axis_to_number[epic.axis] = issue.number
+            succeeded.append((epic.title, issue.number))
+        except Exception as exc:  # noqa: BLE001
+            failed.append((epic.title, str(exc)))
+
+    # Tickets — cross-link to the same-axis epic that was just filed.
+    for ticket in report.proposed_tickets:
+        labels = [f"axis:{ticket.axis}", "loop:ready"]
+        parent = epic_axis_to_number.get(ticket.axis)
+        body = _render_ticket_body(ticket, parent)
+        try:
+            issue = gh_client.create_issue(
+                owner=owner, repo=repo_name, title=ticket.title, body=body, labels=labels,
+            )
+            succeeded.append((ticket.title, issue.number))
+        except Exception as exc:  # noqa: BLE001
+            failed.append((ticket.title, str(exc)))
+
+    typer.echo("brainstorm: filed:")
+    for title, number in succeeded:
+        typer.echo(f"  + #{number}: {title}")
+    if failed:
+        typer.echo("brainstorm: failed:", err=True)
+        for title, err in failed:
+            typer.echo(f"  ! {title}: {err}", err=True)
+        return 1
     return 0
 
 
@@ -818,8 +1086,15 @@ def _cmd_replay_diff(args: SimpleNamespace) -> int:
 
 
 def _default_repos_dir() -> Path:
-    env = os.environ.get("LOOP_REPOS_DIR")
-    return Path(env).expanduser() if env else Path.cwd() / ".forge" / "repos"
+    # Settings-driven (issue #84): was env LOOP_REPOS_DIR, now repo.repos_dir.
+    try:
+        from forge_loop.settings import Settings as _Settings
+        path = _Settings.load().repo.repos_dir
+        if path is not None:
+            return Path(path).expanduser()
+    except Exception:  # noqa: BLE001
+        pass
+    return Path.cwd() / ".forge" / "repos"
 
 
 def _cmd_repos_list(args: SimpleNamespace) -> int:
@@ -999,37 +1274,48 @@ def _cmd_pipeline_show(args: SimpleNamespace) -> int:
 
 
 def _cmd_config(args: SimpleNamespace) -> int:
-    cfg = load()
-    out = {
-        "repo": str(cfg.repo),
-        "base_branch": cfg.base_branch,
-        "parallel": cfg.parallel,
-        "tick_interval_s": cfg.tick_interval_s,
-        "max_ticks": cfg.max_ticks,
-        "query_label": cfg.labels.ready,
-        "worker_timeout_s": cfg.worker_timeout_s,
-        "state_file": str(cfg.state_file),
-        "events_file": str(cfg.events_file),
-        "worker": {
-            "provider": cfg.worker.provider,
-            "model": cfg.worker.model,
-            "thinking": cfg.worker.thinking,
-        },
-        "po": {
-            "provider": cfg.po.provider,
-            "model": cfg.po.model,
-            "thinking": cfg.po.thinking,
-        },
-        "critic": {
-            "provider": cfg.critic.provider,
-            "model": cfg.critic.model,
-            "thinking": cfg.critic.thinking,
-        },
-    }
-    # Historical surface: ``config`` always emits JSON (the ``--json`` flag
-    # was a no-op kept for back-compat). Preserve that.
-    _ = getattr(args, "json", False)
-    typer.echo(json.dumps(out, indent=2))
+    """Print the resolved Settings tree (issue #84).
+
+    Output format:
+        --yaml (default)  full resolved Settings as YAML — the single
+                          source of truth, round-trippable
+        --json            JSON shape (legacy summary) for back-compat
+                          scripting
+    """
+    from forge_loop.settings import Settings
+
+    s = Settings.load()
+    if getattr(args, "json", False):
+        # Back-compat summary surface — pre-#84 callers that scrape JSON.
+        cfg = load()
+        out = {
+            "repo": str(cfg.repo),
+            "parallel": cfg.parallel,
+            "tick_interval_s": cfg.tick_interval_s,
+            "max_ticks": cfg.max_ticks,
+            "query_label": cfg.labels.ready,
+            "worker_timeout_s": cfg.worker_timeout_s,
+            "state_file": str(cfg.state_file),
+            "events_file": str(cfg.events_file),
+            "worker": {
+                "provider": cfg.worker.provider,
+                "model": cfg.worker.model,
+                "thinking": cfg.worker.thinking,
+            },
+            "po": {
+                "provider": cfg.po.provider,
+                "model": cfg.po.model,
+                "thinking": cfg.po.thinking,
+            },
+            "critic": {
+                "provider": cfg.critic.provider,
+                "model": cfg.critic.model,
+                "thinking": cfg.critic.thinking,
+            },
+        }
+        typer.echo(json.dumps(out, indent=2))
+    else:
+        typer.echo(s.dump_yaml())
     return 0
 
 
@@ -1139,18 +1425,32 @@ def cmd_run(
         "--queue",
         help="Queue backend URL. Default in-memory; sqlite:///path for durable.",
     ),
+    axis: list[str] = typer.Option(
+        [],
+        "--axis",
+        help=(
+            "Narrow dispatch to issues carrying ``axis:<name>`` labels. "
+            "Repeatable; values are unioned. Omit to preserve pre-#126 "
+            "behaviour (no filter)."
+        ),
+    ),
 ) -> None:
     if orchestrator not in {"sync", "async"}:
         typer.echo(f"run: invalid --orchestrator {orchestrator!r}", err=True)
         raise typer.Exit(code=2)
-    _exit(_cmd_run(SimpleNamespace(orchestrator=orchestrator, queue=queue)))
+    _exit(_cmd_run(SimpleNamespace(orchestrator=orchestrator, queue=queue, axis=axis)))
 
 
 @app.command("status", help="Operator-facing health surface.")
 def cmd_status(
     json_: bool = typer.Option(False, "--json", help="Emit raw JSON for scripts."),
+    axis: list[str] = typer.Option(
+        [],
+        "--axis",
+        help="Narrow the axis-grouped view to these slugs (repeatable).",
+    ),
 ) -> None:
-    _exit(_cmd_status(SimpleNamespace(json=json_)))
+    _exit(_cmd_status(SimpleNamespace(json=json_, axis=axis)))
 
 
 @app.command("doctor", help="One-shot health check (config-independent checks still run).")
@@ -1219,6 +1519,13 @@ def cmd_init(
             SimpleNamespace(target=target, repo=repo, force=force, create_labels=create_labels)
         )
     )
+
+
+@app.command("brainstorm", help="Propose axis-aligned epics/tickets from product vision (dry-run by default; --apply files them on GitHub).")
+def cmd_brainstorm(
+    apply: bool = typer.Option(False, "--apply", help="Actually file the proposed epics + tickets on GitHub."),
+) -> None:
+    _exit(_cmd_brainstorm(SimpleNamespace(apply=apply)))
 
 
 @app.command("record-session", help="Record a real SDK session to a JSONL fixture.")
@@ -1420,15 +1727,22 @@ def cmd_cluster_status(
 def main(argv: list[str] | None = None) -> int:
     """Programmatic entry point — used by ``forge-loop`` and ``python -m forge_loop``.
 
-    Runs the Typer app in *standalone* mode, which mirrors the historical
-    argparse behaviour: ``--help`` and parse errors raise ``SystemExit``
-    with the appropriate exit code, and successful subcommand returns
-    raise ``SystemExit(0)``. Callers who want an int back can wrap in
-    ``try/except SystemExit``. The ``sys.exit(main())`` idiom at the
-    bottom keeps the historical script wrapper happy.
+    Normal subcommands return an integer so tests and replay tools can call
+    ``main([...])`` directly. Help keeps the historical CLI shape and raises
+    ``SystemExit(0)`` through Typer standalone mode.
     """
-    app(args=argv, standalone_mode=True)
-    return 0  # unreachable in standalone mode — kept for type-checkers
+    if argv and (argv[0] in {"replay", "record-session"} or any(arg in {"-h", "--help"} for arg in argv)):
+        app(args=argv, standalone_mode=True)
+        return 0  # unreachable in standalone mode — kept for type-checkers
+    try:
+        result = app(args=argv, standalone_mode=False)
+    except typer.Exit as exc:
+        return int(exc.exit_code or 0)
+    except click.exceptions.Exit as exc:
+        return int(exc.exit_code or 0)
+    except click.ClickException as exc:
+        raise SystemExit(exc.exit_code) from exc
+    return int(result or 0)
 
 
 if __name__ == "__main__":

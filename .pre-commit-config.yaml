@@ -1,0 +1,46 @@
+# Pre-commit hooks for forge-loop (issue #90).
+#
+# Install: pre-commit install
+# Run all hooks on every file: pre-commit run --all-files
+#
+# Local hooks reuse the project venv (uv) so version drift between
+# hook env + dev env can't happen. CI runs the same hooks via
+# `pre-commit run --all-files` so the gate is identical local + CI.
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+        require_serial: true
+
+      - id: ruff-check
+        name: ruff lint
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+        require_serial: true
+
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        types: [python]
+        # Only check production source — tests have looser typing on
+        # purpose (fixtures, monkeypatches, hypothesis decorators).
+        files: ^src/forge_loop/
+        require_serial: true
+        pass_filenames: false
+        args: [src/forge_loop/]
+
+      - id: pyright
+        name: pyright
+        entry: uv run pyright
+        language: system
+        types: [python]
+        files: ^src/forge_loop/
+        require_serial: true
+        pass_filenames: false

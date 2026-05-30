@@ -18,13 +18,15 @@ MAX_ARCHIVES = 3
 
 
 def _rotate_bytes_threshold() -> int:
-    raw = os.environ.get("LOOP_EVENTS_ROTATE_BYTES")
-    if not raw:
-        return DEFAULT_ROTATE_BYTES
+    """Resolve via the unified Settings layer (issue #84).
+    Was ``LOOP_EVENTS_ROTATE_BYTES`` env-only; now ``misc.events_rotate_bytes``.
+    """
     try:
-        v = int(raw)
+        from forge_loop.settings import Settings
+
+        v = Settings.load().misc.events_rotate_bytes
         return v if v > 0 else DEFAULT_ROTATE_BYTES
-    except ValueError:
+    except Exception:  # noqa: BLE001
         return DEFAULT_ROTATE_BYTES
 
 
@@ -150,11 +152,16 @@ def read_state(path: Path) -> dict[str, Any]:
 
 
 def append_event(events_path: Path, kind: str, **fields: Any) -> None:
-    """Append a single JSON object as a line to the events log."""
-    events_path.parent.mkdir(parents=True, exist_ok=True)
-    rec = {"ts": now_iso(), "kind": kind, **fields}
-    with open(events_path, "a") as f:
-        f.write(json.dumps(rec, default=str) + "\n")
+    """Append a single JSON object as a line to the events log.
+
+    Delegates to :func:`forge_loop.events.append_event_with_registry_check`
+    so emissions of a ``kind`` for which a typed model already exists
+    surface a DeprecationWarning pointing the caller at the typed path.
+    Behaviour is unchanged for the unregistered kinds.
+    """
+    from forge_loop.events import append_event_with_registry_check
+
+    append_event_with_registry_check(events_path, kind, **fields)
 
 
 def tail_events(events_path: Path, n: int = 30) -> list[str]:

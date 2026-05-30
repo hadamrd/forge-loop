@@ -42,8 +42,16 @@ _EXPERIMENTAL_SENTINELS = (
 def experimental_installed() -> bool:
     """Return True if any sentinel dep from [experimental] is importable."""
 
-    if os.environ.get("FORGE_LOOP_EXPERIMENTAL") == "1":
-        return True
+    # Settings-driven (issue #84): was env FORGE_LOOP_EXPERIMENTAL,
+    # now misc.experimental_enabled. Kept the legacy env-name as the
+    # only knob — operators on subscription plans want the explicit
+    # opt-in toggle.
+    try:
+        from forge_loop.settings import Settings as _Settings
+        if _Settings.load().misc.experimental_enabled:
+            return True
+    except Exception:  # noqa: BLE001 — bootstrap helpers must not crash
+        pass
     for name in _EXPERIMENTAL_SENTINELS:
         try:
             importlib.import_module(name)

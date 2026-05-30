@@ -64,10 +64,14 @@ def plan_actions(
 
     has_sev1 = report.has_sev1()
     has_sev2 = report.has_sev2()
+    has_sev1_manifesto = report.has_sev1_manifesto_violation()
 
-    if report.overall == "block" or has_sev1:
+    if report.overall == "block" or has_sev1 or has_sev1_manifesto:
         plan.block_merge = True
         plan.labels_to_add.append("critic:blocking")
+        if has_sev1_manifesto:
+            plan.labels_to_add.append("critic:manifesto-violation")
+            reasons.append("sev1_manifesto_violation")
         if has_sev1:
             reasons.append("sev1_finding")
         if report.overall == "block":
@@ -147,6 +151,18 @@ def apply_critic_report(
             for f in plan.summary_comments
         )
         gh.post_review_comment(pr_url, f"Critic findings:\n{summary}", repo=repo)
+
+    if report.manifesto_violations:
+        viol_summary = "\n".join(
+            f"- **[{v.severity}] {v.manifesto}#{v.rule_id}** — "
+            f"`{v.quote.strip()[:120]}` → {v.suggested_fix}"
+            for v in report.manifesto_violations
+        )
+        gh.post_review_comment(
+            pr_url,
+            f"Manifesto violations:\n{viol_summary}",
+            repo=repo,
+        )
 
     if emit is not None:
         emit("critic_actions_applied", {
