@@ -15,6 +15,9 @@ from forge_loop.state import tail_events
 
 
 class StatusCommandsMixin:
+    subprocess: Any
+    operator_cfg: Any
+
     def _cmd_status(self, args: SimpleNamespace) -> int:
         """Operator-facing health surface — Rich Panel + Table by default;
         ``--json`` emits a raw machine-parseable blob for scripts.

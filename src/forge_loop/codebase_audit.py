@@ -47,10 +47,10 @@ zero LLM involvement. Keeping them apart means the audit pass runs in
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Protocol
-
+from typing import Any, Protocol
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -197,11 +197,9 @@ def walk_source_files(
         for entry in entries:
             name = entry.name
             if entry.is_dir():
-                if name in ignore_dirs or name.startswith("."):
-                    # Skip hidden + ignored dirs but keep ``.`` itself
-                    # (the repo root) which never recurses here.
-                    if name not in {".github"}:  # keep workflows visible
-                        continue
+                # Skip hidden + ignored dirs but keep ``.github`` visible.
+                if (name in ignore_dirs or name.startswith(".")) and name != ".github":
+                    continue
                 stack.append(entry)
             elif entry.is_file():
                 if entry.suffix in suffix_set:
@@ -256,10 +254,11 @@ def audit(repo: Path, probes: list[Probe] | None = None) -> AuditReport:
 # ``GithubkitClient`` and ``MockGhClient`` structurally without forcing
 # callers to import the heavy module.
 class _GhLike(Protocol):
-    def issues_by_label(self, owner: str, repo: str, label: str, limit: int) -> list: ...
+    def issues_by_label(self, owner: str, repo: str, label: str, limit: int) -> list[Any]: ...
+
     def create_issue(
         self, owner: str, repo: str, title: str, body: str, labels: list[str]
-    ): ...
+    ) -> Any: ...
 
 
 def render_ticket_body(v: Violation) -> str:

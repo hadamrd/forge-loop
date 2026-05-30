@@ -77,13 +77,13 @@ def _parse_condition(raw: Any) -> Condition:
 _YAML11_BOOL_KEY_REMAP = {True: "on", False: "off"}
 
 
-def _remap_yaml_bool_keys(raw: dict) -> dict:
+def _remap_yaml_bool_keys(raw: dict[Any, Any]) -> dict[str, Any]:
     """YAML 1.1 (PyYAML default) parses bare ``on:``/``off:``/``yes:``/``no:``
     as booleans. We want them as literal strings so the example in the
     issue body parses without quoting. Remap True->"on" / False->"off"."""
     if not any(isinstance(k, bool) for k in raw):
         return raw
-    out: dict = {}
+    out: dict[str, Any] = {}
     for k, v in raw.items():
         if isinstance(k, bool):
             new_k = _YAML11_BOOL_KEY_REMAP[k]

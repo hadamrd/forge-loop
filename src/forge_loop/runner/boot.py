@@ -388,7 +388,7 @@ def run_async(cfg: Config) -> int:
             [issue],
             cfg.repo,
             cfg.logs_dir,
-            github_repo=cfg.github_repo,
+            github_repo=cfg.github_repo or "",
             timeout_s=cfg.po.timeout_s,
             max_to_expand=1,
             model=cfg.po.model,

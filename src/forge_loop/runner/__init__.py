@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sys as _sys
 import types as _types
+from typing import Any
 
 from forge_loop.config import Config as _Config
 
@@ -101,7 +102,7 @@ def _consecutive_deploy_fails(cfg: _Config) -> int:
     return _consecutive_deploy_fails_impl(cfg.events_file)
 
 
-def __getattr__(name: str):  # pragma: no cover — thin compat shim
+def __getattr__(name: str) -> Any:  # pragma: no cover — thin compat shim
     if name == "_RUN":
         return _boot._RUN
     raise AttributeError(f"module 'forge_loop.runner' has no attribute {name!r}")
@@ -149,7 +150,7 @@ _sys.modules[__name__].__class__ = _RunnerFacadeModule
 # default :class:`RunnerState` singleton.
 # ---------------------------------------------------------------------------
 
-from forge_loop.runner.state import RunnerState as RunnerState
+from forge_loop.runner.state import RunnerState as RunnerState  # noqa: E402
 
 
 class Runner:

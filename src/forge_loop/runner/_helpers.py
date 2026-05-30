@@ -27,7 +27,7 @@ from forge_loop.state import append_event, rotate_events_file_if_needed
 # ---------------------------------------------------------------------------
 
 
-def rotate_events_file_at_boot(events_file: Path) -> dict | None:
+def rotate_events_file_at_boot(events_file: Path) -> dict[str, Any] | None:
     """Boot-time wrapper around :func:`forge_loop.state.rotate_events_file_if_needed`.
 
     Centralises the call so the runner ``boot`` module stays a thin facade

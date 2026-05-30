@@ -16,6 +16,10 @@ from forge_loop.state import tail_events
 
 
 class ProductCommandsMixin:
+    load: Any
+    brainstormer_factory: Any
+    gh_client_factory: Any
+
     def _cmd_brainstorm(self, args: SimpleNamespace) -> int:
         """`forge-loop brainstorm` — dry-run by default, files issues with --apply.
 
@@ -198,6 +202,7 @@ class ProductCommandsMixin:
         owner = ""
         repo_name = ""
         extra_labels: tuple[str, ...] = ()
+        cfg: Any | None = None
         try:
             cfg = self.load()
             repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path
@@ -258,12 +263,9 @@ class ProductCommandsMixin:
 
         # Wire events file from the resolved config (best-effort).
         events_file: Path | None = None
-        try:
-            events_file = cfg.events_file  # type: ignore[name-defined]
-        except Exception:  # noqa: BLE001
-            events_file = None
+        events_file = getattr(cfg, "events_file", None)
 
-        def _emit_filed(v, number):  # noqa: ANN001 — internal
+        def _emit_filed(v: Any, number: int) -> None:
             if events_file is None:
                 return
             try:
@@ -299,4 +301,3 @@ class ProductCommandsMixin:
                 typer.echo(f"audit: ERROR filing {key}: {err}", err=True)
             return 1
         return 0
-

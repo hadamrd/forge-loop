@@ -182,7 +182,7 @@ def _commands() -> CliCommands:
 
 def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     def _cmd(args: SimpleNamespace) -> int:
-        return getattr(_commands(), f"_cmd_{name}")(args)
+        return int(getattr(_commands(), f"_cmd_{name}")(args))
 
     return _cmd
 

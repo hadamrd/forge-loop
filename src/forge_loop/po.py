@@ -41,8 +41,10 @@ Agent SDK (separate follow-up issue) before wiring that knob.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
+
 # subprocess imports removed in #85 — PO now drives the Claude Agent SDK
 # via _critic_sdk.run_po_sdk(). Codex provider still uses agent_backend.
 import time
@@ -199,10 +201,8 @@ def _run_one(
         model=model,
         add_dirs=(repo,),
     )
-    try:
+    with contextlib.suppress(OSError):
         log_path.write_text(sdk_result.last_message or "")
-    except OSError:
-        pass
     if sdk_result.timed_out:
         return POOutcome(
             issue=issue_number,
@@ -229,22 +229,22 @@ def _run_one(
     # stream-json so the legacy log-walker (_extract_outcome) finds
     # nothing. The agent's contract is "last line of last message is
     # a JSON object with skipped/reason/sections_added".
-    parsed: dict[str, Any] = {}
+    sdk_parsed: dict[str, Any] = {}
     for chunk in reversed((sdk_result.last_message or "").strip().splitlines()):
         chunk = chunk.strip()
         if chunk.startswith("{") and chunk.endswith("}"):
             try:
-                parsed = json.loads(chunk)
+                sdk_parsed = json.loads(chunk)
                 break
             except json.JSONDecodeError:
                 continue
-    if not parsed:
-        parsed = {"skipped": False, "reason": "no-final-json"}
+    if not sdk_parsed:
+        sdk_parsed = {"skipped": False, "reason": "no-final-json"}
     return POOutcome(
         issue=issue_number,
-        skipped=bool(parsed.get("skipped", False)),
-        reason=str(parsed.get("reason", "")),
-        sections_added=list(parsed.get("sections_added", []) or []),
+        skipped=bool(sdk_parsed.get("skipped", False)),
+        reason=str(sdk_parsed.get("reason", "")),
+        sections_added=list(sdk_parsed.get("sections_added", []) or []),
         duration_s=duration,
         stdout_tail=_tail(log_path, 400),
     )

@@ -23,6 +23,16 @@ from forge_loop.worker_worktree import prep_repair_worktree as _prep_repair_work
 from forge_loop.worker_worktree import prep_worktree as _prep_worktree
 from forge_loop.worker_worktree import subagent_env as _worktree_subagent_env
 
+__all__ = [
+    "WorkerOutcome",
+    "brief_template_hash",
+    "ensure_subagent_trusted",
+    "make_brief",
+    "make_repair_brief",
+    "run_repair_worker",
+    "run_worker",
+]
+
 
 def brief_template_hash() -> str:
     """Compatibility export for callers that fingerprint worker briefs."""
@@ -422,7 +432,8 @@ def _run_worker_codex(
         )
     obj = extract_last_json_object(result.last_message) or {}
     pr_url = obj.get("pr") if isinstance(obj.get("pr"), str) else None
-    status = obj.get("status") if isinstance(obj.get("status"), str) else "no_pr"
+    raw_status = obj.get("status")
+    status: str = raw_status if isinstance(raw_status, str) else "no_pr"
     if pr_url is None:
         pr_url = extract_github_pr(result.last_message)
         if pr_url:

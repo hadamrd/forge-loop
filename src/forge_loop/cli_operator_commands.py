@@ -22,6 +22,10 @@ _STATUS_MARKERS = {
 
 
 class OperatorCommandsMixin:
+    load: Any
+    run_loop: Any
+    operator_cfg: Any
+
     def _cmd_run(self, args: SimpleNamespace) -> int:
         queue_url = getattr(args, "queue", None)
         if queue_url:
@@ -48,7 +52,7 @@ class OperatorCommandsMixin:
                 from forge_loop.runner import run_async as run_async_loop
 
                 return run_async_loop(self.load())
-            return self.run_loop(self.load())
+            return int(self.run_loop(self.load()))
         finally:
             if not axes or previous_axis_filter is None:
                 os.environ.pop(AXIS_FILTER_ENV, None)
@@ -288,4 +292,3 @@ class OperatorCommandsMixin:
         typer.echo("  3. Label issues with `loop:ready` for the loop to attack")
         typer.echo("  4. Run:  forge-loop run        (or: task loop:start)")
         return 0
-

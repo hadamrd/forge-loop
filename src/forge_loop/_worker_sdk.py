@@ -285,7 +285,7 @@ async def run_sdk_session(
     them None imports the real ``claude_agent_sdk`` at call time.
     """
     if query_fn is None or options_cls is None:
-        from claude_agent_sdk import (  # type: ignore[import-not-found]
+        from claude_agent_sdk import (
             ClaudeAgentOptions as _Opts,
         )
         from claude_agent_sdk import (
@@ -296,7 +296,7 @@ async def run_sdk_session(
             query_fn = _query
         if options_cls is None:
             options_cls = _Opts
-    from claude_agent_sdk import (  # type: ignore[import-not-found]
+    from claude_agent_sdk import (
         AssistantMessage,
         ResultMessage,
         SystemMessage,

@@ -24,7 +24,6 @@ unit tests don't shell out.
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import time
@@ -32,7 +31,10 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from forge_loop.settings import OperatorSettings
 
 # Default timeout: 30 minutes (per spec).
 DEFAULT_TIMEOUT_S = 30 * 60
@@ -419,18 +421,16 @@ def _utc_iso() -> str:
 # ── Env helpers — used by the MCP tool ──────────────────────────────────────
 
 
-def _live_operator():
+def _live_operator() -> OperatorSettings:
     """Always read FRESH settings — these helpers are called from MCP tool
     invocations where env may have changed since boot (e.g. a test
     monkeypatches LOOP_OPERATOR_TIMEOUT_S between calls). Cost is one
     yaml read; negligible vs the MCP RPC round-trip cost."""
-    from forge_loop.settings import Settings
+    from forge_loop.settings import OperatorSettings, Settings
 
     try:
         return Settings.load().operator
     except Exception:  # noqa: BLE001 — Settings failure shouldn't kill MCP helpers
-        from forge_loop.settings import OperatorSettings
-
         return OperatorSettings()
 
 
@@ -449,4 +449,5 @@ def env_slack() -> str | None:
 
 
 def env_issue() -> int | None:
-    return _live_operator().issue
+    issue = _live_operator().issue
+    return int(issue) if issue is not None else None

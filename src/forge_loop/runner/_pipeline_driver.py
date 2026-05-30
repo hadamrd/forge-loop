@@ -24,7 +24,6 @@ Out of scope (matches the issue's "Out of scope" section):
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -89,8 +88,11 @@ def _build_default_handlers(
     """
     from forge_loop.pipeline.executor import StepOutcome
 
-    if critic_review_fn is None:  # pragma: no cover — wired by the runner
-        from forge_loop.critic import review_pr as critic_review_fn  # type: ignore[assignment]
+    critic_fn = critic_review_fn
+    if critic_fn is None:  # pragma: no cover — wired by the runner
+        from forge_loop.critic import review_pr
+
+        critic_fn = review_pr
 
     def po_handler(ctx: StepContext) -> StepOutcome:
         # The PO expansion pass runs ABOVE the dispatch loop in _tick
@@ -146,7 +148,7 @@ def _build_default_handlers(
         if worker_outcome.status not in {"open", "merged"}:
             return StepOutcome(role="critic", status="ok", detail="worker not open/merged")
         try:
-            c = critic_review_fn(
+            c = critic_fn(
                 worker_outcome.pr_url,
                 worker_outcome.issue,
                 cfg.repo,
@@ -230,8 +232,12 @@ def dispatch_via_pipeline(
         wrapped: dict[str, Any] = {}
         for role, h in handlers.items():
 
-            def _wrap(role_=role, h_=h, sink=all_prior):
-                def runner(ctx):
+            def _wrap(
+                role_: str = role,
+                h_: RoleHandler = h,
+                sink: dict[str, StepOutcome] = all_prior,
+            ) -> RoleHandler:
+                def runner(ctx: StepContext) -> StepOutcome:
                     out = h_(ctx)
                     sink[role_] = out
                     return out

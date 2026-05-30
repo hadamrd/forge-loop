@@ -27,8 +27,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Protocol
-
+from typing import Any, Protocol, cast
 
 # ---------------------------------------------------------------------------
 # Typed return shapes — small, hand-curated dataclasses covering what
@@ -163,7 +162,7 @@ class GithubkitClient:
         )
         self._raise_if_error(f"list_for_repo({label})", resp)
         out: list[Issue] = []
-        for item in resp.parsed_data[:limit]:
+        for item in cast(list[Any], resp.parsed_data or [])[:limit]:
             # Skip PRs — list_for_repo returns issues + PRs by default.
             if getattr(item, "pull_request", None):
                 continue
@@ -172,7 +171,11 @@ class GithubkitClient:
                 title=item.title or "",
                 body=item.body or "",
                 state=str(item.state),
-                labels=[lab.name for lab in (item.labels or []) if hasattr(lab, "name")],
+                labels=[
+                    str(lab.name)
+                    for lab in (item.labels or [])
+                    if hasattr(lab, "name") and lab.name is not None
+                ],
             ))
         return out
 
@@ -188,7 +191,11 @@ class GithubkitClient:
             title=item.title or "",
             body=item.body or "",
             state=str(item.state),
-            labels=[lab.name for lab in (item.labels or []) if hasattr(lab, "name")],
+            labels=[
+                str(lab.name)
+                for lab in (item.labels or [])
+                if hasattr(lab, "name") and lab.name is not None
+            ],
         )
 
     def add_comment(self, owner: str, repo: str, number: int, body: str) -> None:
@@ -228,7 +235,11 @@ class GithubkitClient:
             title=item.title or "",
             body=item.body or "",
             state=str(item.state),
-            labels=[lab.name for lab in (item.labels or []) if hasattr(lab, "name")],
+            labels=[
+                str(lab.name)
+                for lab in (item.labels or [])
+                if hasattr(lab, "name") and lab.name is not None
+            ],
         )
 
     def get_pull(self, owner: str, repo: str, number: int) -> PullRequest | None:
@@ -246,7 +257,11 @@ class GithubkitClient:
             draft=bool(getattr(item, "draft", False)),
             head_ref=getattr(item.head, "ref", "") if item.head else "",
             base_ref=getattr(item.base, "ref", "") if item.base else "",
-            labels=[lab.name for lab in (item.labels or []) if hasattr(lab, "name")],
+            labels=[
+                str(lab.name)
+                for lab in (item.labels or [])
+                if hasattr(lab, "name") and lab.name is not None
+            ],
             additions=getattr(item, "additions", 0) or 0,
             deletions=getattr(item, "deletions", 0) or 0,
             changed_files=getattr(item, "changed_files", 0) or 0,
@@ -275,7 +290,7 @@ class MockGhClient:
     raise_on_create_titles: dict[str, Exception] = field(default_factory=dict)
     create_issue_responses: list[int] = field(default_factory=list)
     next_issue_number: int | None = None
-    calls: list[tuple[str, dict]] = field(default_factory=list)
+    calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
     def _record(self, method: str, **kwargs: Any) -> None:
         self.calls.append((method, kwargs))
@@ -315,16 +330,13 @@ class MockGhClient:
         if title in self.raise_on_create_titles:
             raise self.raise_on_create_titles[title]
         responses = self.create_issue_responses
-        if responses:
-            n = responses.pop(0)
-        else:
-            n = self._next_number()
+        n = responses.pop(0) if responses else self._next_number()
         issue = Issue(number=n, title=title, body=body, state="open", labels=list(labels))
         self.issues[(owner, repo, n)] = issue
         return issue
 
     def _next_number(self) -> int:
-        existing = [n for (_, _, n) in self.issues.keys()]
+        existing = [n for (_, _, n) in self.issues]
         seed = self.next_issue_number
         if seed is not None and not existing:
             self.next_issue_number = seed + 1

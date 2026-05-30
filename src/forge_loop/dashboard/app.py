@@ -29,7 +29,6 @@ that pokes that handler directly).
 
 import asyncio
 import json
-import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -217,7 +216,7 @@ def build_app(
     pipeline_renderer: Any = None,
     kill_dir: Path | None = None,
     events_path: Path | None = None,
-):
+) -> Any:
     """Build the FastAPI app. All paths are injected for testability."""
 
     # Local imports — fastapi is in the [experimental] extra, gated by
@@ -259,7 +258,7 @@ def build_app(
             raise HTTPException(status_code=401, detail="invalid bearer token")
 
     @app.middleware("http")
-    async def _auth_mw(request: Request, call_next):
+    async def _auth_mw(request: Request, call_next: Any) -> Any:
         # Health endpoints are always open so the operator can probe liveness
         # without leaking the token into curl history.
         if request.url.path in {"/healthz", "/metrics"}:

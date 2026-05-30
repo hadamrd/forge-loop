@@ -42,6 +42,7 @@ from forge_loop.worker_sessions import WorkerSessionStore
 __all__ = [
     "NEEDS_HUMAN_LABEL",
     "NEEDS_REVIEW_LABEL",
+    "_sev_counts",
     "enforce_critic_iteration_cap",
     "format_critic_followup_prompt",
     "handle_critic_verdict",

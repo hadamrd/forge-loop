@@ -154,6 +154,8 @@ def _open_rescue_pr(
     *,
     has_tests: bool,
 ) -> str | None:
+    if not cfg.github_repo:
+        return None
     pr_args = [
         "gh",
         "pr",

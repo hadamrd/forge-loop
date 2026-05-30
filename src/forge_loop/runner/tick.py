@@ -311,7 +311,7 @@ def _tick(cfg: Config, tick: int) -> None:
             issues,
             cfg.repo,
             cfg.logs_dir,
-            github_repo=cfg.github_repo,
+            github_repo=cfg.github_repo or "",
             timeout_s=cfg.po.timeout_s,
             max_to_expand=cfg.po.max_to_expand_per_tick,
             model=cfg.po.model,
@@ -510,8 +510,8 @@ def _tick(cfg: Config, tick: int) -> None:
             # converting a good PR into a follow-up failure.
             if o.status == "open" and o.pr_url:
                 continue
-            issue = issue_by_n.get(o.issue)
-            if issue is None:
+            issue_for_iteration = issue_by_n.get(o.issue)
+            if issue_for_iteration is None:
                 continue
             wt = Path(f"/tmp/wt-loop-{o.issue}")
 
@@ -545,7 +545,7 @@ def _tick(cfg: Config, tick: int) -> None:
             try:
                 new_outcome = run_iteration_loop(
                     o,
-                    issue,
+                    issue_for_iteration,
                     repo=cfg.github_repo or "",
                     base_branch=cfg.base_branch,
                     worktree=wt,

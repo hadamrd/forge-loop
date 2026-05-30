@@ -16,6 +16,8 @@ from forge_loop.state import tail_events
 
 
 class RepoCommandsMixin:
+    load: Any
+
     def _default_repos_dir(self) -> Path:
         # Settings-driven (issue #84): was env LOOP_REPOS_DIR, now repo.repos_dir.
         try:
@@ -34,8 +36,8 @@ class RepoCommandsMixin:
         repos_dir = Path(args.repos_dir) if args.repos_dir else self._default_repos_dir()
         try:
             specs = load_repos(repos_dir)
-        except RepoLoadError as e:
-            sys.stderr.write(f"[repos list] {e}\n")
+        except RepoLoadError as exc:
+            sys.stderr.write(f"[repos list] {exc}\n")
             return 2
 
         last_activity: dict[str, dict[str, Any]] = {}
@@ -69,7 +71,7 @@ class RepoCommandsMixin:
             except OSError:
                 pass
 
-        rows = []
+        rows: list[dict[str, Any]] = []
         for spec in specs:
             bad = validate_checkout(spec)
             rows.append(
@@ -325,4 +327,3 @@ class RepoCommandsMixin:
         if "tick" in on_set:
             return "every loop tick"
         return "on " + ", ".join(on_set)
-

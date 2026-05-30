@@ -20,7 +20,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class GitError(RuntimeError):
@@ -205,10 +205,10 @@ class FakeGitClient:
     """
 
     results_by_method: dict[str, GitResult] = field(default_factory=dict)
-    calls: list[tuple[str, tuple, dict]] = field(default_factory=list)
+    calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = field(default_factory=list)
     next_result: GitResult | None = None
 
-    def _capture(self, method: str, args: tuple, kwargs: dict) -> GitResult:
+    def _capture(self, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> GitResult:
         self.calls.append((method, args, kwargs))
         if self.next_result is not None:
             r = self.next_result
@@ -216,43 +216,51 @@ class FakeGitClient:
             return r
         return self.results_by_method.get(method, GitResult(argv=["git", method], returncode=0))
 
-    def worktree_add(self, cwd, path, *, branch=None, base=None):  # noqa: D102
+    def worktree_add(
+        self, cwd: Path, path: Path, *, branch: str | None = None, base: str | None = None
+    ) -> GitResult:  # noqa: D102
         return self._capture("worktree_add", (cwd, path), {"branch": branch, "base": base})
 
-    def worktree_remove(self, cwd, path, *, force=False):  # noqa: D102
+    def worktree_remove(self, cwd: Path, path: Path, *, force: bool = False) -> GitResult:  # noqa: D102
         return self._capture("worktree_remove", (cwd, path), {"force": force})
 
-    def worktree_list(self, cwd):  # noqa: D102
+    def worktree_list(self, cwd: Path) -> GitResult:  # noqa: D102
         return self._capture("worktree_list", (cwd,), {})
 
-    def worktree_prune(self, cwd):  # noqa: D102
+    def worktree_prune(self, cwd: Path) -> GitResult:  # noqa: D102
         return self._capture("worktree_prune", (cwd,), {})
 
-    def status(self, cwd, *, porcelain=True):  # noqa: D102
+    def status(self, cwd: Path, *, porcelain: bool = True) -> GitResult:  # noqa: D102
         return self._capture("status", (cwd,), {"porcelain": porcelain})
 
-    def add(self, cwd, *paths):  # noqa: D102
+    def add(self, cwd: Path, *paths: str) -> GitResult:  # noqa: D102
         return self._capture("add", (cwd, *paths), {})
 
-    def commit(self, cwd, message, *, no_verify=False, allow_empty=False):  # noqa: D102
+    def commit(
+        self, cwd: Path, message: str, *, no_verify: bool = False, allow_empty: bool = False
+    ) -> GitResult:  # noqa: D102
         return self._capture("commit", (cwd, message), {"no_verify": no_verify, "allow_empty": allow_empty})
 
-    def push(self, cwd, remote, branch, *, set_upstream=False):  # noqa: D102
+    def push(
+        self, cwd: Path, remote: str, branch: str, *, set_upstream: bool = False
+    ) -> GitResult:  # noqa: D102
         return self._capture("push", (cwd, remote, branch), {"set_upstream": set_upstream})
 
-    def log(self, cwd, *args):  # noqa: D102
+    def log(self, cwd: Path, *args: str) -> GitResult:  # noqa: D102
         return self._capture("log", (cwd, *args), {})
 
-    def rev_parse(self, cwd, *args):  # noqa: D102
+    def rev_parse(self, cwd: Path, *args: str) -> GitResult:  # noqa: D102
         return self._capture("rev_parse", (cwd, *args), {})
 
-    def branch_create(self, cwd, name, *, start_point=None):  # noqa: D102
+    def branch_create(
+        self, cwd: Path, name: str, *, start_point: str | None = None
+    ) -> GitResult:  # noqa: D102
         return self._capture("branch_create", (cwd, name), {"start_point": start_point})
 
-    def branch_delete(self, cwd, name, *, force=False):  # noqa: D102
+    def branch_delete(self, cwd: Path, name: str, *, force: bool = False) -> GitResult:  # noqa: D102
         return self._capture("branch_delete", (cwd, name), {"force": force})
 
-    def fetch(self, cwd, remote, *refspecs, prune=False):  # noqa: D102
+    def fetch(self, cwd: Path, remote: str, *refspecs: str, prune: bool = False) -> GitResult:  # noqa: D102
         return self._capture("fetch", (cwd, remote, *refspecs), {"prune": prune})
 
 

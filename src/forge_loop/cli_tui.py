@@ -196,7 +196,7 @@ if _TEXTUAL_AVAILABLE:
             cap_s = f"${cap:.2f}" if cap else "uncapped"
             self.update(f"[bold]budget[/bold]: spent ${spent:.4f} / cap {cap_s}")
 
-    class ForgeLoopTUI(App):  # type: ignore[misc]
+    class ForgeLoopTUI(App[None]):
         """Textual app that surfaces the live operator view."""
 
         CSS = """

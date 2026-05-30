@@ -177,7 +177,7 @@ class CriticSettings(BaseSettings):
     def _provider_known(cls, v: str) -> str:
         if v not in _AGENT_PROVIDERS:
             raise ConfigError(f"critic.provider={v!r} — expected one of {sorted(_AGENT_PROVIDERS)}")
-        return v
+        return str(v)
 
     @field_validator("thinking", mode="before")
     @classmethod
@@ -191,7 +191,7 @@ class CriticSettings(BaseSettings):
             v = "off"
         if v not in _THINKING_VALUES:
             raise ConfigError(f"critic.thinking={v!r} — expected one of {sorted(_THINKING_VALUES)}")
-        return v
+        return str(v)
 
     @model_validator(mode="after")
     def _model_alias(self) -> CriticSettings:
@@ -213,7 +213,7 @@ class POSettings(BaseSettings):
     def _provider_known(cls, v: str) -> str:
         if v not in _AGENT_PROVIDERS:
             raise ConfigError(f"po.provider={v!r} — expected one of {sorted(_AGENT_PROVIDERS)}")
-        return v
+        return str(v)
 
     @field_validator("thinking", mode="before")
     @classmethod
@@ -225,7 +225,7 @@ class POSettings(BaseSettings):
             v = "off"
         if v not in _THINKING_VALUES:
             raise ConfigError(f"po.thinking={v!r} — expected one of {sorted(_THINKING_VALUES)}")
-        return v
+        return str(v)
 
     @model_validator(mode="after")
     def _model_alias(self) -> POSettings:
@@ -249,7 +249,7 @@ class WorkerSettings(BaseSettings):
     def _provider_known(cls, v: str) -> str:
         if v not in _AGENT_PROVIDERS:
             raise ConfigError(f"worker.provider={v!r} — expected one of {sorted(_AGENT_PROVIDERS)}")
-        return v
+        return str(v)
 
     @field_validator("thinking", mode="before")
     @classmethod
@@ -261,7 +261,7 @@ class WorkerSettings(BaseSettings):
             v = "off"
         if v not in _THINKING_VALUES:
             raise ConfigError(f"worker.thinking={v!r} — expected one of {sorted(_THINKING_VALUES)}")
-        return v
+        return str(v)
 
     @model_validator(mode="after")
     def _model_alias(self) -> WorkerSettings:

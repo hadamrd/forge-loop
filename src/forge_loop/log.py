@@ -26,10 +26,10 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Any
+from typing import Any, cast
 
 import structlog
-
+from structlog.stdlib import BoundLogger
 
 _CONFIGURED = False
 
@@ -93,7 +93,7 @@ def configure_logging(level: int = logging.INFO) -> None:
     _CONFIGURED = True
 
 
-def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
+def get_logger(name: str | None = None) -> BoundLogger:
     """Return a configured logger.
 
     Bare ``get_logger()`` is fine for module-level use; pass ``name``
@@ -102,7 +102,7 @@ def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     """
     if not _CONFIGURED:
         configure_logging()
-    return structlog.get_logger(name) if name else structlog.get_logger()
+    return cast(BoundLogger, structlog.get_logger(name) if name else structlog.get_logger())
 
 
 __all__ = ["configure_logging", "get_logger"]

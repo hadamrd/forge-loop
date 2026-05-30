@@ -98,10 +98,8 @@ def run_maintenance_tick(cfg: Config, tick: int) -> None:
     write_state(cfg.state_file, {"state": "maintenance", "tick": tick})
     append_event(cfg.events_file, "maintenance_start", tick=tick)
     brief = cfg.briefs.maintenance
-    outcome = (
-        run_maintenance(cfg.repo, cfg.logs_dir, brief=brief if brief else None)
-        if brief
-        else run_maintenance(cfg.repo, cfg.logs_dir)
+    outcome = run_maintenance(cfg.repo, cfg.logs_dir, brief=brief) if brief else run_maintenance(
+        cfg.repo, cfg.logs_dir
     )
     append_event(
         cfg.events_file,

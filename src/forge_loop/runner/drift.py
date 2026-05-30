@@ -7,10 +7,8 @@ no behaviour change, no signature change.
 from __future__ import annotations
 
 import contextlib
-import os
 import subprocess
 import time
-from collections import deque
 
 from forge_loop.config import Config
 from forge_loop.runner._helpers import (
@@ -57,6 +55,8 @@ def _check_drift_and_maybe_halt(
             "file to resume."
         )
         with contextlib.suppress(subprocess.TimeoutExpired, FileNotFoundError):
+            if not cfg.github_repo:
+                raise FileNotFoundError
             subprocess.run(
                 ["gh", "issue", "create",
                  "--repo", cfg.github_repo,

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Protocol
+
 from forge_loop.config import Config
 from forge_loop.gh import unlabel
 from forge_loop.state import append_event
+
+
+class UnlabelFn(Protocol):
+    def __call__(self, issue: int, label: str, *, repo: str | None = None) -> None: ...
 
 
 def remove_ready_label(
@@ -13,7 +19,7 @@ def remove_ready_label(
     *,
     status: str,
     pr_url: str | None = None,
-    unlabel_fn=unlabel,
+    unlabel_fn: UnlabelFn = unlabel,
 ) -> None:
     try:
         unlabel_fn(issue, cfg.labels.ready, repo=cfg.github_repo)

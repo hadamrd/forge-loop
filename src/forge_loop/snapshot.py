@@ -108,7 +108,8 @@ def build_snapshot(
     if since_minutes <= 0:
         since_minutes = 15
     now = now or datetime.now(UTC)
-    wt_root = worktree_root or getattr(cfg, "worktree_root", _DEFAULT_WORKTREE_ROOT)
+    wt_root_value = worktree_root or getattr(cfg, "worktree_root", _DEFAULT_WORKTREE_ROOT)
+    wt_root = wt_root_value if isinstance(wt_root_value, Path) else _DEFAULT_WORKTREE_ROOT
     errors: dict[str, str] = {}
 
     # ── 1. State file: tick, state, runner_id ────────────────────────────

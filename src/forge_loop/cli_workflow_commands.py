@@ -16,6 +16,8 @@ from forge_loop.state import tail_events
 
 
 class WorkflowCommandsMixin:
+    load: Any
+
     def _cmd_record_session(self, args: SimpleNamespace) -> int:
         from forge_loop._testing.recorder import SessionRecorder
         from forge_loop.worker import make_brief
@@ -263,4 +265,3 @@ class WorkflowCommandsMixin:
         else:
             sys.stdout.write(_replay.render_diff_report_text(report))
         return 0
-
