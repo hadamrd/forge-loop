@@ -71,12 +71,13 @@ def test_make_brief_risk_gated_disables_automerge(tmp_path: Path) -> None:
     assert '"status": "open"' in brief
 
 
-def test_make_brief_default_keeps_automerge(tmp_path: Path) -> None:
+def test_make_brief_default_stops_before_automerge(tmp_path: Path) -> None:
     issue = {"number": 942, "title": "fix x", "body": ""}
     brief = make_brief(issue, tmp_path / "w")
-    assert "gh pr merge" in brief
-    assert "--auto" in brief
-    assert "DO NOT enable auto-merge" not in brief
+    assert "DO NOT enable auto-merge" in brief
+    assert "DO NOT merge the PR" in brief
+    assert "owns merge after critic approval" in brief
+    assert '"status": "open|failed"' in brief
 
 
 def test_make_repair_brief_keeps_same_pr_contract(tmp_path: Path) -> None:

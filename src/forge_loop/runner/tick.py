@@ -78,6 +78,40 @@ def _remove_ready_label(
     _remove_ready_label_impl(cfg, issue, status=status, pr_url=pr_url, unlabel_fn=unlabel)
 
 
+def _enable_automerge_for_reviewed_outcomes(
+    cfg: Config,
+    outcomes: list[WorkerOutcome],
+    *,
+    risk_gated_issues: set[int],
+    refused_issues: set[int],
+) -> None:
+    """Enable auto-merge only after critic and merge gates have passed."""
+    from forge_loop import gh as _gh
+
+    for outcome in outcomes:
+        if outcome.status != "open" or not outcome.pr_url:
+            continue
+        if outcome.issue in risk_gated_issues or outcome.issue in refused_issues:
+            continue
+        if outcome.error:
+            continue
+        if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
+            outcome.status = "merged"
+            append_event(
+                cfg.events_file,
+                "post_critic_automerge_enabled",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+            )
+        else:
+            append_event(
+                cfg.events_file,
+                "post_critic_automerge_failed",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+            )
+
+
 def _tick(cfg: Config, tick: int) -> None:
     # Imported lazily to avoid an import cycle (boot.py imports tick.py).
     from forge_loop.runner.boot import _short_sleep
@@ -368,6 +402,12 @@ def _tick(cfg: Config, tick: int) -> None:
         _short_sleep(cfg.tick_interval_s, cfg)
         return
 
+    risk_gated_issues = {
+        issue["number"]
+        for issue, meta in zip(issues, workers_meta, strict=True)
+        if meta.get("risk_gated")
+    }
+
     master_log_path = cfg.logs_dir / "master.log"
     _mlog.info(
         master_log_path,
@@ -491,6 +531,12 @@ def _tick(cfg: Config, tick: int) -> None:
         repo=cfg.github_repo,
         events_file=cfg.events_file,
         emit=_bus_emit,
+    )
+    _enable_automerge_for_reviewed_outcomes(
+        cfg,
+        outcomes,
+        risk_gated_issues=risk_gated_issues,
+        refused_issues=set(refused),
     )
     if refused:
         _mlog.info(

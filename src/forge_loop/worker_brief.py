@@ -59,14 +59,15 @@ def make_brief(
         if risk_gated
         else "10. `gh pr create` with a clear title + body (the body should restate\n"
         "    the acceptance criteria and how they're tested).\n"
-        "11. `gh pr merge <N> --squash --auto --delete-branch`."
+        "11. STOP. DO NOT enable auto-merge and DO NOT merge the PR. The runner\n"
+        "    owns merge after critic approval and merge gates. Your status is `open`."
     )
 
     lumen_total = lumen_top_k + 1
     final_status = (
         f'{{"issue": {n}, "pr": "<url>", "status": "open", "note": "risk-gated"}}'
         if risk_gated
-        else f'{{"issue": {n}, "pr": "<url-or-null>", "status": "merged|open|failed", "note": "<short>"}}'
+        else f'{{"issue": {n}, "pr": "<url-or-null>", "status": "open|failed", "note": "<short>"}}'
     )
     coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
 

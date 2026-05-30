@@ -259,12 +259,12 @@ _WORKER_DISCIPLINE_PHRASES = (
     "Every 20 turns of editing OR every 5 file edits",
     'git add -A && git commit -m "wip:',
     "Before any tool call after turn 40",
-    "git commit, git push, gh pr create, gh pr merge --auto",
+    "git commit, git push, gh pr create",
     "EXIT CHECKLIST",
     "git log origin/trunk..HEAD --oneline",
     "git push -u origin <branch>",
     "gh pr view <branch> --json url",
-    "gh pr merge <N> --squash --auto --delete-branch",
+    "Do NOT run `gh pr merge`",
 )
 
 
@@ -288,9 +288,9 @@ def test_worker_brief_exit_checklist_ordering() -> None:
     idx_log = out.index("git log origin/trunk..HEAD", idx_header)
     idx_push = out.index("git push -u origin <branch>", idx_log)
     idx_view = out.index("gh pr view <branch>", idx_push)
-    idx_merge = out.index("gh pr merge <N>", idx_view)
+    idx_stop = out.index("Do NOT run `gh pr merge`", idx_view)
     # All four found, and they are strictly increasing — that's the assertion.
-    assert idx_header < idx_log < idx_push < idx_view < idx_merge
+    assert idx_header < idx_log < idx_push < idx_view < idx_stop
 
 
 def test_worker_brief_fallback_commit_on_checklist_failure() -> None:
@@ -354,7 +354,7 @@ def test_cli_brief_worker_emits_commit_discipline_sections(
     assert rc == 0
     assert "COMMIT DISCIPLINE — HARD RULE" in out
     assert "EXIT CHECKLIST" in out
-    assert "gh pr merge <N> --squash --auto --delete-branch" in out
+    assert "Do NOT run `gh pr merge`" in out
 
 
 def test_cli_brief_renders_worker_with_placeholder_when_no_gh(

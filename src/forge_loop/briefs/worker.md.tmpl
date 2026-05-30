@@ -61,13 +61,13 @@ CONTRACT (content-grade — NOT the smallest possible diff):
 
 COMMIT DISCIPLINE — HARD RULE:
 - Every 20 turns of editing OR every 5 file edits, run `git add -A && git commit -m "wip: <one-line>"` (no need to push). This is non-negotiable: even partial work that exits cleanly will produce a draft PR that the operator can pick up.
-- Before any tool call after turn 40, your IMMEDIATELY-NEXT tool call must be one of: git commit, git push, gh pr create, gh pr merge --auto. The implementation phase is over; ship what you have.
+- Before any tool call after turn 40, your IMMEDIATELY-NEXT tool call must be one of: git commit, git push, gh pr create. The implementation phase is over; ship what you have to PR-open.
 
 EXIT CHECKLIST — the final 4 actions of every session, in order:
 1. `git log origin/trunk..HEAD --oneline` — there MUST be ≥1 commit.
 2. `git push -u origin <branch>` — exit code MUST be 0.
 3. `gh pr view <branch> --json url` — PR MUST exist.
-4. `gh pr merge <N> --squash --auto --delete-branch` — fired (or a risk-gated note posted on the PR explaining why auto-merge is unsafe).
+4. Stop after PR creation. Do NOT run `gh pr merge`; the runner owns post-critic merge enablement.
 
 If ANY checklist item fails, your FINAL ACTION before exit MUST be
 `git add -A && git commit -m "wip: exit-checklist fallback" && git push -u origin HEAD`

@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from forge_loop import attempts as _attempts
+from forge_loop import gh as _gh
 from forge_loop import runner as _runner
 from forge_loop import worker as _worker
 from forge_loop.config import (
@@ -86,6 +87,7 @@ class _State:
         self.unlabeled: list[tuple[int, str, str | None]] = []
         self.blocking_comments: dict[int, list[str]] = {}
         self.worker_kwargs: list[dict[str, Any]] = []
+        self.automerge_calls: list[tuple[str, str | None]] = []
 
 
 @pytest.fixture
@@ -147,6 +149,12 @@ def fake_world(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(_attempts, "record", fake_record)
     monkeypatch.setattr(_runner, "run_worker", fake_run_worker)
     monkeypatch.setattr(_runner, "unlabel", fake_unlabel)
+    monkeypatch.setattr(_gh, "get_issue_state", lambda *_a, **_kw: "OPEN")
+    monkeypatch.setattr(
+        _gh,
+        "enable_pr_auto_merge",
+        lambda pr, repo=None: state.automerge_calls.append((pr, repo)) is None,
+    )
     # Defang side effects:
     monkeypatch.setattr(_runner, "_reap_worktree", lambda *a, **k: None)
     monkeypatch.setattr(_runner, "redeploy", lambda *a, **k: (True, "ok"))
@@ -186,6 +194,33 @@ def test_open_pr_removes_ready_label(fake_world) -> None:
     assert removed["issue"] == 99
     assert removed["status"] == "open"
     assert removed["pr_url"] == "https://github.com/o/r/pull/100"
+
+
+def test_open_pr_automerge_is_runner_owned_after_gates(fake_world) -> None:
+    state, cfg, _ = fake_world
+    state.scripted_status = "open"
+    state.scripted_pr = "https://github.com/o/r/pull/100"
+    state.scripted_error = None
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.automerge_calls == [("https://github.com/o/r/pull/100", "o/r")]
+    assert state.history[99][0]["status"] == "merged"
+    events = _read_events(cfg)
+    assert "post_critic_automerge_enabled" in _kinds(events)
+
+
+def test_risk_gated_open_pr_does_not_automerge(fake_world) -> None:
+    state, cfg, issue = fake_world
+    issue["labels"] = [{"name": "risk:high"}]
+    state.scripted_status = "open"
+    state.scripted_pr = "https://github.com/o/r/pull/100"
+    state.scripted_error = None
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.automerge_calls == []
+    assert state.history[99][0]["status"] == "open"
 
 
 def test_attempt_record_uses_post_critic_status(fake_world, monkeypatch) -> None:
