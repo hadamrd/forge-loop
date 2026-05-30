@@ -292,6 +292,51 @@ def test_run_worker_codex_provider_maps_final_json(
     assert out.model == "gpt-5-codex"
 
 
+def test_run_worker_emits_start_and_done_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from forge_loop import worker as worker_mod
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    def fake_prep(_repo: Path, _n: int, _branch: str, **_kwargs: Any) -> tuple[Path, None]:
+        return worktree, None
+
+    def fake_sdk(**_kwargs: Any) -> worker_mod.WorkerOutcome:
+        return worker_mod.WorkerOutcome(
+            issue=12,
+            title="ship events",
+            pr_url="https://github.com/o/r/pull/12",
+            status="open",
+            duration_s=2.4,
+            stdout_tail="",
+        )
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(worker_mod, "_prep_worktree", fake_prep)
+    monkeypatch.setattr(worker_mod, "_run_worker_sdk", fake_sdk)
+
+    out = worker_mod.run_worker(
+        {"number": 12, "title": "ship events", "body": "body"},
+        tmp_path,
+        tmp_path / "logs",
+        30,
+        emit=lambda kind, payload: events.append((kind, payload)),
+        tick=5,
+        model="claude-opus-4-7",
+    )
+
+    assert out.status == "open"
+    assert [kind for kind, _payload in events] == ["worker_start", "worker_done"]
+    assert events[0][1]["issue"] == 12
+    assert events[0][1]["tick"] == 5
+    assert events[0][1]["worktree"] == str(worktree)
+    assert events[1][1]["status"] == "open"
+    assert events[1][1]["pr_url"] == "https://github.com/o/r/pull/12"
+
+
 def test_prep_worktree_uses_configured_base_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -368,9 +413,9 @@ def test_prep_worktree_quarantines_undeletable_dir(
         worktree, err = _prep_worktree(tmp_path, 9999, "loop/9999-demo")
         assert err is None
         # `git worktree add` MUST still get called — quarantine unblocked it.
-        assert any(
-            cmd[:3] == ["git", "worktree", "add"] for cmd in calls
-        ), f"worktree add was not called: {calls!r}"
+        assert any(cmd[:3] == ["git", "worktree", "add"] for cmd in calls), (
+            f"worktree add was not called: {calls!r}"
+        )
         # The blocking dir got renamed out of the way.
         assert not blocking.exists(), "blocking dir should have been quarantined"
         quarantined = sorted(

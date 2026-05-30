@@ -353,6 +353,18 @@ def _cmd_status(args: SimpleNamespace) -> int:
     prs_today: list[int] = []
     last_failure: dict[str, Any] | None = None
     last_5_events: list[dict[str, str]] = []
+    active_workers_by_issue: dict[int, dict[str, Any]] = {}
+    worker_terminal_kinds = {
+        "worker_done",
+        "worker_failed",
+        "worker_skip_in_flight",
+        "worker_skip_cooldown",
+        "budget_worker_killed",
+        "watchdog_worker_killed",
+        "worker_completed",
+        "worker_merged",
+    }
+    raw: list[str] = []
     if cfg.events_file.exists():
         try:
             with open(cfg.events_file) as f:
@@ -379,12 +391,59 @@ def _cmd_status(args: SimpleNamespace) -> int:
                     "kind": kind,
                     "detail": str(e.get("detail") or e.get("err") or "")[:120],
                 }
+            issue = e.get("issue") or e.get("issue_number")
+            if not isinstance(issue, int):
+                try:
+                    issue = int(issue)
+                except (TypeError, ValueError):
+                    issue = None
+            if isinstance(issue, int):
+                if kind == "worker_start":
+                    active_workers_by_issue[issue] = {
+                        "issue": issue,
+                        "title": e.get("title"),
+                        "started_ts": ts,
+                        "last_event_ts": ts,
+                        "status": "running",
+                        "worktree": e.get("worktree"),
+                        "log_path": e.get("log_path"),
+                    }
+                elif kind in worker_terminal_kinds:
+                    active_workers_by_issue.pop(issue, None)
+                elif issue in active_workers_by_issue:
+                    active_workers_by_issue[issue]["last_event_ts"] = ts
         for line in raw[-5:]:
             try:
                 e = json.loads(line)
                 last_5_events.append({"ts": str(e.get("ts", "?")), "kind": str(e.get("kind", "?"))})
             except json.JSONDecodeError:
                 pass
+    runner_stale = state_blob.get("state") == "running" and not pid_alive
+    active_workers = list(active_workers_by_issue.values())
+    if not active_workers and state_blob.get("state") == "running":
+        for entry in state_blob.get("dispatched") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("issue"), int):
+                active_workers.append(
+                    {
+                        "issue": entry["issue"],
+                        "title": entry.get("title"),
+                        "started_ts": None,
+                        "last_event_ts": None,
+                        "status": "stale_unconfirmed" if runner_stale else "running_unconfirmed",
+                        "worktree": None,
+                        "log_path": None,
+                    }
+                )
+    for worker in active_workers:
+        last_ts = worker.get("last_event_ts") or worker.get("started_ts")
+        try:
+            last_dt = datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            worker["last_event_age_s"] = None
+        else:
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=UTC)
+            worker["last_event_age_s"] = max(0, int((now - last_dt).total_seconds()))
 
     # Issue #126 — fetch labels + title alongside number so we can group
     # the open ready-queue by ``axis:*`` label below. Cheap: same call,
@@ -449,11 +508,13 @@ def _cmd_status(args: SimpleNamespace) -> int:
         "halt_reason": halt_reason,
         "state": state_blob.get("state"),
         "tick": state_blob.get("tick"),
+        "runner_stale": runner_stale,
         "queue_depth": queue_depth,
         "queue_label": cfg.labels.ready,
         "prs_today": prs_today,
         "last_failure": last_failure,
         "last_events": last_5_events,
+        "active_workers": sorted(active_workers, key=lambda w: int(w.get("issue") or 0)),
         "events_file": str(cfg.events_file),
         "axes": axes_payload,
         "unaligned_count": unaligned_count,
@@ -507,6 +568,16 @@ def _cmd_status(args: SimpleNamespace) -> int:
             joined.append(ev["kind"], style="cyan")
             joined.append("\n")
         table.add_row("last 5 events", joined)
+    if active_workers:
+        workers_text = Text()
+        for worker in sorted(active_workers, key=lambda w: int(w.get("issue") or 0)):
+            workers_text.append(f"  #{worker.get('issue')} ", style="cyan")
+            workers_text.append(str(worker.get("status") or "running"))
+            age = worker.get("last_event_age_s")
+            if age is not None:
+                workers_text.append(f"  quiet={age}s")
+            workers_text.append("\n")
+        table.add_row("active workers", workers_text)
     table.add_row("events", str(cfg.events_file))
 
     # Issue #126 — axis breakdown. Render one row per axis (sorted for

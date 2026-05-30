@@ -460,6 +460,17 @@ def _tail(path: Path, n_chars: int) -> str:
         return ""
 
 
+def _emit_worker_event(
+    emit: Callable[[str, dict[str, Any]], None] | None,
+    kind: str,
+    **payload: Any,
+) -> None:
+    if emit is None:
+        return
+    with contextlib.suppress(Exception):
+        emit(kind, payload)
+
+
 def run_worker(
     issue: dict[str, Any],
     repo: Path,
@@ -515,6 +526,18 @@ def run_worker(
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"worker-{n}-{int(time.time())}.log"
+    _emit_worker_event(
+        emit,
+        "worker_start",
+        issue=n,
+        title=title,
+        tick=tick,
+        provider=provider,
+        model=model or "",
+        worktree=str(worktree),
+        log_path=str(log_path),
+        branch=branch,
+    )
     # Issue #132 — discover the active manifestos once at dispatch time.
     # The bundle threads into BOTH the brief renderer (prepends MANIFESTO
     # block) AND the outcome telemetry (``manifesto_sha`` audit field).
@@ -557,25 +580,64 @@ def run_worker(
             model=model,
         )
         outcome.manifesto_sha = manifesto_sha
+        _emit_worker_event(
+            emit,
+            "worker_done",
+            issue=n,
+            title=title,
+            tick=tick,
+            status=outcome.status,
+            pr_url=outcome.pr_url,
+            duration_s=round(outcome.duration_s, 1),
+            error=outcome.error,
+            worktree=str(worktree),
+            log_path=str(log_path),
+        )
         return outcome
 
-    outcome = _run_worker_sdk(
-        issue=issue,
-        worktree=worktree,
-        log_path=log_path,
-        brief=brief,
-        timeout_s=timeout_s,
-        emit=emit,
-        tick=tick,
-        model=model,
-        thinking=thinking,
-        allowed_mcp_servers=allowed_mcp_servers,
-        load_timeout_ms=load_timeout_ms,
-        strict_mcp_config=strict_mcp_config,
-        mcp_servers=mcp_servers,
-    )
-    outcome.manifesto_sha = manifesto_sha
-    return outcome
+    try:
+        outcome = _run_worker_sdk(
+            issue=issue,
+            worktree=worktree,
+            log_path=log_path,
+            brief=brief,
+            timeout_s=timeout_s,
+            emit=emit,
+            tick=tick,
+            model=model,
+            thinking=thinking,
+            allowed_mcp_servers=allowed_mcp_servers,
+            load_timeout_ms=load_timeout_ms,
+            strict_mcp_config=strict_mcp_config,
+            mcp_servers=mcp_servers,
+        )
+        outcome.manifesto_sha = manifesto_sha
+        _emit_worker_event(
+            emit,
+            "worker_done",
+            issue=n,
+            title=title,
+            tick=tick,
+            status=outcome.status,
+            pr_url=outcome.pr_url,
+            duration_s=round(outcome.duration_s, 1),
+            error=outcome.error,
+            worktree=str(worktree),
+            log_path=str(log_path),
+        )
+        return outcome
+    except BaseException as exc:
+        _emit_worker_event(
+            emit,
+            "worker_failed",
+            issue=n,
+            title=title,
+            tick=tick,
+            error=f"{type(exc).__name__}: {exc!s:.200}",
+            worktree=str(worktree),
+            log_path=str(log_path),
+        )
+        raise
 
 
 def run_repair_worker(
