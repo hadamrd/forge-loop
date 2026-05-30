@@ -76,7 +76,8 @@ def test_each_tool_has_independent_counter(monkeypatch: pytest.MonkeyPatch) -> N
         return {"ok": True, "fn": "y"}
 
     # Burn tool_x's cap.
-    x(); x()
+    x()
+    x()
     r = x()
     assert r["error"] == "rate_limited"
     # tool_y is untouched.

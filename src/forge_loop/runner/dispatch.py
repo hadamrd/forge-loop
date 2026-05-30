@@ -17,6 +17,17 @@ from forge_loop import master_log as _mlog
 from forge_loop.config import Config
 from forge_loop.critic import review_pr as _critic_review
 from forge_loop.critic_actions import apply_critic_report
+from forge_loop.runner.critic_flow import (
+    NEEDS_HUMAN_LABEL,
+    NEEDS_REVIEW_LABEL,
+    enforce_critic_iteration_cap,
+    format_critic_followup_prompt,
+    handle_critic_verdict,
+    resume_kwargs_for,
+)
+from forge_loop.runner.critic_flow import (
+    sev_counts as _sev_counts,
+)
 from forge_loop.runner.persistent_dispatch import (
     get_or_resume_session,
     mark_running,
@@ -27,51 +38,15 @@ from forge_loop.runner.persistent_dispatch import (
 from forge_loop.state import append_event
 from forge_loop.worker import WorkerOutcome, run_repair_worker, run_worker
 from forge_loop.worker_sessions import WorkerSessionStore
-from forge_loop.worker_state import InvalidTransition, WorkerState
 
-# Label applied to PRs whose persistent-worker session has exhausted the
-# critic ping-pong budget. Operators filter on this label to triage stuck
-# work that the loop has decided not to keep grinding on.
-NEEDS_HUMAN_LABEL = "loop:needs-human"
-
-# Label applied to PRs whose critic returned a BLOCK (sev1) verdict during
-# the ping-pong protocol (issue #110). Distinct from NEEDS_HUMAN_LABEL,
-# which fires on iteration-cap exhaustion (#111). Operators reading the
-# PR list can tell the two failure modes apart at a glance.
-NEEDS_REVIEW_LABEL = "loop:needs-review"
-
-
-def resume_kwargs_for(
-    store: WorkerSessionStore,
-    session_id: str,
-) -> dict[str, str]:
-    """Return ``{"resume": <sdk_id>}`` if this session can warm-resume.
-
-    The SDK preserves its prompt cache across calls when the caller passes
-    ``resume=<prior session_id>`` (issue #109 — the headline efficiency win
-    of epic #95). We resume on RUNNING/REVISING because those are the two
-    states where the FSM signals "the worker is still on the same logical
-    piece of work" (RUNNING = mid-attempt, REVISING = post-critic feedback,
-    same brief). DISPATCHED is a cold start by definition; AWAITING_CRITIC
-    means control is with the critic, so the worker isn't dispatching.
-
-    Returns an empty dict when:
-    - the session doesn't exist (caller bug, but treat defensively),
-    - the session has no ``sdk_session_id`` yet (first dispatch),
-    - the session isn't in a resumable state.
-
-    The empty dict is splat-safe at the call site: just
-    ``await run_sdk_session(..., **resume_kwargs_for(store, sid))``.
-    """
-    sess = store.get(session_id)
-    if sess is None:
-        return {}
-    if not sess.sdk_session_id:
-        return {}
-    if sess.state not in {WorkerState.RUNNING, WorkerState.REVISING}:
-        return {}
-    return {"resume": sess.sdk_session_id}
-
+__all__ = [
+    "NEEDS_HUMAN_LABEL",
+    "NEEDS_REVIEW_LABEL",
+    "enforce_critic_iteration_cap",
+    "format_critic_followup_prompt",
+    "handle_critic_verdict",
+    "resume_kwargs_for",
+]
 
 def persist_sdk_result(
     *,
@@ -149,311 +124,6 @@ def free_dispatch_slots(store: WorkerSessionStore, parallel: int) -> int:
         have to special-case.
     """
     return max(0, parallel - store.active_count())
-
-
-def enforce_critic_iteration_cap(
-    *,
-    store: WorkerSessionStore,
-    session_id: str,
-    pr_url: str | None,
-    max_critic_iterations: int,
-    findings_summary: str = "",
-    gh: Any = _gh,
-    repo: str | None = None,
-    emit: Any = None,
-) -> bool:
-    """Handle a REQUEST_CHANGES verdict against the iteration cap.
-
-    Called on every AWAITING_CRITIC -> (REVISING|ABANDONED) decision.
-    Reads ``session.critic_iterations`` and compares against
-    ``settings.iteration.max_critic_iterations``:
-
-    * counter >= cap  -> transition AWAITING_CRITIC -> ABANDONED with
-      ``reason="max_critic_iterations reached: N"``, label the PR
-      ``loop:needs-human``, and post a comment summarising the last
-      critic findings so a human picking this up has the context.
-    * counter <  cap  -> bump the counter, transition to REVISING with
-      ``reason="critic requested changes"`` so the persistent worker
-      session can resume with a warm prompt cache (issue #95).
-
-    Returns ``True`` when the session was abandoned (caller should stop
-    dispatching this issue's revision loop), ``False`` when a revision
-    is in flight.
-
-    Side effects on the GitHub side (label + comment) are best-effort:
-    a transient ``gh`` failure must not prevent the FSM transition from
-    landing, because the FSM is the source of truth — the label/comment
-    are operator UX. Failures are surfaced via ``emit`` so they're
-    observable in the event bus without blocking the loop.
-    """
-    sess = store.get(session_id)
-    if sess is None:
-        raise KeyError(f"unknown session_id: {session_id}")
-    if sess.state != WorkerState.AWAITING_CRITIC:
-        # Caller bug — the cap check belongs on the exact ping-pong edge,
-        # not on arbitrary state transitions. Surface this loudly.
-        raise InvalidTransition(sess.state, WorkerState.REVISING)
-
-    current = sess.critic_iterations
-    if current >= max_critic_iterations:
-        reason = f"max_critic_iterations reached: {current}"
-        store.transition_to(session_id, WorkerState.ABANDONED, reason=reason)
-        if pr_url:
-            try:
-                gh.add_pr_label(pr_url, [NEEDS_HUMAN_LABEL], repo=repo)
-            except Exception as ex_:  # noqa: BLE001 — best-effort
-                if emit is not None:
-                    with contextlib.suppress(Exception):
-                        emit("critic_cap_label_failed", issue=sess.issue, err=str(ex_)[:200])
-            body = (
-                f"Persistent-worker session abandoned after {current} critic "
-                f"iteration(s) (cap = {max_critic_iterations}).\n\n"
-                "Last critic findings:\n\n"
-                f"{findings_summary or '(no findings summary provided)'}"
-            )
-            try:
-                gh.pr_comment(pr_url, body, repo=repo)
-            except Exception as ex_:  # noqa: BLE001 — best-effort
-                if emit is not None:
-                    with contextlib.suppress(Exception):
-                        emit("critic_cap_comment_failed", issue=sess.issue, err=str(ex_)[:200])
-        if emit is not None:
-            with contextlib.suppress(Exception):
-                emit(
-                    "critic_iteration_cap_abandoned",
-                    issue=sess.issue,
-                    session_id=session_id,
-                    iterations=current,
-                    cap=max_critic_iterations,
-                    pr=pr_url,
-                )
-        return True
-
-    # Under the cap — bump counter, move to REVISING. The counter is
-    # bumped BEFORE the transition so a crash between the two leaves
-    # the session in AWAITING_CRITIC with the incremented count; the
-    # next tick re-enters this function and decides correctly.
-    new_count = store.increment_iterations(session_id)
-    store.transition_to(
-        session_id,
-        WorkerState.REVISING,
-        reason="critic requested changes",
-    )
-    if emit is not None:
-        with contextlib.suppress(Exception):
-            emit(
-                "critic_iteration_revising",
-                issue=sess.issue,
-                session_id=session_id,
-                iterations=new_count,
-                cap=max_critic_iterations,
-            )
-    return False
-
-
-def format_critic_followup_prompt(report: Any) -> str:
-    """Serialise critic findings into the next worker prompt VERBATIM.
-
-    Issue #110 contract: "The critic's comments get serialised into the
-    next worker prompt verbatim — no summarisation." So we render every
-    finding's full message + file/line + severity/category tag with NO
-    truncation, NO paraphrase, NO re-ordering. The worker sees exactly
-    what the critic wrote.
-
-    The leading instruction line tells the resumed SDK session that
-    these are the changes-requested findings to address. Because the
-    session resumes via ``resume=<sdk_session_id>``, the model already
-    has the prior worker context loaded (warm prompt cache) — we only
-    need to deliver the new feedback.
-    """
-    findings = list(getattr(report, "findings", []) or [])
-    header = (
-        "The critic returned REQUEST_CHANGES on your PR. "
-        "Address every finding below verbatim, then push a follow-up commit."
-    )
-    if not findings:
-        # Defensive: a REQUEST_CHANGES with zero findings is unusual but
-        # legal. Pass the raw report text through so the worker sees the
-        # critic's own words rather than an empty prompt.
-        raw = str(getattr(report, "raw", "")).strip()
-        body = raw or "(critic provided no findings text)"
-        return f"{header}\n\nCritic report:\n{body}"
-
-    lines: list[str] = [header, "", "Critic findings:"]
-    for f in findings:
-        loc = ""
-        if getattr(f, "file", None):
-            loc = f.file
-            if getattr(f, "line", None):
-                loc = f"{loc}:{f.line}"
-            loc = f" ({loc})"
-        lines.append(f"- [{f.severity}/{f.category}]{loc} {f.message}")
-    return "\n".join(lines)
-
-
-def handle_critic_verdict(
-    *,
-    store: WorkerSessionStore,
-    session_id: str,
-    report: Any,
-    pr_url: str | None,
-    gh: Any = _gh,
-    repo: str | None = None,
-    emit: Any = None,
-    dispatch_revision: Any = None,
-) -> str:
-    """Apply a critic verdict to the persistent-worker FSM (issue #110).
-
-    Routing table (matches the issue's acceptance criteria):
-
-    * ``approve`` → AWAITING_CRITIC → MERGED. Auto-merge has already
-      been queued by the gh layer; the FSM edge records that the loop
-      considers this session complete. Returns ``"merged"``.
-
-    * ``request_changes`` → AWAITING_CRITIC → REVISING. Bumps
-      ``critic_iterations`` via ``store.increment_iterations`` (counter
-      first so a crash between bump-and-transition still observes the
-      intended attempt count), then dispatches a follow-up worker via
-      the ``dispatch_revision`` callback. The callback is given the
-      resumed-session kwargs (``resume=<sdk_session_id>``) and the
-      verbatim critic-comments prompt — NO summarisation per the
-      ticket. ``dispatch_revision=None`` skips the dispatch step (used
-      by unit tests that only want to verify the FSM edge + bump).
-      Returns ``"revising"``.
-
-    * ``block`` → AWAITING_CRITIC → ABANDONED. The session is over;
-      a human takes it from here. Labels the PR ``loop:needs-review``
-      so operators can triage. Returns ``"abandoned"``.
-
-    * any other verdict (error / unknown) → no-op, returns ``"noop"``.
-      The caller MUST be able to keep the session in AWAITING_CRITIC
-      so the next tick can re-run the critic on a fresh log.
-
-    Pre-condition: ``session.state == AWAITING_CRITIC``. Any other
-    state raises :class:`InvalidTransition` so caller bugs surface
-    loudly instead of silently corrupting the FSM.
-
-    Iteration-cap enforcement (the >= max_critic_iterations gate) is
-    NOT handled here — that's issue #111 / :func:`enforce_critic_iteration_cap`.
-    This function is the verdict→state router; the cap is a separate
-    policy layer the runner stacks on top.
-    """
-    sess = store.get(session_id)
-    if sess is None:
-        raise KeyError(f"unknown session_id: {session_id}")
-    if sess.state != WorkerState.AWAITING_CRITIC:
-        raise InvalidTransition(sess.state, WorkerState.REVISING)
-
-    overall = str(getattr(report, "overall", "")).lower()
-
-    if overall == "approve":
-        store.transition_to(
-            session_id,
-            WorkerState.MERGED,
-            reason="critic approved",
-        )
-        if emit is not None:
-            with contextlib.suppress(Exception):
-                emit(
-                    "critic_verdict_merged",
-                    issue=sess.issue,
-                    session_id=session_id,
-                    pr=pr_url,
-                )
-        return "merged"
-
-    if overall == "block":
-        reason = "critic blocked (sev1)"
-        store.transition_to(session_id, WorkerState.ABANDONED, reason=reason)
-        if pr_url:
-            try:
-                gh.add_pr_label(pr_url, [NEEDS_REVIEW_LABEL], repo=repo)
-            except Exception as ex_:  # noqa: BLE001 — best-effort
-                if emit is not None:
-                    with contextlib.suppress(Exception):
-                        emit(
-                            "critic_block_label_failed",
-                            issue=sess.issue,
-                            err=str(ex_)[:200],
-                        )
-        if emit is not None:
-            with contextlib.suppress(Exception):
-                emit(
-                    "critic_verdict_blocked",
-                    issue=sess.issue,
-                    session_id=session_id,
-                    pr=pr_url,
-                )
-        return "abandoned"
-
-    if overall == "request_changes":
-        # Bump BEFORE transitioning so a crash mid-edge leaves the row
-        # in AWAITING_CRITIC with the new count — the next tick will
-        # re-route correctly.
-        new_count = store.increment_iterations(session_id)
-        store.transition_to(
-            session_id,
-            WorkerState.REVISING,
-            reason="critic requested changes",
-        )
-        # Build the verbatim follow-up prompt. This is what the spec
-        # calls "the critic's comments serialised into the next worker
-        # prompt verbatim".
-        followup_prompt = format_critic_followup_prompt(report)
-        resume_kw = resume_kwargs_for(store, session_id)
-        if emit is not None:
-            with contextlib.suppress(Exception):
-                emit(
-                    "critic_verdict_revising",
-                    issue=sess.issue,
-                    session_id=session_id,
-                    iterations=new_count,
-                    pr=pr_url,
-                    resumed=bool(resume_kw),
-                )
-        if dispatch_revision is not None:
-            # Best-effort — a dispatch failure must not undo the FSM
-            # edge. The next tick can re-attempt from REVISING.
-            try:
-                dispatch_revision(
-                    session=store.get(session_id),
-                    prompt=followup_prompt,
-                    resume_kwargs=resume_kw,
-                )
-            except Exception as ex_:  # noqa: BLE001 — boundary
-                if emit is not None:
-                    with contextlib.suppress(Exception):
-                        emit(
-                            "critic_revision_dispatch_failed",
-                            issue=sess.issue,
-                            session_id=session_id,
-                            err=str(ex_)[:300],
-                        )
-        return "revising"
-
-    # Unknown / error verdict — leave the row in AWAITING_CRITIC so
-    # the next tick can retry the critic on a fresh log.
-    if emit is not None:
-        with contextlib.suppress(Exception):
-            emit(
-                "critic_verdict_unknown",
-                issue=sess.issue,
-                session_id=session_id,
-                overall=overall,
-            )
-    return "noop"
-
-
-def _sev_counts(outcome: Any) -> dict[str, int]:
-    """Tally sev1/sev2/sev3 from a CriticOutcome.report. Safe on None."""
-    report = getattr(outcome, "report", None)
-    counts = {"sev1": 0, "sev2": 0, "sev3": 0}
-    if report is None:
-        return counts
-    for f in report.findings:
-        if f.severity in counts:
-            counts[f.severity] += 1
-    return counts
 
 
 def _branch_for_issue(issue: dict[str, Any]) -> str:

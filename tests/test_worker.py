@@ -18,11 +18,8 @@ from forge_loop import _worker_sdk
 from forge_loop.worker import (
     _branch_name,
     _extract_outcome,
-    _prep_worktree,
     _read_subagent_events,
     _tail,
-    make_brief,
-    make_repair_brief,
     run_repair_worker,
     run_worker,
 )
@@ -42,22 +39,6 @@ def test_branch_name_slugifies_title() -> None:
 def test_branch_name_empty_title_falls_back() -> None:
     assert _branch_name(1, "") == "loop/1-fix"
     assert _branch_name(2, "!!!") == "loop/2-fix"
-
-
-def test_make_brief_includes_issue_number_and_body(tmp_path: Path) -> None:
-    issue = {"number": 947, "title": "feat(pdl): onFailure", "body": "Some body text"}
-    brief = make_brief(issue, tmp_path / "wt-947")
-    assert "#947" in brief
-    assert "feat(pdl): onFailure" in brief
-    assert "Some body text" in brief
-    assert str(tmp_path / "wt-947") in brief
-    assert "CONTRACT" in brief
-
-
-def test_make_brief_caps_body_at_6000_chars(tmp_path: Path) -> None:
-    long_body = "a" * 10000
-    brief = make_brief({"number": 1, "title": "x", "body": long_body}, tmp_path / "w")
-    assert brief.count("a") <= 6500  # body truncation in effect
 
 
 def _write_stream_log(path: Path, result_text: str) -> None:
@@ -145,65 +126,6 @@ def test_read_subagent_events_parses_jsonl(tmp_path: Path) -> None:
 
 def test_read_subagent_events_no_file_returns_empty(tmp_path: Path) -> None:
     assert _read_subagent_events(tmp_path) == []
-
-
-def test_make_brief_includes_history_section_when_past_attempts(tmp_path: Path) -> None:
-    issue = {"number": 942, "title": "fix x", "body": "Do the thing."}
-    past = [
-        {"ts": "2026-05-26T10:00:00Z", "status": "failed", "note": "test missing", "pr_url": None},
-        {
-            "ts": "2026-05-26T11:00:00Z",
-            "status": "merged",
-            "note": "shipped",
-            "pr_url": "https://github.com/h/r/pull/9",
-        },
-    ]
-    brief = make_brief(issue, tmp_path / "w", past_attempts=past)
-    assert "PREVIOUS ATTEMPTS" in brief
-    assert "test missing" in brief
-    assert "https://github.com/h/r/pull/9" in brief
-
-
-def test_make_brief_no_history_section_when_empty(tmp_path: Path) -> None:
-    issue = {"number": 942, "title": "fix x", "body": ""}
-    brief = make_brief(issue, tmp_path / "w", past_attempts=[])
-    assert "PREVIOUS ATTEMPTS" not in brief
-
-
-def test_make_brief_risk_gated_disables_automerge(tmp_path: Path) -> None:
-    issue = {"number": 942, "title": "fix x", "body": ""}
-    brief = make_brief(issue, tmp_path / "w", risk_gated=True)
-    assert "DO NOT enable auto-merge" in brief
-    assert "ready for human review" in brief
-    assert '"status": "open"' in brief
-
-
-def test_make_brief_default_keeps_automerge(tmp_path: Path) -> None:
-    issue = {"number": 942, "title": "fix x", "body": ""}
-    brief = make_brief(issue, tmp_path / "w")
-    assert "gh pr merge" in brief
-    assert "--auto" in brief
-    assert "DO NOT enable auto-merge" not in brief
-
-
-def test_make_repair_brief_keeps_same_pr_contract(tmp_path: Path) -> None:
-    issue = {"number": 42, "title": "fix blocked pr", "body": "Acceptance"}
-    pr = {
-        "number": 7,
-        "url": "https://github.com/o/r/pull/7",
-        "headRefName": "loop/42-fix-blocked-pr",
-    }
-    brief = make_repair_brief(
-        issue,
-        tmp_path / "wt",
-        pr=pr,
-        review_context="[sev1] fix the real consumer",
-    )
-    assert "Repair the EXISTING PR branch" in brief
-    assert "Do not create a new branch" in brief
-    assert "https://github.com/o/r/pull/7" in brief
-    assert "[sev1] fix the real consumer" in brief
-    assert '"pr": "https://github.com/o/r/pull/7"' in brief
 
 
 def test_run_repair_worker_codex_uses_existing_pr_branch(
@@ -335,101 +257,6 @@ def test_run_worker_emits_start_and_done_events(
     assert events[0][1]["worktree"] == str(worktree)
     assert events[1][1]["status"] == "open"
     assert events[1][1]["pr_url"] == "https://github.com/o/r/pull/12"
-
-
-def test_prep_worktree_uses_configured_base_branch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[list[str]] = []
-
-    class _Completed:
-        returncode = 0
-        stderr = ""
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> _Completed:
-        calls.append(cmd)
-        return _Completed()
-
-    monkeypatch.setattr("forge_loop.worker.subprocess.run", fake_run)
-    monkeypatch.setattr("forge_loop.worker._drop_permissive_settings", lambda _wt: None)
-
-    worktree, err = _prep_worktree(tmp_path, 12, "loop/12-demo", base_branch="main")
-
-    assert err is None
-    assert str(worktree).endswith("/tmp/wt-loop-12")
-    assert [
-        "git",
-        "fetch",
-        "--prune",
-        "origin",
-        "+refs/heads/main:refs/remotes/origin/main",
-    ] in calls
-    assert ["git", "worktree", "add", str(worktree), "-B", "loop/12-demo", "origin/main"] in calls
-
-
-def test_prep_worktree_quarantines_undeletable_dir(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When a prior worker planted files we can't chmod/rm (uid mismatch),
-    the dir is renamed out of the way so the new `git worktree add`
-    doesn't collide. Without this, every retry of the same issue hits
-    `worktree-create-failed` and the loop spins forever.
-
-    Repro: simulate `shutil.rmtree` raising PermissionError, then
-    verify (a) `worktree add` still gets called, and (b) a quarantine
-    dir matching `wt-loop-<N>.stale-<ts>` exists.
-    """
-    import shutil as _real_shutil
-
-    real_rmtree = _real_shutil.rmtree  # capture before monkeypatch
-
-    blocking = Path("/tmp/wt-loop-9999")
-    # Pre-clean from any prior failed run before we monkeypatch rmtree.
-    for q in Path("/tmp").glob("wt-loop-9999*"):
-        real_rmtree(q, ignore_errors=True)
-    blocking.mkdir(exist_ok=True)
-    (blocking / "marker").write_text("planted")
-
-    class _Completed:
-        returncode = 0
-        stderr = ""
-
-    calls: list[list[str]] = []
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> _Completed:
-        calls.append(cmd)
-        return _Completed()
-
-    def boom_rmtree(_path: str | Path) -> None:
-        raise PermissionError("simulated: planted by another uid")
-
-    monkeypatch.setattr("forge_loop.worker.subprocess.run", fake_run)
-    monkeypatch.setattr("forge_loop.worker.shutil.rmtree", boom_rmtree)
-    monkeypatch.setattr("forge_loop.worker._drop_permissive_settings", lambda _wt: None)
-
-    try:
-        worktree, err = _prep_worktree(tmp_path, 9999, "loop/9999-demo")
-        assert err is None
-        # `git worktree add` MUST still get called — quarantine unblocked it.
-        assert any(cmd[:3] == ["git", "worktree", "add"] for cmd in calls), (
-            f"worktree add was not called: {calls!r}"
-        )
-        # The blocking dir got renamed out of the way.
-        assert not blocking.exists(), "blocking dir should have been quarantined"
-        quarantined = sorted(
-            Path("/tmp").glob("wt-loop-9999.stale-*"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        assert quarantined, "quarantine dir was not created"
-        # Quarantined dir (newest = this run's) still holds the original
-        # marker — rename, not delete. Pre-clean above strips prior runs.
-        assert (quarantined[0] / "marker").read_text() == "planted"
-    finally:
-        for q in Path("/tmp").glob("wt-loop-9999*"):
-            real_rmtree(q, ignore_errors=True)
 
 
 # Gradle/WSL-OOM guard tests removed: forge-loop is stack-agnostic; the

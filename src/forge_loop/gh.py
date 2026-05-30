@@ -8,91 +8,44 @@ from __future__ import annotations
 
 import json
 import subprocess
-from contextlib import suppress
 from typing import Any
 
-from forge_loop.gh_client import GhClient, GithubkitClient, Issue
+from forge_loop import gh_issues
 
 DEFAULT_REPO: str | None = None
-_GH_CLIENT: GhClient | None = None
 
 
 def _require_repo(repo: str | None) -> str:
-    if not repo:
-        raise RuntimeError("gh.* called without a repo; pass repo='owner/name' or set LOOP_GH_REPO")
-    return repo
+    return gh_issues.require_repo(repo)
 
 
 def _split_repo(repo: str) -> tuple[str, str]:
-    try:
-        owner, name = repo.split("/", 1)
-    except ValueError as exc:
-        raise RuntimeError(f"invalid GitHub repo {repo!r}; expected owner/name") from exc
-    if not owner or not name:
-        raise RuntimeError(f"invalid GitHub repo {repo!r}; expected owner/name")
-    return owner, name
-
-
-def _client() -> GhClient:
-    global _GH_CLIENT
-    if _GH_CLIENT is None:
-        _GH_CLIENT = GithubkitClient()
-    return _GH_CLIENT
-
-
-def _issue_payload(issue: Issue) -> dict[str, Any]:
-    return {
-        "number": issue.number,
-        "title": issue.title,
-        "body": issue.body,
-        "state": issue.state,
-        "labels": [{"name": label} for label in issue.labels],
-        "createdAt": "",
-        "updatedAt": "",
-    }
+    return gh_issues.split_repo(repo)
 
 
 def top_issues(label: str, limit: int, repo: str | None = None) -> list[dict[str, Any]]:
     """Return open issues carrying ``label`` (oldest first)."""
-    repo = _require_repo(repo)
-    owner, name = _split_repo(repo)
-    return [_issue_payload(issue) for issue in _client().issues_by_label(owner, name, label, limit)]
+    return gh_issues.top_issues(label, limit, repo=repo)
 
 
 def fetch_issue(issue: int, repo: str | None = None) -> dict[str, Any] | None:
     """Fetch a single issue by number. Returns None if not found / failed."""
-    repo = _require_repo(repo)
-    owner, name = _split_repo(repo)
-    found = _client().get_issue(owner, name, issue)
-    if found is None:
-        return None
-    return _issue_payload(found)
+    return gh_issues.fetch_issue(issue, repo=repo)
 
 
 def comment(issue: int, body: str, repo: str | None = None) -> None:
     """Post a comment to an issue. Errors are swallowed (caller logs)."""
-    repo = _require_repo(repo)
-    owner, name = _split_repo(repo)
-    with suppress(Exception):
-        _client().add_comment(owner, name, issue, body)
+    gh_issues.comment(issue, body, repo=repo)
 
 
 def label(issue: int, labels: list[str], repo: str | None = None) -> None:
     """Add labels to an issue."""
-    if not labels:
-        return
-    repo = _require_repo(repo)
-    owner, name = _split_repo(repo)
-    with suppress(Exception):
-        _client().add_labels(owner, name, issue, labels)
+    gh_issues.label(issue, labels, repo=repo)
 
 
 def unlabel(issue: int, label: str, repo: str | None = None) -> None:
     """Remove a single label from an issue."""
-    repo = _require_repo(repo)
-    owner, name = _split_repo(repo)
-    with suppress(Exception):
-        _client().remove_label(owner, name, issue, label)
+    gh_issues.unlabel(issue, label, repo=repo)
 
 
 def remove_pr_label(pr: int | str, label: str, repo: str | None = None) -> bool:
@@ -114,13 +67,7 @@ def create_issue(
     repo: str | None = None,
 ) -> int | None:
     """Open a new issue. Returns the new number or None on failure."""
-    repo = _require_repo(repo)
-    owner, name = _split_repo(repo)
-    try:
-        issue = _client().create_issue(owner, name, title, body, labels or [])
-    except Exception:
-        return None
-    return issue.number
+    return gh_issues.create_issue(title, body, labels, repo=repo)
 
 
 def update_issue(

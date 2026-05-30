@@ -249,7 +249,8 @@ _ALLOWED_LEGACY_SITES = {
     "src/forge_loop/log.py",
     # Dynamic env-var name (computed at call time, not a fixed knob).
     "src/forge_loop/briefs/__init__.py",
-    "src/forge_loop/mcp_server.py",  # per-tool LOOP_MCP_CAP_<TOOL> + ENV pass-through
+    "src/forge_loop/mcp_rate_limit.py",  # per-tool LOOP_MCP_CAP_<TOOL> dynamic keys
+    "src/forge_loop/mcp_server.py",  # MCP env pass-through for workflow invocation
     # Axis filter is a transient CLI-to-runner handoff, also directly
     # injectable in tests via parse_filter_env(env=...); not persisted
     # operator configuration.

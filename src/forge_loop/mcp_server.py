@@ -12,10 +12,6 @@ Run via:
 
 from __future__ import annotations
 
-import functools
-import os
-from collections import Counter
-from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -33,100 +29,12 @@ from forge_loop.config import load as load_config
 from forge_loop.critic import review_pr as _critic_review
 from forge_loop.deploy import redeploy as _redeploy
 from forge_loop.maintenance import run_maintenance as _run_maintenance
+from forge_loop.mcp_rate_limit import rate_limited
 from forge_loop.runner import run as _run_loop
 from forge_loop.worker import run_worker as _run_worker
 from forge_loop.worker_logs import read_worker_logs as _read_worker_logs
 
 mcp = FastMCP("forge-loop")
-
-
-# ── Rate limiting ──────────────────────────────────────────────────────────
-# Each MCP server process keeps a per-tool call counter. When a tool's count
-# exceeds its cap, subsequent invocations return a structured error and emit
-# a `mcp_tool_rate_limited` event on the configured events bus. Resets every
-# time the MCP server is started (= per-worker-invocation for the loop's own
-# dispatch path).
-#
-# Defaults:
-#   * LOOP_MCP_CAP_DEFAULT (env): default cap for every tool, default 20.
-#   * LOOP_MCP_CAP_<TOOL_NAME_UPPER> (env): per-tool override.
-#
-# Mutating tools (issue/comment/label/dispatch) should be tightened
-# explicitly; pure-read tools can stay at the default.
-
-_TOOL_CALLS: Counter[str] = Counter()
-
-
-def _default_cap() -> int:
-    # Settings-driven default (issue #84): was env LOOP_MCP_CAP_DEFAULT,
-    # now misc.mcp_cap_default. The per-tool override below is still
-    # dynamic env (LOOP_MCP_CAP_<TOOL_NAME>) — too many tools to enumerate
-    # in Settings, and operators set those only in extreme cases.
-    try:
-        from forge_loop.settings import Settings
-        return Settings.load().misc.mcp_cap_default
-    except Exception:  # noqa: BLE001
-        return 20
-
-
-def _cap_for(tool_name: str) -> int:
-    env_key = f"LOOP_MCP_CAP_{tool_name.upper()}"
-    return int(os.environ.get(env_key, _default_cap()))
-
-
-def _emit_rate_limited(tool_name: str, cap: int, count: int) -> None:
-    """Best-effort: write a `mcp_tool_rate_limited` event to the configured
-    events bus. Swallows OSError so a broken bus does not crash a tool call.
-    """
-    try:
-        cfg = load_config()
-    except Exception:  # noqa: BLE001
-        return
-    try:
-        _state.append_event(
-            cfg.events_file,
-            "mcp_tool_rate_limited",
-            tool=tool_name, cap=cap, count=count,
-        )
-    except OSError:
-        pass
-
-
-def rate_limited(tool_name: str | None = None) -> Callable[..., Any]:
-    """Decorator: cap a tool's per-process call count.
-
-    Usage:
-        @mcp.tool()
-        @rate_limited("gh_create_issue")
-        def gh_create_issue(...): ...
-
-    The cap is read at decoration time from env (so tests can override).
-    Returns a structured error dict on exceed; never raises.
-    """
-
-    def _decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
-        name = tool_name or fn.__name__
-        cap = _cap_for(name)
-
-        @functools.wraps(fn)
-        def _wrapper(*args: Any, **kwargs: Any) -> Any:
-            _TOOL_CALLS[name] += 1
-            count = _TOOL_CALLS[name]
-            if count > cap:
-                _emit_rate_limited(name, cap, count)
-                return {
-                    "ok": False,
-                    "error": "rate_limited",
-                    "tool": name,
-                    "cap": cap,
-                    "count": count,
-                    "hint": f"set LOOP_MCP_CAP_{name.upper()}=N to raise the cap",
-                }
-            return fn(*args, **kwargs)
-
-        return _wrapper
-
-    return _decorate
 
 
 # ── GH tools ────────────────────────────────────────────────────────────────
@@ -245,29 +153,9 @@ def dispatch_worker(issue_number: int, timeout_s: int = 3600) -> dict[str, Any]:
     issues = _gh.top_issues("", limit=1, repo=cfg.github_repo)
     matches = [i for i in issues if i.get("number") == issue_number]
     if not matches:
-        # Fall back to a direct GH fetch since `gh issue list` doesn't filter
-        # by number — use `gh issue view` instead.
-        import json
-        import subprocess
-
-        r = subprocess.run(
-            [
-                "gh",
-                "issue",
-                "view",
-                str(issue_number),
-                "--repo",
-                cfg.github_repo,
-                "--json",
-                "number,title,body,labels",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if r.returncode != 0:
-            return {"status": "failed", "error": f"gh view failed: {r.stderr[:200]}"}
-        issue = json.loads(r.stdout)
+        issue = _gh.fetch_issue(issue_number, repo=cfg.github_repo)
+        if issue is None:
+            return {"status": "failed", "error": f"issue #{issue_number} not found"}
     else:
         issue = matches[0]
     outcome = _run_worker(issue, cfg.repo, cfg.logs_dir, timeout_s, base_branch=cfg.base_branch)

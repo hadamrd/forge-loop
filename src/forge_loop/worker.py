@@ -3,59 +3,45 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
-import inspect
 import json
-import os
 import re
-import shutil
-import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from forge_loop.worker_brief import (
+    brief_template_hash as _brief_template_hash,
+)
+from forge_loop.worker_brief import make_brief, make_repair_brief
+from forge_loop.worker_worktree import (
+    drop_permissive_settings as _worktree_drop_permissive_settings,
+)
+from forge_loop.worker_worktree import ensure_subagent_trusted as _ensure_subagent_trusted
+from forge_loop.worker_worktree import prep_repair_worktree as _prep_repair_worktree
+from forge_loop.worker_worktree import prep_worktree as _prep_worktree
+from forge_loop.worker_worktree import subagent_env as _worktree_subagent_env
+
+
+def brief_template_hash() -> str:
+    """Compatibility export for callers that fingerprint worker briefs."""
+    return _brief_template_hash()
+
 
 def ensure_subagent_trusted(target_dir: Path) -> None:
-    """Plant `.claude/settings.json` in target_dir if missing.
-
-    Belt-and-suspenders to the static `.claude/settings.json` checked in to
-    the main repo: on fresh checkouts / CI / new operator machines where the
-    static file might be missing or stale, we still want subagents to start
-    in a trusted state. Idempotent — never overwrites an existing file
-    (operators may have customised it).
-
-    Without this trust-marker, the harness applies the "untrusted project"
-    gate (anthropics/claude-code#58663) and denies Edit/Write/most Bash
-    actions even with --allow-dangerously-skip-permissions.
-    """
-    cdir = target_dir / ".claude"
-    settings_path = cdir / "settings.json"
-    if settings_path.exists():
-        return
-    cdir.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(_PERMISSIVE_WORKTREE_SETTINGS)
+    """Compatibility export for callers that prepare SDK/CLI trust files."""
+    _ensure_subagent_trusted(target_dir)
 
 
 def _subagent_env() -> dict[str, str]:
-    """Env for spawned claude subagents.
+    """Compatibility export for legacy subprocess workers."""
+    return _worktree_subagent_env()
 
-    The `claude` CLI checks ``CLAUDECODE=1`` and refuses to run as a fresh
-    autonomous session if it's set (because it thinks it's inside an existing
-    Claude Code session — see anthropics/claude-code#37442 and
-    anthropics/claude-agent-sdk-python#573). When the loop runner ITSELF is
-    spawned from inside a Claude Code session (e.g. an operator running it
-    via the IDE's Bash tool), CLAUDECODE=1 propagates to the workers and they
-    can't acquire Edit/Write permissions.
 
-    Clear the var so the subprocess starts a clean session. Same fix the
-    Anthropic SDK recommends.
-    """
-    env = dict(os.environ)
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_SSE_PORT", None)  # also leaked by some IDE integrations
-    return env
+def _drop_permissive_settings(worktree: Path) -> None:
+    """Compatibility export for tests that patch worktree trust setup."""
+    _worktree_drop_permissive_settings(worktree)
 
 
 @dataclass
@@ -78,339 +64,9 @@ class WorkerOutcome:
     manifesto_sha: dict[str, str | None] | None = None
 
 
-def make_brief(
-    issue: dict[str, Any],
-    worktree: Path,
-    *,
-    risk_gated: bool = False,
-    past_attempts: list[dict[str, Any]] | None = None,
-    lumen_top_k: int = 3,
-    lumen_test_pattern: str = "**/*Test.*",
-    coauthor: str = "",
-    dry_run: bool = False,
-    manifesto_bundle: Any | None = None,
-) -> str:
-    """Render the worker brief for an issue.
-
-    ``risk_gated`` (True): the worker opens the PR but DOES NOT enable
-    auto-merge. It posts a comment "ready for human review" and exits.
-
-    ``past_attempts`` (non-empty): includes a "PREVIOUS ATTEMPTS" section
-    so the worker can learn from prior tries.
-    """
-    body = (issue.get("body") or "")[:6000]
-    n = issue["number"]
-
-    history_section = ""
-    if past_attempts:
-        rendered = "\n".join(
-            f"- {a.get('ts', '?')} → {a.get('status', '?')}"
-            + (f" (note: {a['note']})" if a.get("note") else "")
-            + (f"; PR={a['pr_url']}" if a.get("pr_url") else "")
-            for a in past_attempts[-10:]
-        )
-        history_section = (
-            "\nPREVIOUS ATTEMPTS ON THIS ISSUE (oldest first):\n"
-            f"{rendered}\n"
-            "Use these to avoid repeating the same dead-ends.\n"
-        )
-
-    merge_step_renumbered = (
-        "10. `gh pr create` with a clear title + body, then\n"
-        "    STOP. DO NOT enable auto-merge. The `risk:high` label on this issue\n"
-        "    means a human must review. Post a comment on the PR: 'Risk-gated;\n"
-        "    ready for human review.' Your status is `open` (not `merged`)."
-        if risk_gated
-        else "10. `gh pr create` with a clear title + body (the body should restate\n"
-        "    the acceptance criteria and how they're tested).\n"
-        "11. `gh pr merge <N> --squash --auto --delete-branch`."
-    )
-
-    lumen_total = lumen_top_k + 1
-
-    final_status = (
-        f'{{"issue": {n}, "pr": "<url>", "status": "open", "note": "risk-gated"}}'
-        if risk_gated
-        else f'{{"issue": {n}, "pr": "<url-or-null>", "status": "merged|open|failed", "note": "<short>"}}'
-    )
-
-    coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
-
-    from forge_loop.briefs import render_brief
-
-    rendered = render_brief(
-        "worker",
-        n=n,
-        worktree=worktree,
-        issue_title=issue["title"],
-        body=body,
-        history_section=history_section,
-        merge_step_renumbered=merge_step_renumbered,
-        lumen_top_k=lumen_top_k,
-        lumen_test_pattern=lumen_test_pattern,
-        lumen_total=lumen_total,
-        coauthor_line=coauthor_line,
-        final_status=final_status,
-    )
-    if dry_run:
-        from forge_loop.replay import apply_dry_run_to_brief
-
-        rendered = apply_dry_run_to_brief(rendered)
-    # Issue #132 — manifesto injection. The MANIFESTO block goes in FRONT
-    # of every other brief line so the worker reads the house rules before
-    # it sees the issue body, the contract, or the exit checklist. When
-    # the bundle is empty (no manifestos in this repo), inject_into_brief
-    # is a no-op and the rendered brief is byte-identical to the
-    # pre-feature baseline (back-compat acceptance criterion).
-    if manifesto_bundle is not None:
-        from forge_loop.manifestos import inject_into_brief
-
-        rendered = inject_into_brief(rendered, manifesto_bundle)
-    return rendered
-
-
-def make_repair_brief(
-    issue: dict[str, Any],
-    worktree: Path,
-    *,
-    pr: dict[str, Any],
-    review_context: str,
-    lumen_top_k: int = 3,
-    lumen_test_pattern: str = "**/*Test.*",
-    coauthor: str = "",
-) -> str:
-    """Render a worker brief for repairing an existing blocked PR."""
-    body = (issue.get("body") or "")[:6000]
-    n = issue["number"]
-    pr_url = pr.get("url") or f"https://github.com/pull/{pr.get('number', '')}"
-    pr_number = pr.get("number", "")
-    head = pr.get("headRefName") or ""
-    final_status = f'{{"issue": {n}, "pr": "{pr_url}", "status": "open", "note": "repair pushed"}}'
-    coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
-    return f"""You are an autonomous repair worker in a sprint loop.
-
-WORKTREE (already created): {worktree}
-cd there. Stay there. Don't touch the main checkout.
-
-SOURCE ISSUE #{n}: {issue.get("title", "")}
----
-{body}
----
-
-EXISTING PR TO REPAIR:
-- PR: #{pr_number} {pr_url}
-- Branch: {head}
-
-REVIEW / CRITIC CONTEXT TO ADDRESS:
----
-{review_context[:12000]}
----
-
-CONTRACT:
-1. Repair the EXISTING PR branch. Do not create a new branch and do not open a new PR.
-2. Address every unresolved review thread and every sev1/blocking review point with production behavior and tests.
-3. If the branch is behind or conflicted, merge/rebase the current base branch and resolve conflicts in scope.
-4. Preserve the original issue scope; do not add unrelated refactors.
-5. Run focused tests that prove the review comments are fixed.
-6. Run formatting/lint gates appropriate for touched files.
-7. Commit with a message referencing #{n}.
-8. Push the current branch with `git push`.
-9. Resolve review threads after fixing them when the GitHub API/CLI allows it; otherwise reply/comment with the fixed evidence.
-10. Leave a short PR comment summarizing the repair and remaining state.
-
-LOOP INFRASTRUCTURE — DO NOT TOUCH:
-- `{worktree}/.claude/settings.json` is loop-planted. Do NOT `git clean`, `rm`, or chmod it.
-- Don't run `git clean -fdx`.
-
-LUMEN TEST DISCOVERY:
-If available, query Lumen with the issue title, review findings, and changed files.
-Cap at K={lumen_top_k} discovered + 1 authored test. If unavailable, echo a one-line skip and continue.
-Test pattern: {lumen_test_pattern}
-
-{coauthor_line}
-
-FINAL LINE OF YOUR OUTPUT MUST BE THIS JSON SHAPE, with no prose after it:
-{final_status}
-"""
-
-
-def brief_template_hash() -> str:
-    """Stable digest of the worker brief template.
-
-    Used by ``attempts.compute_fingerprint`` so that a meaningful change to
-    the worker's instructions (e.g. a new contract clause) invalidates the
-    in-flight/cooldown skip — the next dispatch is for materially different
-    work even if the issue body hasn't changed.
-
-    Hashes the source of ``make_brief`` AND the externalised template
-    file/override so any change to either bumps the digest. Cheap
-    (called once per dispatch).
-    """
-    from forge_loop.briefs import load_template
-
-    src = inspect.getsource(make_brief) + load_template("worker")
-    return hashlib.sha256(src.encode("utf-8")).hexdigest()
-
-
 def _branch_name(n: int, title: str) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", title.lower())[:40].strip("-")
     return f"loop/{n}-{slug or 'fix'}"
-
-
-_PERMISSIVE_WORKTREE_SETTINGS = """{
-  "permissions": {
-    "defaultMode": "bypassPermissions",
-    "allow": ["Bash(*)", "Edit(*)", "Write(*)", "Read(*)", "Grep(*)", "Glob(*)", "WebFetch(*)", "WebSearch(*)", "Task(*)", "TodoWrite(*)", "NotebookEdit(*)", "mcp__*"],
-    "deny": []
-  },
-  "hasTrustDialogAccepted": true,
-  "hasCompletedProjectOnboarding": true
-}
-"""
-
-
-def _drop_permissive_settings(worktree: Path) -> None:
-    """Plant a .claude/settings.json in the worktree so the worker subprocess
-    doesn't get blocked by the harness 'untrusted project' gate.
-
-    Observed: when workers run `git clean -fd` or similar (common when
-    inspecting a worktree to "reset"), they delete the planted file and
-    Claude re-evaluates permissions, locking the worker out. Fix:
-
-    1. Chmod 444 the file so a naive `rm` triggers a permission warning
-       (workers tend to skip protected files rather than `rm -f`).
-    2. The brief calls this out explicitly so the agent doesn't fight it.
-
-    Ref: anthropics/claude-code#58663 + observed deletion behavior in
-    parallel sprint runs (PR #993 was the only one of 3 that survived).
-    """
-    cdir = worktree / ".claude"
-    cdir.mkdir(parents=True, exist_ok=True)
-    settings_path = cdir / "settings.json"
-    settings_path.write_text(_PERMISSIVE_WORKTREE_SETTINGS)
-    # Read-only — workers shouldn't be removing this file.
-    settings_path.chmod(0o444)
-    cdir.chmod(0o555)
-
-
-def _quarantine_if_blocking(wt: Path) -> Path | None:
-    """If `wt` still exists after normal cleanup (e.g. worker-planted files
-    owned by a different uid that we can't chmod/rm), rename it out of the
-    way so `git worktree add` can proceed. Returns the quarantined path,
-    or None if the dir is already gone.
-
-    Quarantined dirs use the suffix ``.stale-<unix-ts>`` so the boot
-    reaper + operator can find + sweep them later without risk of colliding
-    with the live path.
-    """
-    if not wt.exists():
-        return None
-    quarantine = wt.with_name(f"{wt.name}.stale-{int(time.time())}")
-    try:
-        wt.rename(quarantine)
-    except OSError:
-        return None
-    return quarantine
-
-
-def _prep_worktree(
-    repo: Path,
-    n: int,
-    branch: str,
-    *,
-    base_branch: str = "trunk",
-) -> tuple[Path, str | None]:
-    wt = Path(f"/tmp/wt-loop-{n}")
-    # chmod the planted .claude/ back to writable so worktree remove can
-    # delete it (we set it read-only at the end of last run to prevent worker
-    # tampering).
-    claude_dir = wt / ".claude"
-    if claude_dir.exists():
-        subprocess.run(["chmod", "-R", "u+w", str(claude_dir)], capture_output=True)
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", str(wt)],
-        cwd=repo,
-        capture_output=True,
-    )
-    if wt.exists():
-        with contextlib.suppress(OSError, PermissionError):
-            shutil.rmtree(wt)
-    # If the worker planted files owned by a different uid (subprocess
-    # ran under a different namespace), chmod+rmtree above will silently
-    # fail and leave the dir behind. Quarantine it so the new worktree
-    # add doesn't collide. Without this, every retry of this issue hits
-    # `worktree-create-failed` → infinite loop until operator intervenes.
-    _quarantine_if_blocking(wt)
-    # If a previous failed attempt left a local branch lying around, delete
-    # it so `git worktree add -B` can recreate it cleanly off the freshest
-    # origin/<base_branch>. `-B` would overwrite anyway, but we use plain `-b`
-    # after an explicit delete to fail loudly if the branch is still in use.
-    subprocess.run(
-        ["git", "branch", "-D", branch],
-        cwd=repo,
-        capture_output=True,
-    )
-    # Force-update the configured upstream branch so the worktree always starts
-    # at the freshest commit, even if many PRs landed during the prior tick.
-    # `+refs/heads/...` makes the fetch force the ref update (defensive —
-    # non-FF should never happen for protected branches, but if it does we want
-    # the upstream view).
-    remote_ref = f"refs/remotes/origin/{base_branch}"
-    subprocess.run(
-        [
-            "git",
-            "fetch",
-            "--prune",
-            "origin",
-            f"+refs/heads/{base_branch}:{remote_ref}",
-        ],
-        cwd=repo,
-        capture_output=True,
-    )
-    r = subprocess.run(
-        ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{base_branch}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        return wt, r.stderr
-    if wt.exists():
-        _drop_permissive_settings(wt)
-    return wt, None
-
-
-def _prep_repair_worktree(
-    repo: Path,
-    issue: int,
-    branch: str,
-) -> tuple[Path, str | None]:
-    wt = Path(f"/tmp/wt-loop-{issue}")
-    claude_dir = wt / ".claude"
-    if claude_dir.exists():
-        subprocess.run(["chmod", "-R", "u+w", str(claude_dir)], capture_output=True)
-    subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=repo, capture_output=True)
-    if wt.exists():
-        with contextlib.suppress(OSError, PermissionError):
-            shutil.rmtree(wt)
-    _quarantine_if_blocking(wt)
-    remote_ref = f"refs/remotes/origin/{branch}"
-    subprocess.run(
-        ["git", "fetch", "--prune", "origin", f"+refs/heads/{branch}:{remote_ref}"],
-        cwd=repo,
-        capture_output=True,
-    )
-    r = subprocess.run(
-        ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{branch}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        return wt, r.stderr
-    if wt.exists():
-        _drop_permissive_settings(wt)
-    return wt, None
 
 
 def _extract_outcome(log_path: Path) -> tuple[str | None, str]:

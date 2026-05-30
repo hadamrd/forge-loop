@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from forge_loop import gh
+from forge_loop import gh, gh_issues
 from forge_loop.gh_client import GhError, Issue, MockGhClient
 
 
 @pytest.fixture(autouse=True)
 def _reset_client() -> None:
-    gh._GH_CLIENT = None
+    gh_issues.set_client(None)
     yield
-    gh._GH_CLIENT = None
+    gh_issues.set_client(None)
 
 
 def test_top_issues_uses_typed_client_not_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -21,7 +21,7 @@ def test_top_issues_uses_typed_client_not_subprocess(monkeypatch: pytest.MonkeyP
             Issue(number=1, title="one", body="body", labels=["loop:ready", "axis:cli"])
         ]
     )
-    gh._GH_CLIENT = client
+    gh_issues.set_client(client)
     monkeypatch.setattr(
         gh.subprocess,
         "run",
@@ -50,7 +50,7 @@ def test_fetch_issue_uses_typed_client_and_preserves_none() -> None:
     client = MockGhClient(
         issues={("owner", "repo", 2): Issue(number=2, title="two", body="b", state="closed")}
     )
-    gh._GH_CLIENT = client
+    gh_issues.set_client(client)
 
     issue = gh.fetch_issue(2, repo="owner/repo")
     missing = gh.fetch_issue(3, repo="owner/repo")
@@ -63,7 +63,7 @@ def test_fetch_issue_uses_typed_client_and_preserves_none() -> None:
 
 def test_issue_mutations_use_typed_client_and_keep_best_effort_semantics() -> None:
     client = MockGhClient(raise_on={"add_comment": GhError("add_comment", 500, "boom")})
-    gh._GH_CLIENT = client
+    gh_issues.set_client(client)
 
     gh.comment(4, "hello", repo="owner/repo")
     gh.label(4, ["a", "b"], repo="owner/repo")
@@ -76,7 +76,7 @@ def test_issue_mutations_use_typed_client_and_keep_best_effort_semantics() -> No
 
 def test_create_issue_returns_number_and_none_on_failure() -> None:
     client = MockGhClient(create_issue_responses=[44])
-    gh._GH_CLIENT = client
+    gh_issues.set_client(client)
 
     assert gh.create_issue("title", "body", ["x"], repo="owner/repo") == 44
 

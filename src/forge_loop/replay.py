@@ -38,10 +38,11 @@ from __future__ import annotations
 from forge_loop._extras import require_experimental as _require_experimental
 _require_experimental('replay')
 import json
-import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from forge_loop.replay_fixture import extract_diff_from_events
 
 
 class ReplayError(RuntimeError):
@@ -216,82 +217,6 @@ def assemble_replay_invocations(
 # ---------------------------------------------------------------- fixtures
 
 
-_DIFF_HEAD_RE = re.compile(r"^(?:diff --git |--- |\+\+\+ |@@ )")
-
-
-def _extract_diff_from_events(events: list[dict[str, Any]]) -> tuple[str, str | None]:
-    """Best-effort diff + commit-hash extraction from recorded SDK events.
-
-    Walks tool_result events looking for:
-    - ``git diff`` output (lines starting with ``diff --git``, ``--- ``,
-      ``+++ ``, ``@@ ``) — capture the longest such block.
-    - ``git rev-parse HEAD`` / ``git commit`` output containing a 40-char
-      hex SHA.
-
-    Returns ``(diff_text, commit_hash)``. Either may be empty / None if
-    the recording didn't capture them — that's fine, the diff-report
-    surfaces "(no diff captured)" rather than failing.
-    """
-    best_diff = ""
-    commit_hash: str | None = None
-
-    for e in events:
-        # SDK stream-json shape: user message carries tool_result content.
-        msg = e.get("message") or {}
-        content_items = msg.get("content") if isinstance(msg, dict) else None
-        if not isinstance(content_items, list):
-            continue
-        for item in content_items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") != "tool_result":
-                continue
-            raw = item.get("content")
-            text = ""
-            if isinstance(raw, str):
-                text = raw
-            elif isinstance(raw, list):
-                text = "\n".join(
-                    c.get("text", "") if isinstance(c, dict) else str(c) for c in raw
-                )
-            if not text:
-                continue
-
-            # Diff block — heuristic: contiguous lines starting with the diff
-            # markers. We extract as long a contiguous block as we can find.
-            lines = text.splitlines()
-            run_start = None
-            for i, line in enumerate(lines):
-                if _DIFF_HEAD_RE.match(line) or (
-                    run_start is not None
-                    and (
-                        line.startswith(("+", "-", " ", "@"))
-                        or line == ""
-                    )
-                ):
-                    if run_start is None:
-                        run_start = i
-                else:
-                    if run_start is not None:
-                        block = "\n".join(lines[run_start:i])
-                        if "diff --git " in block and len(block) > len(best_diff):
-                            best_diff = block
-                        run_start = None
-            if run_start is not None:
-                block = "\n".join(lines[run_start:])
-                if "diff --git " in block and len(block) > len(best_diff):
-                    best_diff = block
-
-            # Commit hash — first 40-hex match wins (so we get the "head"
-            # the worker would have committed on).
-            if commit_hash is None:
-                m = re.search(r"\b([0-9a-f]{40})\b", text)
-                if m:
-                    commit_hash = m.group(1)
-
-    return best_diff, commit_hash
-
-
 def replay_from_fixture(invocation: ReplayInvocation) -> DryRunCapture:
     """Replay ``invocation`` from its attached fixture (zero cost).
 
@@ -317,7 +242,7 @@ def replay_from_fixture(invocation: ReplayInvocation) -> DryRunCapture:
             f"({invocation.fixture_path}): {exc}"
         ) from exc
 
-    diff_text, commit_hash = _extract_diff_from_events(session.events)
+    diff_text, commit_hash = extract_diff_from_events(session.events)
     return DryRunCapture(
         issue=invocation.issue,
         title=invocation.title or str(session.header.get("title", "")),

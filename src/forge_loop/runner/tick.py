@@ -4,6 +4,8 @@ Extracted from ``runner/__init__.py`` (issue #50). Pure mechanical move:
 no behaviour change, no signature change.
 """
 
+# ruff: noqa: I001
+
 from __future__ import annotations
 
 import subprocess
@@ -17,20 +19,11 @@ from forge_loop import worker as _worker
 from forge_loop.config import Config
 from forge_loop.deploy import redeploy
 from forge_loop.gh import fetch_issue, pr_review_context, prs_requiring_repair, top_issues, unlabel
-from forge_loop.maintenance import run_maintenance
 from forge_loop.po import expand_thin_specs as _po_expand
-from forge_loop.runner._helpers import (
-    consume_force_set as _consume_force_set_impl,
-)
-from forge_loop.runner._helpers import (
-    error_signature as _error_signature,
-)
-from forge_loop.runner._helpers import (
-    force_retry_file as _force_retry_file_impl,
-)
-from forge_loop.runner._helpers import (
-    reap_worktree as _reap_worktree,
-)
+from forge_loop.runner._helpers import consume_force_set as _consume_force_set_impl
+from forge_loop.runner._helpers import error_signature as _error_signature
+from forge_loop.runner._helpers import force_retry_file as _force_retry_file_impl
+from forge_loop.runner._helpers import reap_worktree as _reap_worktree
 from forge_loop.runner.dispatch import (
     _run_critic_for_outcomes,
     _run_repair_workers,
@@ -41,9 +34,14 @@ from forge_loop.runner.drift import (
     _check_drift_and_maybe_halt,
     _maybe_deploy_drift_halt,
 )
+from forge_loop.runner.label_hygiene import remove_ready_label as _remove_ready_label_impl
+from forge_loop.runner.repairs import blocking_pr_repairs as _blocking_pr_repairs_impl
+from forge_loop.runner.repairs import enable_automerge_for_repaired_prs as _enable_automerge_for_repaired_prs
+from forge_loop.runner.rescue import rescue_uncommitted_work as _rescue_uncommitted_work
+from forge_loop.runner.tick_checks import run_codebase_audit as _run_codebase_audit
+from forge_loop.runner.tick_checks import run_maintenance_tick as _run_maintenance_tick
+from forge_loop.runner.tick_checks import run_stuck_sweep as _run_stuck_sweep
 from forge_loop.state import append_event, consolidate_sprint, write_state
-from forge_loop.stuck_sweep import SweepReport
-from forge_loop.stuck_sweep import sweep as _stuck_sweep
 from forge_loop.worker import WorkerOutcome
 
 
@@ -56,315 +54,18 @@ def _consume_force_set(cfg: Config) -> set[int]:
 
 
 def _issue_number_from_pr(pr: dict[str, Any]) -> int | None:
-    import re
+    from forge_loop.runner.repairs import issue_number_from_pr
 
-    for value in (pr.get("headRefName"), pr.get("body"), pr.get("title")):
-        if not isinstance(value, str):
-            continue
-        match = re.search(r"(?:^|/)loop/(\d+)-", value)
-        if match:
-            return int(match.group(1))
-        match = re.search(r"(?:refs?|closes|fixes|resolves)\s+#(\d+)", value, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    return None
+    return issue_number_from_pr(pr)
 
 
 def _blocking_pr_repairs(cfg: Config) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
-    from forge_loop.axis import matches_axes, parse_filter_env
-
-    axis_filter = parse_filter_env()
-    repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
-    for pr in prs_requiring_repair(cfg.parallel, repo=cfg.github_repo):
-        issue_num = _issue_number_from_pr(pr)
-        if issue_num is None:
-            append_event(
-                cfg.events_file,
-                "repair_pr_skipped",
-                pr=pr.get("url"),
-                reason="source_issue_not_found",
-            )
-            continue
-        issue = fetch_issue(issue_num, repo=cfg.github_repo)
-        if not issue:
-            append_event(
-                cfg.events_file,
-                "repair_pr_skipped",
-                pr=pr.get("url"),
-                issue=issue_num,
-                reason="issue_fetch_failed",
-            )
-            continue
-        if axis_filter and not matches_axes(issue.get("labels") or [], axis_filter):
-            append_event(
-                cfg.events_file,
-                "repair_pr_skipped",
-                pr=pr.get("url"),
-                issue=issue_num,
-                reason="axis_filter_mismatch",
-                axes=axis_filter,
-            )
-            continue
-        append_event(
-            cfg.events_file,
-            "repair_pr_selected",
-            pr=pr.get("url"),
-            issue=issue_num,
-            reasons=pr.get("repairReasons") or [],
-        )
-        repairs.append((issue, pr, pr_review_context(pr["number"], repo=cfg.github_repo)))
-    return repairs
-
-
-def _enable_automerge_for_repaired_prs(
-    cfg: Config,
-    outcomes: list[WorkerOutcome],
-    emit: Any,
-) -> None:
-    """After repair + critic, put fixed PRs back on the merge conveyor."""
-    from forge_loop import gh as _gh
-    from forge_loop.runner.merge_gate import apply_issue_closed_gate
-
-    apply_issue_closed_gate(
-        outcomes,
-        gh=_gh,
-        repo=cfg.github_repo,
-        events_file=cfg.events_file,
-        emit=emit,
+    return _blocking_pr_repairs_impl(
+        cfg,
+        prs_requiring_repair_fn=prs_requiring_repair,
+        fetch_issue_fn=fetch_issue,
+        pr_review_context_fn=pr_review_context,
     )
-    for outcome in outcomes:
-        if outcome.status not in {"open", "merged"} or not outcome.pr_url:
-            continue
-        threads = _gh.unresolved_review_threads(outcome.pr_url, repo=cfg.github_repo)
-        if threads:
-            append_event(
-                cfg.events_file,
-                "repair_automerge_skipped",
-                issue=outcome.issue,
-                pr=outcome.pr_url,
-                reason="unresolved_review_threads",
-                unresolved=len(threads),
-            )
-            continue
-        if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
-            outcome.status = "merged"
-            append_event(
-                cfg.events_file,
-                "repair_automerge_enabled",
-                issue=outcome.issue,
-                pr=outcome.pr_url,
-            )
-        else:
-            append_event(
-                cfg.events_file,
-                "repair_automerge_failed",
-                issue=outcome.issue,
-                pr=outcome.pr_url,
-            )
-
-
-_TEST_FILE_GLOBS = (
-    "**/test/**",
-    "**/tests/**",
-    "**/*Test.java",
-    "**/*Test.kt",
-    "**/*.test.ts",
-    "**/*.test.tsx",
-    "**/*.test.js",
-    "**/*.spec.ts",
-    "**/*.spec.tsx",
-    "**/*.spec.js",
-    "**/*_test.go",
-    "**/test_*.py",
-)
-
-
-def _rescue_uncommitted_work(o: WorkerOutcome, cfg: Config) -> str | None:
-    """Auto-commit + format + push + open + auto-merge a PR for a dirty worker.
-
-    Zero-touch policy: the operator (CTO) writes the vision + tickets;
-    the loop ships the code. Rescue therefore goes ALL THE WAY:
-
-      1. Run the project's format command (``cfg.worker.rescue_format_cmd``,
-         e.g. ``./gradlew spotlessApply --no-daemon`` or ``pnpm format``)
-         on the worktree so pre-commit gates would pass downstream.
-      2. ``git add -A && git commit --no-verify`` (bypasses operator's
-         pre-commit hooks — they get checked again at CI).
-      3. ``git push -u origin <branch>``.
-      4. ``gh pr create`` — DRAFT only if the diff contains NO test files
-         (heuristic: worker stopped before writing tests, so likely
-         incomplete and needs review). Otherwise READY.
-      5. ``gh pr merge <pr> --squash --auto --delete-branch`` so the
-         moment CI passes, the loop merges it. The critic gates on
-         sev1 via its existing label path.
-      6. Labels: ``loop:auto-rescued`` always; ``loop:needs-review``
-         only when the diff had no tests (the draft case).
-
-    Returns the PR URL on success, or None when there's nothing to rescue
-    or any subprocess failure. Never raises.
-    """
-    import contextlib
-    import fnmatch
-    import os as _os
-    import subprocess as _sp
-    from pathlib import Path as _Path
-
-    wt = _Path(f"/tmp/wt-loop-{o.issue}")
-    if not wt.exists():
-        return None
-
-    # Uncommitted changes?
-    porcelain = _sp.run(
-        ["git", "status", "--porcelain"],
-        cwd=wt,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if porcelain.returncode != 0 or not porcelain.stdout.strip():
-        return None
-
-    # Determine branch.
-    branch_r = _sp.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=wt,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    branch = branch_r.stdout.strip() if branch_r.returncode == 0 else ""
-    if not branch or branch in ("trunk", "main", "HEAD"):
-        return None
-
-    # 1. Format the worktree before committing so CI gates don't reject.
-    # Configurable per-project via worker.rescue_format_cmd (default
-    # empty = skip). Best-effort: any failure here is NON-fatal.
-    fmt_cmd_str = getattr(cfg.worker, "rescue_format_cmd", "") or ""
-    if fmt_cmd_str.strip():
-        with contextlib.suppress(_sp.SubprocessError):
-            _sp.run(
-                fmt_cmd_str,
-                cwd=wt,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env={**_os.environ, "JAVA_TOOL_OPTIONS": "-Xmx1500m"},
-            )
-
-    # 2. Stage + commit (bypass operator pre-commit; CI will re-check).
-    commit_msg = (
-        f"feat(loop): auto-shipped from worker session — closes #{o.issue}\n"
-        "\n"
-        "Worker exited its SDK session without running git commit. The\n"
-        "loop captured the uncommitted output, applied the configured\n"
-        "format command, committed, and pushed. Auto-merge is enabled;\n"
-        "CI gates + critic-block-on-sev1 are the merge contract.\n"
-        "\n"
-        f"Worker status: {o.status}\n"
-        f"Worker log: docs/ops/loop-runner-logs/worker-{o.issue}-*.log\n"
-    )
-    if cfg.coauthor:
-        commit_msg += f"\nCo-Authored-By: {cfg.coauthor}\n"
-
-    if _sp.run(["git", "add", "-A"], cwd=wt, capture_output=True, timeout=60).returncode != 0:
-        return None
-    if (
-        _sp.run(
-            ["git", "commit", "--no-verify", "-m", commit_msg, "--allow-empty-message"],
-            cwd=wt,
-            capture_output=True,
-            timeout=60,
-        ).returncode
-        != 0
-    ):
-        return None
-    if (
-        _sp.run(
-            ["git", "push", "-u", "origin", branch],
-            cwd=wt,
-            capture_output=True,
-            timeout=120,
-        ).returncode
-        != 0
-    ):
-        return None
-
-    # 3. Detect test files in the diff to decide DRAFT vs READY.
-    diff_r = _sp.run(
-        ["git", "diff", "--name-only", f"origin/{cfg.base_branch}"],
-        cwd=wt,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    changed_files = diff_r.stdout.strip().splitlines() if diff_r.returncode == 0 else []
-    has_tests = any(fnmatch.fnmatch(f, g) for f in changed_files for g in _TEST_FILE_GLOBS)
-
-    # 4. Open PR. With tests → READY (loop trusts the work). Without → DRAFT.
-    pr_args = [
-        "gh",
-        "pr",
-        "create",
-        "--repo",
-        cfg.github_repo,
-        "--base",
-        cfg.base_branch,
-        "--head",
-        branch,
-        "--title",
-        f"feat(loop): auto-shipped #{o.issue} — worker session captured",
-        "--body",
-        (
-            f"**Auto-shipped by forge-loop** — worker for #{o.issue} exited its\n"
-            "SDK session without committing. The loop captured + formatted +\n"
-            "pushed the output. Auto-merge is enabled.\n"
-            "\n"
-            f"- has tests in diff: **{has_tests}**\n"
-            f"- worker status: `{o.status}`\n"
-            f"- worker log: `docs/ops/loop-runner-logs/worker-{o.issue}-*.log`\n"
-            "\n"
-            "Merge gate: CI must pass + critic must not block on sev1.\n"
-        ),
-        "--label",
-        "loop:auto-rescued",
-    ]
-    if not has_tests:
-        # No tests → mark as needing human review and leave draft.
-        pr_args.insert(3, "--draft")
-        pr_args.extend(["--label", "loop:needs-review"])
-    pr_r = _sp.run(pr_args, cwd=wt, capture_output=True, text=True, timeout=60)
-    if pr_r.returncode != 0:
-        return None
-    url = pr_r.stdout.strip().splitlines()[-1] if pr_r.stdout.strip() else ""
-    if not url.startswith("https://github.com/"):
-        return None
-
-    # 5. If READY, enable auto-merge so the moment CI greens + critic
-    # doesn't sev1-block, the merge fires without operator action.
-    if has_tests:
-        _sp.run(
-            [
-                "gh",
-                "pr",
-                "merge",
-                url,
-                "--squash",
-                "--auto",
-                "--delete-branch",
-            ],
-            cwd=wt,
-            capture_output=True,
-            timeout=60,
-        )
-        # If --auto isn't available on this repo (branch protection
-        # required), fall back to an immediate admin merge so the work
-        # lands without manual help.
-        # NB: --admin requires the operator's gh token to have admin.
-        # Best-effort: failure here just leaves the PR open + auto-merge
-        # request live for whenever CI completes.
-
-    return url
 
 
 def _remove_ready_label(
@@ -374,139 +75,7 @@ def _remove_ready_label(
     status: str,
     pr_url: str | None = None,
 ) -> None:
-    try:
-        unlabel(issue, cfg.labels.ready, repo=cfg.github_repo)
-        append_event(
-            cfg.events_file,
-            "issue_ready_label_removed",
-            issue=issue,
-            status=status,
-            pr_url=pr_url,
-            label=cfg.labels.ready,
-        )
-    except Exception as ex_:  # do not fail the tick on label hygiene
-        append_event(
-            cfg.events_file,
-            "issue_ready_label_remove_failed",
-            issue=issue,
-            err=str(ex_)[:200],
-        )
-
-
-def _run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
-    """Per-tick stuck-issue sweep (issue #129).
-
-    Runs after the iteration loop (which may have written
-    ``worker_iterations_exhausted`` for issues whose escalation didn't
-    land) and before the next dispatch batch — so an issue that was
-    supposed to be demoted but wasn't gets caught here, before
-    ``top_issues`` re-picks it.
-
-    Fully best-effort: any failure (gh client init, sweep crash) is
-    swallowed with a single event. The tick itself must never fail
-    because of a maintenance sweep.
-    """
-    if cfg.github_repo is None or "/" not in cfg.github_repo:
-        return None
-    owner, repo = cfg.github_repo.split("/", 1)
-    try:
-        # Lazy import — keeps the tick startup fast and lets tests stub
-        # the constructor via the env-token path without importing
-        # githubkit when not needed.
-        from forge_loop.gh_client import GithubkitClient
-
-        client = GithubkitClient()
-    except Exception as ex:  # noqa: BLE001
-        append_event(
-            cfg.events_file,
-            "stuck_sweep_skipped",
-            tick=tick,
-            reason=f"gh_client_init: {ex}"[:200],
-        )
-        return None
-    try:
-        report = _stuck_sweep(
-            cfg.events_file,
-            client,
-            owner=owner,
-            repo=repo,
-            threshold=cfg.stuck_threshold_attempts,
-            ready_label=cfg.labels.ready,
-            tail=cfg.stuck_tail_events,
-        )
-    except Exception as ex:  # noqa: BLE001 — sweep promises not to raise, belt-and-braces
-        append_event(
-            cfg.events_file,
-            "stuck_sweep_crashed",
-            tick=tick,
-            err=str(ex)[:200],
-        )
-        return None
-    if report.demotions:
-        append_event(
-            cfg.events_file,
-            "stuck_sweep_done",
-            tick=tick,
-            demoted=[d.issue for d in report.demotions if d.ok],
-            failed=list(report.errors),
-            scanned=report.scanned,
-        )
-    return report
-
-
-def _run_codebase_audit(cfg: Config, tick: int) -> None:
-    """Per-cadence codebase-state audit (issue #156).
-
-    Runs on the maintenance cadence so the deterministic state-rule
-    check (regex / LOC counting) lands alongside the LLM grooming pass.
-    Dry-run on the runner: we emit ``audit_violation_filed`` /
-    ``audit_clean`` events so the operator dashboard surfaces drift, but
-    we do NOT auto-file tickets here. The ``forge-loop audit --apply``
-    CLI command is the explicit, operator-driven side.
-
-    Best-effort: any exception is swallowed with a single event. The
-    tick itself must never crash because of an audit pass.
-    """
-    try:
-        from forge_loop.codebase_audit import audit as _audit
-        from forge_loop.events import AuditCleanEvent, emit
-
-        report = _audit(cfg.repo)
-    except Exception as ex:  # noqa: BLE001
-        append_event(
-            cfg.events_file,
-            "audit_skipped",
-            tick=tick,
-            reason=f"{type(ex).__name__}: {ex}"[:200],
-        )
-        return
-    if report.is_clean:
-        try:
-            emit(cfg.events_file, AuditCleanEvent(probes_run=list(report.probes_run)))
-        except Exception:  # noqa: BLE001
-            pass
-        return
-    # Non-empty: emit one summary event per violation (probe + target).
-    # No gh side-effect — the operator runs `forge-loop audit --apply`.
-    for v in report.violations:
-        append_event(
-            cfg.events_file,
-            "audit_violation_observed",
-            tick=tick,
-            probe=v.probe,
-            target=v.target,
-            severity=v.severity,
-            title=v.title,
-            metrics=v.metrics,
-        )
-    for probe_name, err in report.errors.items():
-        append_event(
-            cfg.events_file,
-            "audit_probe_crashed",
-            tick=tick,
-            probe=probe_name,
-            err=err,
-        )
+    _remove_ready_label_impl(cfg, issue, status=status, pr_url=pr_url, unlabel_fn=unlabel)
 
 
 def _tick(cfg: Config, tick: int) -> None:
@@ -519,43 +88,8 @@ def _tick(cfg: Config, tick: int) -> None:
     if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
         _run_codebase_audit(cfg, tick)
 
-    # Maintenance ticks: every Nth tick, run the AI-as-PM subagent instead
-    # of dispatching workers. The maintenance agent grooms + triages the
-    # backlog so subsequent ticks have a clean queue.
     if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
-        write_state(cfg.state_file, {"state": "maintenance", "tick": tick})
-        append_event(cfg.events_file, "maintenance_start", tick=tick)
-        brief = cfg.briefs.maintenance  # may be None → maintenance.run_maintenance uses default
-        outcome = (
-            run_maintenance(
-                cfg.repo,
-                cfg.logs_dir,
-                brief=brief if brief else None,  # type: ignore[arg-type]
-            )
-            if brief
-            else run_maintenance(cfg.repo, cfg.logs_dir)
-        )
-        append_event(
-            cfg.events_file,
-            "maintenance_done",
-            tick=tick,
-            acted_on=outcome.acted_on,
-            added_ready=outcome.added_ready,
-            closed_dupes=outcome.closed_dupes,
-            retitled=outcome.retitled,
-            duration_s=round(outcome.duration_s, 1),
-        )
-        write_state(
-            cfg.state_file,
-            {
-                "state": "between-ticks",
-                "tick": tick,
-                "last_maintenance": {
-                    "acted_on": outcome.acted_on,
-                    "added_ready": outcome.added_ready,
-                },
-            },
-        )
+        _run_maintenance_tick(cfg, tick)
         _short_sleep(cfg.tick_interval_s, cfg)
         return
 
