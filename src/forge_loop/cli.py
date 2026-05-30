@@ -56,6 +56,7 @@ import typer
 
 from forge_loop.config import load
 from forge_loop.runner import run as run_loop
+from forge_loop.settings import Settings
 from forge_loop.state import tail_events
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,44 @@ app = typer.Typer(
     add_completion=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+
+
+def _local_operator_cfg() -> SimpleNamespace:
+    """Best-effort local cfg for commands that only inspect loop files.
+
+    ``config.load()`` intentionally refuses to build a runner config without
+    ``repo.github``. Operator visibility should be weaker than runner startup:
+    status/events/pause/stop still need to work while repo config is broken.
+    """
+    try:
+        settings = Settings.load()
+        repo = settings.repo_path
+        ready_label = settings.labels.ready
+    except Exception:  # noqa: BLE001 - operator commands must fail soft
+        repo = Path.cwd()
+        ready_label = "loop:ready"
+    state_dir = repo / "docs" / "ops"
+    return SimpleNamespace(
+        repo=repo,
+        github_repo=None,
+        labels=SimpleNamespace(ready=ready_label),
+        state_dir=state_dir,
+        state_file=state_dir / "loop-runner.json",
+        events_file=state_dir / "loop-runner-events.jsonl",
+        summaries_file=state_dir / "loop-runner-summaries.jsonl",
+        pause_file=state_dir / "loop-runner.pause",
+        stop_file=state_dir / "loop-runner.stop",
+        pid_file=state_dir / "loop-runner.pid",
+        logs_dir=state_dir / "loop-runner-logs",
+    )
+
+
+def _operator_cfg() -> tuple[Any, str | None]:
+    try:
+        return load(), None
+    except Exception as exc:  # noqa: BLE001 - surfaced in status payload
+        return _local_operator_cfg(), str(exc)
+
 
 config_app = typer.Typer(help="Resolved config (models, ...)", no_args_is_help=False)
 pipeline_app = typer.Typer(help="Inspect the role-chain pipeline.", no_args_is_help=True)
@@ -112,7 +151,7 @@ def _cmd_run(args: SimpleNamespace) -> int:
     from forge_loop.axis import AXIS_FILTER_ENV
 
     axes = [a.strip().lower() for a in (getattr(args, "axis", None) or []) if a and a.strip()]
-    previous_axis_filter = os.environ[AXIS_FILTER_ENV] if AXIS_FILTER_ENV in os.environ else None
+    previous_axis_filter = os.getenv(AXIS_FILTER_ENV)
     if axes:
         os.environ[AXIS_FILTER_ENV] = ",".join(axes)
     else:
@@ -126,9 +165,7 @@ def _cmd_run(args: SimpleNamespace) -> int:
             return run_async_loop(load())
         return run_loop(load())
     finally:
-        if not axes:
-            os.environ.pop(AXIS_FILTER_ENV, None)
-        elif previous_axis_filter is None:
+        if not axes or previous_axis_filter is None:
             os.environ.pop(AXIS_FILTER_ENV, None)
         else:
             os.environ[AXIS_FILTER_ENV] = previous_axis_filter
@@ -268,6 +305,7 @@ def _cmd_doctor(_args: SimpleNamespace) -> int:
             line("yellow", "git probe failed")
 
     from forge_loop.settings import Settings as _Settings  # noqa: PLC0415
+
     try:
         drift_halt_opt_in = _Settings.load().deploy.drift_halt
     except Exception:  # noqa: BLE001 — doctor must keep running even if cfg fails
@@ -288,7 +326,7 @@ def _cmd_status(args: SimpleNamespace) -> int:
     """
     from datetime import datetime
 
-    cfg = load()
+    cfg, config_error = _operator_cfg()
     now = datetime.now(UTC)
     today = now.date()
 
@@ -353,31 +391,34 @@ def _cmd_status(args: SimpleNamespace) -> int:
     # one additional JSON field.
     queue_depth = 0
     ready_issues: list[dict[str, Any]] = []
-    try:
-        r = subprocess.run(
-            [
-                "gh",
-                "issue",
-                "list",
-                "--repo",
-                cfg.github_repo,
-                "--label",
-                cfg.labels.ready,
-                "--state",
-                "open",
-                "--limit",
-                "200",
-                "--json",
-                "number,title,labels",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if r.returncode == 0:
-            ready_issues = json.loads(r.stdout or "[]")
-            queue_depth = len(ready_issues)
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+    if cfg.github_repo:
+        try:
+            r = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "list",
+                    "--repo",
+                    cfg.github_repo,
+                    "--label",
+                    cfg.labels.ready,
+                    "--state",
+                    "open",
+                    "--limit",
+                    "200",
+                    "--json",
+                    "number,title,labels",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if r.returncode == 0:
+                ready_issues = json.loads(r.stdout or "[]")
+                queue_depth = len(ready_issues)
+        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+            queue_depth = -1
+    else:
         queue_depth = -1
 
     # Group the open ready-queue by axis. Axis filter (--axis) narrows
@@ -385,7 +426,9 @@ def _cmd_status(args: SimpleNamespace) -> int:
     # "sanity check before running" surface called out in the spec.
     from forge_loop.axis import UNALIGNED_BUCKET, group_by_axis
 
-    axis_filter = [a.strip().lower() for a in (getattr(args, "axis", None) or []) if a and a.strip()]
+    axis_filter = [
+        a.strip().lower() for a in (getattr(args, "axis", None) or []) if a and a.strip()
+    ]
     grouped_all, unaligned_count = group_by_axis(ready_issues)
     if axis_filter:
         axes_view: dict[str, list[dict[str, Any]]] = {
@@ -415,6 +458,8 @@ def _cmd_status(args: SimpleNamespace) -> int:
         "axes": axes_payload,
         "unaligned_count": unaligned_count,
         "axis_filter": axis_filter,
+        "config_ok": config_error is None,
+        "config_error": config_error,
     }
 
     if getattr(args, "json", False):
@@ -434,6 +479,8 @@ def _cmd_status(args: SimpleNamespace) -> int:
 
     if halt_reason:
         table.add_row("[red]HALTED[/red]", halt_reason)
+    if config_error:
+        table.add_row("[yellow]config[/yellow]", f"[yellow]{config_error}[/yellow]")
     pid_render = f"{pid_text or '(no pidfile)'} " + (
         "[green](alive)[/green]" if pid_alive else "[red](NOT running)[/red]"
     )
@@ -490,7 +537,7 @@ def _cmd_status(args: SimpleNamespace) -> int:
 
 def _cmd_events(args: SimpleNamespace) -> int:
     """Tail recent events. Rich-formatted by default; ``--raw`` skips colour."""
-    cfg = load()
+    cfg, _config_error = _operator_cfg()
 
     if getattr(args, "raw", False):
         for line in tail_events(cfg.events_file, n=args.n):
@@ -551,14 +598,15 @@ def _cmd_events(args: SimpleNamespace) -> int:
 
 
 def _cmd_pause(_args: SimpleNamespace) -> int:
-    cfg = load()
+    cfg, _config_error = _operator_cfg()
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.pause_file.touch()
     typer.echo(f"[pause] touched {cfg.pause_file}")
     return 0
 
 
 def _cmd_resume(_args: SimpleNamespace) -> int:
-    cfg = load()
+    cfg, _config_error = _operator_cfg()
     if cfg.pause_file.exists():
         cfg.pause_file.unlink()
     typer.echo(f"[resume] cleared {cfg.pause_file}")
@@ -566,7 +614,8 @@ def _cmd_resume(_args: SimpleNamespace) -> int:
 
 
 def _cmd_stop(_args: SimpleNamespace) -> int:
-    cfg = load()
+    cfg, _config_error = _operator_cfg()
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.stop_file.touch()
     typer.echo(f"[stop] touched {cfg.stop_file}")
     return 0
@@ -590,6 +639,7 @@ def _cmd_dashboard(args: SimpleNamespace) -> int:
 
     cfg = load()
     from forge_loop.settings import Settings as _Settings  # noqa: PLC0415
+
     _dash = _Settings.load().dashboard
     host = args.host or "127.0.0.1"
     port = int(args.port or _dash.port)
@@ -801,7 +851,11 @@ def _cmd_brainstorm(args: SimpleNamespace) -> int:
         body = _render_epic_body(epic)
         try:
             issue = gh_client.create_issue(
-                owner=owner, repo=repo_name, title=epic.title, body=body, labels=labels,
+                owner=owner,
+                repo=repo_name,
+                title=epic.title,
+                body=body,
+                labels=labels,
             )
             epic_axis_to_number[epic.axis] = issue.number
             succeeded.append((epic.title, issue.number))
@@ -815,7 +869,11 @@ def _cmd_brainstorm(args: SimpleNamespace) -> int:
         body = _render_ticket_body(ticket, parent)
         try:
             issue = gh_client.create_issue(
-                owner=owner, repo=repo_name, title=ticket.title, body=body, labels=labels,
+                owner=owner,
+                repo=repo_name,
+                title=ticket.title,
+                body=body,
+                labels=labels,
             )
             succeeded.append((ticket.title, issue.number))
         except Exception as exc:  # noqa: BLE001
@@ -1089,6 +1147,7 @@ def _default_repos_dir() -> Path:
     # Settings-driven (issue #84): was env LOOP_REPOS_DIR, now repo.repos_dir.
     try:
         from forge_loop.settings import Settings as _Settings
+
         path = _Settings.load().repo.repos_dir
         if path is not None:
             return Path(path).expanduser()
@@ -1413,6 +1472,23 @@ def _exit(rc: int) -> None:
     raise typer.Exit(code=int(rc))
 
 
+_RUN_AXIS_OPTION = typer.Option(
+    [],
+    "--axis",
+    help=(
+        "Narrow dispatch to issues carrying ``axis:<name>`` labels. "
+        "Repeatable; values are unioned. Omit to preserve pre-#126 "
+        "behaviour (no filter)."
+    ),
+)
+
+_STATUS_AXIS_OPTION = typer.Option(
+    [],
+    "--axis",
+    help="Narrow the axis-grouped view to these slugs (repeatable).",
+)
+
+
 @app.command("run", help="Run the loop in the foreground.")
 def cmd_run(
     orchestrator: str = typer.Option(
@@ -1425,15 +1501,7 @@ def cmd_run(
         "--queue",
         help="Queue backend URL. Default in-memory; sqlite:///path for durable.",
     ),
-    axis: list[str] = typer.Option(
-        [],
-        "--axis",
-        help=(
-            "Narrow dispatch to issues carrying ``axis:<name>`` labels. "
-            "Repeatable; values are unioned. Omit to preserve pre-#126 "
-            "behaviour (no filter)."
-        ),
-    ),
+    axis: list[str] = _RUN_AXIS_OPTION,
 ) -> None:
     if orchestrator not in {"sync", "async"}:
         typer.echo(f"run: invalid --orchestrator {orchestrator!r}", err=True)
@@ -1444,11 +1512,7 @@ def cmd_run(
 @app.command("status", help="Operator-facing health surface.")
 def cmd_status(
     json_: bool = typer.Option(False, "--json", help="Emit raw JSON for scripts."),
-    axis: list[str] = typer.Option(
-        [],
-        "--axis",
-        help="Narrow the axis-grouped view to these slugs (repeatable).",
-    ),
+    axis: list[str] = _STATUS_AXIS_OPTION,
 ) -> None:
     _exit(_cmd_status(SimpleNamespace(json=json_, axis=axis)))
 
@@ -1521,9 +1585,14 @@ def cmd_init(
     )
 
 
-@app.command("brainstorm", help="Propose axis-aligned epics/tickets from product vision (dry-run by default; --apply files them on GitHub).")
+@app.command(
+    "brainstorm",
+    help="Propose axis-aligned epics/tickets from product vision (dry-run by default; --apply files them on GitHub).",
+)
 def cmd_brainstorm(
-    apply: bool = typer.Option(False, "--apply", help="Actually file the proposed epics + tickets on GitHub."),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually file the proposed epics + tickets on GitHub."
+    ),
 ) -> None:
     _exit(_cmd_brainstorm(SimpleNamespace(apply=apply)))
 
@@ -1731,7 +1800,9 @@ def main(argv: list[str] | None = None) -> int:
     ``main([...])`` directly. Help keeps the historical CLI shape and raises
     ``SystemExit(0)`` through Typer standalone mode.
     """
-    if argv and (argv[0] in {"replay", "record-session"} or any(arg in {"-h", "--help"} for arg in argv)):
+    if argv and (
+        argv[0] in {"replay", "record-session"} or any(arg in {"-h", "--help"} for arg in argv)
+    ):
         app(args=argv, standalone_mode=True)
         return 0  # unreachable in standalone mode — kept for type-checkers
     try:

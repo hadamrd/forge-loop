@@ -55,9 +55,26 @@ def test_help_lists_every_subcommand(runner: CliRunner) -> None:
     result = runner.invoke(cli.app, ["--help"])
     assert result.exit_code == 0
     for cmd in (
-        "run", "status", "doctor", "events", "pause", "resume", "stop",
-        "retry", "dashboard", "init", "brainstorm", "record-session", "brief",
-        "config", "pipeline", "repos", "mcp", "replay", "roles", "cluster",
+        "run",
+        "status",
+        "doctor",
+        "events",
+        "pause",
+        "resume",
+        "stop",
+        "retry",
+        "dashboard",
+        "init",
+        "brainstorm",
+        "record-session",
+        "brief",
+        "config",
+        "pipeline",
+        "repos",
+        "mcp",
+        "replay",
+        "roles",
+        "cluster",
     ):
         assert cmd in result.stdout, f"missing {cmd} in help"
 
@@ -91,26 +108,20 @@ def test_run_dispatches_with_orchestrator_and_queue(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured = _stub_handler(monkeypatch, "run")
-    result = runner.invoke(
-        cli.app, ["run", "--orchestrator", "async", "--queue", "sqlite:///x.db"]
-    )
+    result = runner.invoke(cli.app, ["run", "--orchestrator", "async", "--queue", "sqlite:///x.db"])
     assert result.exit_code == 0, result.stderr
     assert captured["args"].orchestrator == "async"
     assert captured["args"].queue == "sqlite:///x.db"
 
 
-def test_status_default_invokes_handler(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_status_default_invokes_handler(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _stub_handler(monkeypatch, "status")
     result = runner.invoke(cli.app, ["status"])
     assert result.exit_code == 0
     assert captured["args"].json is False
 
 
-def test_status_json_backcompat_flag(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_status_json_backcompat_flag(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
     """`status --json` MUST still emit raw JSON for scripts."""
     captured = _stub_handler(monkeypatch, "status")
     result = runner.invoke(cli.app, ["status", "--json"])
@@ -118,9 +129,7 @@ def test_status_json_backcompat_flag(
     assert captured["args"].json is True
 
 
-def test_events_default_n_and_raw_flag(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_events_default_n_and_raw_flag(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _stub_handler(monkeypatch, "events")
     runner.invoke(cli.app, ["events"])
     assert captured["args"].n == 30 and captured["args"].raw is False
@@ -172,9 +181,7 @@ def test_dashboard_rejects_both_modes(runner: CliRunner) -> None:
     assert "choose --web or --tui" in (result.stdout + result.stderr)
 
 
-def test_config_default_emits_json(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_config_default_emits_json(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
     """`config` historically always emitted JSON — preserve."""
     captured = _stub_handler(monkeypatch, "config")
     result = runner.invoke(cli.app, ["config"])
@@ -182,18 +189,14 @@ def test_config_default_emits_json(
     assert captured["args"].json is False  # flag absent → False, handler still emits
 
 
-def test_config_models_subcommand(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_config_models_subcommand(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _stub_handler(monkeypatch, "config_models")
     result = runner.invoke(cli.app, ["config", "models", "--json"])
     assert result.exit_code == 0
     assert captured["args"].json is True
 
 
-def test_repos_list_disable_enable(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_repos_list_disable_enable(runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
     cap_list = _stub_handler(monkeypatch, "repos_list")
     cap_dis = _stub_handler(monkeypatch, "repos_disable")
     cap_en = _stub_handler(monkeypatch, "repos_enable")
@@ -292,7 +295,8 @@ def test_status_handler_respects_json_for_scripts(
     monkeypatch.setattr(cli, "load", lambda: fake_cfg)
     # No `gh` call: monkeypatch subprocess.run to fail fast.
     monkeypatch.setattr(
-        cli.subprocess, "run",
+        cli.subprocess,
+        "run",
         lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("gh")),
     )
     rc = cli._cmd_status(SimpleNamespace(json=True))
@@ -301,6 +305,56 @@ def test_status_handler_respects_json_for_scripts(
     blob = json.loads(out)
     for key in ("pid", "pid_alive", "queue_depth", "events_file", "last_events"):
         assert key in blob
+
+
+def test_status_json_falls_back_to_local_ops_without_github_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Local operator visibility should survive missing repo.github."""
+
+    ops = tmp_path / "docs" / "ops"
+    ops.mkdir(parents=True)
+    (ops / "loop-runner.json").write_text(json.dumps({"state": "idle", "tick": 7}))
+    (ops / "loop-runner-events.jsonl").write_text(
+        json.dumps({"ts": "2026-05-30T10:00:00Z", "kind": "tick_idle"}) + "\n"
+    )
+    monkeypatch.setenv("LOOP_REPO_DIR", str(tmp_path))
+    monkeypatch.delenv("LOOP_GH_REPO", raising=False)
+    monkeypatch.setattr(cli, "load", lambda: (_ for _ in ()).throw(RuntimeError("repo missing")))
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("gh must not run")),
+    )
+
+    rc = cli._cmd_status(SimpleNamespace(json=True))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    blob = json.loads(out)
+    assert blob["config_ok"] is False
+    assert blob["config_error"] == "repo missing"
+    assert blob["state"] == "idle"
+    assert blob["tick"] == 7
+    assert blob["queue_depth"] == -1
+    assert blob["last_events"] == [{"ts": "2026-05-30T10:00:00Z", "kind": "tick_idle"}]
+
+
+def test_events_raw_falls_back_to_local_ops_without_github_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ops = tmp_path / "docs" / "ops"
+    ops.mkdir(parents=True)
+    line = json.dumps({"ts": "2026-05-30T10:00:00Z", "kind": "loop_start"}) + "\n"
+    (ops / "loop-runner-events.jsonl").write_text(line)
+    monkeypatch.setenv("LOOP_REPO_DIR", str(tmp_path))
+    monkeypatch.delenv("LOOP_GH_REPO", raising=False)
+    monkeypatch.setattr(cli, "load", lambda: (_ for _ in ()).throw(RuntimeError("repo missing")))
+
+    rc = cli._cmd_events(SimpleNamespace(n=10, raw=True))
+
+    assert rc == 0
+    assert capsys.readouterr().out == line
 
 
 def test_doctor_runs_without_loop_gh_repo(
@@ -322,9 +376,7 @@ def test_doctor_runs_without_loop_gh_repo(
     assert "deploy-drift" in out
 
 
-def test_no_color_env_drops_ansi(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_no_color_env_drops_ansi(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Rich output respects NO_COLOR — no ANSI escapes in the dump."""
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setenv("TERM", "dumb")
