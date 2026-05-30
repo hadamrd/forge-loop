@@ -36,6 +36,7 @@ from forge_loop.gh import top_issues as top_issues
 from forge_loop.gh import unlabel as unlabel
 from forge_loop.runner import boot as _boot
 from forge_loop.runner import dispatch as _dispatch_mod
+from forge_loop.runner import iteration as iteration
 from forge_loop.runner import tick as _tick_mod
 from forge_loop.runner._helpers import (
     consecutive_deploy_fails as _consecutive_deploy_fails_impl,

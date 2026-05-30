@@ -802,6 +802,12 @@ def _tick(cfg: Config, tick: int) -> None:
         for idx, o in enumerate(list(outcomes)):
             if o.status == "merged":
                 continue
+            # A worker that already opened a PR has completed the dispatch
+            # contract. Let the normal critic / ready-label / merge-gate path
+            # handle it instead of probing the worktree and accidentally
+            # converting a good PR into a follow-up failure.
+            if o.status == "open" and o.pr_url:
+                continue
             issue = issue_by_n.get(o.issue)
             if issue is None:
                 continue

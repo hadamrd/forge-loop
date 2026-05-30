@@ -270,7 +270,7 @@ def dispatch_worker(issue_number: int, timeout_s: int = 3600) -> dict[str, Any]:
         issue = json.loads(r.stdout)
     else:
         issue = matches[0]
-    outcome = _run_worker(issue, cfg.repo, cfg.logs_dir, timeout_s)
+    outcome = _run_worker(issue, cfg.repo, cfg.logs_dir, timeout_s, base_branch=cfg.base_branch)
     return asdict(outcome)
 
 

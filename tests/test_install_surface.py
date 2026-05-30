@@ -16,6 +16,8 @@ import sys
 
 import pytest
 
+from tests.import_isolation import isolated_import
+
 # Modules that must always import with only the default dependencies.
 STABLE_MODULES = [
     "forge_loop",
@@ -47,15 +49,9 @@ EXPERIMENTAL_MODULES = [
 @pytest.mark.parametrize("mod", STABLE_MODULES)
 def test_stable_module_imports_clean(mod: str) -> None:
     """Stable surface imports without any experimental dep present."""
-    saved = sys.modules.pop(mod, None)
-    try:
-        importlib.import_module(mod)
-    finally:
-        # Restore the original module object so any other test that
-        # imported it at file-top continues to see the same class
-        # identities (avoid isinstance flakes).
-        if saved is not None:
-            sys.modules[mod] = saved
+    # isolated_import restores both sys.modules and parent package attrs.
+    with isolated_import(mod):
+        pass
 
 
 def test_no_redis_or_cluster_module_exists() -> None:

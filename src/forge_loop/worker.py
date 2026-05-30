@@ -375,7 +375,8 @@ def _prep_worktree(
     )
     if r.returncode != 0:
         return wt, r.stderr
-    _drop_permissive_settings(wt)
+    if wt.exists():
+        _drop_permissive_settings(wt)
     return wt, None
 
 
@@ -407,7 +408,8 @@ def _prep_repair_worktree(
     )
     if r.returncode != 0:
         return wt, r.stderr
-    _drop_permissive_settings(wt)
+    if wt.exists():
+        _drop_permissive_settings(wt)
     return wt, None
 
 

@@ -119,6 +119,7 @@ def _build_default_handlers(
             thinking=cfg.worker.thinking,
             provider=getattr(cfg.worker, "provider", "claude"),
             allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+            base_branch=getattr(cfg, "base_branch", "trunk"),
         )
         ok = out.status in {"merged", "open"}
         return StepOutcome(

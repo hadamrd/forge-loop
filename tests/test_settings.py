@@ -250,6 +250,13 @@ _ALLOWED_LEGACY_SITES = {
     # Dynamic env-var name (computed at call time, not a fixed knob).
     "src/forge_loop/briefs/__init__.py",
     "src/forge_loop/mcp_server.py",  # per-tool LOOP_MCP_CAP_<TOOL> + ENV pass-through
+    # Axis filter is a transient CLI-to-runner handoff, also directly
+    # injectable in tests via parse_filter_env(env=...); not persisted
+    # operator configuration.
+    "src/forge_loop/axis.py",
+    # Manifesto discovery has a test/operator escape hatch for pointing at
+    # fixture docs without changing the runtime Settings tree.
+    "src/forge_loop/_critic_sdk.py",
     # Observability extras live behind FORGE_LOOP_EXPERIMENTAL gate and read
     # their own LOOP_PROM_* / LOOP_OTEL_* knobs — out of scope for #84's
     # core cleanup; will be folded in when observability stabilises.

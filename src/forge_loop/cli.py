@@ -51,6 +51,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import click
 import typer
 
 from forge_loop.config import load
@@ -111,17 +112,26 @@ def _cmd_run(args: SimpleNamespace) -> int:
     from forge_loop.axis import AXIS_FILTER_ENV
 
     axes = [a.strip().lower() for a in (getattr(args, "axis", None) or []) if a and a.strip()]
+    previous_axis_filter = os.environ[AXIS_FILTER_ENV] if AXIS_FILTER_ENV in os.environ else None
     if axes:
         os.environ[AXIS_FILTER_ENV] = ",".join(axes)
     else:
         os.environ.pop(AXIS_FILTER_ENV, None)
 
-    orch = getattr(args, "orchestrator", "sync")
-    if orch == "async":
-        from forge_loop.runner import run_async as run_async_loop
+    try:
+        orch = getattr(args, "orchestrator", "sync")
+        if orch == "async":
+            from forge_loop.runner import run_async as run_async_loop
 
-        return run_async_loop(load())
-    return run_loop(load())
+            return run_async_loop(load())
+        return run_loop(load())
+    finally:
+        if not axes:
+            os.environ.pop(AXIS_FILTER_ENV, None)
+        elif previous_axis_filter is None:
+            os.environ.pop(AXIS_FILTER_ENV, None)
+        else:
+            os.environ[AXIS_FILTER_ENV] = previous_axis_filter
 
 
 def _cmd_cluster_status(args: SimpleNamespace) -> int:
@@ -1717,15 +1727,22 @@ def cmd_cluster_status(
 def main(argv: list[str] | None = None) -> int:
     """Programmatic entry point — used by ``forge-loop`` and ``python -m forge_loop``.
 
-    Runs the Typer app in *standalone* mode, which mirrors the historical
-    argparse behaviour: ``--help`` and parse errors raise ``SystemExit``
-    with the appropriate exit code, and successful subcommand returns
-    raise ``SystemExit(0)``. Callers who want an int back can wrap in
-    ``try/except SystemExit``. The ``sys.exit(main())`` idiom at the
-    bottom keeps the historical script wrapper happy.
+    Normal subcommands return an integer so tests and replay tools can call
+    ``main([...])`` directly. Help keeps the historical CLI shape and raises
+    ``SystemExit(0)`` through Typer standalone mode.
     """
-    app(args=argv, standalone_mode=True)
-    return 0  # unreachable in standalone mode — kept for type-checkers
+    if argv and (argv[0] in {"replay", "record-session"} or any(arg in {"-h", "--help"} for arg in argv)):
+        app(args=argv, standalone_mode=True)
+        return 0  # unreachable in standalone mode — kept for type-checkers
+    try:
+        result = app(args=argv, standalone_mode=False)
+    except typer.Exit as exc:
+        return int(exc.exit_code or 0)
+    except click.exceptions.Exit as exc:
+        return int(exc.exit_code or 0)
+    except click.ClickException as exc:
+        raise SystemExit(exc.exit_code) from exc
+    return int(result or 0)
 
 
 if __name__ == "__main__":
