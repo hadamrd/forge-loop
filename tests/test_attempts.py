@@ -10,6 +10,7 @@ from forge_loop.attempts import (
     classify_skip,
     compute_fingerprint,
     cooldown_from_env,
+    parse_blocking_comments,
     parse_history,
     parse_history_strict,
     render_comment,
@@ -53,6 +54,24 @@ def test_parse_history_extracts_attempts_in_order() -> None:
 
 def test_parse_history_ignores_non_marker_comments() -> None:
     assert parse_history(["just a comment", "another one"]) == []
+
+
+def test_parse_blocking_comments_extracts_critic_repair_contract() -> None:
+    comments = [
+        "nice work",
+        "Post-merge critic found AR5 is not actually complete.\n\n"
+        "Remaining blocker:\n"
+        "- native proof is still entry-point-only.\n\n"
+        "Required repair:\n"
+        "1. Add a native stock-Git test.",
+        "ordinary follow-up without critic keywords",
+    ]
+
+    blockers = parse_blocking_comments(comments)
+
+    assert len(blockers) == 1
+    assert "Remaining blocker" in blockers[0]
+    assert "native stock-Git test" in blockers[0]
 
 
 def test_parse_history_skips_malformed_json_blocks() -> None:

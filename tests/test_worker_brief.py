@@ -40,6 +40,23 @@ def test_make_brief_includes_history_section_when_past_attempts(tmp_path: Path) 
     assert "https://github.com/h/r/pull/9" in brief
 
 
+def test_make_brief_promotes_critic_blockers_to_hard_contract(tmp_path: Path) -> None:
+    issue = {"number": 23, "title": "AR4 proof", "body": "Do AR4."}
+    brief = make_brief(
+        issue,
+        tmp_path / "w",
+        blocking_comments=[
+            "Post-merge critic found AR4 is not actually complete.\n"
+            "Required repair: add a test with at least two candidate summaries."
+        ],
+    )
+
+    assert "CRITIC / OPERATOR BLOCKERS" in brief
+    assert "HARD ACCEPTANCE CONTRACT" in brief
+    assert "two candidate summaries" in brief
+    assert "Do not satisfy this issue with adjacent cleanup" in brief
+
+
 def test_make_brief_no_history_section_when_empty(tmp_path: Path) -> None:
     issue = {"number": 942, "title": "fix x", "body": ""}
     brief = make_brief(issue, tmp_path / "w", past_attempts=[])

@@ -290,9 +290,14 @@ def _tick(cfg: Config, tick: int) -> None:
         labels = [lab.get("name", "") for lab in (i.get("labels") or [])]
         gated = bool(risk_gate_label) and risk_gate_label in labels
         past: list[dict[str, Any]] = []
+        blocking_comments: list[str] = []
         corrupt = 0
         if cfg.attempts.enabled:
             past, corrupt = _attempts.fetch_history_strict(
+                i["number"],
+                repo=cfg.github_repo,
+            )
+            blocking_comments = _attempts.fetch_blocking_comments(
                 i["number"],
                 repo=cfg.github_repo,
             )
@@ -303,11 +308,10 @@ def _tick(cfg: Config, tick: int) -> None:
                     issue=i["number"],
                     rows=corrupt,
                 )
-        fp = _attempts.compute_fingerprint(
-            i["number"],
-            i.get("body") or "",
-            brief_hash,
-        )
+        fingerprint_body = i.get("body") or ""
+        if blocking_comments:
+            fingerprint_body = fingerprint_body + "\n\n" + "\n\n".join(blocking_comments)
+        fp = _attempts.compute_fingerprint(i["number"], fingerprint_body, brief_hash)
         forced = i["number"] in force_set
         if cfg.attempts.enabled and not forced:
             decision = _attempts.classify_skip(
@@ -346,6 +350,7 @@ def _tick(cfg: Config, tick: int) -> None:
             {
                 "risk_gated": gated,
                 "past_attempts": trimmed,
+                "blocking_comments": blocking_comments,
                 "brief_fingerprint": fp,
                 "forced": forced,
             }
@@ -456,28 +461,10 @@ def _tick(cfg: Config, tick: int) -> None:
                     err=str(ex_)[:200],
                 )
 
-    # Persist this attempt as a GH issue comment (per-issue history grows).
     fingerprint_by_issue = {
         i["number"]: meta.get("brief_fingerprint", "")
         for i, meta in zip(issues, workers_meta, strict=True)
     }
-    if cfg.attempts.enabled:
-        for o in outcomes:
-            try:
-                _attempts.record(
-                    o.issue,
-                    status=o.status,
-                    pr_url=o.pr_url,
-                    duration_s=o.duration_s,
-                    note=(o.error or "")[:200],
-                    event_count=len(o.events or []),
-                    repo=cfg.github_repo,
-                    brief_fingerprint=fingerprint_by_issue.get(o.issue, ""),
-                )
-            except Exception as ex_:  # don't fail tick on history-write error
-                append_event(
-                    cfg.events_file, "attempt_record_failed", issue=o.issue, err=str(ex_)[:200]
-                )
 
     # Critic agent: review PRs the workers opened, before auto-merge fires.
     # In pipeline-driven mode the critic ran as a chain step already.
@@ -510,6 +497,27 @@ def _tick(cfg: Config, tick: int) -> None:
             master_log_path,
             f"merge gate refused {len(refused)} PR(s) — closed issues: {refused}",
         )
+
+    # Persist this attempt as a GH issue comment after critic + merge gates so
+    # the ledger reflects the real post-review state, not the worker's
+    # optimistic pre-critic status.
+    if cfg.attempts.enabled:
+        for o in outcomes:
+            try:
+                _attempts.record(
+                    o.issue,
+                    status=o.status,
+                    pr_url=o.pr_url,
+                    duration_s=o.duration_s,
+                    note=(o.error or "")[:200],
+                    event_count=len(o.events or []),
+                    repo=cfg.github_repo,
+                    brief_fingerprint=fingerprint_by_issue.get(o.issue, ""),
+                )
+            except Exception as ex_:  # don't fail tick on history-write error
+                append_event(
+                    cfg.events_file, "attempt_record_failed", issue=o.issue, err=str(ex_)[:200]
+                )
 
     merged_nums = [o.issue for o in outcomes if o.status == "merged"]
     append_event(

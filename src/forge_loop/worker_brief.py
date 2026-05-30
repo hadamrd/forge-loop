@@ -14,6 +14,7 @@ def make_brief(
     *,
     risk_gated: bool = False,
     past_attempts: list[dict[str, Any]] | None = None,
+    blocking_comments: list[str] | None = None,
     lumen_top_k: int = 3,
     lumen_test_pattern: str = "**/*Test.*",
     coauthor: str = "",
@@ -36,6 +37,18 @@ def make_brief(
             "\nPREVIOUS ATTEMPTS ON THIS ISSUE (oldest first):\n"
             f"{rendered}\n"
             "Use these to avoid repeating the same dead-ends.\n"
+        )
+
+    blocker_section = ""
+    if blocking_comments:
+        rendered_blockers = "\n\n---\n\n".join(comment[:4000] for comment in blocking_comments[-3:])
+        blocker_section = (
+            "\nCRITIC / OPERATOR BLOCKERS - HARD ACCEPTANCE CONTRACT:\n"
+            "These comments are newer than the original issue body or carry a blocking review.\n"
+            "Treat every Required repair, Remaining blocker, sev1 finding, and named proof command below as mandatory.\n"
+            "Do not satisfy this issue with adjacent cleanup, nearby tests, or a different proof surface.\n"
+            "If a blocker names a file, behavior, proof command, or test shape, implement that exact contract.\n\n"
+            f"{rendered_blockers}\n"
         )
 
     merge_step_renumbered = (
@@ -65,7 +78,7 @@ def make_brief(
         worktree=worktree,
         issue_title=issue["title"],
         body=body,
-        history_section=history_section,
+        history_section=history_section + blocker_section,
         merge_step_renumbered=merge_step_renumbered,
         lumen_top_k=lumen_top_k,
         lumen_test_pattern=lumen_test_pattern,

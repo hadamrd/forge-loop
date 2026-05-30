@@ -26,6 +26,14 @@ from forge_loop import gh as _gh
 
 MARKER = "<!-- forge-loop-attempt -->"
 COMMENT_RE = re.compile(re.escape(MARKER) + r".*?```json\s*\n(.*?)\n```", re.DOTALL)
+BLOCKING_COMMENT_MARKERS = (
+    "critic found",
+    "critic still blocks",
+    "post-merge critic",
+    "blocking repair",
+    "remaining blocker",
+    "required repair",
+)
 
 # Default cooldown after a failed attempt before the same fingerprint is
 # eligible for a fresh dispatch. Override via LOOP_RETRY_COOLDOWN_S.
@@ -160,6 +168,28 @@ def parse_history_strict(
     return out, corrupt
 
 
+def parse_blocking_comments(
+    comments_body: list[str],
+    *,
+    limit: int = 3,
+    max_chars: int = 4000,
+) -> list[str]:
+    """Extract recent critic/operator blocker comments for the next worker.
+
+    Attempt records only say "failed/no_pr/merged"; they do not carry the
+    human or critic repair contract. Keep those comments visible to the worker
+    so it cannot satisfy the issue with adjacent cleanup.
+    """
+    blockers: list[str] = []
+    for body in comments_body:
+        normalized = body.lower()
+        if MARKER in body:
+            continue
+        if any(marker in normalized for marker in BLOCKING_COMMENT_MARKERS):
+            blockers.append(body.strip()[:max_chars])
+    return blockers[-limit:]
+
+
 def fetch_history(issue: int, repo: str | None = None) -> list[dict[str, Any]]:
     """Fetch all forge-loop attempt records for an issue (oldest first)."""
     records, _ = fetch_history_strict(issue, repo=repo)
@@ -188,6 +218,13 @@ def fetch_history_strict(
         return [], 0
     bodies = [c.get("body", "") for c in payload.get("comments", [])]
     return parse_history_strict(bodies)
+
+
+def fetch_blocking_comments(issue: int, repo: str | None = None) -> list[str]:
+    """Fetch recent critic/operator blocker comments for an issue."""
+    if not repo:
+        raise RuntimeError("fetch_blocking_comments requires repo='owner/name'")
+    return parse_blocking_comments(_gh.issue_comment_bodies(issue, repo=repo))
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +327,8 @@ __all__ = [
     "cooldown_from_env",
     "fetch_history",
     "fetch_history_strict",
+    "fetch_blocking_comments",
+    "parse_blocking_comments",
     "parse_history",
     "parse_history_strict",
     "record",

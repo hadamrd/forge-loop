@@ -14,6 +14,7 @@ Covers the contract from the issue body:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from forge_loop.config import (
     LumenConfig,
     POConfig,
 )
+from forge_loop.runner import tick as _tick_mod
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -82,6 +84,8 @@ class _State:
         self.scripted_pr: str | None = None
         self.scripted_error: str | None = "boom"
         self.unlabeled: list[tuple[int, str, str | None]] = []
+        self.blocking_comments: dict[int, list[str]] = {}
+        self.worker_kwargs: list[dict[str, Any]] = []
 
 
 @pytest.fixture
@@ -105,6 +109,9 @@ def fake_world(monkeypatch, tmp_path: Path):
     def fake_fetch_history_strict(num: int, repo: str | None = None):
         return list(state.history.get(num, [])), state.corrupt.get(num, 0)
 
+    def fake_fetch_blocking_comments(num: int, repo: str | None = None):
+        return list(state.blocking_comments.get(num, []))
+
     def fake_record(num: int, *, status, pr_url, duration_s, note, event_count,
                     repo=None, brief_fingerprint=""):
         state.history.setdefault(num, []).append({
@@ -120,6 +127,7 @@ def fake_world(monkeypatch, tmp_path: Path):
     def fake_run_worker(issue_, repo, logs_dir, timeout_s, **kwargs):
         from forge_loop.worker import WorkerOutcome
         state.dispatched.append(issue_["number"])
+        state.worker_kwargs.append(kwargs)
         return WorkerOutcome(
             issue=issue_["number"], title=issue_["title"],
             pr_url=state.scripted_pr, status=state.scripted_status,
@@ -135,6 +143,7 @@ def fake_world(monkeypatch, tmp_path: Path):
     # name in runner via `from forge_loop.worker import run_worker`).
     monkeypatch.setattr(_runner, "top_issues", fake_top_issues)
     monkeypatch.setattr(_attempts, "fetch_history_strict", fake_fetch_history_strict)
+    monkeypatch.setattr(_attempts, "fetch_blocking_comments", fake_fetch_blocking_comments)
     monkeypatch.setattr(_attempts, "record", fake_record)
     monkeypatch.setattr(_runner, "run_worker", fake_run_worker)
     monkeypatch.setattr(_runner, "unlabel", fake_unlabel)
@@ -177,6 +186,25 @@ def test_open_pr_removes_ready_label(fake_world) -> None:
     assert removed["issue"] == 99
     assert removed["status"] == "open"
     assert removed["pr_url"] == "https://github.com/o/r/pull/100"
+
+
+def test_attempt_record_uses_post_critic_status(fake_world, monkeypatch) -> None:
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    state.scripted_status = "merged"
+    state.scripted_pr = "https://github.com/o/r/pull/100"
+    state.scripted_error = None
+
+    def critic_blocks(_cfg, outcomes, _emit):
+        outcomes[0].status = "open"
+        outcomes[0].error = "critic blocked"
+
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", critic_blocks)
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.history[99][0]["status"] == "open"
+    assert state.history[99][0]["note"] == "critic blocked"
 
 
 def test_failure_then_cooldown_skip_then_release(fake_world, monkeypatch) -> None:
@@ -249,6 +277,30 @@ def test_body_change_invalidates_in_flight_skip(fake_world) -> None:
     }]
     _runner._tick(cfg, tick=1)
     assert state.dispatched == [99]
+
+
+def test_blocking_comment_invalidates_cooldown_and_reaches_worker(fake_world, monkeypatch) -> None:
+    state, cfg, issue = fake_world
+    monkeypatch.setenv("LOOP_RETRY_COOLDOWN_S", "3600")
+    stale_fp = _attempts.compute_fingerprint(
+        issue["number"], issue["body"], _worker.brief_template_hash(),
+    )
+    state.history[99] = [{
+        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+        "status": "no_pr",
+        "pr_url": None,
+        "brief_fingerprint": stale_fp,
+    }]
+    state.blocking_comments[99] = [
+        "Post-merge critic found this incomplete.\n"
+        "Required repair: add the exact native proof, not an adjacent edge test."
+    ]
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.dispatched == [99]
+    assert state.worker_kwargs[0]["blocking_comments"] == state.blocking_comments[99]
+    assert "worker_skip_cooldown" not in _kinds(_read_events(cfg))
 
 
 def test_force_marker_bypasses_both_guards(fake_world) -> None:

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
-from forge_loop.critic import CriticReport, Finding
+from forge_loop.config import Config, CriticConfig
+from forge_loop.critic import CriticOutcome, CriticReport, Finding
 from forge_loop.critic_actions import apply_critic_report, plan_actions
+from forge_loop.runner import dispatch as dispatch_mod
+from forge_loop.worker import WorkerOutcome
 
 
 @dataclass
@@ -185,6 +189,48 @@ def test_apply_only_sev3_posts_comment_no_block() -> None:
     # sev3 with no file/line lands as a summary comment
     assert len(gh.comment_calls) == 1
     assert gh.comment_calls[0]["file"] is None
+
+
+def test_run_critic_block_reopens_optimistic_merged_outcome(monkeypatch, tmp_path) -> None:
+    cfg = Config(
+        repo=tmp_path,
+        github_repo="o/r",
+        critic=CriticConfig(enabled=True, timeout_s=10),
+    )
+    outcome = WorkerOutcome(
+        issue=99,
+        title="fix thing",
+        pr_url="https://github.com/o/r/pull/123",
+        status="merged",
+        duration_s=1.0,
+        stdout_tail="",
+    )
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_critic_review",
+        lambda *_a, **_kw: CriticOutcome(
+            verdict="changes_requested",
+            reasons=["missing required proof"],
+            duration_s=1.0,
+            stdout_tail="",
+            report=_report(
+                "request_changes",
+                [Finding("sev1", "tests", "tests/test_x.py", 7, "missing required proof")],
+            ),
+        ),
+    )
+    monkeypatch.setattr(dispatch_mod._gh, "pr_changed_lines", lambda *_a, **_kw: 12)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "apply_critic_report",
+        lambda *_a, **_kw: SimpleNamespace(block_merge=True),
+    )
+
+    dispatch_mod._run_critic_for_outcomes(cfg, [outcome], lambda *_a, **_kw: None)
+
+    assert outcome.status == "open"
+    assert outcome.error == "critic blocked merge: missing required proof"
 
 
 if __name__ == "__main__":

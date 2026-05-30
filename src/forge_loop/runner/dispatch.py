@@ -177,6 +177,7 @@ def _dispatch_one_worker(
             cfg.worker_timeout_s,
             risk_gated=meta["risk_gated"],
             past_attempts=meta["past_attempts"],
+            blocking_comments=meta.get("blocking_comments") or [],
             emit=bus_emit,
             lumen_top_k=cfg.lumen.top_k,
             lumen_test_pattern=cfg.lumen_test_pattern,
@@ -211,6 +212,7 @@ def _dispatch_one_worker(
             cfg.worker_timeout_s,
             risk_gated=meta["risk_gated"],
             past_attempts=meta["past_attempts"],
+            blocking_comments=meta.get("blocking_comments") or [],
             emit=bus_emit,
             lumen_top_k=cfg.lumen.top_k,
             lumen_test_pattern=cfg.lumen_test_pattern,
@@ -444,7 +446,12 @@ def _run_critic_for_outcomes(
                             repo=cfg.github_repo,
                             emit=bus_emit,
                         )
-                        if not plan.block_merge:
+                        if plan.block_merge:
+                            o.status = "open"
+                            reason = "; ".join(critic_outcome.reasons) or critic_outcome.verdict
+                            note = f"critic blocked merge: {reason}"[:200]
+                            o.error = f"{o.error}; {note}" if o.error else note
+                        else:
                             _gh.remove_pr_label(o.pr_url, "critic:blocking", repo=cfg.github_repo)
                             _gh.remove_pr_label(o.pr_url, "critic:suspicious", repo=cfg.github_repo)
                     except Exception as act_ex:

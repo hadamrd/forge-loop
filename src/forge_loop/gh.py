@@ -33,6 +33,34 @@ def fetch_issue(issue: int, repo: str | None = None) -> dict[str, Any] | None:
     return gh_issues.fetch_issue(issue, repo=repo)
 
 
+def issue_comment_bodies(issue: int, repo: str | None = None) -> list[str]:
+    """Fetch issue comment bodies. Returns an empty list on GitHub/CLI failure."""
+    repo = _require_repo(repo)
+    r = subprocess.run(
+        [
+            "gh",
+            "issue",
+            "view",
+            str(issue),
+            "--repo",
+            repo,
+            "--comments",
+            "--json",
+            "comments",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return []
+    try:
+        payload = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return []
+    return [str(c.get("body") or "") for c in payload.get("comments", [])]
+
+
 def comment(issue: int, body: str, repo: str | None = None) -> None:
     """Post a comment to an issue. Errors are swallowed (caller logs)."""
     gh_issues.comment(issue, body, repo=repo)
