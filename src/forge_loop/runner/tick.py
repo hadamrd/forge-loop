@@ -454,9 +454,70 @@ def _run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
     return report
 
 
+def _run_codebase_audit(cfg: Config, tick: int) -> None:
+    """Per-cadence codebase-state audit (issue #156).
+
+    Runs on the maintenance cadence so the deterministic state-rule
+    check (regex / LOC counting) lands alongside the LLM grooming pass.
+    Dry-run on the runner: we emit ``audit_violation_filed`` /
+    ``audit_clean`` events so the operator dashboard surfaces drift, but
+    we do NOT auto-file tickets here. The ``forge-loop audit --apply``
+    CLI command is the explicit, operator-driven side.
+
+    Best-effort: any exception is swallowed with a single event. The
+    tick itself must never crash because of an audit pass.
+    """
+    try:
+        from forge_loop.codebase_audit import audit as _audit
+        from forge_loop.events import AuditCleanEvent, emit
+
+        report = _audit(cfg.repo)
+    except Exception as ex:  # noqa: BLE001
+        append_event(
+            cfg.events_file,
+            "audit_skipped",
+            tick=tick,
+            reason=f"{type(ex).__name__}: {ex}"[:200],
+        )
+        return
+    if report.is_clean:
+        try:
+            emit(cfg.events_file, AuditCleanEvent(probes_run=list(report.probes_run)))
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    # Non-empty: emit one summary event per violation (probe + target).
+    # No gh side-effect — the operator runs `forge-loop audit --apply`.
+    for v in report.violations:
+        append_event(
+            cfg.events_file,
+            "audit_violation_observed",
+            tick=tick,
+            probe=v.probe,
+            target=v.target,
+            severity=v.severity,
+            title=v.title,
+            metrics=v.metrics,
+        )
+    for probe_name, err in report.errors.items():
+        append_event(
+            cfg.events_file,
+            "audit_probe_crashed",
+            tick=tick,
+            probe=probe_name,
+            err=err,
+        )
+
+
 def _tick(cfg: Config, tick: int) -> None:
     # Imported lazily to avoid an import cycle (boot.py imports tick.py).
     from forge_loop.runner.boot import _short_sleep
+
+    # Codebase-state audit (issue #156) — same cadence as maintenance.
+    # Runs *before* the maintenance branch so it fires even when the
+    # maintenance subagent is the body of the tick.
+    if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
+        _run_codebase_audit(cfg, tick)
 
     # Maintenance ticks: every Nth tick, run the AI-as-PM subagent instead
     # of dispatching workers. The maintenance agent grooms + triages the

@@ -209,6 +209,37 @@ class WorktreeReapedEvent(EventBase):
 
 
 @register_event
+class AuditViolationFiledEvent(EventBase):
+    """One :func:`forge_loop.codebase_audit.file_violations` filing.
+
+    Emitted per ticket created — operators can see the audit pass
+    actually translated a manifesto-state violation into a downstream
+    work item without grepping the gh API.
+    """
+
+    KIND: ClassVar[str] = "audit_violation_filed"
+    probe: str = ""
+    target: str = ""
+    severity: int = Field(ge=1, le=5, default=2)
+    issue_number: int = Field(ge=0, default=0)
+    title: str = ""
+
+
+@register_event
+class AuditCleanEvent(EventBase):
+    """The audit pass found zero violations.
+
+    Emitted at the end of a clean pass — the explicit "clean" event is
+    important because absence-of-violations could otherwise look like
+    the auditor never ran. ``probes_run`` lets the operator confirm the
+    probe set that actually fired.
+    """
+
+    KIND: ClassVar[str] = "audit_clean"
+    probes_run: list[str] = Field(default_factory=list)
+
+
+@register_event
 class StuckSweepDemotedEvent(EventBase):
     """A per-tick stuck-sweep decision (issue #129).
 
@@ -305,6 +336,8 @@ def append_event_with_registry_check(events_path: Path, kind: str, **fields: Any
 
 __all__ = [
     "EVENT_REGISTRY",
+    "AuditCleanEvent",
+    "AuditViolationFiledEvent",
     "EventBase",
     "LoopStartEvent",
     "LoopStopEvent",
