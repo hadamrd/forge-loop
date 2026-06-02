@@ -171,11 +171,14 @@ class ProductCommandsMixin:
 
         if report_path_arg:
             try:
-                report, duplicate_count = _drop_duplicate_titles(
-                    report, list_open_backlog(gh_client, owner, repo_name)
+                backlog = list_open_backlog(gh_client, owner, repo_name)
+            except Exception as exc:  # noqa: BLE001
+                typer.echo(
+                    f"brainstorm: failed to scan open backlog before applying report: {exc}",
+                    err=True,
                 )
-            except Exception:  # noqa: BLE001 — duplicate check is best-effort
-                duplicate_count = 0
+                return 1
+            report, duplicate_count = _drop_duplicate_titles(report, backlog)
             dropped_count += duplicate_count
             if dropped_count:
                 typer.echo(

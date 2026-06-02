@@ -312,6 +312,32 @@ def test_brainstorm_apply_report_revalidates_axes_and_duplicates(
     assert "dropped" in result.stdout.lower()
 
 
+def test_brainstorm_apply_report_backlog_scan_failure_exits_1(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_path = cwd_repo / "reviewed.yaml"
+    report_path.write_text(
+        yaml.safe_dump(_fixed_report().model_dump(mode="json"), sort_keys=False),
+        encoding="utf-8",
+    )
+    gh = MockGhClient(
+        create_issue_responses=[901, 902, 903],
+        raise_on={"issues_by_label": GhError("issues_by_label", 401, "unauthorized")},
+    )
+
+    def _explode(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("brainstormer SDK must not run when applying a report")
+
+    monkeypatch.setattr(cli, "_brainstormer_factory", _explode)
+    monkeypatch.setattr(cli, "_gh_client_factory", lambda: gh)
+
+    result = runner.invoke(cli.app, ["brainstorm", "--apply", "--report", str(report_path)])
+
+    assert result.exit_code == 1
+    assert "failed to scan open backlog" in (result.stderr + result.stdout).lower()
+    assert not any(c[0] == "create_issue" for c in gh.calls)
+
+
 def test_brainstorm_report_without_apply_exits_2(
     runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
