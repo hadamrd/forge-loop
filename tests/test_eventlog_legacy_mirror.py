@@ -107,10 +107,55 @@ def test_legacy_runner_mirror_keeps_distinct_worker_records(tmp_path: Path) -> N
 
     events = list(log.since(0))
     assert len(events) == 2
-    assert {event.idempotency_key for event in events} == {
-        "legacy-runner:task.dispatched:worker_iteration_attempt:tick=3:issue=167:worker=worker-a:pr=",
-        "legacy-runner:task.dispatched:worker_iteration_attempt:tick=3:issue=167:worker=worker-b:pr=",
-    }
+    keys = {event.idempotency_key for event in events}
+    assert len(keys) == 2
+    assert any(":worker=worker-a:" in str(key) for key in keys)
+    assert any(":worker=worker-b:" in str(key) for key in keys)
+
+
+def test_legacy_runner_mirror_keeps_distinct_same_worker_transitions(
+    tmp_path: Path,
+) -> None:
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+
+    first = mirror.mirror_record(
+        {
+            "kind": "worker_session_transition",
+            "issue": 167,
+            "session_id": "worker-a",
+            "prior_state": "",
+            "new_state": "dispatched",
+            "reason": "fresh dispatch",
+        }
+    )
+    second = mirror.mirror_record(
+        {
+            "kind": "worker_session_transition",
+            "issue": 167,
+            "session_id": "worker-a",
+            "prior_state": "dispatched",
+            "new_state": "running",
+            "reason": "sdk call starting",
+        }
+    )
+    duplicate_second = mirror.mirror_record(
+        {
+            "kind": "worker_session_transition",
+            "issue": 167,
+            "session_id": "worker-a",
+            "prior_state": "dispatched",
+            "new_state": "running",
+            "reason": "sdk call starting",
+        }
+    )
+
+    events = list(log.since(0))
+    assert len(events) == 2
+    assert first is not None
+    assert second == duplicate_second
+    assert [event.payload["new_state"] for event in events] == ["dispatched", "running"]
+    assert len({event.idempotency_key for event in events}) == 2
 
 
 def test_legacy_runner_mirror_records_merge_blocked_from_critic_verdict(

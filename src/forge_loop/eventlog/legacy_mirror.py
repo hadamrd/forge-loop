@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -484,8 +486,14 @@ def _idempotency_key(legacy_kind: LegacyRunnerEventKind, spec: _AppendSpec) -> s
             f"issue={spec.issue or ''}",
             f"worker={spec.worker or ''}",
             f"pr={spec.pr_url or ''}",
+            f"payload={_payload_fingerprint(spec.payload)}",
         ]
     )
+
+
+def _payload_fingerprint(payload: Mapping[str, Any]) -> str:
+    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload_json.encode()).hexdigest()[:16]
 
 
 def _issue_from_event(event: EventEnvelope) -> int | None:
