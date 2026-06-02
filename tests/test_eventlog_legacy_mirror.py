@@ -194,6 +194,48 @@ def test_runner_jsonl_path_mirrors_to_repo_durable_event_log_by_default(
     assert durable[0].payload == {"legacy_kind": "tick_start", "tick": 2, "issues": [167]}
 
 
+def test_runner_jsonl_path_logs_default_mirror_setup_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    events_file = tmp_path / "docs" / "ops" / "loop-runner-events.jsonl"
+    warnings: list[tuple[str, dict[str, object]]] = []
+
+    class FakeLogger:
+        def info(self, _event: str, **_payload: object) -> None:
+            pass
+
+        def warning(self, event: str, **payload: object) -> None:
+            warnings.append((event, payload))
+
+    def fail_mirror_setup(_events_path: Path) -> None:
+        raise OSError("durable store unavailable")
+
+    monkeypatch.setattr(
+        "forge_loop.eventlog.legacy_mirror.legacy_runner_mirror_for_events_path",
+        fail_mirror_setup,
+    )
+    monkeypatch.setattr("forge_loop.log.get_logger", lambda: FakeLogger())
+
+    append_event(events_file, "tick_start", tick=2, issues=[167])
+
+    lines = events_file.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["kind"] == "tick_start"
+    assert "durable_mirror_error" not in record
+    assert warnings == [
+        (
+            "durable_mirror_failed",
+            {
+                "kind": "tick_start",
+                "events_path": str(events_file),
+                "error": "OSError: durable store unavailable",
+            },
+        )
+    ]
+
+
 def test_append_event_preserves_jsonl_when_durable_mirroring_is_enabled(
     tmp_path: Path,
 ) -> None:

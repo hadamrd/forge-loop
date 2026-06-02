@@ -328,11 +328,21 @@ def append_event_with_registry_check(events_path: Path, kind: str, **fields: Any
             stacklevel=3,
         )
     durable_mirror = fields.pop("durable_mirror", None)
+    durable_mirror_error = fields.pop("durable_mirror_error", None)
     events_path.parent.mkdir(parents=True, exist_ok=True)
     rec = {"ts": _now_iso(), "kind": kind, **fields}
     with open(events_path, "a") as f:
         f.write(json.dumps(rec, default=str) + "\n")
     _log_event(kind, rec)
+    if durable_mirror_error is not None:
+        from forge_loop.log import get_logger
+
+        get_logger().warning(
+            "durable_mirror_failed",
+            kind=kind,
+            events_path=str(events_path),
+            error=str(durable_mirror_error)[:300],
+        )
     if durable_mirror is not None:
         try:
             durable_mirror.mirror_record(rec)
@@ -342,6 +352,7 @@ def append_event_with_registry_check(events_path: Path, kind: str, **fields: Any
             get_logger().warning(
                 "durable_mirror_failed",
                 kind=kind,
+                events_path=str(events_path),
                 error=f"{type(exc).__name__}: {exc!s}"[:300],
             )
 

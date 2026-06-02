@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -164,10 +165,13 @@ def append_event(events_path: Path, kind: str, **fields: Any) -> None:
     Behaviour is unchanged for the unregistered kinds.
     """
     if "durable_mirror" not in fields:
-        with contextlib.suppress(Exception):
+        try:
             from forge_loop.eventlog.legacy_mirror import legacy_runner_mirror_for_events_path
 
             mirror = legacy_runner_mirror_for_events_path(events_path)
+        except (OSError, sqlite3.Error) as exc:
+            fields["durable_mirror_error"] = f"{type(exc).__name__}: {exc!s}"
+        else:
             if mirror is not None:
                 fields["durable_mirror"] = mirror
     from forge_loop.events import append_event_with_registry_check
