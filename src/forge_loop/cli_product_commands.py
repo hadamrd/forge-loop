@@ -37,7 +37,9 @@ class ProductCommandsMixin:
             BrainstormReport,
             ProposedEpic,
             ProposedTicket,
+            filter_report_for_vision,
         )
+        from forge_loop.gh_client import OpenBacklog, list_open_backlog
         from forge_loop.product_vision import MissingVisionError, discover
 
         # 1. Resolve repo path + GitHub coordinates from the existing config
@@ -71,26 +73,82 @@ class ProductCommandsMixin:
             typer.echo(f"brainstorm: failed to load product vision: {exc}", err=True)
             return 2
 
-        # 3. Run the brainstormer. Tests monkeypatch ``cli._brainstormer_factory``
-        #    to inject a stub that skips the real SDK session.
-        brainstormer = self.brainstormer_factory(
-            repo_path,
-            owner,
-            repo_name,
-            provider=provider,
-            model=model,
-            timeout_s=timeout_s,
-        )
-        try:
-            report: BrainstormReport = brainstormer.run(vision)
-        except Exception as exc:  # noqa: BLE001 — propagate as runtime error to operator
-            typer.echo(f"brainstorm: brainstormer run failed: {exc}", err=True)
-            return 1
+        report_path_arg = getattr(args, "report", None)
+        output_path_arg = getattr(args, "output", None)
+        if report_path_arg and not args.apply:
+            typer.echo("brainstorm: --report requires --apply.", err=True)
+            return 2
+
+        def _revalidate_report(raw: BrainstormReport) -> tuple[BrainstormReport, int]:
+            return filter_report_for_vision(raw, vision)
+
+        def _load_report(path: Path) -> tuple[BrainstormReport, int]:
+            try:
+                payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+                raw = BrainstormReport.model_validate(payload)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"failed to load report {path}: {exc}") from exc
+            return _revalidate_report(raw)
+
+        def _drop_duplicate_titles(
+            raw: BrainstormReport, backlog: OpenBacklog
+        ) -> tuple[BrainstormReport, int]:
+            existing = {
+                item.title.strip().casefold()
+                for item in [*backlog.epics, *backlog.tickets]
+                if item.title.strip()
+            }
+            seen = set(existing)
+            epics: list[ProposedEpic] = []
+            tickets: list[ProposedTicket] = []
+            dropped = 0
+            for epic in raw.proposed_epics:
+                key = epic.title.strip().casefold()
+                if key in seen:
+                    dropped += 1
+                    continue
+                seen.add(key)
+                epics.append(epic)
+            for ticket in raw.proposed_tickets:
+                key = ticket.title.strip().casefold()
+                if key in seen:
+                    dropped += 1
+                    continue
+                seen.add(key)
+                tickets.append(ticket)
+            return BrainstormReport(proposed_epics=epics, proposed_tickets=tickets), dropped
+
+        dropped_count = 0
+        if report_path_arg:
+            try:
+                report, dropped_count = _load_report(Path(report_path_arg))
+            except ValueError as exc:
+                typer.echo(f"brainstorm: {exc}", err=True)
+                return 2
+        else:
+            # 3. Run the brainstormer. Tests monkeypatch ``cli._brainstormer_factory``
+            #    to inject a stub that skips the real SDK session.
+            brainstormer = self.brainstormer_factory(
+                repo_path,
+                owner,
+                repo_name,
+                provider=provider,
+                model=model,
+                timeout_s=timeout_s,
+            )
+            try:
+                report = brainstormer.run(vision)
+            except Exception as exc:  # noqa: BLE001 — propagate as runtime error to operator
+                typer.echo(f"brainstorm: brainstormer run failed: {exc}", err=True)
+                return 1
 
         # 4. Dry-run path: YAML-dump the report; never touch GitHub.
         if not args.apply:
             payload = report.model_dump(mode="json")
-            typer.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+            rendered = yaml.safe_dump(payload, sort_keys=False).rstrip()
+            if output_path_arg:
+                Path(output_path_arg).write_text(f"{rendered}\n", encoding="utf-8")
+            typer.echo(rendered)
             return 0
 
         # 5. --apply path: epics first, then tickets cross-linked to the epic
@@ -110,6 +168,19 @@ class ProductCommandsMixin:
                 err=True,
             )
             return 2
+
+        if report_path_arg:
+            try:
+                report, duplicate_count = _drop_duplicate_titles(
+                    report, list_open_backlog(gh_client, owner, repo_name)
+                )
+            except Exception:  # noqa: BLE001 — duplicate check is best-effort
+                duplicate_count = 0
+            dropped_count += duplicate_count
+            if dropped_count:
+                typer.echo(
+                    f"brainstorm: dropped {dropped_count} proposal(s) during report validation."
+                )
 
         if not report.proposed_epics and not report.proposed_tickets:
             typer.echo("brainstorm: no proposals — nothing to file.")

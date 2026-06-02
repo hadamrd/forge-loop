@@ -262,11 +262,11 @@ axes:
 ```bash
 # 1. Drop manifestos in .forge/ (see above)
 
-# 2. Dry-run — propose axis-aligned epics + tickets, print them
-GH_TOKEN=$(gh auth token) forge-loop brainstorm
+# 2. Dry-run — propose axis-aligned epics + tickets, print and save them
+GH_TOKEN=$(gh auth token) forge-loop brainstorm --output report.yaml
 
-# 3. Apply — file them on GitHub with axis labels
-forge-loop brainstorm --apply
+# 3. Review/curate report.yaml, then apply exactly that reviewed report
+forge-loop brainstorm --apply --report report.yaml
 
 # 4. The loop dispatches on the new loop:ready tickets normally
 forge-loop run
