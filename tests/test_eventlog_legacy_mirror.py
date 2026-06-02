@@ -3,6 +3,7 @@ from pathlib import Path
 
 from forge_loop.eventlog import EventKind, ProjectionCursor, SqliteEventLog
 from forge_loop.eventlog.legacy_mirror import LegacyEventMirror, replay_task_timeline
+from forge_loop.events import WorkerSessionTransitionEvent, emit
 from forge_loop.state import append_event
 
 
@@ -192,6 +193,30 @@ def test_runner_jsonl_path_mirrors_to_repo_durable_event_log_by_default(
     durable = list(SqliteEventLog(tmp_path / ".forge" / "events.db").since(0))
     assert [event.kind for event in durable] == [EventKind.TICK_STARTED]
     assert durable[0].payload == {"legacy_kind": "tick_start", "tick": 2, "issues": [167]}
+
+
+def test_runner_jsonl_path_mirrors_typed_emit_to_durable_event_log_by_default(
+    tmp_path: Path,
+) -> None:
+    events_file = tmp_path / "docs" / "ops" / "loop-runner-events.jsonl"
+
+    emit(
+        events_file,
+        WorkerSessionTransitionEvent(
+            session_id="worker-a",
+            issue=167,
+            prior_state="",
+            new_state="dispatched",
+            reason="fresh dispatch",
+        ),
+    )
+
+    assert len(events_file.read_text().splitlines()) == 1
+    durable = list(SqliteEventLog(tmp_path / ".forge" / "events.db").since(0))
+    assert [event.kind for event in durable] == [EventKind.TASK_DISPATCHED]
+    assert durable[0].task_id == "issue:167"
+    assert durable[0].payload["legacy_kind"] == "worker_session_transition"
+    assert durable[0].payload["session_id"] == "worker-a"
 
 
 def test_runner_jsonl_path_logs_default_mirror_setup_failure(
