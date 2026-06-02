@@ -254,6 +254,30 @@ def test_legacy_runner_mirror_records_default_critic_done(tmp_path: Path) -> Non
     assert events[0].payload["verdict"] == "approved"
 
 
+def test_legacy_runner_mirror_idempotency_ignores_incidental_critic_duration(
+    tmp_path: Path,
+) -> None:
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+    base = {
+        "kind": "critic_done",
+        "issue": 167,
+        "pr": "https://github.com/acme/forge-loop/pull/167",
+        "verdict": "approved",
+        "reasons": [],
+        "sev_counts": {"sev1": 0, "sev2": 0},
+        "parse_retries": 0,
+    }
+
+    first = mirror.mirror_record({**base, "duration_s": 12.3})
+    second = mirror.mirror_record({**base, "duration_s": 99.9})
+
+    events = list(log.since(0))
+    assert first == second
+    assert len(events) == 1
+    assert events[0].payload["duration_s"] == 12.3
+
+
 def test_legacy_runner_mirror_records_issue_closed_merge_refusal(
     tmp_path: Path,
 ) -> None:
@@ -454,6 +478,45 @@ def test_append_event_logs_expected_durable_mirror_write_failure(
                 "kind": "tick_start",
                 "events_path": str(events_file),
                 "error": "OSError: sqlite unavailable",
+            },
+        )
+    ]
+
+
+def test_runner_jsonl_path_logs_unexpected_default_mirror_bug(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    events_file = tmp_path / "docs" / "ops" / "loop-runner-events.jsonl"
+    warnings: list[tuple[str, dict[str, object]]] = []
+
+    class FakeLogger:
+        def info(self, _event: str, **_payload: object) -> None:
+            pass
+
+        def warning(self, event: str, **payload: object) -> None:
+            warnings.append((event, payload))
+
+    class BuggyDefaultMirror:
+        def mirror_record(self, _record: dict[str, object]) -> None:
+            raise RuntimeError("bug in default mirror translation")
+
+    monkeypatch.setattr(
+        "forge_loop.eventlog.legacy_mirror.legacy_runner_mirror_for_events_path",
+        lambda _events_path: BuggyDefaultMirror(),
+    )
+    monkeypatch.setattr("forge_loop.log.get_logger", lambda: FakeLogger())
+
+    append_event(events_file, "tick_start", tick=2, issues=[167])
+
+    assert len(events_file.read_text().splitlines()) == 1
+    assert warnings == [
+        (
+            "durable_mirror_failed",
+            {
+                "kind": "tick_start",
+                "events_path": str(events_file),
+                "error": "RuntimeError: bug in default mirror translation",
             },
         )
     ]

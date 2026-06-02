@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -83,6 +81,7 @@ class _AppendSpec:
     issue: int | None = None
     worker: str | None = None
     pr_url: str | None = None
+    discriminator: str = ""
 
 
 class LegacyEventMirror:
@@ -234,7 +233,6 @@ def _append_specs(
     if legacy_kind in {
         LegacyRunnerEventKind.WORKER_START,
         LegacyRunnerEventKind.WORKER_STARTED,
-        LegacyRunnerEventKind.WORKER_ITERATION_ATTEMPT,
     }:
         return (
             _AppendSpec(
@@ -247,6 +245,17 @@ def _append_specs(
         )
     if legacy_kind is LegacyRunnerEventKind.WORKER_SESSION_TRANSITION:
         return _worker_session_transition_specs(record, payload, tick, issue, worker)
+    if legacy_kind is LegacyRunnerEventKind.WORKER_ITERATION_ATTEMPT:
+        return (
+            _AppendSpec(
+                EventKind.TASK_DISPATCHED,
+                payload,
+                tick=tick,
+                issue=issue,
+                worker=worker,
+                discriminator=_discriminator(record, "attempt", "state", "status"),
+            ),
+        )
     if legacy_kind is LegacyRunnerEventKind.WORKER_DONE:
         return _worker_done_specs(record, payload, tick, worker)
     if legacy_kind is LegacyRunnerEventKind.WORKER_FAILED:
@@ -306,7 +315,14 @@ def _append_specs(
     }:
         if legacy_kind is LegacyRunnerEventKind.CRITIC_VERDICT_BLOCKED:
             return (
-                _AppendSpec(EventKind.CRITIQUE_ISSUED, payload, tick=tick, issue=issue),
+                _AppendSpec(
+                    EventKind.CRITIQUE_ISSUED,
+                    payload,
+                    tick=tick,
+                    issue=issue,
+                    pr_url=_pr_url(record),
+                    discriminator=_discriminator(record, "verdict"),
+                ),
                 _AppendSpec(
                     EventKind.MERGE_BLOCKED,
                     payload,
@@ -315,7 +331,16 @@ def _append_specs(
                     pr_url=_pr_url(record),
                 ),
             )
-        return (_AppendSpec(EventKind.CRITIQUE_ISSUED, payload, tick=tick, issue=issue),)
+        return (
+            _AppendSpec(
+                EventKind.CRITIQUE_ISSUED,
+                payload,
+                tick=tick,
+                issue=issue,
+                pr_url=_pr_url(record),
+                discriminator=_discriminator(record, "verdict"),
+            ),
+        )
     if legacy_kind is LegacyRunnerEventKind.MERGE_REFUSED_ISSUE_CLOSED:
         return (
             _AppendSpec(
@@ -501,6 +526,7 @@ def _worker_session_transition_specs(
                 issue=issue,
                 worker=worker,
                 pr_url=pr_url,
+                discriminator=_transition_discriminator(record),
             ),
         )
     if new_state == "abandoned":
@@ -512,6 +538,7 @@ def _worker_session_transition_specs(
                 issue=issue,
                 worker=worker,
                 pr_url=pr_url,
+                discriminator=_transition_discriminator(record),
             ),
         )
     if new_state == "merged":
@@ -523,6 +550,7 @@ def _worker_session_transition_specs(
                 issue=issue,
                 worker=worker,
                 pr_url=pr_url,
+                discriminator=_transition_discriminator(record),
             )
         ]
         if pr_url is not None:
@@ -534,6 +562,7 @@ def _worker_session_transition_specs(
                     issue=issue,
                     worker=worker,
                     pr_url=pr_url,
+                    discriminator=_transition_discriminator(record),
                 )
             )
         return tuple(specs)
@@ -544,6 +573,7 @@ def _worker_session_transition_specs(
             tick=tick,
             issue=issue,
             worker=worker,
+            discriminator=_transition_discriminator(record),
         ),
     )
 
@@ -566,14 +596,24 @@ def _idempotency_key(legacy_kind: LegacyRunnerEventKind, spec: _AppendSpec) -> s
             f"issue={spec.issue or ''}",
             f"worker={spec.worker or ''}",
             f"pr={spec.pr_url or ''}",
-            f"payload={_payload_fingerprint(spec.payload)}",
+            f"step={spec.discriminator}",
         ]
     )
 
 
-def _payload_fingerprint(payload: Mapping[str, Any]) -> str:
-    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(payload_json.encode()).hexdigest()[:16]
+def _transition_discriminator(record: Mapping[str, Any]) -> str:
+    prior_state = str(record.get("prior_state") or "")
+    new_state = str(record.get("new_state") or "")
+    return f"{prior_state}->{new_state}"
+
+
+def _discriminator(record: Mapping[str, Any], *keys: str) -> str:
+    parts = []
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, ""):
+            parts.append(f"{key}={value}")
+    return "|".join(parts)
 
 
 def _issue_from_event(event: EventEnvelope) -> int | None:

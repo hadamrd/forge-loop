@@ -49,6 +49,23 @@ class _DurableMirror(Protocol):
         """Mirror a JSONL record into a durable event stream."""
 
 
+class DurableMirrorError(RuntimeError):
+    """Default durable mirror failed after the JSONL record was written."""
+
+
+class _BestEffortDurableMirror:
+    def __init__(self, mirror: _DurableMirror) -> None:
+        self._mirror = mirror
+
+    def mirror_record(self, record: Mapping[str, Any]) -> object:
+        try:
+            return self._mirror.mirror_record(record)
+        except (OSError, sqlite3.Error) as exc:
+            raise DurableMirrorError(f"{type(exc).__name__}: {exc!s}") from exc
+        except Exception as exc:
+            raise DurableMirrorError(f"{type(exc).__name__}: {exc!s}") from exc
+
+
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
@@ -373,14 +390,19 @@ def _write_record(
     if durable_mirror is not None:
         try:
             cast(_DurableMirror, durable_mirror).mirror_record(rec)
-        except (OSError, sqlite3.Error) as exc:
+        except (OSError, sqlite3.Error, DurableMirrorError) as exc:
             from forge_loop.log import get_logger
 
+            error = (
+                str(exc)
+                if isinstance(exc, DurableMirrorError)
+                else f"{type(exc).__name__}: {exc!s}"
+            )
             get_logger().warning(
                 "durable_mirror_failed",
                 kind=kind,
                 events_path=str(events_path),
-                error=f"{type(exc).__name__}: {exc!s}"[:300],
+                error=error[:300],
             )
 
 
@@ -388,7 +410,10 @@ def _default_durable_mirror(events_path: Path) -> tuple[object | None, str | Non
     try:
         from forge_loop.eventlog.legacy_mirror import legacy_runner_mirror_for_events_path
 
-        return legacy_runner_mirror_for_events_path(events_path), None
+        mirror = legacy_runner_mirror_for_events_path(events_path)
+        if mirror is None:
+            return None, None
+        return _BestEffortDurableMirror(mirror), None
     except (OSError, sqlite3.Error) as exc:
         return None, f"{type(exc).__name__}: {exc!s}"
 
