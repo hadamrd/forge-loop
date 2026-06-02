@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from forge_loop.memory.models import MemoryItem
+from forge_loop.memory.store import MemoryStore
 
 
 @dataclass(frozen=True)
@@ -22,7 +23,10 @@ class PromotionCandidate:
 
 
 class MemoryCurator:
-    """Minimal curator interface for future durable memory backends."""
+    """Memory promotion policy with an optional durable store."""
+
+    def __init__(self, store: MemoryStore | None = None) -> None:
+        self._store = store
 
     def should_promote(self, candidate: PromotionCandidate) -> bool:
         """Return whether a candidate should become durable memory.
@@ -33,9 +37,7 @@ class MemoryCurator:
         return bool(candidate.reason_to_remember.strip())
 
     def promote(self, item: MemoryItem) -> MemoryItem:
-        """Persist ``item`` in a future backend.
-
-        The scaffolding implementation is a pass-through; durable storage lands
-        after the contracts settle.
-        """
+        """Persist ``item`` when a durable store is configured."""
+        if self._store is not None:
+            return self._store.put(item)
         return item

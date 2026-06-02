@@ -9,6 +9,7 @@ from typing import Any
 
 from forge_loop.control.boot import BootContext
 from forge_loop.frontier import FrontierCursor, FrontierStore
+from forge_loop.memory import SqliteMemoryStore
 from forge_loop.worker_sessions import WorkerSessionStore, recoverable_sessions
 
 
@@ -24,7 +25,7 @@ def collect_control_plane_status(
     runner_state_dir = state_dir or repo / "docs" / "ops"
     event_log_path = forge_dir / "events.db"
     frontier_path = forge_dir / "frontier.yaml"
-    memory_path = forge_dir / "memory.yaml"
+    memory_path = forge_dir / "memory.db"
     tasks_path = runner_state_dir / "worker-sessions.db"
 
     event_log, projections, last_sequence = _event_log_status(event_log_path)
@@ -133,7 +134,27 @@ def _unavailable_frontier(path: Path) -> dict[str, Any]:
 
 
 def _memory_status(path: Path) -> tuple[dict[str, Any], tuple[str, ...]]:
-    return _unavailable_memory(path), ()
+    if not path.exists():
+        return _unavailable_memory(path), ()
+
+    try:
+        store = SqliteMemoryStore(path)
+        active = store.list_active()
+        rejected = store.list_rejected_paths()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        status = _unavailable_memory(path)
+        status["error"] = str(exc)
+        return status, ()
+
+    return (
+        {
+            "available": True,
+            "path": str(path),
+            "active_count": len(active),
+            "rejected_count": len(rejected),
+        },
+        tuple(item.memory_id for item in active),
+    )
 
 
 def _unavailable_memory(path: Path) -> dict[str, Any]:
