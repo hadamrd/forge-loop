@@ -103,8 +103,9 @@ class ProductCommandsMixin:
                 )
                 return 2
             try:
-                gh_client = self.gh_client_factory()
-                gh_client.check_auth()
+                client = self.gh_client_factory()
+                gh_client = client
+                client.check_auth()
             except Exception as exc:  # noqa: BLE001
                 auth_source = getattr(gh_client, "auth_source", None) or getattr(
                     exc, "auth_source", "unknown"

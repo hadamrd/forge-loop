@@ -21,7 +21,6 @@ from forge_loop.gh_client import (
     resolve_token,
 )
 
-
 # ---------------------------------------------------------------------------
 # Auth resolution
 # ---------------------------------------------------------------------------
@@ -95,9 +94,11 @@ def test_mock_records_calls_with_kwargs() -> None:
 
 
 def test_mock_get_issue_returns_preloaded() -> None:
-    gh = MockGhClient(issues={
-        ("o", "r", 42): Issue(number=42, title="t", body="b", labels=["a"]),
-    })
+    gh = MockGhClient(
+        issues={
+            ("o", "r", 42): Issue(number=42, title="t", body="b", labels=["a"]),
+        }
+    )
     issue = gh.get_issue("o", "r", 42)
     assert issue is not None
     assert issue.title == "t"
@@ -110,10 +111,19 @@ def test_mock_get_issue_returns_none_when_missing() -> None:
 
 
 def test_mock_get_pull_returns_preloaded() -> None:
-    gh = MockGhClient(pulls={
-        ("o", "r", 5): PullRequest(number=5, title="pr", state="open", draft=True,
-                                    head_ref="feat/x", additions=10, deletions=2),
-    })
+    gh = MockGhClient(
+        pulls={
+            ("o", "r", 5): PullRequest(
+                number=5,
+                title="pr",
+                state="open",
+                draft=True,
+                head_ref="feat/x",
+                additions=10,
+                deletions=2,
+            ),
+        }
+    )
     pr = gh.get_pull("o", "r", 5)
     assert pr is not None
     assert pr.draft is True
@@ -122,9 +132,7 @@ def test_mock_get_pull_returns_preloaded() -> None:
 
 
 def test_mock_issues_by_label_respects_limit() -> None:
-    gh = MockGhClient(issues_by_label_response=[
-        Issue(number=i, title=f"i{i}") for i in range(10)
-    ])
+    gh = MockGhClient(issues_by_label_response=[Issue(number=i, title=f"i{i}") for i in range(10)])
     out = gh.issues_by_label("o", "r", "ready", limit=3)
     assert len(out) == 3
     assert out[0].number == 0

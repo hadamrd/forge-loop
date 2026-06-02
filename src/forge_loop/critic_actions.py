@@ -20,15 +20,18 @@ class GhClient(Protocol):
     """The slice of forge_loop.gh that we need. Allows tests to inject a
     spy without monkey-patching the global module."""
 
-    def add_pr_label(self, pr: int | str, labels: list[str],
-                     repo: str | None = None) -> bool: ...
+    def add_pr_label(self, pr: int | str, labels: list[str], repo: str | None = None) -> bool: ...
 
-    def disable_pr_auto_merge(self, pr: int | str,
-                              repo: str | None = None) -> bool: ...
+    def disable_pr_auto_merge(self, pr: int | str, repo: str | None = None) -> bool: ...
 
-    def post_review_comment(self, pr: int | str, body: str,
-                            file: str | None = None, line: int | None = None,
-                            repo: str | None = None) -> bool: ...
+    def post_review_comment(
+        self,
+        pr: int | str,
+        body: str,
+        file: str | None = None,
+        line: int | None = None,
+        repo: str | None = None,
+    ) -> bool: ...
 
     @property
     def auth_source(self) -> str: ...
@@ -38,6 +41,7 @@ class GhClient(Protocol):
 class CriticActionPlan:
     """What the runner should do given a CriticReport. Returned by the pure
     decision function and then executed by ``apply_critic_report``."""
+
     block_merge: bool = False
     labels_to_add: list[str] = field(default_factory=list)
     inline_comments: list[Finding] = field(default_factory=list)
@@ -96,9 +100,7 @@ def plan_actions(
         plan.suspicious_approve = True
         plan.block_merge = True
         plan.labels_to_add.append("critic:suspicious")
-        reasons.append(
-            f"approve_with_zero_findings_on_{pr_changed_lines}_line_pr"
-        )
+        reasons.append(f"approve_with_zero_findings_on_{pr_changed_lines}_line_pr")
 
     for f in report.findings:
         if f.severity == "sev1":
@@ -134,7 +136,10 @@ def apply_critic_report(
     """Compute the plan and execute it via ``gh``. Returns the plan so the
     runner can log a summary event."""
     plan = plan_actions(
-        report, pr_changed_lines, block_on_sev2, min_findings_for_approve,
+        report,
+        pr_changed_lines,
+        block_on_sev2,
+        min_findings_for_approve,
     )
     mutation_failed = False
 
@@ -161,7 +166,9 @@ def apply_critic_report(
             gh.post_review_comment(
                 pr_url,
                 f"**[{f.severity}/{f.category}]** {f.message}",
-                file=f.file, line=f.line, repo=repo,
+                file=f.file,
+                line=f.line,
+                repo=repo,
             ),
             gh=gh,
             pr_url=pr_url,
@@ -202,15 +209,18 @@ def apply_critic_report(
         )
 
     if emit is not None and not mutation_failed:
-        emit("critic_actions_applied", {
-            "pr": pr_url,
-            "block_merge": plan.block_merge,
-            "labels": plan.labels_to_add,
-            "inline_count": len(plan.inline_comments),
-            "summary_count": len(plan.summary_comments),
-            "suspicious_approve": plan.suspicious_approve,
-            "reason": plan.reason,
-        })
+        emit(
+            "critic_actions_applied",
+            {
+                "pr": pr_url,
+                "block_merge": plan.block_merge,
+                "labels": plan.labels_to_add,
+                "inline_count": len(plan.inline_comments),
+                "summary_count": len(plan.summary_comments),
+                "suspicious_approve": plan.suspicious_approve,
+                "reason": plan.reason,
+            },
+        )
 
     return plan
 

@@ -49,6 +49,7 @@ __all__ = [
     "resume_kwargs_for",
 ]
 
+
 def persist_sdk_result(
     *,
     store: WorkerSessionStore,
@@ -453,8 +454,26 @@ def _run_critic_for_outcomes(
                             note = f"critic blocked merge: {reason}"[:200]
                             o.error = f"{o.error}; {note}" if o.error else note
                         else:
-                            _gh.remove_pr_label(o.pr_url, "critic:blocking", repo=cfg.github_repo)
-                            _gh.remove_pr_label(o.pr_url, "critic:suspicious", repo=cfg.github_repo)
+                            for label in ("critic:blocking", "critic:suspicious"):
+                                ok = _gh.remove_pr_label(
+                                    o.pr_url,
+                                    label,
+                                    repo=cfg.github_repo,
+                                )
+                                if not ok:
+                                    bus_emit(
+                                        "critic_actions_failed",
+                                        {
+                                            "pr": o.pr_url,
+                                            "method": "remove_pr_label",
+                                            "label": label,
+                                            "auth_source": getattr(
+                                                _gh,
+                                                "auth_source",
+                                                "github-client",
+                                            ),
+                                        },
+                                    )
                     except Exception as act_ex:
                         append_event(
                             cfg.events_file,
