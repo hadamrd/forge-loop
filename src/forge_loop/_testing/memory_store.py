@@ -29,6 +29,8 @@ class FakeMemoryStore:
         return tuple(item for item in self.list_active() if REJECTED_PATH_TAG in item.tags)
 
     def supersede(self, memory_id: str, *, by_memory_id: str) -> MemoryItem:
+        if by_memory_id not in self.items:
+            raise KeyError(by_memory_id)
         item = self.items.get(memory_id)
         if item is None:
             raise KeyError(memory_id)

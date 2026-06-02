@@ -209,8 +209,25 @@ def test_superseding_missing_memory_raises_keyerror_for_real_and_fake_stores(
     fake = FakeMemoryStore()
 
     for store in (real, fake):
+        store.put(_item("mem-new", MemoryKind.SEMANTIC))
         with pytest.raises(KeyError, match="mem-missing"):
             store.supersede("mem-missing", by_memory_id="mem-new")
+
+
+def test_superseding_to_missing_replacement_raises_without_mutating(
+    tmp_path: Path,
+) -> None:
+    real = SqliteMemoryStore(tmp_path / "memory.db")
+    fake = FakeMemoryStore()
+    item = _item("mem-old", MemoryKind.SEMANTIC)
+
+    for store in (real, fake):
+        store.put(item)
+        with pytest.raises(KeyError, match="mem-missing-replacement"):
+            store.supersede("mem-old", by_memory_id="mem-missing-replacement")
+        unchanged = store.get("mem-old")
+        assert unchanged is not None
+        assert unchanged.is_active
 
 
 def test_fake_memory_store_matches_real_shape(tmp_path: Path) -> None:

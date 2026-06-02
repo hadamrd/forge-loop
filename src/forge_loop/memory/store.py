@@ -164,6 +164,8 @@ class SqliteMemoryStore:
         return tuple(item for item in self.list_active() if REJECTED_PATH_TAG in item.tags)
 
     def supersede(self, memory_id: str, *, by_memory_id: str) -> MemoryItem:
+        if self.get(by_memory_id) is None:
+            raise KeyError(by_memory_id)
         with self._connection:
             cursor = self._connection.execute(
                 """
