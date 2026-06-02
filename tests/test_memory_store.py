@@ -24,7 +24,7 @@ def _item(
     body: str = "Durable memory keeps load-bearing context out of transcripts.",
     tags: tuple[str, ...] = ("boot-context",),
     source_event: EventRef | None = None,
-    source_task_ref: str | None = None,
+    source_task_ref: str | None = "task:#171",
     supersedes: tuple[str, ...] = (),
 ) -> MemoryItem:
     return MemoryItem(
@@ -166,7 +166,25 @@ def test_invalid_confidence_is_rejected(confidence: float) -> None:
 
 def test_invalid_provenance_is_rejected() -> None:
     with pytest.raises(ValueError, match="provenance"):
-        MemoryProvenance(source_event=None, authored_by=" ", confidence=0.7)
+        MemoryProvenance(
+            source_event=None,
+            authored_by=" ",
+            source_task_ref="task:#171",
+            confidence=0.7,
+        )
+
+
+def test_missing_source_provenance_is_rejected() -> None:
+    with pytest.raises(ValueError, match="source event or source task"):
+        MemoryProvenance(source_event=None, authored_by="test", confidence=0.7)
+
+    with pytest.raises(ValueError, match="source event or source task"):
+        MemoryProvenance(
+            source_event=None,
+            authored_by="test",
+            source_task_ref=" ",
+            confidence=0.7,
+        )
 
 
 def test_curator_does_not_promote_empty_reason_candidates() -> None:

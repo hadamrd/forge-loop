@@ -77,7 +77,11 @@ class TestStatusControlPlane:
                 title="Status reads durable memory",
                 body="The boot summary can name curated memory ids.",
                 tags=("boot-context",),
-                provenance=MemoryProvenance(source_event=None, authored_by="test"),
+                provenance=MemoryProvenance(
+                    source_event=None,
+                    authored_by="test",
+                    source_task_ref="task:#171",
+                ),
             )
         )
         memory_store.put(
@@ -87,7 +91,11 @@ class TestStatusControlPlane:
                 title="Rejected path remains queryable",
                 body="Rejected paths are counted separately for operators.",
                 tags=(REJECTED_PATH_TAG,),
-                provenance=MemoryProvenance(source_event=None, authored_by="test"),
+                provenance=MemoryProvenance(
+                    source_event=None,
+                    authored_by="test",
+                    source_task_ref="task:#171",
+                ),
             )
         )
         ops_dir = tmp_path / "docs" / "ops"

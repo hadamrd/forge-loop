@@ -37,6 +37,12 @@ class MemoryProvenance:
             raise ValueError("memory confidence must be between 0 and 1")
         if not self.authored_by.strip():
             raise ValueError("memory provenance authored_by must be non-empty")
+        if self.source_event is None and (
+            self.source_task_ref is None or not self.source_task_ref.strip()
+        ):
+            raise ValueError(
+                "memory provenance must include a source event or source task reference"
+            )
 
 
 @dataclass(frozen=True)
