@@ -219,7 +219,18 @@ def _append_specs(
     worker = _worker_ref(record)
 
     if legacy_kind is LegacyRunnerEventKind.TICK_START:
-        return (_AppendSpec(EventKind.TICK_STARTED, payload, tick=tick),)
+        return (
+            _AppendSpec(EventKind.TICK_STARTED, payload, tick=tick),
+            *(
+                _AppendSpec(
+                    EventKind.TASK_PLANNED,
+                    {**payload, "issue": planned_issue},
+                    tick=tick,
+                    issue=planned_issue,
+                )
+                for planned_issue in _int_list(record.get("issues"))
+            ),
+        )
     if legacy_kind is LegacyRunnerEventKind.PO_DONE:
         return tuple(
             _AppendSpec(
