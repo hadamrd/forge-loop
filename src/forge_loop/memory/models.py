@@ -17,12 +17,16 @@ class MemoryKind(StrEnum):
     PROCEDURAL = "procedural"
 
 
+REJECTED_PATH_TAG = "rejected-path"
+
+
 @dataclass(frozen=True)
 class MemoryProvenance:
     """Evidence and lifecycle metadata for a durable memory item."""
 
     source_event: EventRef | None
     authored_by: str
+    source_task_ref: str | None = None
     confidence: float = 1.0
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     supersedes: tuple[str, ...] = ()
@@ -31,6 +35,8 @@ class MemoryProvenance:
     def __post_init__(self) -> None:
         if not 0 <= self.confidence <= 1:
             raise ValueError("memory confidence must be between 0 and 1")
+        if not self.authored_by.strip():
+            raise ValueError("memory provenance authored_by must be non-empty")
 
 
 @dataclass(frozen=True)
