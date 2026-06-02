@@ -14,7 +14,9 @@ Win shape:
   ``monkeypatch.setattr(subprocess, "run", ...)`` per case.
 * :class:`GhError` raises a typed exception with HTTP status + body.
 
-Auth: ``GH_TOKEN`` env var (universal pattern across dev tools).
+Auth: ``GH_TOKEN`` env var first, then ``GITHUB_TOKEN``, then the
+authenticated ``gh auth token`` fallback used by operators who log in
+through the GitHub CLI instead of exporting an SDK token.
 
 Migration pattern: this PR ships the framework (Protocol, githubkit-
 backed impl, mock, auth, error type) + tests. Per-method follow-ups
@@ -26,6 +28,7 @@ until each method migrates.
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
@@ -76,11 +79,21 @@ class GhError(RuntimeError):
     readers can reconstruct what happened without re-issuing the call.
     """
 
-    def __init__(self, method: str, status: int, body_tail: str) -> None:
-        super().__init__(f"github {method} returned HTTP {status}: {body_tail[:300]}")
+    def __init__(
+        self,
+        method: str,
+        status: int,
+        body_tail: str,
+        *,
+        auth_source: str = "unknown",
+    ) -> None:
+        super().__init__(
+            f"github {method} via {auth_source} returned HTTP {status}: {body_tail[:300]}"
+        )
         self.method = method
         self.status = status
         self.body_tail = body_tail
+        self.auth_source = auth_source
 
 
 # ---------------------------------------------------------------------------
@@ -91,28 +104,26 @@ class GhError(RuntimeError):
 class GhClient(Protocol):
     """GitHub operations the loop uses. Subset of githubkit's full API."""
 
-    def issues_by_label(self, owner: str, repo: str, label: str, limit: int) -> list[Issue]:
-        ...
+    def issues_by_label(self, owner: str, repo: str, label: str, limit: int) -> list[Issue]: ...
 
-    def get_issue(self, owner: str, repo: str, number: int) -> Issue | None:
-        ...
+    def get_issue(self, owner: str, repo: str, number: int) -> Issue | None: ...
 
-    def add_comment(self, owner: str, repo: str, number: int, body: str) -> None:
-        ...
+    def add_comment(self, owner: str, repo: str, number: int, body: str) -> None: ...
 
-    def add_labels(self, owner: str, repo: str, number: int, labels: list[str]) -> None:
-        ...
+    def add_labels(self, owner: str, repo: str, number: int, labels: list[str]) -> None: ...
 
-    def remove_label(self, owner: str, repo: str, number: int, label: str) -> None:
-        ...
+    def remove_label(self, owner: str, repo: str, number: int, label: str) -> None: ...
 
-    def get_pull(self, owner: str, repo: str, number: int) -> PullRequest | None:
-        ...
+    def get_pull(self, owner: str, repo: str, number: int) -> PullRequest | None: ...
 
     def create_issue(
         self, owner: str, repo: str, title: str, body: str, labels: list[str]
-    ) -> Issue:
-        ...
+    ) -> Issue: ...
+
+    def check_auth(self) -> None: ...
+
+    @property
+    def auth_source(self) -> str: ...
 
 
 # ---------------------------------------------------------------------------
@@ -120,18 +131,82 @@ class GhClient(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def resolve_token() -> str | None:
+class TokenSource(Protocol):
+    def env_token(self, name: str) -> str | None: ...
+
+    def gh_auth_token(self) -> str | None: ...
+
+
+@dataclass(frozen=True)
+class ResolvedToken:
+    token: str | None
+    source: str
+
+
+class GhTokenSource:
+    """Real GitHub token source for SDK clients.
+
+    Precedence is intentionally aligned with common GitHub tooling:
+    ``GH_TOKEN`` first, ``GITHUB_TOKEN`` second, then the authenticated
+    ``gh`` CLI token. Token values are never logged.
+    """
+
+    def env_token(self, name: str) -> str | None:
+        value = os.environ.get(name)
+        return value.strip() if value and value.strip() else None
+
+    def gh_auth_token(self) -> str | None:
+        try:
+            result = subprocess.run(
+                ["gh", "auth", "token"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        token = result.stdout.strip()
+        return token or None
+
+
+def resolve_token_info(source: TokenSource | None = None) -> ResolvedToken:
+    source = source or GhTokenSource()
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        token = source.env_token(name)
+        if token:
+            return ResolvedToken(token=token, source=name)
+    token = source.gh_auth_token()
+    if token:
+        return ResolvedToken(token=token, source="gh auth token")
+    return ResolvedToken(token=None, source="none")
+
+
+def resolve_token(source: TokenSource | None = None) -> str | None:
     """Resolve a GitHub token from env (canonical for dev tools).
 
     Precedence:
     1. ``GH_TOKEN`` env (gh CLI convention)
     2. ``GITHUB_TOKEN`` env (GitHub Actions convention)
-    3. None — caller decides whether unauthenticated mode is acceptable.
+    3. ``gh auth token`` (operator is authenticated through the gh CLI)
+    4. None — caller decides whether unauthenticated mode is acceptable.
 
     Operators set the token in their ``.env`` next to ``LOOP_GH_REPO``.
     A future Settings field could surface this if needed.
     """
-    return os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or None
+    return resolve_token_info(source).token
+
+
+def _label_names(labels: Any) -> list[str]:
+    out: list[str] = []
+    for raw in labels or []:
+        lab = cast(Any, raw)
+        name = getattr(lab, "name", None)
+        if name is not None:
+            out.append(str(name))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -146,19 +221,45 @@ class GithubkitClient:
     + reuses connections, so concurrent calls share the pipeline.
     """
 
-    def __init__(self, token: str | None = None) -> None:
+    def __init__(
+        self, token: str | None = None, *, token_source: TokenSource | None = None
+    ) -> None:
         from githubkit import GitHub
-        self._gh = GitHub(token or resolve_token())
+
+        resolved = (
+            resolve_token_info(token_source) if token is None else ResolvedToken(token, "explicit")
+        )
+        self._auth_source = resolved.source
+        self._gh = GitHub(resolved.token)
+
+    @property
+    def auth_source(self) -> str:
+        return self._auth_source
 
     def _raise_if_error(self, method: str, response: Any) -> None:
         status = getattr(response, "status_code", None)
         if status and status >= 400:
             body = getattr(response, "text", "") or str(getattr(response, "parsed_data", ""))
-            raise GhError(method, status, body)
+            raise GhError(method, status, body, auth_source=self.auth_source)
+
+    def check_auth(self) -> None:
+        if self.auth_source == "none":
+            raise GhError(
+                "check_auth",
+                401,
+                "no GitHub token available; set GH_TOKEN/GITHUB_TOKEN or run gh auth login",
+                auth_source=self.auth_source,
+            )
+        resp = self._gh.rest.users.get_authenticated()
+        self._raise_if_error("check_auth", resp)
 
     def issues_by_label(self, owner: str, repo: str, label: str, limit: int) -> list[Issue]:
         resp = self._gh.rest.issues.list_for_repo(
-            owner=owner, repo=repo, labels=label, per_page=min(limit, 100), state="open",
+            owner=owner,
+            repo=repo,
+            labels=label,
+            per_page=min(limit, 100),
+            state="open",
         )
         self._raise_if_error(f"list_for_repo({label})", resp)
         out: list[Issue] = []
@@ -166,17 +267,15 @@ class GithubkitClient:
             # Skip PRs — list_for_repo returns issues + PRs by default.
             if getattr(item, "pull_request", None):
                 continue
-            out.append(Issue(
-                number=item.number,
-                title=item.title or "",
-                body=item.body or "",
-                state=str(item.state),
-                labels=[
-                    str(lab.name)
-                    for lab in (item.labels or [])
-                    if hasattr(lab, "name") and lab.name is not None
-                ],
-            ))
+            out.append(
+                Issue(
+                    number=item.number,
+                    title=item.title or "",
+                    body=item.body or "",
+                    state=str(item.state),
+                    labels=_label_names(item.labels),
+                )
+            )
         return out
 
     def get_issue(self, owner: str, repo: str, number: int) -> Issue | None:
@@ -191,29 +290,34 @@ class GithubkitClient:
             title=item.title or "",
             body=item.body or "",
             state=str(item.state),
-            labels=[
-                str(lab.name)
-                for lab in (item.labels or [])
-                if hasattr(lab, "name") and lab.name is not None
-            ],
+            labels=_label_names(item.labels),
         )
 
     def add_comment(self, owner: str, repo: str, number: int, body: str) -> None:
         resp = self._gh.rest.issues.create_comment(
-            owner=owner, repo=repo, issue_number=number, body=body,
+            owner=owner,
+            repo=repo,
+            issue_number=number,
+            body=body,
         )
         self._raise_if_error(f"add_comment({number})", resp)
 
     def add_labels(self, owner: str, repo: str, number: int, labels: list[str]) -> None:
         resp = self._gh.rest.issues.add_labels(
-            owner=owner, repo=repo, issue_number=number, labels=labels,
+            owner=owner,
+            repo=repo,
+            issue_number=number,
+            labels=labels,
         )
         self._raise_if_error(f"add_labels({number}, {labels})", resp)
 
     def remove_label(self, owner: str, repo: str, number: int, label: str) -> None:
         try:
             resp = self._gh.rest.issues.remove_label(
-                owner=owner, repo=repo, issue_number=number, name=label,
+                owner=owner,
+                repo=repo,
+                issue_number=number,
+                name=label,
             )
             self._raise_if_error(f"remove_label({number}, {label})", resp)
         except GhError as e:
@@ -226,7 +330,11 @@ class GithubkitClient:
         self, owner: str, repo: str, title: str, body: str, labels: list[str]
     ) -> Issue:
         resp = self._gh.rest.issues.create(
-            owner=owner, repo=repo, title=title, body=body, labels=list(labels),
+            owner=owner,
+            repo=repo,
+            title=title,
+            body=body,
+            labels=list(labels),
         )
         self._raise_if_error(f"create_issue({title!r})", resp)
         item = resp.parsed_data
@@ -235,11 +343,7 @@ class GithubkitClient:
             title=item.title or "",
             body=item.body or "",
             state=str(item.state),
-            labels=[
-                str(lab.name)
-                for lab in (item.labels or [])
-                if hasattr(lab, "name") and lab.name is not None
-            ],
+            labels=_label_names(item.labels),
         )
 
     def get_pull(self, owner: str, repo: str, number: int) -> PullRequest | None:
@@ -257,11 +361,7 @@ class GithubkitClient:
             draft=bool(getattr(item, "draft", False)),
             head_ref=getattr(item.head, "ref", "") if item.head else "",
             base_ref=getattr(item.base, "ref", "") if item.base else "",
-            labels=[
-                str(lab.name)
-                for lab in (item.labels or [])
-                if hasattr(lab, "name") and lab.name is not None
-            ],
+            labels=_label_names(item.labels),
             additions=getattr(item, "additions", 0) or 0,
             deletions=getattr(item, "deletions", 0) or 0,
             changed_files=getattr(item, "changed_files", 0) or 0,
@@ -291,6 +391,7 @@ class MockGhClient:
     create_issue_responses: list[int] = field(default_factory=list)
     next_issue_number: int | None = None
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    auth_source: str = "mock"
 
     def _record(self, method: str, **kwargs: Any) -> None:
         self.calls.append((method, kwargs))
@@ -325,7 +426,12 @@ class MockGhClient:
         self, owner: str, repo: str, title: str, body: str, labels: list[str]
     ) -> Issue:
         self._record(
-            "create_issue", owner=owner, repo=repo, title=title, body=body, labels=list(labels),
+            "create_issue",
+            owner=owner,
+            repo=repo,
+            title=title,
+            body=body,
+            labels=list(labels),
         )
         if title in self.raise_on_create_titles:
             raise self.raise_on_create_titles[title]
@@ -334,6 +440,9 @@ class MockGhClient:
         issue = Issue(number=n, title=title, body=body, state="open", labels=list(labels))
         self.issues[(owner, repo, n)] = issue
         return issue
+
+    def check_auth(self) -> None:
+        self._record("check_auth")
 
     def _next_number(self) -> int:
         existing = [n for (_, _, n) in self.issues]
@@ -397,11 +506,15 @@ def list_open_backlog(
 __all__ = [
     "GhClient",
     "GhError",
+    "GhTokenSource",
     "GithubkitClient",
     "Issue",
     "MockGhClient",
     "OpenBacklog",
     "PullRequest",
+    "ResolvedToken",
+    "TokenSource",
     "list_open_backlog",
+    "resolve_token_info",
     "resolve_token",
 ]

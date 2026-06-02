@@ -12,6 +12,8 @@ from typing import Any
 
 from forge_loop import gh_issues
 
+auth_source = "gh cli"
+
 DEFAULT_REPO: str | None = None
 
 

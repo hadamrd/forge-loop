@@ -92,6 +92,29 @@ class ProductCommandsMixin:
             if source_report_path is not None and source_report_path.exists()
             else None
         )
+        gh_client: Any | None = None
+        duplicate_decisions: list[FrontierDecision] = []
+
+        if args.apply:
+            if not owner or not repo_name:
+                typer.echo(
+                    "brainstorm: --apply requires a configured GitHub repo (owner/name).",
+                    err=True,
+                )
+                return 2
+            try:
+                client = self.gh_client_factory()
+                gh_client = client
+                client.check_auth()
+            except Exception as exc:  # noqa: BLE001
+                auth_source = getattr(gh_client, "auth_source", None) or getattr(
+                    exc, "auth_source", "unknown"
+                )
+                typer.echo(
+                    f"brainstorm: GitHub auth check failed via {auth_source}: {exc}",
+                    err=True,
+                )
+                return 1
 
         def _revalidate_report(raw: BrainstormReport) -> tuple[BrainstormReport, int]:
             return filter_report_for_vision(raw, vision)
@@ -232,21 +255,7 @@ class ProductCommandsMixin:
 
         # 5. --apply path: epics first, then tickets cross-linked to the epic
         #    that was just filed in *this* run.
-        try:
-            gh_client = self.gh_client_factory()
-        except Exception as exc:  # noqa: BLE001
-            typer.echo(
-                f"brainstorm: cannot construct GhClient ({exc}); set GH_TOKEN or monkeypatch _gh_client_factory.",
-                err=True,
-            )
-            return 1
-
-        if not owner or not repo_name:
-            typer.echo(
-                "brainstorm: --apply requires a configured GitHub repo (owner/name).",
-                err=True,
-            )
-            return 2
+        assert gh_client is not None
 
         if report_path_arg:
             try:
@@ -263,9 +272,6 @@ class ProductCommandsMixin:
                 typer.echo(
                     f"brainstorm: dropped {dropped_count} proposal(s) during report validation."
                 )
-        else:
-            duplicate_decisions = []
-
         if not report.proposed_epics and not report.proposed_tickets:
             if source_report_path is not None:
                 ledger = FrontierDecisionLedger(repo_path / ".forge" / "frontier-decisions.yaml")

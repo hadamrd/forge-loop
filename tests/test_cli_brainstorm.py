@@ -226,6 +226,28 @@ def test_brainstorm_apply_files_epics_first(
     assert "Parent: #501" in create_calls[2][1]["body"]
 
 
+def test_brainstorm_apply_validates_github_auth_before_generating_proposals(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gh = MockGhClient(raise_on={"check_auth": GhError("check_auth", 401, "bad credentials")})
+
+    def _explode(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("brainstormer SDK must not run when GitHub auth is invalid")
+
+    monkeypatch.setattr(cli, "_brainstormer_factory", _explode)
+    monkeypatch.setattr(cli, "_gh_client_factory", lambda: gh)
+
+    result = runner.invoke(cli.app, ["brainstorm", "--apply"])
+
+    assert result.exit_code == 1
+    combined = result.stdout + result.stderr
+    assert "github auth check failed" in combined.lower()
+    assert "check_auth" in combined
+    assert "bad credentials" in combined
+    assert "via mock" in combined.lower()
+    assert not any(c[0] == "create_issue" for c in gh.calls)
+
+
 def test_brainstorm_apply_report_files_exact_reviewed_items_without_sdk(
     runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
