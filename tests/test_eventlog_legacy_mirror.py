@@ -158,6 +158,55 @@ def test_legacy_runner_mirror_keeps_distinct_same_worker_transitions(
     assert len({event.idempotency_key for event in events}) == 2
 
 
+def test_legacy_runner_mirror_records_pr_opened_session_transition(
+    tmp_path: Path,
+) -> None:
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+
+    mirror.mirror_record(
+        {
+            "kind": "worker_session_transition",
+            "issue": 167,
+            "session_id": "worker-a",
+            "prior_state": "running",
+            "new_state": "awaiting_critic",
+            "reason": "worker opened PR",
+            "pr_url": "https://github.com/acme/forge-loop/pull/167",
+        }
+    )
+
+    events = list(log.since(0))
+    assert [event.kind for event in events] == [EventKind.PR_OPENED]
+    assert events[0].task_id == "issue:167"
+    assert events[0].payload["pr_url"] == "https://github.com/acme/forge-loop/pull/167"
+
+
+def test_legacy_runner_mirror_records_abandoned_session_transition(
+    tmp_path: Path,
+) -> None:
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+
+    mirror.mirror_record(
+        {
+            "kind": "worker_session_transition",
+            "issue": 167,
+            "session_id": "worker-a",
+            "prior_state": "running",
+            "new_state": "abandoned",
+            "reason": "worker failed: tests failed",
+            "pr_url": None,
+        }
+    )
+
+    events = list(log.since(0))
+    assert [event.kind for event in events] == [EventKind.TASK_FAILED]
+    assert events[0].task_id == "issue:167"
+    assert events[0].payload["status"] == "failed"
+    assert events[0].payload["reason"] == "worker failed: tests failed"
+
+
 def test_legacy_runner_mirror_records_merge_blocked_from_critic_verdict(
     tmp_path: Path,
 ) -> None:

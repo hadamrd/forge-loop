@@ -234,7 +234,6 @@ def _append_specs(
     if legacy_kind in {
         LegacyRunnerEventKind.WORKER_START,
         LegacyRunnerEventKind.WORKER_STARTED,
-        LegacyRunnerEventKind.WORKER_SESSION_TRANSITION,
         LegacyRunnerEventKind.WORKER_ITERATION_ATTEMPT,
     }:
         return (
@@ -246,6 +245,8 @@ def _append_specs(
                 worker=worker,
             ),
         )
+    if legacy_kind is LegacyRunnerEventKind.WORKER_SESSION_TRANSITION:
+        return _worker_session_transition_specs(record, payload, tick, issue, worker)
     if legacy_kind is LegacyRunnerEventKind.WORKER_DONE:
         return _worker_done_specs(record, payload, tick, worker)
     if legacy_kind is LegacyRunnerEventKind.WORKER_FAILED:
@@ -479,6 +480,72 @@ def _worker_done_specs(
             )
         )
     return tuple(specs)
+
+
+def _worker_session_transition_specs(
+    record: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    tick: int | None,
+    issue: int | None,
+    worker: str | None,
+) -> tuple[_AppendSpec, ...]:
+    new_state = str(record.get("new_state") or "").lower()
+    pr_url = _pr_url(record)
+
+    if new_state == "awaiting_critic":
+        return (
+            _AppendSpec(
+                EventKind.PR_OPENED,
+                payload,
+                tick=tick,
+                issue=issue,
+                worker=worker,
+                pr_url=pr_url,
+            ),
+        )
+    if new_state == "abandoned":
+        return (
+            _AppendSpec(
+                EventKind.TASK_FAILED,
+                {**payload, "status": "failed"},
+                tick=tick,
+                issue=issue,
+                worker=worker,
+                pr_url=pr_url,
+            ),
+        )
+    if new_state == "merged":
+        specs = [
+            _AppendSpec(
+                EventKind.TASK_COMPLETED,
+                {**payload, "status": "merged"},
+                tick=tick,
+                issue=issue,
+                worker=worker,
+                pr_url=pr_url,
+            )
+        ]
+        if pr_url is not None:
+            specs.append(
+                _AppendSpec(
+                    EventKind.PR_MERGED,
+                    {**payload, "status": "merged"},
+                    tick=tick,
+                    issue=issue,
+                    worker=worker,
+                    pr_url=pr_url,
+                )
+            )
+        return tuple(specs)
+    return (
+        _AppendSpec(
+            EventKind.TASK_DISPATCHED,
+            payload,
+            tick=tick,
+            issue=issue,
+            worker=worker,
+        ),
+    )
 
 
 def _payload(record: Mapping[str, Any]) -> dict[str, Any]:
