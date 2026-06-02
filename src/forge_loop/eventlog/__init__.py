@@ -7,6 +7,8 @@ control-plane work should use.
 """
 
 from forge_loop.eventlog.models import EventEnvelope, EventId, EventKind, EventRef
+from forge_loop.eventlog.projections import ProjectionCursor
+from forge_loop.eventlog.sqlite import SqliteEventLog
 from forge_loop.eventlog.store import EventLog, InMemoryEventLog
 
 __all__ = [
@@ -16,4 +18,6 @@ __all__ = [
     "EventLog",
     "EventRef",
     "InMemoryEventLog",
+    "ProjectionCursor",
+    "SqliteEventLog",
 ]
