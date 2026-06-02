@@ -78,7 +78,7 @@ def test_block_overall_without_sev1_still_blocks() -> None:
     assert plan.labels_to_add == ["critic:blocking"]
 
 
-def test_sev2_does_not_block_by_default() -> None:
+def test_request_changes_blocks_even_when_sev2_knob_is_off() -> None:
     rep = _report(
         "request_changes",
         [
@@ -86,8 +86,8 @@ def test_sev2_does_not_block_by_default() -> None:
         ],
     )
     plan = plan_actions(rep, 100, block_on_sev2=False, min_findings_for_approve=50)
-    assert plan.block_merge is False
-    assert "critic:blocking" not in plan.labels_to_add
+    assert plan.block_merge is True
+    assert "critic:blocking" in plan.labels_to_add
     assert plan.inline_comments
 
 

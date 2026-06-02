@@ -61,6 +61,8 @@ def plan_actions(
     Rules:
     - ``overall == "block"`` OR any sev1 finding → block merge,
       label ``critic:blocking``.
+    - ``overall == "request_changes"`` with any sev2 finding → block merge,
+      label ``critic:blocking``.
     - ``block_on_sev2`` AND any sev2 finding → also block + label
       ``critic:blocking``.
     - sev2/sev3 findings → inline comment if file+line, else summary.
@@ -86,6 +88,11 @@ def plan_actions(
             reasons.append("sev1_finding")
         if report.overall == "block":
             reasons.append("overall_block")
+
+    if report.overall == "request_changes" and has_sev2 and not plan.block_merge:
+        plan.block_merge = True
+        plan.labels_to_add.append("critic:blocking")
+        reasons.append("request_changes_sev2")
 
     if block_on_sev2 and has_sev2 and not plan.block_merge:
         plan.block_merge = True
