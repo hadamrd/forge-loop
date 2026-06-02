@@ -67,6 +67,8 @@ class SqliteMemoryStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         connect_path: str | Path = ":memory:" if str(path) == ":memory:" else self.path
+        if str(path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(connect_path)
         self._connection.row_factory = sqlite3.Row
         if str(path) != ":memory:":

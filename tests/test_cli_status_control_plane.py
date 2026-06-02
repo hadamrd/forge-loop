@@ -9,6 +9,13 @@ from typing import Any
 from forge_loop import cli
 from forge_loop.eventlog import EventKind, ProjectionCursor, SqliteEventLog
 from forge_loop.frontier import FrontierCursor, FrontierStore
+from forge_loop.memory import (
+    REJECTED_PATH_TAG,
+    MemoryItem,
+    MemoryKind,
+    MemoryProvenance,
+    SqliteMemoryStore,
+)
 from forge_loop.worker_sessions import WorkerSessionStore
 from forge_loop.worker_state import WorkerState
 
@@ -62,6 +69,27 @@ class TestStatusControlPlane:
                 why_now="status is the operator entrypoint",
             )
         )
+        memory_store = SqliteMemoryStore(forge_dir / "memory.db")
+        memory_store.put(
+            MemoryItem(
+                memory_id="m1",
+                kind=MemoryKind.SEMANTIC,
+                title="Status reads durable memory",
+                body="The boot summary can name curated memory ids.",
+                tags=("boot-context",),
+                provenance=MemoryProvenance(source_event=None, authored_by="test"),
+            )
+        )
+        memory_store.put(
+            MemoryItem(
+                memory_id="m2",
+                kind=MemoryKind.SEMANTIC,
+                title="Rejected path remains queryable",
+                body="Rejected paths are counted separately for operators.",
+                tags=(REJECTED_PATH_TAG,),
+                provenance=MemoryProvenance(source_event=None, authored_by="test"),
+            )
+        )
         ops_dir = tmp_path / "docs" / "ops"
         ops_dir.mkdir(parents=True)
         session_store = WorkerSessionStore(ops_dir / "worker-sessions.db")
@@ -97,10 +125,10 @@ class TestStatusControlPlane:
             "next_expansion": "surface control-plane status",
         }
         assert control["memory"] == {
-            "available": False,
-            "path": str(forge_dir / "memory.yaml"),
-            "active_count": None,
-            "rejected_count": None,
+            "available": True,
+            "path": str(forge_dir / "memory.db"),
+            "active_count": 2,
+            "rejected_count": 1,
         }
         assert control["tasks"] == {
             "available": True,
@@ -108,7 +136,9 @@ class TestStatusControlPlane:
             "in_flight_count": 2,
             "stale_lease_count": 1,
         }
-        assert control["boot"] == {"available": False, "summary": None}
+        assert control["boot"]["available"] is True
+        assert "memory: m1, m2" in control["boot"]["summary"]
+        assert "in_flight:" in control["boot"]["summary"]
 
     def test_status_json_reports_missing_control_plane_stores_as_unavailable(
         self,
@@ -133,7 +163,7 @@ class TestStatusControlPlane:
         }
         assert control["memory"] == {
             "available": False,
-            "path": str(tmp_path / ".forge" / "memory.yaml"),
+            "path": str(tmp_path / ".forge" / "memory.db"),
             "active_count": None,
             "rejected_count": None,
         }

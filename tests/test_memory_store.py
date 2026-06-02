@@ -181,6 +181,38 @@ def test_curator_does_not_promote_empty_reason_candidates() -> None:
     assert not curator.should_promote(candidate)
 
 
+def test_curator_promotes_to_configured_store(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    curator = MemoryCurator(store)
+    item = _item("mem-curated", MemoryKind.SEMANTIC)
+
+    promoted = curator.promote(item)
+
+    assert promoted == item
+    assert store.get("mem-curated") == item
+
+
+def test_sqlite_store_creates_parent_directories(tmp_path: Path) -> None:
+    db = tmp_path / ".forge" / "memory.db"
+
+    store = SqliteMemoryStore(db)
+    store.put(_item("mem-parent", MemoryKind.SEMANTIC))
+
+    assert db.exists()
+    assert SqliteMemoryStore(db).get("mem-parent") is not None
+
+
+def test_superseding_missing_memory_raises_keyerror_for_real_and_fake_stores(
+    tmp_path: Path,
+) -> None:
+    real = SqliteMemoryStore(tmp_path / "memory.db")
+    fake = FakeMemoryStore()
+
+    for store in (real, fake):
+        with pytest.raises(KeyError, match="mem-missing"):
+            store.supersede("mem-missing", by_memory_id="mem-new")
+
+
 def test_fake_memory_store_matches_real_shape(tmp_path: Path) -> None:
     real = SqliteMemoryStore(tmp_path / "memory.db")
     fake = FakeMemoryStore()
