@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -106,21 +105,26 @@ def rotate_events_file_if_needed(
     except OSError as e:
         error = str(e)
         # Best-effort: try to record the failure.
-        _try_append_event(events_path, "events_rotation_failed", error=error,
-                          attempted_size=size)
+        _try_append_event(events_path, "events_rotation_failed", error=error, attempted_size=size)
         return {
-            "rotated": False, "rotated_size": size,
-            "archive_count": archive_count, "error": error,
+            "rotated": False,
+            "rotated_size": size,
+            "archive_count": archive_count,
+            "error": error,
         }
 
     # Success path: stamp the first event in the fresh file.
     _try_append_event(
-        events_path, "events_file_rotated",
-        rotated_size=size, archive_count=archive_count,
+        events_path,
+        "events_file_rotated",
+        rotated_size=size,
+        archive_count=archive_count,
     )
     return {
-        "rotated": True, "rotated_size": size,
-        "archive_count": archive_count, "error": None,
+        "rotated": True,
+        "rotated_size": size,
+        "archive_count": archive_count,
+        "error": None,
     }
 
 
@@ -194,12 +198,12 @@ def consolidate_sprint(
         "total": len(outcomes),
         "merged": [o["issue"] for o in outcomes if o.get("status") == "merged"],
         "open": [o["issue"] for o in outcomes if o.get("status") == "open"],
-        "failed": [o["issue"] for o in outcomes if o.get("status") in {"failed", "timeout", "no_pr"}],
+        "failed": [
+            o["issue"] for o in outcomes if o.get("status") in {"failed", "timeout", "no_pr"}
+        ],
         "pr_urls": [o["pr_url"] for o in outcomes if o.get("pr_url")],
         # Carry up the most-interesting subagent events (e.g. "bug_found")
-        "subagent_events_count": sum(
-            len(o.get("events") or []) for o in outcomes
-        ),
+        "subagent_events_count": sum(len(o.get("events") or []) for o in outcomes),
     }
     summaries_path.parent.mkdir(parents=True, exist_ok=True)
     with open(summaries_path, "a") as f:

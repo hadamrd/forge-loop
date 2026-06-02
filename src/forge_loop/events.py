@@ -32,12 +32,38 @@ Migration pattern for a call site:
 from __future__ import annotations
 
 import json
+import sqlite3
 import warnings
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
+
+_DEFAULT_DURABLE_MIRROR = object()
+
+
+class _DurableMirror(Protocol):
+    def mirror_record(self, record: Mapping[str, Any]) -> object:
+        """Mirror a JSONL record into a durable event stream."""
+
+
+class DurableMirrorError(RuntimeError):
+    """Default durable mirror failed after the JSONL record was written."""
+
+
+class _BestEffortDurableMirror:
+    def __init__(self, mirror: _DurableMirror) -> None:
+        self._mirror = mirror
+
+    def mirror_record(self, record: Mapping[str, Any]) -> object:
+        try:
+            return self._mirror.mirror_record(record)
+        except (OSError, sqlite3.Error) as exc:
+            raise DurableMirrorError(f"{type(exc).__name__}: {exc!s}") from exc
+        except Exception as exc:
+            raise DurableMirrorError(f"{type(exc).__name__}: {exc!s}") from exc
 
 
 def _now_iso() -> str:
@@ -280,11 +306,8 @@ def emit(events_path: Path, event: EventBase) -> None:
     """
     if not isinstance(event, EventBase):
         raise TypeError(f"emit expected EventBase, got {type(event).__name__}")
-    events_path.parent.mkdir(parents=True, exist_ok=True)
     rec = event.to_record()
-    with open(events_path, "a") as f:
-        f.write(json.dumps(rec, default=str) + "\n")
-    _log_event(event.KIND, rec)
+    _write_record(events_path, rec)
 
 
 def _log_event(kind: str, rec: dict[str, Any]) -> None:
@@ -327,11 +350,72 @@ def append_event_with_registry_check(events_path: Path, kind: str, **fields: Any
             DeprecationWarning,
             stacklevel=3,
         )
-    events_path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mirror = fields.pop("durable_mirror", _DEFAULT_DURABLE_MIRROR)
+    durable_mirror_error = fields.pop("durable_mirror_error", None)
     rec = {"ts": _now_iso(), "kind": kind, **fields}
+    _write_record(
+        events_path,
+        rec,
+        durable_mirror=durable_mirror,
+        durable_mirror_error=durable_mirror_error,
+    )
+
+
+def _write_record(
+    events_path: Path,
+    rec: dict[str, Any],
+    *,
+    durable_mirror: object = _DEFAULT_DURABLE_MIRROR,
+    durable_mirror_error: str | None = None,
+) -> None:
+    if durable_mirror is _DEFAULT_DURABLE_MIRROR:
+        durable_mirror, default_error = _default_durable_mirror(events_path)
+        if durable_mirror_error is None:
+            durable_mirror_error = default_error
+
+    events_path.parent.mkdir(parents=True, exist_ok=True)
     with open(events_path, "a") as f:
         f.write(json.dumps(rec, default=str) + "\n")
+    kind = str(rec.get("kind", ""))
     _log_event(kind, rec)
+    if durable_mirror_error is not None:
+        from forge_loop.log import get_logger
+
+        get_logger().warning(
+            "durable_mirror_failed",
+            kind=kind,
+            events_path=str(events_path),
+            error=str(durable_mirror_error)[:300],
+        )
+    if durable_mirror is not None:
+        try:
+            cast(_DurableMirror, durable_mirror).mirror_record(rec)
+        except (OSError, sqlite3.Error, DurableMirrorError) as exc:
+            from forge_loop.log import get_logger
+
+            error = (
+                str(exc)
+                if isinstance(exc, DurableMirrorError)
+                else f"{type(exc).__name__}: {exc!s}"
+            )
+            get_logger().warning(
+                "durable_mirror_failed",
+                kind=kind,
+                events_path=str(events_path),
+                error=error[:300],
+            )
+
+
+def _default_durable_mirror(events_path: Path) -> tuple[object | None, str | None]:
+    try:
+        from forge_loop.eventlog.legacy_mirror import legacy_runner_mirror_for_events_path
+
+        mirror = legacy_runner_mirror_for_events_path(events_path)
+        if mirror is None:
+            return None, None
+        return _BestEffortDurableMirror(mirror), None
+    except (OSError, sqlite3.Error) as exc:
+        return None, f"{type(exc).__name__}: {exc!s}"
 
 
 __all__ = [
