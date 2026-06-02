@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from forge_loop._testing.frontier_decisions import FakeFrontierDecisionLedger
 from forge_loop.frontier.decisions import (
     FrontierDecision,
@@ -131,3 +133,38 @@ def test_fake_frontier_decision_ledger_matches_real_shape(tmp_path: Path) -> Non
     assert real.find_by_candidate(title=" contract   shape ", axis="frontier-generation") == (
         fake.find_by_candidate(title=" contract   shape ", axis="frontier-generation")
     )
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("[]\n", "must be a mapping"),
+        ("decisions: nope\n", "decisions must be a list"),
+        ("decisions:\n  - nope\n", "records must be mappings"),
+        (
+            "\n".join(
+                [
+                    "decisions:",
+                    "  - proposal_title: Corrupt decision",
+                    "    proposal_kind: ticket",
+                    "    axis: frontier-generation",
+                    "    outcome: accepted",
+                    "    rationale: bad issue number",
+                    "    source_key: corrupt:1",
+                    "    issue_number: nope",
+                    "    decided_at: '2026-06-02T20:00:00Z'",
+                    "",
+                ]
+            ),
+            "issue_number must be an integer",
+        ),
+    ],
+)
+def test_frontier_decision_ledger_rejects_malformed_yaml(
+    tmp_path: Path, payload: str, message: str
+) -> None:
+    path = tmp_path / "frontier-decisions.yaml"
+    path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        FrontierDecisionLedger(path).list()
