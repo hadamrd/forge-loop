@@ -144,13 +144,7 @@ def apply_critic_report(
     mutation_failed = False
 
     if plan.block_merge:
-        mutation_failed |= _record_mutation_result(
-            "disable_pr_auto_merge",
-            gh.disable_pr_auto_merge(pr_url, repo=repo),
-            gh=gh,
-            pr_url=pr_url,
-            emit=emit,
-        )
+        gh.disable_pr_auto_merge(pr_url, repo=repo)
     if plan.labels_to_add:
         mutation_failed |= _record_mutation_result(
             "add_pr_label",

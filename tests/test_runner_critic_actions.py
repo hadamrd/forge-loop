@@ -20,6 +20,7 @@ class _FakeGh:
     disable_calls: list[tuple] = field(default_factory=list)
     comment_calls: list[dict] = field(default_factory=list)
     remove_label_calls: list[tuple] = field(default_factory=list)
+    disable_result: bool = True
     label_result: bool = True
     comment_result: bool = True
     remove_label_result: bool = True
@@ -30,7 +31,7 @@ class _FakeGh:
 
     def disable_pr_auto_merge(self, pr, repo=None):  # type: ignore[no-untyped-def]
         self.disable_calls.append((pr, repo))
-        return True
+        return self.disable_result
 
     def post_review_comment(self, pr, body, file=None, line=None, repo=None):  # type: ignore[no-untyped-def]
         self.comment_calls.append(
@@ -196,6 +197,34 @@ def test_apply_reports_failed_label_mutation_without_success_event() -> None:
     assert failed
     assert failed[0]["method"] == "add_pr_label"
     assert failed[0]["auth_source"] == "github-client"
+
+
+def test_apply_ignores_false_disable_auto_merge_when_other_mutations_succeed() -> None:
+    gh = _FakeGh(disable_result=False)
+    rep = _report(
+        "request_changes",
+        [
+            Finding("sev1", "correctness", "src/foo.py", 7, "uh oh"),
+        ],
+    )
+    emits: list[tuple[str, dict]] = []
+
+    apply_critic_report(
+        rep,
+        "https://gh.com/o/r/pull/9",
+        pr_changed_lines=120,
+        block_on_sev2=False,
+        min_findings_for_approve=50,
+        gh=gh,
+        repo="o/r",
+        emit=lambda k, p: emits.append((k, p)),
+    )
+
+    assert gh.disable_calls == [("https://gh.com/o/r/pull/9", "o/r")]
+    assert gh.label_calls
+    assert gh.comment_calls
+    assert not any(k == "critic_actions_failed" for k, _ in emits)
+    assert any(k == "critic_actions_applied" for k, _ in emits)
 
 
 def test_apply_approve_zero_findings_large_pr_blocks_and_labels_suspicious() -> None:
