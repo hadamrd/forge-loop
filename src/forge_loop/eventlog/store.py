@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from forge_loop.eventlog.models import EventEnvelope, EventId, EventKind
+from forge_loop.eventlog.projections import ProjectionCursor
 
 
 class EventLog(Protocol):
@@ -28,9 +29,31 @@ class EventLog(Protocol):
         idempotency_key: str | None = None,
     ) -> EventEnvelope:
         """Append one event and return its durable envelope."""
+        ...
 
     def since(self, sequence: int = 0) -> Iterable[EventEnvelope]:
         """Yield events with sequence greater than ``sequence``."""
+        ...
+
+    def latest_sequence(self) -> int:
+        """Return the highest durable event sequence, or 0 when empty."""
+        ...
+
+    def get_projection_cursor(self, projection_name: str) -> ProjectionCursor:
+        """Return one projection cursor, or sequence 0 when absent."""
+        ...
+
+    def set_projection_cursor(
+        self,
+        projection_name: str,
+        cursor: ProjectionCursor,
+    ) -> None:
+        """Persist a projection cursor."""
+        ...
+
+    def list_projection_cursors(self) -> Mapping[str, ProjectionCursor]:
+        """Return all saved projection cursors by projection name."""
+        ...
 
 
 @dataclass
@@ -42,6 +65,7 @@ class InMemoryEventLog:
     """
 
     _events: list[EventEnvelope] = field(default_factory=list)
+    _projection_cursors: dict[str, ProjectionCursor] = field(default_factory=dict)
 
     def append(
         self,
@@ -66,3 +90,21 @@ class InMemoryEventLog:
 
     def since(self, sequence: int = 0) -> Iterable[EventEnvelope]:
         return (event for event in self._events if event.sequence > sequence)
+
+    def latest_sequence(self) -> int:
+        if not self._events:
+            return 0
+        return self._events[-1].sequence
+
+    def get_projection_cursor(self, projection_name: str) -> ProjectionCursor:
+        return self._projection_cursors.get(projection_name, ProjectionCursor(sequence=0))
+
+    def set_projection_cursor(
+        self,
+        projection_name: str,
+        cursor: ProjectionCursor,
+    ) -> None:
+        self._projection_cursors[projection_name] = cursor
+
+    def list_projection_cursors(self) -> Mapping[str, ProjectionCursor]:
+        return dict(self._projection_cursors)
