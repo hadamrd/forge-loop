@@ -24,6 +24,7 @@ from typer.testing import CliRunner
 
 from forge_loop import cli
 from forge_loop.brainstormer import BrainstormReport, ProposedEpic, ProposedTicket
+from forge_loop.frontier.decisions import FrontierDecisionLedger, FrontierDecisionOutcome
 from forge_loop.gh_client import GhError, Issue, MockGhClient
 
 # ---------------------------------------------------------------------------
@@ -260,6 +261,12 @@ def test_brainstorm_apply_report_files_exact_reviewed_items_without_sdk(
             "Parent: #901\n\nGET /receipts\n\n\n## Customer story\n\nOperator wants receipts",
         ),
     ]
+    decisions = FrontierDecisionLedger(cwd_repo / ".forge" / "frontier-decisions.yaml").list()
+    assert [(d.proposal_title, d.outcome, d.issue_number) for d in decisions] == [
+        ("Billing epic", FrontierDecisionOutcome.ACCEPTED, 901),
+        ("Wire Stripe SDK", FrontierDecisionOutcome.ACCEPTED, 902),
+        ("Add receipt endpoint", FrontierDecisionOutcome.ACCEPTED, 903),
+    ]
 
 
 def test_brainstorm_apply_report_revalidates_axes_and_duplicates(
@@ -310,6 +317,13 @@ def test_brainstorm_apply_report_revalidates_axes_and_duplicates(
     create_calls = [c for c in gh.calls if c[0] == "create_issue"]
     assert [c[1]["title"] for c in create_calls] == ["File deterministic report"]
     assert "dropped" in result.stdout.lower()
+    decisions = FrontierDecisionLedger(cwd_repo / ".forge" / "frontier-decisions.yaml").list()
+    assert [
+        (d.proposal_title, d.outcome, d.issue_number, d.duplicate_of_issue) for d in decisions
+    ] == [
+        ("Wire Stripe SDK", FrontierDecisionOutcome.REJECTED, None, 42),
+        ("File deterministic report", FrontierDecisionOutcome.ACCEPTED, 777, None),
+    ]
 
 
 def test_brainstorm_apply_report_backlog_scan_failure_exits_1(
@@ -446,6 +460,43 @@ def test_brainstorm_partial_failure_exits_1(
     assert "#701" in result.stdout and "Wire Stripe SDK" in result.stdout
     assert "Add receipt endpoint" in result.stderr
     assert "rate-limited" in result.stderr or "422" in result.stderr
+
+
+def test_brainstorm_apply_report_failure_does_not_record_accepted_decision(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = BrainstormReport(
+        proposed_epics=[],
+        proposed_tickets=[
+            ProposedTicket(
+                title="Create failing proposal",
+                body="Failure should not be accepted",
+                axis="billing",
+                customer_story="Operator wants trustworthy decision state",
+            ),
+        ],
+    )
+    report_path = cwd_repo / "reviewed.yaml"
+    report_path.write_text(
+        yaml.safe_dump(report.model_dump(mode="json"), sort_keys=False),
+        encoding="utf-8",
+    )
+    gh = MockGhClient()
+    gh.raise_on_create_titles = {
+        "Create failing proposal": GhError("create_issue", 500, "server error"),
+    }
+
+    def _explode(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("brainstormer SDK must not run when applying a report")
+
+    monkeypatch.setattr(cli, "_brainstormer_factory", _explode)
+    monkeypatch.setattr(cli, "_gh_client_factory", lambda: gh)
+
+    result = runner.invoke(cli.app, ["brainstorm", "--apply", "--report", str(report_path)])
+
+    assert result.exit_code == 1
+    decisions = FrontierDecisionLedger(cwd_repo / ".forge" / "frontier-decisions.yaml").list()
+    assert decisions == ()
 
 
 def test_brainstorm_apply_no_proposals(
