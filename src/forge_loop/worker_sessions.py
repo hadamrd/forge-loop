@@ -24,9 +24,8 @@ import sqlite3
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 from forge_loop.worker_state import (
     InvalidTransition,
@@ -36,7 +35,7 @@ from forge_loop.worker_state import (
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _new_id() -> str:
@@ -67,6 +66,7 @@ class WorkerSession:
     worktree_path: str = ""
     sdk_session_id: str | None = None
     pr_url: str | None = None
+    lease_expires_at: str | None = None
     critic_iterations: int = 0
     last_transition_reason: str = ""
     created_at: str = field(default_factory=_now_iso)
@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS worker_sessions (
     worktree_path       TEXT NOT NULL DEFAULT '',
     sdk_session_id      TEXT,
     pr_url              TEXT,
+    lease_expires_at    TEXT,
     critic_iterations   INTEGER NOT NULL DEFAULT 0,
     last_transition_reason TEXT NOT NULL DEFAULT '',
     created_at          TEXT NOT NULL,
@@ -126,6 +127,7 @@ class WorkerSessionStore:
         if self._db_path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._ensure_lease_column()
 
     # ------------------------------------------------------------------
     # Create / read
@@ -149,14 +151,22 @@ class WorkerSessionStore:
         self._conn.execute(
             "INSERT INTO worker_sessions ("
             " session_id, issue, branch, state, worktree_path,"
-            " sdk_session_id, pr_url, critic_iterations,"
+            " sdk_session_id, pr_url, lease_expires_at, critic_iterations,"
             " last_transition_reason, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                sess.session_id, sess.issue, sess.branch, sess.state.value,
-                sess.worktree_path, sess.sdk_session_id, sess.pr_url,
-                sess.critic_iterations, sess.last_transition_reason,
-                sess.created_at, sess.updated_at,
+                sess.session_id,
+                sess.issue,
+                sess.branch,
+                sess.state.value,
+                sess.worktree_path,
+                sess.sdk_session_id,
+                sess.pr_url,
+                sess.lease_expires_at,
+                sess.critic_iterations,
+                sess.last_transition_reason,
+                sess.created_at,
+                sess.updated_at,
             ),
         )
         return sess
@@ -187,8 +197,7 @@ class WorkerSessionStore:
             return []
         placeholders = ",".join("?" for _ in states)
         rows = self._conn.execute(
-            f"SELECT * FROM worker_sessions WHERE state IN ({placeholders})"
-            " ORDER BY created_at",
+            f"SELECT * FROM worker_sessions WHERE state IN ({placeholders}) ORDER BY created_at",
             tuple(s.value for s in states),
         ).fetchall()
         return [self._row_to_session(r) for r in rows]
@@ -196,8 +205,7 @@ class WorkerSessionStore:
     def active_count(self) -> int:
         """How many sessions count against the parallel budget right now?"""
         row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM worker_sessions"
-            " WHERE state IN (?, ?)",
+            "SELECT COUNT(*) AS n FROM worker_sessions WHERE state IN (?, ?)",
             (WorkerState.RUNNING.value, WorkerState.REVISING.value),
         ).fetchone()
         return int(row["n"])
@@ -247,9 +255,16 @@ class WorkerSessionStore:
     def set_pr_url(self, session_id: str, pr_url: str) -> None:
         with self._conn:
             self._conn.execute(
-                "UPDATE worker_sessions SET pr_url = ?, updated_at = ?"
-                " WHERE session_id = ?",
+                "UPDATE worker_sessions SET pr_url = ?, updated_at = ? WHERE session_id = ?",
                 (pr_url, _now_iso(), session_id),
+            )
+
+    def set_lease_expires_at(self, session_id: str, lease_expires_at: str | None) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE worker_sessions SET lease_expires_at = ?, updated_at = ?"
+                " WHERE session_id = ?",
+                (lease_expires_at, _now_iso(), session_id),
             )
 
     def increment_iterations(self, session_id: str) -> int:
@@ -278,6 +293,14 @@ class WorkerSessionStore:
     def close(self) -> None:
         self._conn.close()
 
+    def _ensure_lease_column(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(worker_sessions)").fetchall()
+        }
+        if "lease_expires_at" not in columns:
+            self._conn.execute("ALTER TABLE worker_sessions ADD COLUMN lease_expires_at TEXT")
+
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> WorkerSession:
         return WorkerSession(
@@ -288,6 +311,7 @@ class WorkerSessionStore:
             worktree_path=row["worktree_path"] or "",
             sdk_session_id=row["sdk_session_id"],
             pr_url=row["pr_url"],
+            lease_expires_at=row["lease_expires_at"],
             critic_iterations=int(row["critic_iterations"]),
             last_transition_reason=row["last_transition_reason"] or "",
             created_at=row["created_at"],
