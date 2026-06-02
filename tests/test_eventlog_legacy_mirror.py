@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from forge_loop.eventlog import EventKind, ProjectionCursor, SqliteEventLog
 from forge_loop.eventlog.legacy_mirror import LegacyEventMirror, replay_task_timeline
 from forge_loop.events import WorkerSessionTransitionEvent, emit
@@ -420,3 +422,51 @@ def test_append_event_preserves_jsonl_when_durable_mirroring_is_enabled(
     durable = list(log.since(0))
     assert len(durable) == 1
     assert durable[0].kind is EventKind.TICK_STARTED
+
+
+def test_append_event_logs_expected_durable_mirror_write_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    events_file = tmp_path / "loop-runner-events.jsonl"
+    warnings: list[tuple[str, dict[str, object]]] = []
+
+    class FakeLogger:
+        def info(self, _event: str, **_payload: object) -> None:
+            pass
+
+        def warning(self, event: str, **payload: object) -> None:
+            warnings.append((event, payload))
+
+    class FailingMirror:
+        def mirror_record(self, _record: dict[str, object]) -> None:
+            raise OSError("sqlite unavailable")
+
+    monkeypatch.setattr("forge_loop.log.get_logger", lambda: FakeLogger())
+
+    append_event(events_file, "tick_start", tick=2, issues=[167], durable_mirror=FailingMirror())
+
+    assert len(events_file.read_text().splitlines()) == 1
+    assert warnings == [
+        (
+            "durable_mirror_failed",
+            {
+                "kind": "tick_start",
+                "events_path": str(events_file),
+                "error": "OSError: sqlite unavailable",
+            },
+        )
+    ]
+
+
+def test_append_event_surfaces_unexpected_durable_mirror_bug(tmp_path: Path) -> None:
+    events_file = tmp_path / "loop-runner-events.jsonl"
+
+    class BuggyMirror:
+        def mirror_record(self, _record: dict[str, object]) -> None:
+            raise RuntimeError("bug in mirror translation")
+
+    with pytest.raises(RuntimeError, match="bug in mirror translation"):
+        append_event(events_file, "tick_start", tick=2, issues=[167], durable_mirror=BuggyMirror())
+
+    assert len(events_file.read_text().splitlines()) == 1

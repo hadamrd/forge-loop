@@ -373,7 +373,7 @@ def _write_record(
     if durable_mirror is not None:
         try:
             cast(_DurableMirror, durable_mirror).mirror_record(rec)
-        except Exception as exc:  # noqa: BLE001 - JSONL append must remain authoritative
+        except (OSError, sqlite3.Error) as exc:
             from forge_loop.log import get_logger
 
             get_logger().warning(
