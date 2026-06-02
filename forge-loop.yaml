@@ -1,0 +1,49 @@
+# forge-loop dogfood configuration.
+#
+# Operator-local overrides belong in `forge-loop.local.yaml` or env vars.
+# Keep this file conservative: it should support bounded self-dogfood runs
+# without depending on a private machine layout.
+
+repo:
+  github: hadamrd/forge-loop
+  base_branch: trunk
+  worktree_root: /tmp
+
+deploy:
+  task: ""
+
+scheduling:
+  parallel: 1
+  tick_interval_s: 60
+  worker_timeout_s: 3600
+  max_ticks: 1
+  maintenance_every_n_ticks: 0
+
+labels:
+  ready: "loop:ready"
+  triage: "loop:triage"
+  blocked: "loop:blocked"
+  risk_gate: "risk:high"
+
+agent:
+  provider: codex
+
+worker:
+  provider: codex
+  model: ""
+  thinking: medium
+
+po:
+  provider: codex
+  model: ""
+  thinking: high
+  timeout_s: 600
+
+critic:
+  provider: codex
+  model: ""
+  thinking: off
+
+lumen:
+  top_k: 3
+  test_pattern: "tests/test_*.py"

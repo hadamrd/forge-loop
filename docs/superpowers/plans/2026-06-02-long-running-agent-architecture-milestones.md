@@ -40,6 +40,7 @@ Known repo baseline from the 2026-06-02 audit:
 | M0 | Commit Architecture Baseline | Paper, review, architecture doc, and contract packages are in trunk. |
 | M1 | Durable Event Log | SQLite-backed append-only event log can append, replay, enforce sequence/idempotency, and track projection cursors. |
 | M2 | Forge-Loop Frontier Cursor | A forge-loop frontier cursor can be loaded on boot, rendered in status, and advanced only through event-log events. |
+| M2.5 | Frontier Generation Dogfood | `forge-loop brainstorm` uses repo-local vision/axes to generate axis-aligned, non-cosmetic backlog candidates for this architecture. |
 | M3 | Curated Memory Store | Decisions, rejected ideas, episodic lessons, and procedures can be promoted with provenance and loaded into boot context. |
 | M4 | Task Saga Lifecycle | Tasks have saga identity, leases, heartbeats, terminal states, and compensations independent of worker implementation. |
 | M5 | Maestro Boot Protocol | A fresh process can reconstruct frontier, memory, in-flight tasks, and projection cursors from durable state. |

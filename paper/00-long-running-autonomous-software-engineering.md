@@ -269,6 +269,32 @@ execute a boot protocol:
 This converts boot from a vague context-gathering ritual into a deterministic
 reconstruction of project cognition.
 
+### Brainstorming as frontier generation
+
+The frontier cursor should not be advanced by vibes. It needs a proposal
+mechanism.
+
+In `forge-loop`, that mechanism is the brainstormer: a bounded frontier
+generation layer that reads product vision, value axes, current backlog,
+curated memory, and external state-of-art notes, then proposes candidate epics
+and tickets. This layer is useful precisely because it is not trusted. It
+expands the search space; it does not own strategy.
+
+A mature brainstormer should produce proposals with:
+
+- a declared value axis;
+- a customer story;
+- a non-duplicate relation to existing backlog;
+- evidence for why the work matters now;
+- a small enough shape for isolated workers;
+- an explicit rejection/defer reason when the proposal is not accepted.
+
+This turns brainstorming into a disciplined product-frontier function rather
+than an idea dump. The maestro owns acceptance. The memory curator records
+accepted and rejected frontier proposals so the system can learn which
+directions were explored, which were rejected, and under what conditions they
+should be revisited.
+
 ## 5. Hierarchy is not optional
 
 Flat swarms are the wrong default for long-running repo evolution. Peer agents

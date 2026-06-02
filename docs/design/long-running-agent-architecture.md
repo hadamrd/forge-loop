@@ -32,6 +32,7 @@ They are inputs consumed by a broader control system.
 | Control | `forge_loop.control` | Maestro boot/resume, tick state machine, dispatch decisions, recovery. |
 | Tasks | `forge_loop.tasks` | Task/saga lifecycle, leases, heartbeats, compensation, terminal states. |
 | Frontier | `forge_loop.frontier` | Current product frontier cursor, hot files/tests, active decisions, rejected paths. |
+| Frontier generation | Existing `forge_loop.brainstormer` + future proposal ledger | Axis-aligned candidate frontier generation from vision, backlog, memory, and external research. |
 | Memory | `forge_loop.memory` | Semantic/episodic/procedural memory, promotion, supersession, compaction. |
 | Execution | `forge_loop.execution` | Disposable worker runtime contracts and structured worker results. |
 | Sandbox | `forge_loop.sandbox` | Worktree/container policy, MCP allowlists, secrets, egress, cleanup/quarantine. |
@@ -47,9 +48,12 @@ runtime behavior.
 2. Build projections and boot-context assembly from those contracts.
 3. Mirror current runner events into the new event-log shape.
 4. Dogfood a frontier cursor for forge-loop itself.
-5. Add a memory curator that promotes selected worker observations.
-6. Move `_tick` responsibilities into the control/task modules incrementally.
-7. Only then add more parallelism or stronger sandbox backends.
+5. Treat `forge-loop brainstorm` as the frontier-generation layer: proposals
+   become candidate backlog, not accepted strategy, until the maestro/curator
+   records why they are accepted, rejected, or deferred.
+6. Add a memory curator that promotes selected worker observations.
+7. Move `_tick` responsibilities into the control/task modules incrementally.
+8. Only then add more parallelism or stronger sandbox backends.
 
 ## Non-Goals For The First Slice
 
@@ -66,10 +70,12 @@ The dogfood target is:
 
 1. A fresh maestro session can load a forge-loop frontier cursor.
 2. It can see active decisions and rejected paths.
-3. It can dispatch a bounded task with an explicit sandbox policy.
-4. It can record task events into the durable log contract.
-5. It can promote only selected observations into memory.
-6. It can explain why the frontier moved.
+3. It can generate candidate frontier work through the brainstormer without
+   accepting duplicates or cosmetic tickets as strategy.
+4. It can dispatch a bounded task with an explicit sandbox policy.
+5. It can record task events into the durable log contract.
+6. It can promote only selected observations into memory.
+7. It can explain why the frontier moved.
 
 Until those properties are demonstrable, forge-loop should be described as a
 prototype loop runner, not as a mature autonomous engineering system.

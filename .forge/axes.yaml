@@ -1,0 +1,90 @@
+axes:
+  - name: durable-control-plane
+    customer: "A forge-loop operator running autonomous work across multiple sessions."
+    valuable_means: "The system records durable events, projection cursors, task state, and replayable decisions so a reset cannot erase project cognition."
+    acceptable_work:
+      - "SQLite/WAL event-log persistence and replay behavior."
+      - "Projection cursors and boot-time reconstruction checks."
+      - "Legacy runner events mirrored into the durable event spine."
+      - "Idempotency, sequence, and replay invariants tested after process restart."
+    rejected_as_cosmetic:
+      - "rename"
+      - "tidy"
+      - "cleanup only"
+      - "formatting"
+      - "comment polish"
+
+  - name: project-cognition-memory
+    customer: "A maestro resuming forge-loop after context loss."
+    valuable_means: "Important decisions, rejected ideas, task episodes, and reusable skills are curated into durable memory with provenance and supersession."
+    acceptable_work:
+      - "Semantic memory store for decisions, rejected paths, and repo facts."
+      - "Episodic memory for task attempts, failures, and lessons."
+      - "Procedural memory for validated repair or refactor skills."
+      - "Compaction checks that preserve load-bearing decisions."
+    rejected_as_cosmetic:
+      - "transcript dump"
+      - "notes dump"
+      - "summarize everything"
+      - "chat history archive"
+      - "documentation only"
+
+  - name: frontier-generation
+    customer: "A product maestro deciding what forge-loop should attack next."
+    valuable_means: "The brainstormer converts vision, axes, backlog, memory, and external research into non-duplicate frontier candidates that can be accepted, rejected, or deferred."
+    acceptable_work:
+      - "Brainstorm prompt/rubric improvements that produce actionable frontier candidates."
+      - "Backlog deduplication and anti-cosmetic filters tied to value axes."
+      - "Frontier proposal records that preserve why a candidate was accepted or rejected."
+      - "Integration of current state-of-art research into frontier generation inputs."
+    rejected_as_cosmetic:
+      - "idea dump"
+      - "random suggestions"
+      - "vague roadmap"
+      - "nice to have"
+      - "prompt polish only"
+
+  - name: sandboxed-worker-execution
+    customer: "An operator dispatching workers on a real repository without trusting their context or code."
+    valuable_means: "Workers operate in isolated worktrees with explicit capability policy, bounded tools, cleanup, quarantine, and compensating actions."
+    acceptable_work:
+      - "Task worktree lifecycle and cleanup/quarantine behavior."
+      - "Sandbox policy objects for filesystem, network, secrets, and MCP allowlists."
+      - "Lease and heartbeat integration for stale worker detection."
+      - "Saga compensation for abandoned branches, worktrees, and partial changes."
+    rejected_as_cosmetic:
+      - "shared checkout"
+      - "manual cleanup"
+      - "broad shell access"
+      - "trust the worker"
+      - "docker only"
+
+  - name: self-dogfood-operability
+    customer: "A forge-loop maintainer using forge-loop to evolve forge-loop itself."
+    valuable_means: "The repo contains enough local configuration, status commands, and issue hygiene for forge-loop to run on itself with bounded, explainable behavior."
+    acceptable_work:
+      - "Repo-local forge-loop configuration for dogfood runs."
+      - "Status and doctor output that exposes frontier, memory, task, and replay health."
+      - "Issue bodies and labels that make worker dispatch bounded and recoverable."
+      - "Operator runbooks for safe dry-runs and recovery."
+    rejected_as_cosmetic:
+      - "landing page"
+      - "badge"
+      - "readme polish"
+      - "screenshot"
+      - "marketing"
+
+  - name: quality-and-evidence-gates
+    customer: "A maintainer deciding whether an autonomous patch is semantically trustworthy."
+    valuable_means: "Critic, tests, audits, and stronger oracles catch wrong-but-green patches before they advance memory or frontier state."
+    acceptable_work:
+      - "Replay, restart, and adversarial tests for control-plane invariants."
+      - "Contract tests that keep fake adapters aligned with real behavior."
+      - "Critic/enforcer checks for memory, sandbox, and task-saga rules."
+      - "Mutation-style or strengthened test oracles for high-risk changes."
+    rejected_as_cosmetic:
+      - "happy path only"
+      - "increase coverage number"
+      - "snapshot churn"
+      - "test rename"
+      - "assert true"
