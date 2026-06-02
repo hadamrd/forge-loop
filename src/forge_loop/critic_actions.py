@@ -30,6 +30,9 @@ class GhClient(Protocol):
                             file: str | None = None, line: int | None = None,
                             repo: str | None = None) -> bool: ...
 
+    @property
+    def auth_source(self) -> str: ...
+
 
 @dataclass
 class CriticActionPlan:
@@ -133,17 +136,36 @@ def apply_critic_report(
     plan = plan_actions(
         report, pr_changed_lines, block_on_sev2, min_findings_for_approve,
     )
+    mutation_failed = False
 
     if plan.block_merge:
-        gh.disable_pr_auto_merge(pr_url, repo=repo)
+        mutation_failed |= _record_mutation_result(
+            "disable_pr_auto_merge",
+            gh.disable_pr_auto_merge(pr_url, repo=repo),
+            gh=gh,
+            pr_url=pr_url,
+            emit=emit,
+        )
     if plan.labels_to_add:
-        gh.add_pr_label(pr_url, plan.labels_to_add, repo=repo)
+        mutation_failed |= _record_mutation_result(
+            "add_pr_label",
+            gh.add_pr_label(pr_url, plan.labels_to_add, repo=repo),
+            gh=gh,
+            pr_url=pr_url,
+            emit=emit,
+        )
 
     for f in plan.inline_comments:
-        gh.post_review_comment(
-            pr_url,
-            f"**[{f.severity}/{f.category}]** {f.message}",
-            file=f.file, line=f.line, repo=repo,
+        mutation_failed |= _record_mutation_result(
+            "post_review_comment",
+            gh.post_review_comment(
+                pr_url,
+                f"**[{f.severity}/{f.category}]** {f.message}",
+                file=f.file, line=f.line, repo=repo,
+            ),
+            gh=gh,
+            pr_url=pr_url,
+            emit=emit,
         )
 
     if plan.summary_comments:
@@ -153,7 +175,13 @@ def apply_critic_report(
             f"{' — ' if (f.file or f.line) else ''}{f.message}"
             for f in plan.summary_comments
         )
-        gh.post_review_comment(pr_url, f"Critic findings:\n{summary}", repo=repo)
+        mutation_failed |= _record_mutation_result(
+            "post_review_comment",
+            gh.post_review_comment(pr_url, f"Critic findings:\n{summary}", repo=repo),
+            gh=gh,
+            pr_url=pr_url,
+            emit=emit,
+        )
 
     if report.manifesto_violations:
         viol_summary = "\n".join(
@@ -161,13 +189,19 @@ def apply_critic_report(
             f"`{v.quote.strip()[:120]}` → {v.suggested_fix}"
             for v in report.manifesto_violations
         )
-        gh.post_review_comment(
-            pr_url,
-            f"Manifesto violations:\n{viol_summary}",
-            repo=repo,
+        mutation_failed |= _record_mutation_result(
+            "post_review_comment",
+            gh.post_review_comment(
+                pr_url,
+                f"Manifesto violations:\n{viol_summary}",
+                repo=repo,
+            ),
+            gh=gh,
+            pr_url=pr_url,
+            emit=emit,
         )
 
-    if emit is not None:
+    if emit is not None and not mutation_failed:
         emit("critic_actions_applied", {
             "pr": pr_url,
             "block_merge": plan.block_merge,
@@ -179,3 +213,26 @@ def apply_critic_report(
         })
 
     return plan
+
+
+def _record_mutation_result(
+    method: str,
+    ok: bool,
+    *,
+    gh: GhClient,
+    pr_url: str,
+    emit: Callable[[str, dict[str, Any]], None] | None,
+) -> bool:
+    if ok:
+        return False
+    if emit is None:
+        return True
+    emit(
+        "critic_actions_failed",
+        {
+            "pr": pr_url,
+            "method": method,
+            "auth_source": getattr(gh, "auth_source", "github-client"),
+        },
+    )
+    return True

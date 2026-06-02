@@ -26,6 +26,7 @@ until each method migrates.
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
@@ -76,11 +77,21 @@ class GhError(RuntimeError):
     readers can reconstruct what happened without re-issuing the call.
     """
 
-    def __init__(self, method: str, status: int, body_tail: str) -> None:
-        super().__init__(f"github {method} returned HTTP {status}: {body_tail[:300]}")
+    def __init__(
+        self,
+        method: str,
+        status: int,
+        body_tail: str,
+        *,
+        auth_source: str = "unknown",
+    ) -> None:
+        super().__init__(
+            f"github {method} via {auth_source} returned HTTP {status}: {body_tail[:300]}"
+        )
         self.method = method
         self.status = status
         self.body_tail = body_tail
+        self.auth_source = auth_source
 
 
 # ---------------------------------------------------------------------------
@@ -114,24 +125,87 @@ class GhClient(Protocol):
     ) -> Issue:
         ...
 
+    def check_auth(self) -> None:
+        ...
+
+    @property
+    def auth_source(self) -> str:
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Auth resolution — small, explicit, documented.
 # ---------------------------------------------------------------------------
 
 
-def resolve_token() -> str | None:
+class TokenSource(Protocol):
+    def env_token(self, name: str) -> str | None:
+        ...
+
+    def gh_auth_token(self) -> str | None:
+        ...
+
+
+@dataclass(frozen=True)
+class ResolvedToken:
+    token: str | None
+    source: str
+
+
+class GhTokenSource:
+    """Real GitHub token source for SDK clients.
+
+    Precedence is intentionally aligned with common GitHub tooling:
+    ``GH_TOKEN`` first, ``GITHUB_TOKEN`` second, then the authenticated
+    ``gh`` CLI token. Token values are never logged.
+    """
+
+    def env_token(self, name: str) -> str | None:
+        value = os.environ.get(name)
+        return value.strip() if value and value.strip() else None
+
+    def gh_auth_token(self) -> str | None:
+        try:
+            result = subprocess.run(
+                ["gh", "auth", "token"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        token = result.stdout.strip()
+        return token or None
+
+
+def resolve_token_info(source: TokenSource | None = None) -> ResolvedToken:
+    source = source or GhTokenSource()
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        token = source.env_token(name)
+        if token:
+            return ResolvedToken(token=token, source=name)
+    token = source.gh_auth_token()
+    if token:
+        return ResolvedToken(token=token, source="gh auth token")
+    return ResolvedToken(token=None, source="none")
+
+
+def resolve_token(source: TokenSource | None = None) -> str | None:
     """Resolve a GitHub token from env (canonical for dev tools).
 
     Precedence:
     1. ``GH_TOKEN`` env (gh CLI convention)
     2. ``GITHUB_TOKEN`` env (GitHub Actions convention)
-    3. None — caller decides whether unauthenticated mode is acceptable.
+    3. ``gh auth token`` (operator is authenticated through the gh CLI)
+    4. None — caller decides whether unauthenticated mode is acceptable.
 
     Operators set the token in their ``.env`` next to ``LOOP_GH_REPO``.
     A future Settings field could surface this if needed.
     """
-    return os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or None
+    return resolve_token_info(source).token
 
 
 # ---------------------------------------------------------------------------
@@ -146,15 +220,32 @@ class GithubkitClient:
     + reuses connections, so concurrent calls share the pipeline.
     """
 
-    def __init__(self, token: str | None = None) -> None:
+    def __init__(self, token: str | None = None, *, token_source: TokenSource | None = None) -> None:
         from githubkit import GitHub
-        self._gh = GitHub(token or resolve_token())
+        resolved = resolve_token_info(token_source) if token is None else ResolvedToken(token, "explicit")
+        self._auth_source = resolved.source
+        self._gh = GitHub(resolved.token)
+
+    @property
+    def auth_source(self) -> str:
+        return self._auth_source
 
     def _raise_if_error(self, method: str, response: Any) -> None:
         status = getattr(response, "status_code", None)
         if status and status >= 400:
             body = getattr(response, "text", "") or str(getattr(response, "parsed_data", ""))
-            raise GhError(method, status, body)
+            raise GhError(method, status, body, auth_source=self.auth_source)
+
+    def check_auth(self) -> None:
+        if self.auth_source == "none":
+            raise GhError(
+                "check_auth",
+                401,
+                "no GitHub token available; set GH_TOKEN/GITHUB_TOKEN or run gh auth login",
+                auth_source=self.auth_source,
+            )
+        resp = self._gh.rest.users.get_authenticated()
+        self._raise_if_error("check_auth", resp)
 
     def issues_by_label(self, owner: str, repo: str, label: str, limit: int) -> list[Issue]:
         resp = self._gh.rest.issues.list_for_repo(
@@ -291,6 +382,7 @@ class MockGhClient:
     create_issue_responses: list[int] = field(default_factory=list)
     next_issue_number: int | None = None
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    auth_source: str = "mock"
 
     def _record(self, method: str, **kwargs: Any) -> None:
         self.calls.append((method, kwargs))
@@ -334,6 +426,9 @@ class MockGhClient:
         issue = Issue(number=n, title=title, body=body, state="open", labels=list(labels))
         self.issues[(owner, repo, n)] = issue
         return issue
+
+    def check_auth(self) -> None:
+        self._record("check_auth")
 
     def _next_number(self) -> int:
         existing = [n for (_, _, n) in self.issues]
@@ -397,11 +492,15 @@ def list_open_backlog(
 __all__ = [
     "GhClient",
     "GhError",
+    "GhTokenSource",
     "GithubkitClient",
     "Issue",
     "MockGhClient",
     "OpenBacklog",
     "PullRequest",
+    "ResolvedToken",
+    "TokenSource",
     "list_open_backlog",
+    "resolve_token_info",
     "resolve_token",
 ]

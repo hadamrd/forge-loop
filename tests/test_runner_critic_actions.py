@@ -19,10 +19,14 @@ class _FakeGh:
     label_calls: list[tuple] = field(default_factory=list)
     disable_calls: list[tuple] = field(default_factory=list)
     comment_calls: list[dict] = field(default_factory=list)
+    remove_label_calls: list[tuple] = field(default_factory=list)
+    label_result: bool = True
+    comment_result: bool = True
+    remove_label_result: bool = True
 
     def add_pr_label(self, pr, labels, repo=None):  # type: ignore[no-untyped-def]
         self.label_calls.append((pr, tuple(labels), repo))
-        return True
+        return self.label_result
 
     def disable_pr_auto_merge(self, pr, repo=None):  # type: ignore[no-untyped-def]
         self.disable_calls.append((pr, repo))
@@ -32,7 +36,11 @@ class _FakeGh:
         self.comment_calls.append(
             {"pr": pr, "body": body, "file": file, "line": line, "repo": repo}
         )
-        return True
+        return self.comment_result
+
+    def remove_pr_label(self, pr, label, repo=None):  # type: ignore[no-untyped-def]
+        self.remove_label_calls.append((pr, label, repo))
+        return self.remove_label_result
 
 
 def _report(overall: str, findings: list[Finding]) -> CriticReport:
@@ -139,6 +147,26 @@ def test_apply_sev1_disables_auto_merge_and_labels_pr() -> None:
     assert gh.label_calls and "critic:blocking" in gh.label_calls[0][1]
     assert gh.comment_calls and gh.comment_calls[0]["file"] == "src/foo.py"
     assert any(k == "critic_actions_applied" for k, _ in emits)
+
+
+def test_apply_reports_failed_label_mutation_without_success_event() -> None:
+    gh = _FakeGh(label_result=False)
+    rep = _report("request_changes", [
+        Finding("sev1", "correctness", "src/foo.py", 7, "uh oh"),
+    ])
+    emits: list[tuple[str, dict]] = []
+
+    apply_critic_report(
+        rep, "https://gh.com/o/r/pull/9", pr_changed_lines=120,
+        block_on_sev2=False, min_findings_for_approve=50,
+        gh=gh, repo="o/r", emit=lambda k, p: emits.append((k, p)),
+    )
+
+    assert not any(k == "critic_actions_applied" for k, _ in emits)
+    failed = [payload for kind, payload in emits if kind == "critic_actions_failed"]
+    assert failed
+    assert failed[0]["method"] == "add_pr_label"
+    assert failed[0]["auth_source"] == "github-client"
 
 
 def test_apply_approve_zero_findings_large_pr_blocks_and_labels_suspicious() -> None:

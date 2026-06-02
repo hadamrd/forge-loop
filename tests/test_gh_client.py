@@ -8,10 +8,13 @@ in a recorded-fixture pass, deferred to follow-up.
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from forge_loop.gh_client import (
     GhError,
+    GhTokenSource,
     Issue,
     MockGhClient,
     PullRequest,
@@ -36,9 +39,44 @@ def test_resolve_token_falls_back_to_github_token(monkeypatch: pytest.MonkeyPatc
     assert resolve_token() == "from-actions"
 
 
+class _FakeTokenSource:
+    def __init__(self, *, env: dict[str, str | None], gh_token: str | None = None) -> None:
+        self.env = env
+        self.gh_token = gh_token
+
+    def env_token(self, name: str) -> str | None:
+        return self.env.get(name)
+
+    def gh_auth_token(self) -> str | None:
+        return self.gh_token
+
+
+def test_resolve_token_uses_gh_auth_token_after_env_vars() -> None:
+    source = _FakeTokenSource(env={"GH_TOKEN": None, "GITHUB_TOKEN": None}, gh_token="from-gh-cli")
+    assert resolve_token(source) == "from-gh-cli"
+
+
+def test_resolve_token_prefers_env_over_gh_auth_token() -> None:
+    source = _FakeTokenSource(env={"GH_TOKEN": "from-env"}, gh_token="from-gh-cli")
+    assert resolve_token(source) == "from-env"
+
+
+def test_real_token_source_returns_none_when_gh_auth_token_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Run:
+        returncode = 1
+        stdout = ""
+        stderr = "not logged in"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Run())
+    assert GhTokenSource().gh_auth_token() is None
+
+
 def test_resolve_token_returns_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(GhTokenSource, "gh_auth_token", lambda self: None)
     assert resolve_token() is None
 
 
@@ -99,6 +137,14 @@ def test_mock_raise_on_fires_typed_error() -> None:
         gh.add_comment(owner="o", repo="r", number=1, body="x")
     assert excinfo.value.status == 403
     assert "rate limited" in excinfo.value.body_tail
+
+
+def test_mock_check_auth_raises_configured_auth_error() -> None:
+    gh = MockGhClient(raise_on={"check_auth": GhError("check_auth", 401, "bad credentials")})
+    with pytest.raises(GhError) as excinfo:
+        gh.check_auth()
+    assert excinfo.value.method == "check_auth"
+    assert gh.calls == [("check_auth", {})]
 
 
 # ---------------------------------------------------------------------------
