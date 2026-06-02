@@ -6,6 +6,7 @@ legacy JSONL events through :mod:`forge_loop.state` and
 control-plane work should use.
 """
 
+from forge_loop.eventlog.legacy_mirror import LegacyEventMirror, LegacyRunnerEventKind
 from forge_loop.eventlog.models import EventEnvelope, EventId, EventKind, EventRef
 from forge_loop.eventlog.projections import ProjectionCursor
 from forge_loop.eventlog.sqlite import SqliteEventLog
@@ -18,6 +19,8 @@ __all__ = [
     "EventLog",
     "EventRef",
     "InMemoryEventLog",
+    "LegacyEventMirror",
+    "LegacyRunnerEventKind",
     "ProjectionCursor",
     "SqliteEventLog",
 ]

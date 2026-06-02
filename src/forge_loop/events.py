@@ -327,11 +327,14 @@ def append_event_with_registry_check(events_path: Path, kind: str, **fields: Any
             DeprecationWarning,
             stacklevel=3,
         )
+    durable_mirror = fields.pop("durable_mirror", None)
     events_path.parent.mkdir(parents=True, exist_ok=True)
     rec = {"ts": _now_iso(), "kind": kind, **fields}
     with open(events_path, "a") as f:
         f.write(json.dumps(rec, default=str) + "\n")
     _log_event(kind, rec)
+    if durable_mirror is not None:
+        durable_mirror.mirror_record(rec)
 
 
 __all__ = [
