@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from datetime import UTC
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -38,6 +39,13 @@ class ProductCommandsMixin:
             ProposedEpic,
             ProposedTicket,
             filter_report_for_vision,
+        )
+        from forge_loop.frontier.decisions import (
+            FrontierDecision,
+            FrontierDecisionLedger,
+            FrontierDecisionOutcome,
+            ProposalKind,
+            normalize_candidate_key,
         )
         from forge_loop.gh_client import OpenBacklog, list_open_backlog
         from forge_loop.product_vision import MissingVisionError, discover
@@ -78,6 +86,12 @@ class ProductCommandsMixin:
         if report_path_arg and not args.apply:
             typer.echo("brainstorm: --report requires --apply.", err=True)
             return 2
+        source_report_path: Path | None = Path(report_path_arg) if report_path_arg else None
+        source_report_hash = (
+            sha256(source_report_path.read_bytes()).hexdigest()
+            if source_report_path is not None and source_report_path.exists()
+            else None
+        )
 
         def _revalidate_report(raw: BrainstormReport) -> tuple[BrainstormReport, int]:
             return filter_report_for_vision(raw, vision)
@@ -92,31 +106,96 @@ class ProductCommandsMixin:
 
         def _drop_duplicate_titles(
             raw: BrainstormReport, backlog: OpenBacklog
-        ) -> tuple[BrainstormReport, int]:
+        ) -> tuple[BrainstormReport, int, list[FrontierDecision]]:
             existing = {
-                item.title.strip().casefold()
+                normalize_candidate_key(item.title, "")[0]: item
                 for item in [*backlog.epics, *backlog.tickets]
                 if item.title.strip()
             }
-            seen = set(existing)
+            seen: dict[str, Any] = dict(existing)
             epics: list[ProposedEpic] = []
             tickets: list[ProposedTicket] = []
+            duplicate_decisions: list[FrontierDecision] = []
             dropped = 0
             for epic in raw.proposed_epics:
-                key = epic.title.strip().casefold()
+                key = normalize_candidate_key(epic.title, "")[0]
                 if key in seen:
                     dropped += 1
+                    duplicate_decisions.append(
+                        _rejected_duplicate_decision(
+                            epic,
+                            ProposalKind.EPIC,
+                            seen[key],
+                        )
+                    )
                     continue
-                seen.add(key)
+                seen[key] = epic
                 epics.append(epic)
             for ticket in raw.proposed_tickets:
-                key = ticket.title.strip().casefold()
+                key = normalize_candidate_key(ticket.title, "")[0]
                 if key in seen:
                     dropped += 1
+                    duplicate_decisions.append(
+                        _rejected_duplicate_decision(
+                            ticket,
+                            ProposalKind.TICKET,
+                            seen[key],
+                        )
+                    )
                     continue
-                seen.add(key)
+                seen[key] = ticket
                 tickets.append(ticket)
-            return BrainstormReport(proposed_epics=epics, proposed_tickets=tickets), dropped
+            return (
+                BrainstormReport(proposed_epics=epics, proposed_tickets=tickets),
+                dropped,
+                duplicate_decisions,
+            )
+
+        def _source_key(kind: ProposalKind, title: str, axis: str) -> str:
+            title_key, axis_key = normalize_candidate_key(title, axis)
+            source = source_report_hash or str(source_report_path or "brainstorm")
+            return f"{source}:{kind.value}:{axis_key}:{title_key}"
+
+        def _rejected_duplicate_decision(
+            proposal: ProposedEpic | ProposedTicket,
+            kind: ProposalKind,
+            duplicate: Any,
+        ) -> FrontierDecision:
+            duplicate_title = getattr(duplicate, "title", None)
+            duplicate_issue = getattr(duplicate, "number", None)
+            return FrontierDecision(
+                proposal_title=proposal.title,
+                proposal_kind=kind,
+                axis=proposal.axis,
+                outcome=FrontierDecisionOutcome.REJECTED,
+                rationale="dropped during reviewed-report apply because an open backlog item already has this title and axis",
+                source_key=_source_key(kind, proposal.title, proposal.axis),
+                duplicate_of_title=duplicate_title if isinstance(duplicate_title, str) else None,
+                duplicate_of_issue=duplicate_issue if isinstance(duplicate_issue, int) else None,
+                source_report_path=str(source_report_path)
+                if source_report_path is not None
+                else None,
+                source_report_hash=source_report_hash,
+            )
+
+        def _accepted_decision(
+            proposal: ProposedEpic | ProposedTicket,
+            kind: ProposalKind,
+            issue_number: int,
+        ) -> FrontierDecision:
+            return FrontierDecision(
+                proposal_title=proposal.title,
+                proposal_kind=kind,
+                axis=proposal.axis,
+                outcome=FrontierDecisionOutcome.ACCEPTED,
+                rationale="filed from reviewed brainstorm report",
+                source_key=_source_key(kind, proposal.title, proposal.axis),
+                issue_number=issue_number,
+                source_report_path=str(source_report_path)
+                if source_report_path is not None
+                else None,
+                source_report_hash=source_report_hash,
+            )
 
         dropped_count = 0
         if report_path_arg:
@@ -178,20 +257,34 @@ class ProductCommandsMixin:
                     err=True,
                 )
                 return 1
-            report, duplicate_count = _drop_duplicate_titles(report, backlog)
+            report, duplicate_count, duplicate_decisions = _drop_duplicate_titles(report, backlog)
             dropped_count += duplicate_count
             if dropped_count:
                 typer.echo(
                     f"brainstorm: dropped {dropped_count} proposal(s) during report validation."
                 )
+        else:
+            duplicate_decisions = []
 
         if not report.proposed_epics and not report.proposed_tickets:
+            if source_report_path is not None:
+                ledger = FrontierDecisionLedger(repo_path / ".forge" / "frontier-decisions.yaml")
+                for decision in duplicate_decisions:
+                    ledger.record(decision)
             typer.echo("brainstorm: no proposals — nothing to file.")
             return 0
 
         epic_axis_to_number: dict[str, int] = {}
         succeeded: list[tuple[str, int]] = []
         failed: list[tuple[str, str]] = []
+        decision_ledger = (
+            FrontierDecisionLedger(repo_path / ".forge" / "frontier-decisions.yaml")
+            if source_report_path is not None
+            else None
+        )
+        if decision_ledger is not None:
+            for decision in duplicate_decisions:
+                decision_ledger.record(decision)
 
         def _render_epic_body(epic: ProposedEpic) -> str:
             parts = [epic.body.strip()] if epic.body else []
@@ -223,6 +316,10 @@ class ProductCommandsMixin:
                 )
                 epic_axis_to_number[epic.axis] = issue.number
                 succeeded.append((epic.title, issue.number))
+                if decision_ledger is not None:
+                    decision_ledger.record(
+                        _accepted_decision(epic, ProposalKind.EPIC, issue.number)
+                    )
             except Exception as exc:  # noqa: BLE001
                 failed.append((epic.title, str(exc)))
 
@@ -240,6 +337,10 @@ class ProductCommandsMixin:
                     labels=labels,
                 )
                 succeeded.append((ticket.title, issue.number))
+                if decision_ledger is not None:
+                    decision_ledger.record(
+                        _accepted_decision(ticket, ProposalKind.TICKET, issue.number)
+                    )
             except Exception as exc:  # noqa: BLE001
                 failed.append((ticket.title, str(exc)))
 
