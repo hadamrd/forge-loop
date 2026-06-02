@@ -11,6 +11,7 @@ from typing import Any
 
 import typer
 
+from forge_loop.control.status import collect_control_plane_status
 from forge_loop.state import tail_events
 
 
@@ -113,7 +114,9 @@ class StatusCommandsMixin:
             for line in raw[-5:]:
                 try:
                     e = json.loads(line)
-                    last_5_events.append({"ts": str(e.get("ts", "?")), "kind": str(e.get("kind", "?"))})
+                    last_5_events.append(
+                        {"ts": str(e.get("ts", "?")), "kind": str(e.get("kind", "?"))}
+                    )
                 except json.JSONDecodeError:
                     pass
         runner_stale = state_blob.get("state") == "running" and not pid_alive
@@ -127,7 +130,9 @@ class StatusCommandsMixin:
                             "title": entry.get("title"),
                             "started_ts": None,
                             "last_event_ts": None,
-                            "status": "stale_unconfirmed" if runner_stale else "running_unconfirmed",
+                            "status": "stale_unconfirmed"
+                            if runner_stale
+                            else "running_unconfirmed",
                             "worktree": None,
                             "log_path": None,
                         }
@@ -219,6 +224,11 @@ class StatusCommandsMixin:
             "axis_filter": axis_filter,
             "config_ok": config_error is None,
             "config_error": config_error,
+            "control_plane": collect_control_plane_status(
+                Path(getattr(cfg, "repo", cfg.state_dir)),
+                now,
+                state_dir=Path(cfg.state_dir),
+            ),
         }
 
         if getattr(args, "json", False):
@@ -290,7 +300,9 @@ class StatusCommandsMixin:
                 axis_lines.append(f"  {ax}", style="cyan")
                 axis_lines.append(f" ({len(axes_view[ax])})  {nums}\n")
             if UNALIGNED_BUCKET in axes_view:
-                unaligned_nums = ", ".join(f"#{i.get('number')}" for i in axes_view[UNALIGNED_BUCKET])
+                unaligned_nums = ", ".join(
+                    f"#{i.get('number')}" for i in axes_view[UNALIGNED_BUCKET]
+                )
                 axis_lines.append(f"  {UNALIGNED_BUCKET}", style="yellow")
                 axis_lines.append(f" ({len(axes_view[UNALIGNED_BUCKET])})  {unaligned_nums}\n")
             table.add_row("axes", axis_lines)

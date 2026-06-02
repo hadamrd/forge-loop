@@ -8,10 +8,11 @@ behaviour.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from forge_loop.worker_sessions import (
-    WorkerSession,
     WorkerSessionStore,
     recoverable_sessions,
 )
@@ -22,7 +23,6 @@ from forge_loop.worker_state import (
     is_allowed,
     transition,
 )
-
 
 # ---------------------------------------------------------------------------
 # FSM — legal transitions are exactly the set documented in the module.
@@ -42,11 +42,13 @@ def test_running_to_awaiting_critic_is_the_happy_path_edge() -> None:
 
 def test_awaiting_critic_can_revise_merge_or_abandon() -> None:
     next_states = allowed_next(WorkerState.AWAITING_CRITIC)
-    assert next_states == frozenset({
-        WorkerState.REVISING,
-        WorkerState.MERGED,
-        WorkerState.ABANDONED,
-    })
+    assert next_states == frozenset(
+        {
+            WorkerState.REVISING,
+            WorkerState.MERGED,
+            WorkerState.ABANDONED,
+        }
+    )
 
 
 def test_revising_loops_back_to_awaiting_critic() -> None:
@@ -141,7 +143,7 @@ def test_transition_to_raises_keyerror_for_unknown_session() -> None:
 def test_by_state_returns_matching_rows_in_creation_order() -> None:
     store = WorkerSessionStore(":memory:")
     s1 = store.create(issue=1, branch="b1")
-    s2 = store.create(issue=2, branch="b2")
+    store.create(issue=2, branch="b2")
     s3 = store.create(issue=3, branch="b3")
     store.transition_to(s1.session_id, WorkerState.RUNNING)
     store.transition_to(s3.session_id, WorkerState.RUNNING)
@@ -226,6 +228,36 @@ def test_persistence_across_connections(tmp_path) -> None:
     assert loaded.state == WorkerState.RUNNING
 
 
+def test_existing_store_without_lease_column_is_migrated(tmp_path) -> None:
+    db_file = tmp_path / "sessions.db"
+    with sqlite3.connect(db_file) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE worker_sessions (
+                session_id          TEXT PRIMARY KEY,
+                issue               INTEGER NOT NULL,
+                branch              TEXT NOT NULL,
+                state               TEXT NOT NULL,
+                worktree_path       TEXT NOT NULL DEFAULT '',
+                sdk_session_id      TEXT,
+                pr_url              TEXT,
+                critic_iterations   INTEGER NOT NULL DEFAULT 0,
+                last_transition_reason TEXT NOT NULL DEFAULT '',
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL
+            );
+            """
+        )
+
+    store = WorkerSessionStore(db_file)
+    sess = store.create(issue=5, branch="loop/5")
+    store.set_lease_expires_at(sess.session_id, "2026-06-02T21:00:00Z")
+
+    loaded = store.get(sess.session_id)
+    assert loaded is not None
+    assert loaded.lease_expires_at == "2026-06-02T21:00:00Z"
+
+
 # ---------------------------------------------------------------------------
 # Settings — new fields land in the unified config tree.
 # ---------------------------------------------------------------------------
@@ -242,9 +274,7 @@ def test_settings_persistent_worker_default_off(monkeypatch: pytest.MonkeyPatch)
     assert s.max_critic_iterations == 3
 
 
-def test_settings_persistent_worker_env_override(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
+def test_settings_persistent_worker_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     from forge_loop.settings import Settings
 
     monkeypatch.setattr("forge_loop.settings._repo_root", lambda: tmp_path)
