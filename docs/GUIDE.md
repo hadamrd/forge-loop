@@ -211,10 +211,10 @@ $EDITOR .forge/quality-manifesto.md
 $EDITOR .forge/testing-manifesto.md
 
 # 2. Dry-run the brainstormer — it proposes axis-aligned epics + tickets
-GH_TOKEN=$(gh auth token) forge-loop brainstorm
+GH_TOKEN=$(gh auth token) forge-loop brainstorm --output report.yaml
 
-# 3. Apply: file them on GitHub with axis labels + customer-story citations
-forge-loop brainstorm --apply
+# 3. Review/curate report.yaml, then apply those exact reviewed items
+forge-loop brainstorm --apply --report report.yaml
 
 # 4. Dispatch — the loop only picks tickets that carry an axis label
 forge-loop run

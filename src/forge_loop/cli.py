@@ -140,6 +140,7 @@ app.add_typer(cluster_app, name="cluster")
 # unchanged. Tests can still import and call these with a SimpleNamespace.
 # ---------------------------------------------------------------------------
 
+
 def _brainstormer_factory(
     repo_path: Path,
     owner: str,
@@ -372,8 +373,14 @@ def cmd_brainstorm(
     apply: bool = typer.Option(
         False, "--apply", help="Actually file the proposed epics + tickets on GitHub."
     ),
+    output: str | None = typer.Option(
+        None, "--output", help="Write the dry-run BrainstormReport YAML to this path."
+    ),
+    report: str | None = typer.Option(
+        None, "--report", help="Apply this reviewed BrainstormReport YAML without re-sampling."
+    ),
 ) -> None:
-    _exit(_cmd_brainstorm(SimpleNamespace(apply=apply)))
+    _exit(_cmd_brainstorm(SimpleNamespace(apply=apply, output=output, report=report)))
 
 
 @app.command(

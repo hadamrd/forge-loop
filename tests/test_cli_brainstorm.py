@@ -24,7 +24,7 @@ from typer.testing import CliRunner
 
 from forge_loop import cli
 from forge_loop.brainstormer import BrainstormReport, ProposedEpic, ProposedTicket
-from forge_loop.gh_client import GhError, MockGhClient
+from forge_loop.gh_client import GhError, Issue, MockGhClient
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -42,9 +42,7 @@ def runner() -> CliRunner:
 def _write_vision(repo: Path, *, axes: list[dict[str, Any]] | None = None) -> None:
     forge = repo / ".forge"
     forge.mkdir(parents=True, exist_ok=True)
-    (forge / "product-vision.md").write_text(
-        "# Vision\n\nBuild the loop.\n", encoding="utf-8"
-    )
+    (forge / "product-vision.md").write_text("# Vision\n\nBuild the loop.\n", encoding="utf-8")
     if axes is None:
         axes = [
             {
@@ -67,9 +65,8 @@ def cwd_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # repo_path without depending on the operator's environment / cached
     # pydantic-settings.
     from types import SimpleNamespace as _NS
-    monkeypatch.setattr(
-        cli, "load", lambda: _NS(repo=tmp_path, github_repo="acme/widgets")
-    )
+
+    monkeypatch.setattr(cli, "load", lambda: _NS(repo=tmp_path, github_repo="acme/widgets"))
     return tmp_path
 
 
@@ -147,6 +144,26 @@ def test_brainstorm_dry_run_prints_yaml(
     assert not any(c[0] == "create_issue" for c in gh.calls)
 
 
+def test_brainstorm_dry_run_writes_output_report(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = _fixed_report()
+    output = cwd_repo / "brainstorm-report.yaml"
+    stub, gh = _install_stub(monkeypatch, report)
+
+    result = runner.invoke(cli.app, ["brainstorm", "--output", str(output)])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert stub.calls == 1
+    parsed = yaml.safe_load(output.read_text(encoding="utf-8"))
+    assert [e["title"] for e in parsed["proposed_epics"]] == ["Billing epic"]
+    assert [t["title"] for t in parsed["proposed_tickets"]] == [
+        "Wire Stripe SDK",
+        "Add receipt endpoint",
+    ]
+    assert not any(c[0] == "create_issue" for c in gh.calls)
+
+
 def test_brainstorm_factory_receives_po_provider_config(
     runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -199,11 +216,135 @@ def test_brainstorm_apply_files_epics_first(
     create_calls = [c for c in gh.calls if c[0] == "create_issue"]
     # Order: epic (501), ticket1 (502), ticket2 (503).
     assert [c[1]["title"] for c in create_calls] == [
-        "Billing epic", "Wire Stripe SDK", "Add receipt endpoint",
+        "Billing epic",
+        "Wire Stripe SDK",
+        "Add receipt endpoint",
     ]
     # Both ticket bodies cross-link to the epic.
     assert "Parent: #501" in create_calls[1][1]["body"]
     assert "Parent: #501" in create_calls[2][1]["body"]
+
+
+def test_brainstorm_apply_report_files_exact_reviewed_items_without_sdk(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewed report application must be deterministic: no resampling."""
+    report_path = cwd_repo / "reviewed.yaml"
+    report_path.write_text(
+        yaml.safe_dump(_fixed_report().model_dump(mode="json"), sort_keys=False),
+        encoding="utf-8",
+    )
+    gh = MockGhClient(create_issue_responses=[901, 902, 903])
+
+    def _explode(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("brainstormer SDK must not run when applying a report")
+
+    monkeypatch.setattr(cli, "_brainstormer_factory", _explode)
+    monkeypatch.setattr(cli, "_gh_client_factory", lambda: gh)
+
+    result = runner.invoke(cli.app, ["brainstorm", "--apply", "--report", str(report_path)])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    create_calls = [c for c in gh.calls if c[0] == "create_issue"]
+    assert [(c[1]["title"], c[1]["body"]) for c in create_calls] == [
+        (
+            "Billing epic",
+            "Enable payments\n\n\n## Customer story\n\nOperator wants invoicing",
+        ),
+        (
+            "Wire Stripe SDK",
+            "Parent: #901\n\nAdd stripe-python\n\n\n## Customer story\n\nOperator wants invoicing",
+        ),
+        (
+            "Add receipt endpoint",
+            "Parent: #901\n\nGET /receipts\n\n\n## Customer story\n\nOperator wants receipts",
+        ),
+    ]
+
+
+def test_brainstorm_apply_report_revalidates_axes_and_duplicates(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = BrainstormReport(
+        proposed_epics=[],
+        proposed_tickets=[
+            ProposedTicket(
+                title="Wire Stripe SDK",
+                body="Already exists",
+                axis="billing",
+                customer_story="Operator wants invoicing",
+            ),
+            ProposedTicket(
+                title="Bogus axis",
+                body="Must be filtered",
+                axis="missing",
+                customer_story="Operator wants invoicing",
+            ),
+            ProposedTicket(
+                title="File deterministic report",
+                body="Fresh item",
+                axis="billing",
+                customer_story="Operator wants deterministic backlog filing",
+            ),
+        ],
+    )
+    report_path = cwd_repo / "reviewed.yaml"
+    report_path.write_text(
+        yaml.safe_dump(report.model_dump(mode="json"), sort_keys=False),
+        encoding="utf-8",
+    )
+    gh = MockGhClient(
+        create_issue_responses=[777],
+        issues_by_label_response=[Issue(number=42, title="Wire Stripe SDK")],
+    )
+
+    def _explode(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("brainstormer SDK must not run when applying a report")
+
+    monkeypatch.setattr(cli, "_brainstormer_factory", _explode)
+    monkeypatch.setattr(cli, "_gh_client_factory", lambda: gh)
+
+    result = runner.invoke(cli.app, ["brainstorm", "--apply", "--report", str(report_path)])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    create_calls = [c for c in gh.calls if c[0] == "create_issue"]
+    assert [c[1]["title"] for c in create_calls] == ["File deterministic report"]
+    assert "dropped" in result.stdout.lower()
+
+
+def test_brainstorm_apply_report_backlog_scan_failure_exits_1(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_path = cwd_repo / "reviewed.yaml"
+    report_path.write_text(
+        yaml.safe_dump(_fixed_report().model_dump(mode="json"), sort_keys=False),
+        encoding="utf-8",
+    )
+    gh = MockGhClient(
+        create_issue_responses=[901, 902, 903],
+        raise_on={"issues_by_label": GhError("issues_by_label", 401, "unauthorized")},
+    )
+
+    def _explode(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("brainstormer SDK must not run when applying a report")
+
+    monkeypatch.setattr(cli, "_brainstormer_factory", _explode)
+    monkeypatch.setattr(cli, "_gh_client_factory", lambda: gh)
+
+    result = runner.invoke(cli.app, ["brainstorm", "--apply", "--report", str(report_path)])
+
+    assert result.exit_code == 1
+    assert "failed to scan open backlog" in (result.stderr + result.stdout).lower()
+    assert not any(c[0] == "create_issue" for c in gh.calls)
+
+
+def test_brainstorm_report_without_apply_exits_2(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_stub(monkeypatch, _fixed_report())
+    result = runner.invoke(cli.app, ["brainstorm", "--report", "reviewed.yaml"])
+    assert result.exit_code == 2
+    assert "--report requires --apply" in (result.stderr + result.stdout)
 
 
 def test_brainstorm_apply_labels_epic(
@@ -297,9 +438,7 @@ def test_brainstorm_partial_failure_exits_1(
     result = runner.invoke(cli.app, ["brainstorm", "--apply"])
     assert result.exit_code == 1, result.stdout + result.stderr
     # Epic + first ticket DID get filed.
-    titles_created = [
-        c[1]["title"] for c in gh.calls if c[0] == "create_issue"
-    ]
+    titles_created = [c[1]["title"] for c in gh.calls if c[0] == "create_issue"]
     assert "Billing epic" in titles_created
     assert "Wire Stripe SDK" in titles_created
     # Reporting: successes on stdout, failure on stderr.

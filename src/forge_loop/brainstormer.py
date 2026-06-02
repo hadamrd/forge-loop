@@ -35,6 +35,7 @@ __all__ = [
     "Brainstormer",
     "ProposedEpic",
     "ProposedTicket",
+    "filter_report_for_vision",
 ]
 
 _log = get_logger("forge_loop.brainstormer")
@@ -72,6 +73,23 @@ class BrainstormReport(BaseModel):
     proposed_tickets: list[ProposedTicket] = Field(default_factory=list)
 
 
+def filter_report_for_vision(
+    report: BrainstormReport, vision: ProductVision
+) -> tuple[BrainstormReport, int]:
+    """Re-apply the brainstormer rubric to an existing report.
+
+    Returns the filtered report plus the number of proposals dropped. This
+    keeps the reviewed-report apply path on the same guardrails as fresh SDK
+    output without invoking a new SDK session.
+    """
+    epics = _filter_items(list(report.proposed_epics), vision, kind="epic")
+    tickets = _filter_items(list(report.proposed_tickets), vision, kind="ticket")
+    return (
+        BrainstormReport(proposed_epics=epics, proposed_tickets=tickets),
+        len(report.proposed_epics) + len(report.proposed_tickets) - len(epics) - len(tickets),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internals: prompt rendering + filtering
 # ---------------------------------------------------------------------------
@@ -103,10 +121,13 @@ def _render_backlog_block(backlog: Any) -> str:
     and ``tickets`` iterables of ``(number, title)``-shaped items. The
     flexibility keeps tests free of githubkit-shape coupling.
     """
+
     def _fmt(items: Any) -> str:
         out: list[str] = []
         for it in items or []:
-            num = getattr(it, "number", None) or (it.get("number") if isinstance(it, dict) else None)
+            num = getattr(it, "number", None) or (
+                it.get("number") if isinstance(it, dict) else None
+            )
             title = getattr(it, "title", None) or (it.get("title") if isinstance(it, dict) else "")
             out.append(f"  - #{num}: {title}")
         return "\n".join(out) if out else "  (none)"
@@ -283,15 +304,11 @@ class Brainstormer:
             raw = BrainstormReport.model_validate(payload)
         except (ValueError, ValidationError) as exc:
             raise RuntimeError(
-                f"brainstormer SDK returned malformed output ({exc}); "
-                f"last_message={last_message!r}"
+                f"brainstormer SDK returned malformed output ({exc}); last_message={last_message!r}"
             ) from exc
 
         # 4. Apply the anti-cosmetic guardrail.
-        return BrainstormReport(
-            proposed_epics=_filter_items(list(raw.proposed_epics), vision, kind="epic"),
-            proposed_tickets=_filter_items(list(raw.proposed_tickets), vision, kind="ticket"),
-        )
+        return filter_report_for_vision(raw, vision)[0]
 
     # -- helpers --------------------------------------------------------
 
@@ -333,7 +350,9 @@ class Brainstormer:
 
         return run_brainstormer_sdk
 
-    def _codex_sdk_fn(self, prompt: str, *, cwd: Path, timeout_s: int, model: str | None = None) -> Any:
+    def _codex_sdk_fn(
+        self, prompt: str, *, cwd: Path, timeout_s: int, model: str | None = None
+    ) -> Any:
         from forge_loop.agent_backend import run_codex_exec
 
         log_dir = Path(cwd) / "docs" / "ops" / "loop-runner-logs"
