@@ -334,7 +334,16 @@ def append_event_with_registry_check(events_path: Path, kind: str, **fields: Any
         f.write(json.dumps(rec, default=str) + "\n")
     _log_event(kind, rec)
     if durable_mirror is not None:
-        durable_mirror.mirror_record(rec)
+        try:
+            durable_mirror.mirror_record(rec)
+        except Exception as exc:  # noqa: BLE001 - JSONL append must remain authoritative
+            from forge_loop.log import get_logger
+
+            get_logger().warning(
+                "durable_mirror_failed",
+                kind=kind,
+                error=f"{type(exc).__name__}: {exc!s}"[:300],
+            )
 
 
 __all__ = [

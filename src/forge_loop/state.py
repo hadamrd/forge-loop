@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -106,21 +105,26 @@ def rotate_events_file_if_needed(
     except OSError as e:
         error = str(e)
         # Best-effort: try to record the failure.
-        _try_append_event(events_path, "events_rotation_failed", error=error,
-                          attempted_size=size)
+        _try_append_event(events_path, "events_rotation_failed", error=error, attempted_size=size)
         return {
-            "rotated": False, "rotated_size": size,
-            "archive_count": archive_count, "error": error,
+            "rotated": False,
+            "rotated_size": size,
+            "archive_count": archive_count,
+            "error": error,
         }
 
     # Success path: stamp the first event in the fresh file.
     _try_append_event(
-        events_path, "events_file_rotated",
-        rotated_size=size, archive_count=archive_count,
+        events_path,
+        "events_file_rotated",
+        rotated_size=size,
+        archive_count=archive_count,
     )
     return {
-        "rotated": True, "rotated_size": size,
-        "archive_count": archive_count, "error": None,
+        "rotated": True,
+        "rotated_size": size,
+        "archive_count": archive_count,
+        "error": None,
     }
 
 
@@ -159,6 +163,13 @@ def append_event(events_path: Path, kind: str, **fields: Any) -> None:
     surface a DeprecationWarning pointing the caller at the typed path.
     Behaviour is unchanged for the unregistered kinds.
     """
+    if "durable_mirror" not in fields:
+        with contextlib.suppress(Exception):
+            from forge_loop.eventlog.legacy_mirror import legacy_runner_mirror_for_events_path
+
+            mirror = legacy_runner_mirror_for_events_path(events_path)
+            if mirror is not None:
+                fields["durable_mirror"] = mirror
     from forge_loop.events import append_event_with_registry_check
 
     append_event_with_registry_check(events_path, kind, **fields)
@@ -194,12 +205,12 @@ def consolidate_sprint(
         "total": len(outcomes),
         "merged": [o["issue"] for o in outcomes if o.get("status") == "merged"],
         "open": [o["issue"] for o in outcomes if o.get("status") == "open"],
-        "failed": [o["issue"] for o in outcomes if o.get("status") in {"failed", "timeout", "no_pr"}],
+        "failed": [
+            o["issue"] for o in outcomes if o.get("status") in {"failed", "timeout", "no_pr"}
+        ],
         "pr_urls": [o["pr_url"] for o in outcomes if o.get("pr_url")],
         # Carry up the most-interesting subagent events (e.g. "bug_found")
-        "subagent_events_count": sum(
-            len(o.get("events") or []) for o in outcomes
-        ),
+        "subagent_events_count": sum(len(o.get("events") or []) for o in outcomes),
     }
     summaries_path.parent.mkdir(parents=True, exist_ok=True)
     with open(summaries_path, "a") as f:

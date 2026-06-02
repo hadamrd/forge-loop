@@ -13,7 +13,7 @@ def test_legacy_runner_mirror_records_representative_milestones(tmp_path: Path) 
     records = [
         {"kind": "tick_start", "tick": 7, "issues": [167]},
         {"kind": "po_done", "tick": 7, "expanded": [167], "skipped": []},
-        {"kind": "worker_started", "tick": 7, "issue": 167, "worktree": "/tmp/wt-loop-167"},
+        {"kind": "worker_start", "tick": 7, "issue": 167, "worktree": "/tmp/wt-loop-167"},
         {"kind": "watchdog_worker_stuck", "issue": 167, "idle_s": 901},
         {
             "kind": "tick_done",
@@ -83,6 +83,35 @@ def test_legacy_runner_mirror_is_idempotent_for_repeated_records(tmp_path: Path)
     assert [event.kind for event in events] == [EventKind.TICK_COMPLETED, EventKind.TASK_FAILED]
 
 
+def test_legacy_runner_mirror_keeps_distinct_worker_records(tmp_path: Path) -> None:
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+
+    mirror.mirror_record(
+        {
+            "kind": "worker_iteration_attempt",
+            "tick": 3,
+            "issue": 167,
+            "session_id": "worker-a",
+        }
+    )
+    mirror.mirror_record(
+        {
+            "kind": "worker_iteration_attempt",
+            "tick": 3,
+            "issue": 167,
+            "session_id": "worker-b",
+        }
+    )
+
+    events = list(log.since(0))
+    assert len(events) == 2
+    assert {event.idempotency_key for event in events} == {
+        "legacy-runner:task.dispatched:worker_iteration_attempt:tick=3:issue=167:worker=worker-a:pr=",
+        "legacy-runner:task.dispatched:worker_iteration_attempt:tick=3:issue=167:worker=worker-b:pr=",
+    }
+
+
 def test_legacy_runner_mirror_records_merge_blocked_from_critic_verdict(
     tmp_path: Path,
 ) -> None:
@@ -140,6 +169,29 @@ def test_legacy_runner_replay_reconstructs_task_timeline_after_sqlite_reopen(
         ProjectionCursor(sequence=timeline["issue:167"]["last_sequence"]),
     )
     assert reopened.get_projection_cursor("legacy-runner-mirror").sequence == 5
+
+
+def test_legacy_runner_replay_ignores_non_task_and_malformed_payloads(
+    tmp_path: Path,
+) -> None:
+    log = SqliteEventLog(tmp_path / "events.db")
+    log.append(EventKind.TICK_STARTED, {"tick": "not-an-int"})
+    log.append(EventKind.WORKER_OBSERVATION, {"issue": "not-an-int", "tick": 2})
+
+    assert replay_task_timeline(log.since(0)) == {}
+
+
+def test_runner_jsonl_path_mirrors_to_repo_durable_event_log_by_default(
+    tmp_path: Path,
+) -> None:
+    events_file = tmp_path / "docs" / "ops" / "loop-runner-events.jsonl"
+
+    append_event(events_file, "tick_start", tick=2, issues=[167])
+
+    assert len(events_file.read_text().splitlines()) == 1
+    durable = list(SqliteEventLog(tmp_path / ".forge" / "events.db").since(0))
+    assert [event.kind for event in durable] == [EventKind.TICK_STARTED]
+    assert durable[0].payload == {"legacy_kind": "tick_start", "tick": 2, "issues": [167]}
 
 
 def test_append_event_preserves_jsonl_when_durable_mirroring_is_enabled(

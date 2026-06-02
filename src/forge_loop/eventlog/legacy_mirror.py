@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from forge_loop.eventlog.models import EventEnvelope, EventKind
@@ -17,6 +18,9 @@ class LegacyRunnerEventKind(StrEnum):
     TICK_START = "tick_start"
     TICK_DONE = "tick_done"
     PO_DONE = "po_done"
+    WORKER_START = "worker_start"
+    WORKER_DONE = "worker_done"
+    WORKER_FAILED = "worker_failed"
     WORKER_STARTED = "worker_started"
     WORKER_SESSION_TRANSITION = "worker_session_transition"
     WORKER_ITERATION_ATTEMPT = "worker_iteration_attempt"
@@ -150,6 +154,28 @@ def replay_task_timeline(events: Iterable[EventEnvelope]) -> dict[str, dict[str,
     return timeline
 
 
+def legacy_runner_event_log_path(events_path: Path) -> Path | None:
+    """Return the durable WAL path for the canonical runner JSONL stream."""
+
+    if events_path.name != "loop-runner-events.jsonl":
+        return None
+    if events_path.parent.name != "ops" or events_path.parent.parent.name != "docs":
+        return None
+    return events_path.parent.parent.parent / ".forge" / "events.db"
+
+
+def legacy_runner_mirror_for_events_path(events_path: Path) -> LegacyEventMirror | None:
+    """Return a mirror for the canonical runner JSONL file, if any."""
+
+    event_log_path = legacy_runner_event_log_path(events_path)
+    if event_log_path is None:
+        return None
+    from forge_loop.eventlog.sqlite import SqliteEventLog
+
+    event_log_path.parent.mkdir(parents=True, exist_ok=True)
+    return LegacyEventMirror(SqliteEventLog(event_log_path))
+
+
 def _legacy_kind(record: Mapping[str, Any]) -> LegacyRunnerEventKind | None:
     raw_kind = record.get("kind")
     if not isinstance(raw_kind, str):
@@ -187,6 +213,7 @@ def _append_specs(
     tick = _optional_int(record.get("tick"))
     issue = _issue_from_record(record)
     payload = _payload(record)
+    worker = _worker_ref(record)
 
     if legacy_kind is LegacyRunnerEventKind.TICK_START:
         return (_AppendSpec(EventKind.TICK_STARTED, payload, tick=tick),)
@@ -201,16 +228,46 @@ def _append_specs(
             for planned_issue in _int_list(record.get("expanded"))
         )
     if legacy_kind in {
+        LegacyRunnerEventKind.WORKER_START,
         LegacyRunnerEventKind.WORKER_STARTED,
         LegacyRunnerEventKind.WORKER_SESSION_TRANSITION,
         LegacyRunnerEventKind.WORKER_ITERATION_ATTEMPT,
     }:
-        return (_AppendSpec(EventKind.TASK_DISPATCHED, payload, tick=tick, issue=issue),)
+        return (
+            _AppendSpec(
+                EventKind.TASK_DISPATCHED,
+                payload,
+                tick=tick,
+                issue=issue,
+                worker=worker,
+            ),
+        )
+    if legacy_kind is LegacyRunnerEventKind.WORKER_DONE:
+        return _worker_done_specs(record, payload, tick, worker)
+    if legacy_kind is LegacyRunnerEventKind.WORKER_FAILED:
+        return (
+            _AppendSpec(
+                EventKind.TASK_FAILED,
+                {**payload, "status": "failed"},
+                tick=tick,
+                issue=issue,
+                worker=worker,
+                pr_url=_pr_url(record),
+            ),
+        )
     if legacy_kind in {
         LegacyRunnerEventKind.WATCHDOG_WORKER_STUCK,
         LegacyRunnerEventKind.WATCHDOG_WORKER_KILLED,
     }:
-        return (_AppendSpec(EventKind.TASK_HEARTBEAT, payload, tick=tick, issue=issue),)
+        return (
+            _AppendSpec(
+                EventKind.TASK_HEARTBEAT,
+                payload,
+                tick=tick,
+                issue=issue,
+                worker=worker,
+            ),
+        )
     if legacy_kind is LegacyRunnerEventKind.STAGE_TIMEOUT:
         if _stage(record) is LegacyRunnerStage.WORKER:
             return (
@@ -357,6 +414,58 @@ def _tick_done_specs(
     return tuple(specs)
 
 
+def _worker_done_specs(
+    record: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    tick: int | None,
+    worker: str | None,
+) -> tuple[_AppendSpec, ...]:
+    issue = _issue_from_record(record)
+    status = _worker_status(record)
+    pr_url = _pr_url(record)
+    specs: list[_AppendSpec] = []
+    if pr_url is not None:
+        specs.append(
+            _AppendSpec(
+                EventKind.PR_OPENED,
+                {
+                    "legacy_kind": LegacyRunnerEventKind.WORKER_DONE.value,
+                    "tick": tick,
+                    "issue": issue,
+                    "status": status.value if status is not None else "",
+                    "pr_url": pr_url,
+                },
+                tick=tick,
+                issue=issue,
+                worker=worker,
+                pr_url=pr_url,
+            )
+        )
+    if status is not None and (terminal_kind := _TERMINAL_STATUS_TO_KIND.get(status)) is not None:
+        specs.append(
+            _AppendSpec(
+                terminal_kind,
+                payload,
+                tick=tick,
+                issue=issue,
+                worker=worker,
+                pr_url=pr_url,
+            )
+        )
+    if not specs:
+        specs.append(
+            _AppendSpec(
+                EventKind.WORKER_OBSERVATION,
+                payload,
+                tick=tick,
+                issue=issue,
+                worker=worker,
+                pr_url=pr_url,
+            )
+        )
+    return tuple(specs)
+
+
 def _payload(record: Mapping[str, Any]) -> dict[str, Any]:
     legacy_kind = _legacy_kind(record)
     payload = {key: value for key, value in record.items() if key not in {"kind", "ts"}}
@@ -397,6 +506,14 @@ def _pr_url(record: Mapping[str, Any]) -> str | None:
     if raw is None:
         return None
     return str(raw)
+
+
+def _worker_ref(record: Mapping[str, Any]) -> str | None:
+    for key in ("session_id", "worker_id", "worker", "thread_id", "log_path", "worktree", "branch"):
+        raw = record.get(key)
+        if raw is not None:
+            return str(raw)
+    return None
 
 
 def _optional_int(raw: Any) -> int | None:
