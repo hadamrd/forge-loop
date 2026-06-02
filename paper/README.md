@@ -2,6 +2,13 @@
 
 ### A position paper on the architecture of forge-loop
 
+> New broader draft: [Beyond the PR Bot](./00-long-running-autonomous-software-engineering.md)
+> reframes forge-loop as an early prototype for long-running, event-sourced,
+> hierarchical autonomous software engineering systems. The older chapter set
+> below is retained as the governance-focused first draft.
+> Adversarial notes live in
+> [paper/reviews/00-long-running-autonomous-software-engineering-adversarial-review.md](./reviews/00-long-running-autonomous-software-engineering-adversarial-review.md).
+
 *An argument that three coupled control surfaces — explicit product articulation, reinforcement feedback loops, and tight code-quality imperatives — together form a favorable engineering tradeoff for autonomous, multi-agent software development systems.*
 
 ---
