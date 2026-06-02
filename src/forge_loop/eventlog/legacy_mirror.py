@@ -34,6 +34,8 @@ class LegacyRunnerEventKind(StrEnum):
     CRITIC_VERDICT_BLOCKED = "critic_verdict_blocked"
     CRITIC_VERDICT_REVISING = "critic_verdict_revising"
     CRITIC_VERDICT_UNKNOWN = "critic_verdict_unknown"
+    CRITIC_DONE = "critic_done"
+    MERGE_REFUSED_ISSUE_CLOSED = "merge_refused_issue_closed"
     POST_CRITIC_AUTOMERGE_ENABLED = "post_critic_automerge_enabled"
     POST_CRITIC_AUTOMERGE_FAILED = "post_critic_automerge_failed"
     WORKER_WORK_RESCUED = "worker_work_rescued"
@@ -299,6 +301,7 @@ def _append_specs(
         LegacyRunnerEventKind.CRITIC_VERDICT_BLOCKED,
         LegacyRunnerEventKind.CRITIC_VERDICT_REVISING,
         LegacyRunnerEventKind.CRITIC_VERDICT_UNKNOWN,
+        LegacyRunnerEventKind.CRITIC_DONE,
     }:
         if legacy_kind is LegacyRunnerEventKind.CRITIC_VERDICT_BLOCKED:
             return (
@@ -312,6 +315,16 @@ def _append_specs(
                 ),
             )
         return (_AppendSpec(EventKind.CRITIQUE_ISSUED, payload, tick=tick, issue=issue),)
+    if legacy_kind is LegacyRunnerEventKind.MERGE_REFUSED_ISSUE_CLOSED:
+        return (
+            _AppendSpec(
+                EventKind.MERGE_BLOCKED,
+                payload,
+                tick=tick,
+                issue=issue,
+                pr_url=_pr_url(record),
+            ),
+        )
     if legacy_kind is LegacyRunnerEventKind.POST_CRITIC_AUTOMERGE_ENABLED:
         return (
             _AppendSpec(

@@ -179,6 +179,52 @@ def test_legacy_runner_mirror_records_merge_blocked_from_critic_verdict(
     ]
 
 
+def test_legacy_runner_mirror_records_default_critic_done(tmp_path: Path) -> None:
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+
+    mirror.mirror_record(
+        {
+            "kind": "critic_done",
+            "issue": 167,
+            "pr": "https://github.com/acme/forge-loop/pull/167",
+            "verdict": "approved",
+            "reasons": [],
+            "duration_s": 12.3,
+            "sev_counts": {"sev1": 0, "sev2": 0},
+            "parse_retries": 0,
+        }
+    )
+
+    events = list(log.since(0))
+    assert [event.kind for event in events] == [EventKind.CRITIQUE_ISSUED]
+    assert events[0].task_id == "issue:167"
+    assert events[0].payload["legacy_kind"] == "critic_done"
+    assert events[0].payload["verdict"] == "approved"
+
+
+def test_legacy_runner_mirror_records_issue_closed_merge_refusal(
+    tmp_path: Path,
+) -> None:
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+
+    mirror.mirror_record(
+        {
+            "kind": "merge_refused_issue_closed",
+            "issue": 167,
+            "pr": "https://github.com/acme/forge-loop/pull/167",
+            "issue_state": "CLOSED",
+        }
+    )
+
+    events = list(log.since(0))
+    assert [event.kind for event in events] == [EventKind.MERGE_BLOCKED]
+    assert events[0].task_id == "issue:167"
+    assert events[0].payload["legacy_kind"] == "merge_refused_issue_closed"
+    assert events[0].payload["issue_state"] == "CLOSED"
+
+
 def test_legacy_runner_replay_reconstructs_task_timeline_after_sqlite_reopen(
     tmp_path: Path,
 ) -> None:
