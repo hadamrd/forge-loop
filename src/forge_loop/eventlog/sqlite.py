@@ -141,6 +141,14 @@ class SqliteEventLog:
         )
         return (self._envelope_from_row(row) for row in rows)
 
+    def latest_sequence(self) -> int:
+        """Return the highest event sequence, or 0 when the log is empty."""
+
+        row = self._connection.execute("SELECT MAX(sequence) AS sequence FROM events").fetchone()
+        if row is None or row["sequence"] is None:
+            return 0
+        return int(row["sequence"])
+
     def get_projection_cursor(self, projection_name: str) -> ProjectionCursor:
         """Return the saved projection cursor, or sequence 0 when absent."""
 
@@ -169,6 +177,18 @@ class SqliteEventLog:
                 """,
                 (projection_name, cursor.sequence),
             )
+
+    def list_projection_cursors(self) -> Mapping[str, ProjectionCursor]:
+        """Return saved projection cursors by projection name."""
+
+        rows = self._connection.execute(
+            """
+            SELECT projection_name, sequence
+            FROM projection_cursors
+            ORDER BY projection_name ASC
+            """
+        )
+        return {row["projection_name"]: ProjectionCursor(sequence=row["sequence"]) for row in rows}
 
     def _find_by_idempotency_key(self, idempotency_key: str) -> EventEnvelope | None:
         row = self._connection.execute(
