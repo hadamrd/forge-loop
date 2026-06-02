@@ -39,6 +39,20 @@ def test_task_saga_store_round_trips_saga_after_reopen(tmp_path: Path) -> None:
     assert reopened.get("task-165-a") == expected
 
 
+def test_task_saga_store_get_missing_task_returns_none_after_reopen(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "tasks.db"
+    SqliteTaskSagaStore(db).put(_saga("task-existing"))
+
+    reopened = SqliteTaskSagaStore(db)
+    fake = FakeTaskSagaStore()
+    fake.put(_saga("task-existing"))
+
+    assert reopened.get("task-missing") is None
+    assert fake.get("task-missing") is None
+
+
 def test_task_saga_store_lists_only_non_terminal_sagas(tmp_path: Path) -> None:
     store = SqliteTaskSagaStore(tmp_path / "tasks.db")
     running = _saga("task-running", state=TaskState.RUNNING)
