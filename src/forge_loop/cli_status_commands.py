@@ -321,6 +321,96 @@ class StatusCommandsMixin:
         console.print(Panel(table, title="[bold]forge-loop status[/bold]", title_align="left"))
         return 0
 
+    def _cmd_boot(self, args: SimpleNamespace) -> int:
+        """Reload the maestro reset-recovery context from durable ``.forge`` state.
+
+        This is the operator (and future maestro) entrypoint for booting from
+        explicit durable stores instead of transcript memory: it assembles the
+        frontier cursor, curated memory ids, in-flight tasks, and event-log
+        position into one compact summary.
+        """
+        from forge_loop.control.boot import (
+            BootContextError,
+            assemble_boot_context,
+            build_boot_sources,
+        )
+
+        cfg, _config_error = self.operator_cfg()
+        repo = Path(getattr(cfg, "repo", cfg.state_dir))
+        try:
+            context = assemble_boot_context(build_boot_sources(repo))
+        except BootContextError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 1
+
+        if getattr(args, "json", False):
+            payload = {
+                "frontier": {
+                    "product_goal": context.frontier.product_goal,
+                    "current_problem": context.frontier.current_problem,
+                    "next_expansion": context.frontier.next_expansion,
+                    "why_now": context.frontier.why_now,
+                },
+                "active_memory_ids": list(context.active_memory_ids),
+                "rejected_path_memory_ids": list(context.rejected_path_memory_ids),
+                "in_flight_task_ids": list(context.in_flight_task_ids),
+                "in_flight_saga_ids": list(context.in_flight_saga_ids),
+                "stale_saga_ids": list(context.stale_saga_ids),
+                "latest_event_sequence": context.latest_event_sequence,
+                "projection_cursors": {
+                    name: {"sequence": status.sequence, "lag": status.lag}
+                    for name, status in context.projection_cursors.items()
+                },
+            }
+            sys.stdout.write(json.dumps(payload, indent=2, default=str) + "\n")
+            return 0
+
+        sys.stdout.write(context.summary() + "\n")
+        return 0
+
+    def _cmd_recover(self, args: SimpleNamespace) -> int:
+        """Reconcile dead-worker sagas: compensate (reap worktrees) + close.
+
+        The operator one-shot of what the runner now does at boot — turns the
+        stale work ``forge-loop boot`` reports into reaped worktrees and
+        COMPENSATED sagas. Never touches GitHub, safe to run offline.
+        """
+        from functools import partial
+
+        from forge_loop.control.boot import canonical_task_saga_path
+        from forge_loop.control.recovery import reconcile_stale_sagas
+        from forge_loop.runner._helpers import reap_worktree
+        from forge_loop.tasks import SqliteTaskSagaStore
+
+        cfg, _config_error = self.operator_cfg()
+        repo = Path(getattr(cfg, "repo", cfg.state_dir))
+        path = canonical_task_saga_path(repo)
+        if not path.exists():
+            sys.stderr.write(f"no task-saga store at {path}; run `forge-loop init` first\n")
+            return 1
+
+        store = SqliteTaskSagaStore(path)
+        report = reconcile_stale_sagas(store, reap_worktree=partial(reap_worktree, repo))
+
+        if getattr(args, "json", False):
+            payload = {
+                "recovered_count": report.recovered_count,
+                "recovered": [
+                    {
+                        "task_id": item.task_id,
+                        "saga_id": item.saga_id,
+                        "issue": item.issue,
+                        "worktrees_reaped": list(item.worktrees_reaped),
+                    }
+                    for item in report.recovered
+                ],
+                "errors": list(report.errors),
+            }
+            sys.stdout.write(json.dumps(payload, indent=2, default=str) + "\n")
+        else:
+            sys.stdout.write(report.summary() + "\n")
+        return 1 if report.errors else 0
+
     def _cmd_events(self, args: SimpleNamespace) -> int:
         """Tail recent events. Rich-formatted by default; ``--raw`` skips colour."""
         cfg, _config_error = self.operator_cfg()

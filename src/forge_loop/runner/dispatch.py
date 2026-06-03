@@ -7,14 +7,17 @@ no behaviour change, no signature change.
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from forge_loop import gh as _gh
 from forge_loop import master_log as _mlog
 from forge_loop.config import Config
+from forge_loop.control.boot import canonical_task_saga_path
 from forge_loop.critic import review_pr as _critic_review
 from forge_loop.critic_actions import apply_critic_report
 from forge_loop.runner.critic_flow import (
@@ -165,9 +168,23 @@ def capability_policy_for_worker(
     )
 
 
+def _resolve_task_saga_store(cfg: Config) -> TaskSagaStore | None:
+    """Per-thread saga store at the canonical path (or an injected override).
+
+    Best-effort: never let saga bookkeeping break worker dispatch.
+    """
+    explicit = getattr(cfg, "task_store", None)
+    if explicit is not None:
+        return explicit
+    try:
+        return SqliteTaskSagaStore(canonical_task_saga_path(cfg.repo))
+    except Exception:  # noqa: BLE001 - saga state is advisory, dispatch must go on
+        return None
+
+
 def record_worker_task_policy(
     *,
-    state_dir: Path,
+    repo: Path,
     task_id: str,
     saga_id: str,
     issue: int,
@@ -175,7 +192,7 @@ def record_worker_task_policy(
     worktree_path: str,
     capability_policy: CapabilityPolicy,
 ) -> TaskSaga:
-    store = SqliteTaskSagaStore(state_dir / "task-sagas.db")
+    store = SqliteTaskSagaStore(canonical_task_saga_path(repo))
     existing = store.get(task_id)
     if existing is not None:
         return existing
@@ -199,21 +216,21 @@ def record_worker_task_policy(
     )
 
 
-def _record_worker_task_saga(
+def _seed_worker_saga(
     task_store: TaskSagaStore | None,
     *,
-    state_dir: Path,
+    repo: Path,
     issue: dict[str, Any],
     branch: str,
     worktree_path: str,
     capability_policy: CapabilityPolicy,
 ) -> None:
     n = int(issue["number"])
-    task_id = f"task-{n}-worker"
+    task_id = _worker_task_id(n)
     saga_id = f"saga-{n}-worker"
     if task_store is None:
         record_worker_task_policy(
-            state_dir=state_dir,
+            repo=repo,
             task_id=task_id,
             saga_id=saga_id,
             issue=n,
@@ -241,6 +258,116 @@ def _record_worker_task_saga(
     )
 
 
+def _worker_task_id(issue_number: int) -> str:
+    return f"task-{issue_number}-worker"
+
+
+# Liveness: the lease TTL is a small multiple of the heartbeat interval, NOT
+# the (hours-long) worker wall ceiling. A live worker keeps it fresh by
+# heartbeating; a hard-killed one goes stale within ~interval*factor, so
+# recovery reaps it in minutes instead of hours. The factor is a grace margin —
+# several consecutive missed beats are tolerated before a live worker could be
+# mistaken for dead.
+_HEARTBEAT_INTERVAL_S = 60
+_HEARTBEAT_LEASE_FACTOR = 5
+
+
+def _heartbeat_interval_s(cfg: Config) -> float:
+    return max(float(getattr(cfg, "worker_heartbeat_interval_s", _HEARTBEAT_INTERVAL_S)), 1.0)
+
+
+def _lease_worker_saga(
+    task_store: TaskSagaStore | None,
+    *,
+    task_id: str,
+    owner_id: str,
+    lease_ttl_s: float,
+) -> None:
+    """Mark the saga RUNNING under a short, heartbeat-renewed lease.
+
+    The lease lapses ``lease_ttl_s`` after the last heartbeat; a dead worker
+    (no more beats) then reads as stale for recovery. All best-effort — saga
+    state must never break dispatch.
+    """
+    if task_store is None:
+        return
+    now = datetime.now(UTC)
+    with contextlib.suppress(Exception):
+        task_store.acquire_lease(
+            task_id,
+            owner_id=owner_id,
+            expires_at=now + timedelta(seconds=max(lease_ttl_s, 1.0)),
+            acquired_at=now,
+        )
+
+
+def _start_worker_heartbeat(
+    cfg: Config,
+    *,
+    task_id: str,
+    owner_id: str,
+    interval_s: float,
+    lease_ttl_s: float,
+) -> tuple[threading.Event, threading.Thread]:
+    """Renew the saga lease on a timer so a *live* worker never reads as stale.
+
+    Runs in its own daemon thread with its OWN store connection (WAL handles
+    cross-connection writes; sqlite forbids sharing one connection across
+    threads). It beats on a wall-clock timer independent of worker activity, so
+    even a worker silent for 10+ minutes of extended thinking stays leased.
+    Fully best-effort: a heartbeat failure never touches the worker.
+    """
+    stop = threading.Event()
+
+    def _beat() -> None:
+        try:
+            store = SqliteTaskSagaStore(canonical_task_saga_path(cfg.repo))
+        except Exception:  # noqa: BLE001 - no store, no heartbeat; worker runs on
+            return
+        while not stop.wait(interval_s):
+            now = datetime.now(UTC)
+            with contextlib.suppress(Exception):
+                store.heartbeat(
+                    task_id,
+                    owner_id=owner_id,
+                    heartbeat_at=now,
+                    expires_at=now + timedelta(seconds=max(lease_ttl_s, 1.0)),
+                )
+
+    thread = threading.Thread(target=_beat, name=f"hb-{task_id}", daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def _stop_worker_heartbeat(handle: tuple[threading.Event, threading.Thread] | None) -> None:
+    if handle is None:
+        return
+    stop, thread = handle
+    stop.set()
+    thread.join(timeout=2.0)
+
+
+def _finalize_worker_saga(
+    task_store: TaskSagaStore | None,
+    *,
+    task_id: str,
+    status: str,
+) -> None:
+    """Drive the saga to a terminal state from the worker outcome.
+
+    ``merged``/``open`` complete the saga; everything else fails it (the
+    remove-worktree compensation rides along from seeding). Best-effort so a
+    saga-store hiccup never masks the real worker outcome.
+    """
+    if task_store is None:
+        return
+    with contextlib.suppress(Exception):
+        if status in ("merged", "open"):
+            task_store.mark_completed(task_id, reason=f"worker outcome: {status}")
+        else:
+            task_store.mark_failed(task_id, reason=f"worker outcome: {status}")
+
+
 def _dispatch_one_worker(
     cfg: Config,
     issue: dict[str, Any],
@@ -249,6 +376,7 @@ def _dispatch_one_worker(
     tick: int,
     bus_emit: Any,
     store: WorkerSessionStore | None,
+    maestro_context: str = "",
 ) -> WorkerOutcome:
     """Run one worker, threading the persistent-worker FSM if enabled.
 
@@ -279,39 +407,99 @@ def _dispatch_one_worker(
     if capability_policy is None:
         raise RuntimeError(f"worker {issue['number']} missing capability policy record")
     branch = _branch_for_issue(issue)
-    _record_worker_task_saga(
-        getattr(cfg, "task_store", None),
-        state_dir=cfg.state_dir,
-        issue=issue,
-        branch=branch,
-        worktree_path=worktree_path,
-        capability_policy=capability_policy,
-    )
-
-    if store is None:
-        return run_worker(
-            issue,
-            cfg.repo,
-            cfg.logs_dir,
-            cfg.worker_timeout_s,
-            risk_gated=meta["risk_gated"],
-            past_attempts=meta["past_attempts"],
-            blocking_comments=meta.get("blocking_comments") or [],
-            emit=bus_emit,
-            lumen_top_k=cfg.lumen.top_k,
-            lumen_test_pattern=cfg.lumen_test_pattern,
-            coauthor=cfg.coauthor,
-            tick=tick,
-            model=cfg.worker.model,
-            thinking=cfg.worker.thinking,
-            provider=getattr(cfg.worker, "provider", "claude"),
-            allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
-            load_timeout_ms=cfg.worker.load_timeout_ms,
-            strict_mcp_config=cfg.worker.strict_mcp_config,
-            mcp_servers=cfg.worker.mcp_servers,
-            base_branch=cfg.base_branch,
+    n = int(issue["number"])
+    task_id = _worker_task_id(n)
+    saga_store = _resolve_task_saga_store(cfg)
+    with contextlib.suppress(Exception):
+        _seed_worker_saga(
+            saga_store,
+            repo=cfg.repo,
+            issue=issue,
+            branch=branch,
+            worktree_path=worktree_path,
             capability_policy=capability_policy,
         )
+    owner_id = f"worker-{n}-tick-{tick}"
+    interval_s = _heartbeat_interval_s(cfg)
+    lease_ttl_s = interval_s * _HEARTBEAT_LEASE_FACTOR
+    _lease_worker_saga(saga_store, task_id=task_id, owner_id=owner_id, lease_ttl_s=lease_ttl_s)
+
+    heartbeat: tuple[threading.Event, threading.Thread] | None = None
+    if saga_store is not None:
+        heartbeat = _start_worker_heartbeat(
+            cfg,
+            task_id=task_id,
+            owner_id=owner_id,
+            interval_s=interval_s,
+            lease_ttl_s=lease_ttl_s,
+        )
+
+    try:
+        return _run_worker_with_saga(
+            cfg,
+            issue,
+            meta,
+            tick=tick,
+            bus_emit=bus_emit,
+            store=store,
+            saga_store=saga_store,
+            task_id=task_id,
+            capability_policy=capability_policy,
+            worktree_path=worktree_path,
+            branch=branch,
+            maestro_context=maestro_context,
+        )
+    finally:
+        _stop_worker_heartbeat(heartbeat)
+
+
+def _run_worker_with_saga(
+    cfg: Config,
+    issue: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    tick: int,
+    bus_emit: Any,
+    store: WorkerSessionStore | None,
+    saga_store: TaskSagaStore | None,
+    task_id: str,
+    capability_policy: CapabilityPolicy,
+    worktree_path: str,
+    branch: str,
+    maestro_context: str,
+) -> WorkerOutcome:
+    """Invoke the worker and drive the saga terminal edge (legacy + FSM paths)."""
+    if store is None:
+        try:
+            legacy_outcome = run_worker(
+                issue,
+                cfg.repo,
+                cfg.logs_dir,
+                cfg.worker_timeout_s,
+                risk_gated=meta["risk_gated"],
+                past_attempts=meta["past_attempts"],
+                blocking_comments=meta.get("blocking_comments") or [],
+                emit=bus_emit,
+                lumen_top_k=cfg.lumen.top_k,
+                lumen_test_pattern=cfg.lumen_test_pattern,
+                coauthor=cfg.coauthor,
+                tick=tick,
+                model=cfg.worker.model,
+                thinking=cfg.worker.thinking,
+                provider=getattr(cfg.worker, "provider", "claude"),
+                allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+                load_timeout_ms=cfg.worker.load_timeout_ms,
+                strict_mcp_config=cfg.worker.strict_mcp_config,
+                mcp_servers=cfg.worker.mcp_servers,
+                base_branch=cfg.base_branch,
+                capability_policy=capability_policy,
+                maestro_context=maestro_context,
+            )
+        except BaseException:
+            _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
+            raise
+        _finalize_worker_saga(saga_store, task_id=task_id, status=legacy_outcome.status)
+        return legacy_outcome
 
     sess, _resumed = get_or_resume_session(
         store,
@@ -345,6 +533,7 @@ def _dispatch_one_worker(
             mcp_servers=cfg.worker.mcp_servers,
             base_branch=cfg.base_branch,
             capability_policy=capability_policy,
+            maestro_context=maestro_context,
         )
     except BaseException as ex_:
         # The subprocess crashed before producing a WorkerOutcome. We
@@ -366,6 +555,7 @@ def _dispatch_one_worker(
                 outcome=synthetic,
                 events_file=cfg.events_file,
             )
+        _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
         raise
 
     record_outcome(
@@ -374,6 +564,7 @@ def _dispatch_one_worker(
         outcome=outcome,
         events_file=cfg.events_file,
     )
+    _finalize_worker_saga(saga_store, task_id=task_id, status=outcome.status)
     return outcome
 
 
@@ -384,6 +575,8 @@ def _run_workers(
     tick: int,
     master_log_path: Path,
     bus_emit: Any,
+    *,
+    maestro_context: str = "",
 ) -> tuple[list[WorkerOutcome], bool]:
     """Spawn workers (pipeline-driven if enabled, else legacy ThreadPool).
 
@@ -463,6 +656,7 @@ def _run_workers(
                     tick=tick,
                     bus_emit=bus_emit,
                     store=store,
+                    maestro_context=maestro_context,
                 )
                 for i, meta in dispatch
             ]

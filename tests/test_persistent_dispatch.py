@@ -346,7 +346,7 @@ def test_dispatch_one_worker_full_success_path(tmp_path, monkeypatch) -> None:
     final = sessions[0]
     assert final.state == WorkerState.AWAITING_CRITIC
     assert final.pr_url == pr_url
-    task_saga = SqliteTaskSagaStore(cfg.state_dir / "task-sagas.db").get("task-42-worker")
+    task_saga = SqliteTaskSagaStore(cfg.repo / ".forge" / "tasks.db").get("task-42-worker")
     assert task_saga is not None
     assert task_saga.worktree == "/tmp/wt-loop-42"
     assert task_saga.capability_policy == CapabilityPolicy(
@@ -436,7 +436,7 @@ def test_dispatch_one_worker_records_policy_in_default_task_saga_store(
         store=store,
     )
 
-    saga = SqliteTaskSagaStore(cfg.state_dir / "task-sagas.db").get("task-168-worker")
+    saga = SqliteTaskSagaStore(cfg.repo / ".forge" / "tasks.db").get("task-168-worker")
     assert saga is not None
     assert saga.capability_policy.filesystem.read_roots == (str(cfg.repo), "/tmp/wt-loop-168")
     assert saga.capability_policy.network.allow_domains == ("github.com", "api.github.com")

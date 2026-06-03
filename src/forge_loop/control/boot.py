@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from forge_loop.eventlog import ProjectionCursor
-from forge_loop.frontier import FrontierCursor
-from forge_loop.memory import MemoryItem, MemoryKind
-from forge_loop.tasks import TaskSaga
+from forge_loop.eventlog import ProjectionCursor, SqliteEventLog
+from forge_loop.frontier import FrontierCursor, FrontierStore
+from forge_loop.memory import MemoryItem, MemoryKind, SqliteMemoryStore
+from forge_loop.tasks import SqliteTaskSagaStore, TaskSaga
 
 
 class BootContextError(RuntimeError):
@@ -56,6 +57,10 @@ class BootTaskStore(Protocol):
         """Return non-terminal task sagas in insertion order."""
         ...
 
+    def list_stale(self, *, now: datetime) -> tuple[TaskSaga, ...]:
+        """Return non-terminal sagas whose lease has expired by ``now``."""
+        ...
+
 
 @dataclass(frozen=True)
 class ProjectionStatus:
@@ -84,6 +89,7 @@ class BootContext:
     rejected_path_memory_ids: tuple[str, ...] = ()
     in_flight_task_ids: tuple[str, ...] = ()
     in_flight_saga_ids: tuple[str, ...] = ()
+    stale_saga_ids: tuple[str, ...] = ()
     latest_event_sequence: int = 0
     last_event_sequence: int = 0
     projection_cursors: Mapping[str, ProjectionStatus] = field(default_factory=dict)
@@ -119,6 +125,8 @@ class BootContext:
                 lines.append("in_flight: " + ", ".join(pairs))
             else:
                 lines.append("in_flight: " + ", ".join(self.in_flight_task_ids))
+        if self.stale_saga_ids:
+            lines.append("stale (dead-worker leases): " + ", ".join(self.stale_saga_ids))
         lines.append(f"event_sequence: {self.latest_event_sequence}")
         if self.projection_cursors:
             projections = [
@@ -129,9 +137,14 @@ class BootContext:
         return "\n".join(lines)
 
 
-def assemble_boot_context(sources: BootSources) -> BootContext:
-    """Assemble compact maestro reset context from durable stores."""
+def assemble_boot_context(sources: BootSources, *, now: datetime | None = None) -> BootContext:
+    """Assemble compact maestro reset context from durable stores.
 
+    ``now`` anchors stale-lease detection (sagas whose lease has expired are
+    the work a dead worker left behind); it defaults to the current UTC time.
+    """
+
+    moment = now or datetime.now(UTC)
     try:
         frontier = sources.frontier_store.load()
     except FileNotFoundError as exc:
@@ -152,10 +165,12 @@ def assemble_boot_context(sources: BootSources) -> BootContext:
 
     in_flight_task_ids: tuple[str, ...] = ()
     in_flight_saga_ids: tuple[str, ...] = ()
+    stale_saga_ids: tuple[str, ...] = ()
     if sources.task_store is not None:
         in_flight = sources.task_store.list_in_flight()
         in_flight_task_ids = tuple(saga.task_id for saga in in_flight)
         in_flight_saga_ids = tuple(saga.saga_id for saga in in_flight)
+        stale_saga_ids = tuple(saga.saga_id for saga in sources.task_store.list_stale(now=moment))
 
     projection_cursors = {
         name: ProjectionStatus(
@@ -171,6 +186,43 @@ def assemble_boot_context(sources: BootSources) -> BootContext:
         rejected_path_memory_ids=rejected_path_memory_ids,
         in_flight_task_ids=in_flight_task_ids,
         in_flight_saga_ids=in_flight_saga_ids,
+        stale_saga_ids=stale_saga_ids,
         latest_event_sequence=latest_event_sequence,
         projection_cursors=projection_cursors,
+    )
+
+
+def canonical_task_saga_path(repo: Path | str) -> Path:
+    """The one durable task-saga store ``init`` seeds and ``boot`` reads.
+
+    Single source of truth for the saga store location, shared by ``init``,
+    the runner dispatch path, boot assembly, and recovery.
+    """
+    return Path(repo) / ".forge" / "tasks.db"
+
+
+def build_boot_sources(repo: Path | str) -> BootSources:
+    """Wire the durable boot stores from a repository's ``.forge`` layout.
+
+    Mirrors the canonical paths seeded by ``forge-loop init``. Raises
+    :class:`BootContextError` when the frontier cursor is absent, so an
+    uninitialised repo fails fast instead of materialising empty event/memory
+    stores as a side effect of opening them.
+    """
+    forge_dir = Path(repo) / ".forge"
+    frontier_path = forge_dir / "frontier.yaml"
+    if not frontier_path.exists():
+        raise BootContextError(
+            f"frontier state is required at {frontier_path}; run `forge-loop init` first"
+        )
+    # Gate the saga store on existence so repos seeded before the task store
+    # was canonical (or that never ran a recent `init`) still boot — and so a
+    # missing store is not silently materialised on open.
+    tasks_path = canonical_task_saga_path(repo)
+    task_store = SqliteTaskSagaStore(tasks_path) if tasks_path.exists() else None
+    return BootSources(
+        frontier_store=FrontierStore(frontier_path),
+        event_log=SqliteEventLog(forge_dir / "events.db"),
+        memory_store=SqliteMemoryStore(forge_dir / "memory.db"),
+        task_store=task_store,
     )
