@@ -72,7 +72,7 @@ The loop is also **resumable**. A hard-killed run (operator `^C` mid-tick, OOM, 
 | **Durable control plane (`.forge/{events,frontier,memory,tasks}`)** | **stable** | Seeded by `init`; survives a hard kill |
 | **Task-saga lifecycle per dispatch** | **stable** | create → lease RUNNING → terminal; expired lease ⇒ stale (dead-worker) |
 | **Resumable boot recovery** | **stable** | `run` self-heals stale sagas at startup; `forge-loop boot` / `recover` do it on demand |
-| **Boot-context-driven planning (maestro)** | in progress | Boot context is assembled + reported; a maestro that *plans/drives* dispatch from frontier+memory is NOT shipped yet |
+| **Boot-context-driven planning (maestro)** | beta | Each tick reorders candidates by frontier alignment (dead-ends last) and hands workers an advisory frontier+memory context block; emits a `maestro_plan` event. Matching is keyword-based and advisory — it never drops work. |
 | **Pipeline DAG (`.forge/pipeline.yaml`)** | experimental | Opt-in via `LOOP_PIPELINE_DRIVEN=1` |
 | **Multi-repo (`.forge/repos/*.yaml`)** | experimental | Single host, single loop, N repos |
 | **Async runner** | experimental | `--orchestrator async` |
