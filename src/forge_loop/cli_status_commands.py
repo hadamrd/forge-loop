@@ -354,6 +354,7 @@ class StatusCommandsMixin:
                 "active_memory_ids": list(context.active_memory_ids),
                 "rejected_path_memory_ids": list(context.rejected_path_memory_ids),
                 "in_flight_task_ids": list(context.in_flight_task_ids),
+                "in_flight_saga_ids": list(context.in_flight_saga_ids),
                 "latest_event_sequence": context.latest_event_sequence,
                 "projection_cursors": {
                     name: {"sequence": status.sequence, "lag": status.lag}

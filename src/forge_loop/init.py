@@ -12,6 +12,7 @@ from forge_loop.eventlog import SqliteEventLog
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import SqliteMemoryStore
 from forge_loop.precommit import PreCommitRunner, ensure_precommit_hook
+from forge_loop.tasks import SqliteTaskSagaStore
 from forge_loop.worker_sessions import WorkerSessionStore
 
 SAMPLE_YAML = """# forge-loop config — tune the loop for THIS project.
@@ -207,6 +208,10 @@ def _ensure_control_plane_stores(
     memory_path = forge_dir / "memory.db"
     _record_path(memory_path, target_dir, created=created, skipped=skipped, force=force)
     SqliteMemoryStore(memory_path)
+
+    tasks_path = forge_dir / "tasks.db"
+    _record_path(tasks_path, target_dir, created=created, skipped=skipped, force=force)
+    SqliteTaskSagaStore(tasks_path)
 
     sessions_path = ops_dir / "worker-sessions.db"
     _record_path(sessions_path, target_dir, created=created, skipped=skipped, force=force)

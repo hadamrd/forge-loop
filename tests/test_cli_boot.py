@@ -22,6 +22,7 @@ from forge_loop.memory import (
     MemoryProvenance,
     SqliteMemoryStore,
 )
+from forge_loop.tasks import SqliteTaskSagaStore, TaskSaga, TaskState
 
 
 def _cfg(repo: Path) -> SimpleNamespace:
@@ -82,6 +83,40 @@ class TestCliBoot:
         assert payload["rejected_path_memory_ids"] == ["m2"]
         assert payload["latest_event_sequence"] == 2
         assert payload["projection_cursors"]["frontier"] == {"sequence": 1, "lag": 1}
+
+    def test_boot_reports_in_flight_saga_from_canonical_store(
+        self,
+        monkeypatch: Any,
+        tmp_path: Path,
+        capsys: Any,
+    ) -> None:
+        _seed_forge(tmp_path)
+        task_store = SqliteTaskSagaStore(tmp_path / ".forge" / "tasks.db")
+        task_store.put(
+            TaskSaga(
+                task_id="task-42",
+                saga_id="saga-42",
+                state=TaskState.RUNNING,
+                issue=42,
+                branch="loop/42",
+            )
+        )
+        task_store.put(
+            TaskSaga(
+                task_id="task-41-done",
+                saga_id="saga-41-done",
+                state=TaskState.COMPLETED,
+                issue=41,
+            )
+        )
+        monkeypatch.setattr(cli, "load", lambda: _cfg(tmp_path))
+
+        rc = cli._cmd_boot(SimpleNamespace(json=True))
+
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["in_flight_task_ids"] == ["task-42"]
+        assert payload["in_flight_saga_ids"] == ["saga-42"]
 
     def test_boot_summary_renders_human_text(
         self,

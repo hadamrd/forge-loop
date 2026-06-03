@@ -27,6 +27,7 @@ def test_init_creates_empty_durable_control_plane_stores(tmp_path: Path) -> None
     assert ".forge/events.db" in result["created"]
     assert ".forge/frontier.yaml" in result["created"]
     assert ".forge/memory.db" in result["created"]
+    assert ".forge/tasks.db" in result["created"]
     assert "docs/ops/worker-sessions.db" in result["created"]
 
     status = collect_control_plane_status(

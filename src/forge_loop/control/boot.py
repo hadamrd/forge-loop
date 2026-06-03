@@ -10,7 +10,7 @@ from typing import Protocol
 from forge_loop.eventlog import ProjectionCursor, SqliteEventLog
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import MemoryItem, MemoryKind, SqliteMemoryStore
-from forge_loop.tasks import TaskSaga
+from forge_loop.tasks import SqliteTaskSagaStore, TaskSaga
 
 
 class BootContextError(RuntimeError):
@@ -190,8 +190,14 @@ def build_boot_sources(repo: Path | str) -> BootSources:
         raise BootContextError(
             f"frontier state is required at {frontier_path}; run `forge-loop init` first"
         )
+    # Gate the saga store on existence so repos seeded before the task store
+    # was canonical (or that never ran a recent `init`) still boot — and so a
+    # missing store is not silently materialised on open.
+    tasks_path = forge_dir / "tasks.db"
+    task_store = SqliteTaskSagaStore(tasks_path) if tasks_path.exists() else None
     return BootSources(
         frontier_store=FrontierStore(frontier_path),
         event_log=SqliteEventLog(forge_dir / "events.db"),
         memory_store=SqliteMemoryStore(forge_dir / "memory.db"),
+        task_store=task_store,
     )
