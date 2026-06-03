@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
+from forge_loop.control.status import collect_control_plane_status
 from forge_loop.init import init_project
 
 
@@ -17,6 +19,37 @@ def test_init_creates_yaml_and_manual_stub(tmp_path: Path) -> None:
     assert "labels:" in body
     assert "manual/project-quickref.md" in result["created"]
     assert (tmp_path / "manual" / "project-quickref.md").exists()
+
+
+def test_init_creates_empty_durable_control_plane_stores(tmp_path: Path) -> None:
+    result = init_project(tmp_path, github_repo="example/foo")
+
+    assert ".forge/events.db" in result["created"]
+    assert ".forge/frontier.yaml" in result["created"]
+    assert ".forge/memory.db" in result["created"]
+    assert "docs/ops/worker-sessions.db" in result["created"]
+
+    status = collect_control_plane_status(
+        tmp_path,
+        datetime(2026, 6, 3, tzinfo=UTC),
+    )
+
+    assert status["event_log"]["available"] is True
+    assert status["event_log"]["last_sequence"] == 0
+    assert status["frontier"]["available"] is True
+    assert status["memory"] == {
+        "available": True,
+        "path": str(tmp_path / ".forge" / "memory.db"),
+        "active_count": 0,
+        "rejected_count": 0,
+    }
+    assert status["tasks"] == {
+        "available": True,
+        "path": str(tmp_path / "docs" / "ops" / "worker-sessions.db"),
+        "in_flight_count": 0,
+        "stale_lease_count": 0,
+    }
+    assert status["boot"]["available"] is True
 
 
 def test_init_idempotent_skips_existing_without_force(tmp_path: Path) -> None:
@@ -48,7 +81,8 @@ def test_init_scaffold_does_not_leak_project_specific_deploy_task(tmp_path: Path
     # Scan only the active `task:` assignment line — comments may legitimately
     # mention task names as examples.
     task_lines = [
-        line.strip() for line in body.splitlines()
+        line.strip()
+        for line in body.splitlines()
         if line.strip().startswith("task:") and not line.lstrip().startswith("#")
     ]
     assert len(task_lines) == 1, f"expected one `task:` line, got {task_lines}"
@@ -68,6 +102,8 @@ def test_init_appends_to_existing_gitignore(tmp_path: Path) -> None:
     content = (tmp_path / ".gitignore").read_text()
     assert "# existing" in content
     assert "loop-runner.pid" in content
+    assert "docs/ops/worker-sessions.db*" in content
+    assert "docs/ops/critic-*.log*" in content
 
 
 def test_init_skips_gitignore_when_missing(tmp_path: Path) -> None:
