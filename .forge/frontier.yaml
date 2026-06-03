@@ -1,0 +1,55 @@
+product_goal: 'Make forge-loop a resumable, self-improving autonomous loop: it ships
+  PRs from well-specified issues, recovers from crashes, and gets measurably better
+  from its own outcomes.'
+current_problem: "Cognition is half-closed: the loop writes episodic memory and reads\
+  \ rejected paths, but outcomes (critic findings, repeat failures) don't yet become\
+  \ durable rules it consumes \u2014 and nothing measures whether quality is improving."
+next_expansion: "Close the learning loop \u2014 turn critic findings and repeated\
+  \ failures into procedural / rejected-path memory the maestro and worker briefs\
+  \ enforce \u2014 and instrument the event log to measure first-pass critic acceptance,\
+  \ rework rate, and $/merged-PR."
+why_now: The durable control plane, resumable recovery, maestro planning, and a write
+  path to memory all landed; the missing pieces are consumption + measurement, which
+  make the recursive-improvement claim falsifiable.
+active_decisions:
+- Context windows are working memory, not durable state; externalise cognition to
+  .forge.
+- Workers are disposable and leased; control-plane state is external and replayable.
+- The maestro stays stateless deterministic code; context-pressure self-compaction
+  belongs to long-lived worker sessions, not the maestro.
+- Durable cognition is committed as text; runtime journal (events.db) and transient
+  sagas (tasks.db) stay local.
+rejected_paths:
+- idea: commit binary sqlite stores (memory.db / events.db) to git
+  reason: no diffs, merge conflicts, repo bloat; events.db rotates at 10MB
+  revisit_if: a committed text export proves insufficient for the single-maintainer
+    .forge
+- idea: ask the model how full its context window is
+  reason: model self-report on its own context is unreliable; use the SDK get_context_usage
+    percentage instead
+  revisit_if: ''
+- idea: shorten the worker lease TTL without heartbeats
+  reason: a live worker would be reaped as stale; heartbeats are the prerequisite
+  revisit_if: ''
+hot_files:
+- ref: src/forge_loop/runner/maestro.py
+  why_hot: the planning brain; smarter matching + future frontier-advance live here
+- ref: src/forge_loop/runner/learning.py
+  why_hot: write path to memory; the consume path attaches here
+- ref: src/forge_loop/control/boot.py
+  why_hot: reset-recovery context assembly; the maestro boots from it
+- ref: src/forge_loop/runner/dispatch.py
+  why_hot: saga lifecycle + heartbeats; a context-checkpoint hook would attach here
+hot_tests:
+- ref: tests/test_maestro_plan.py
+  why_hot: planner behaviour + matching
+- ref: tests/test_recovery.py
+  why_hot: resumability / dead-worker reconciliation invariants
+open_questions:
+- Should the maestro advance frontier.yaml from outcomes, or stay read-only?
+- 'Memory persistence: committed text export vs single-maintainer binary memory.db?'
+- Wire a context-pressure checkpoint (PreCompact hook) into worker sessions?
+external_sources:
+- docs/design/context-awareness.md
+- docs/design/long-running-agent-architecture.md
+version: 1
