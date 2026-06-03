@@ -53,6 +53,7 @@ class StatusCommandsMixin:
         last_failure: dict[str, Any] | None = None
         last_5_events: list[dict[str, str]] = []
         active_workers_by_issue: dict[int, dict[str, Any]] = {}
+        terminal_worker_issues: set[int] = set()
         worker_terminal_kinds = {
             "worker_done",
             "worker_failed",
@@ -108,6 +109,7 @@ class StatusCommandsMixin:
                             "log_path": e.get("log_path"),
                         }
                     elif kind in worker_terminal_kinds:
+                        terminal_worker_issues.add(issue)
                         active_workers_by_issue.pop(issue, None)
                     elif issue in active_workers_by_issue:
                         active_workers_by_issue[issue]["last_event_ts"] = ts
@@ -123,7 +125,11 @@ class StatusCommandsMixin:
         active_workers = list(active_workers_by_issue.values())
         if not active_workers and state_blob.get("state") == "running":
             for entry in state_blob.get("dispatched") or []:
-                if isinstance(entry, dict) and isinstance(entry.get("issue"), int):
+                if (
+                    isinstance(entry, dict)
+                    and isinstance(entry.get("issue"), int)
+                    and entry["issue"] not in terminal_worker_issues
+                ):
                     active_workers.append(
                         {
                             "issue": entry["issue"],
