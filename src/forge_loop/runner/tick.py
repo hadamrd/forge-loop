@@ -261,7 +261,7 @@ def _tick(cfg: Config, tick: int) -> None:
     # When .forge/axes.yaml exists, default to filtering by ANY known
     # axis label so the legacy maintenance LLM (or stray ops) can't
     # smuggle non-axis-aligned issues onto the dispatch path. Dogfood-
-    # caught: maintenance daemon re-labeled 4 cosmetic Titan tickets as
+    # caught: maintenance daemon re-labeled 4 cosmetic tickets as
     # loop:ready after the brainstormer had explicitly omitted them.
     # Explicit env override (LOOP_AXIS_FILTER) still wins.
     if not axis_filter:
@@ -678,7 +678,7 @@ def _tick(cfg: Config, tick: int) -> None:
 
     # Post-tick: auto-rescue uncommitted work, then reap.
     #
-    # Real failure mode observed in the Titan dogfood:
+    # Real failure mode observed in dogfooding:
     # workers consume 50-90 turns writing + editing real implementation +
     # tests, then exit cleanly without ever running ``git commit``.
     # ``final_result.result == ""`` and there's no PR. With the old reap

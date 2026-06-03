@@ -23,7 +23,7 @@ from typing import Any
 
 from forge_loop.worker import _subagent_env, ensure_subagent_trusted
 
-DEFAULT_BRIEF = """You are the backlog-maintenance subagent for the Titan sprint loop.
+DEFAULT_BRIEF = """You are the backlog-maintenance subagent for the forge-loop sprint loop.
 
 Your job is to keep the loop FED. The worker pool starves if `loop:ready` is empty.
 A `acted_on: 0` outcome is a FAILURE of this role — you must always act.

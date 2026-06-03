@@ -124,7 +124,7 @@ def run_critic_sdk(
             # the wrong field names and silently never saw the assistant
             # text, leading to empty SDK outputs that broke the critic +
             # PO + brainstormer paths in production. Dogfood-caught
-            # running the brainstormer against Titan.
+            # running the brainstormer against a large downstream project.
             kind = event.get("kind") or event.get("type")  # tolerate both
             if kind == "final_result":
                 msg = event.get("text") or event.get("result") or event.get("last_message") or ""

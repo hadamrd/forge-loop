@@ -278,8 +278,9 @@ in your repo telling the worker:
 - Forbidden patterns (Jenkins imports if you're post-Jenkins; `window.confirm` in styled UIs; plaintext secrets)
 - The architecture invariants you'd flag in code review (discriminated-union typed config, pull-based workers, OIDC + PKCE, etc.)
 
-Same for `.forge-loop/briefs/po.md.tmpl`. A Titan-grade PO brief looks like
-[the one used by the Titan engine](https://github.com/hadamrd/dashboard-plugin/blob/trunk/.forge-loop/briefs/po.md.tmpl).
+Same for `.forge-loop/briefs/po.md.tmpl`. A production-grade PO brief is just as
+project-specific: encode your effort bar, file-pointer rules, and what
+"valuable" means for your product.
 
 ---
 
@@ -361,8 +362,8 @@ path. Manual close is the firm path when the worker doesn't notice.
 
 ## 8. Patterns observed across many runs
 
-These come from dogfooding the loop on its own codebase + on the Titan
-engine. They are real, not theoretical.
+These come from dogfooding the loop on its own codebase and on a production
+CI/CD engine. They are real, not theoretical.
 
 **Workers genuinely write good code on falsifiable-AC tickets.** The
 PRs reviewed in the [dogfood retros](../docs/RETROS.md) consistently
@@ -397,10 +398,6 @@ worker's branch name is derived from the issue title at dispatch time.
 - `forge-loop brief --kind worker --issue 42` — the exact brief the
   loop would send for an issue, useful for tightening your project-
   specific overrides
-- [hadamrd/dashboard-plugin](https://github.com/hadamrd/dashboard-plugin)
-  — the Titan engine codebase that forge-loop was extracted from; the
-  PR history is the best demo of what the loop can do on a real
-  production-grade Java + React codebase
 
 ---
 

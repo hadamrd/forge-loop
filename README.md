@@ -165,11 +165,10 @@ empirical claim.
 
 ## Provenance
 
-forge-loop is the extracted harness that built
-[Titan](https://github.com/hadamrd/dashboard-plugin), a post-Jenkins CI/CD
-engine, on its own backlog. The recursive-bootstrap pattern — a loop shipping
-its own features under its own critic — is the experiment; the repository is the
-log. Built on [Claude Code](https://claude.com/claude-code) and the
-[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python).
+forge-loop was extracted from the harness that built a production CI/CD engine
+on its own backlog. The recursive-bootstrap pattern — a loop shipping its own
+features under its own critic — is the experiment; this repository's commit
+history is the log. Built on [Claude Code](https://claude.com/claude-code) and
+the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python).
 
 MIT licensed.

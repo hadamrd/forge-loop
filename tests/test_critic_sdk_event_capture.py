@@ -1,5 +1,5 @@
 """Regression pin for the event-capture field-name mismatch in
-``_critic_sdk.run_critic_sdk`` (dogfood-caught running brainstormer on Titan).
+``_critic_sdk.run_critic_sdk`` (dogfood-caught running brainstormer on a large project).
 
 Pre-fix the capture used ``event["type"]`` + checked for kind ``"result"``,
 but forge_loop._worker_sdk actually emits ``event["kind"]`` with the
