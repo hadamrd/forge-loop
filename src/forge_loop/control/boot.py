@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -56,6 +57,10 @@ class BootTaskStore(Protocol):
         """Return non-terminal task sagas in insertion order."""
         ...
 
+    def list_stale(self, *, now: datetime) -> tuple[TaskSaga, ...]:
+        """Return non-terminal sagas whose lease has expired by ``now``."""
+        ...
+
 
 @dataclass(frozen=True)
 class ProjectionStatus:
@@ -84,6 +89,7 @@ class BootContext:
     rejected_path_memory_ids: tuple[str, ...] = ()
     in_flight_task_ids: tuple[str, ...] = ()
     in_flight_saga_ids: tuple[str, ...] = ()
+    stale_saga_ids: tuple[str, ...] = ()
     latest_event_sequence: int = 0
     last_event_sequence: int = 0
     projection_cursors: Mapping[str, ProjectionStatus] = field(default_factory=dict)
@@ -119,6 +125,8 @@ class BootContext:
                 lines.append("in_flight: " + ", ".join(pairs))
             else:
                 lines.append("in_flight: " + ", ".join(self.in_flight_task_ids))
+        if self.stale_saga_ids:
+            lines.append("stale (dead-worker leases): " + ", ".join(self.stale_saga_ids))
         lines.append(f"event_sequence: {self.latest_event_sequence}")
         if self.projection_cursors:
             projections = [
@@ -129,9 +137,14 @@ class BootContext:
         return "\n".join(lines)
 
 
-def assemble_boot_context(sources: BootSources) -> BootContext:
-    """Assemble compact maestro reset context from durable stores."""
+def assemble_boot_context(sources: BootSources, *, now: datetime | None = None) -> BootContext:
+    """Assemble compact maestro reset context from durable stores.
 
+    ``now`` anchors stale-lease detection (sagas whose lease has expired are
+    the work a dead worker left behind); it defaults to the current UTC time.
+    """
+
+    moment = now or datetime.now(UTC)
     try:
         frontier = sources.frontier_store.load()
     except FileNotFoundError as exc:
@@ -152,10 +165,12 @@ def assemble_boot_context(sources: BootSources) -> BootContext:
 
     in_flight_task_ids: tuple[str, ...] = ()
     in_flight_saga_ids: tuple[str, ...] = ()
+    stale_saga_ids: tuple[str, ...] = ()
     if sources.task_store is not None:
         in_flight = sources.task_store.list_in_flight()
         in_flight_task_ids = tuple(saga.task_id for saga in in_flight)
         in_flight_saga_ids = tuple(saga.saga_id for saga in in_flight)
+        stale_saga_ids = tuple(saga.saga_id for saga in sources.task_store.list_stale(now=moment))
 
     projection_cursors = {
         name: ProjectionStatus(
@@ -171,6 +186,7 @@ def assemble_boot_context(sources: BootSources) -> BootContext:
         rejected_path_memory_ids=rejected_path_memory_ids,
         in_flight_task_ids=in_flight_task_ids,
         in_flight_saga_ids=in_flight_saga_ids,
+        stale_saga_ids=stale_saga_ids,
         latest_event_sequence=latest_event_sequence,
         projection_cursors=projection_cursors,
     )

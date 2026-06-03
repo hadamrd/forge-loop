@@ -8,6 +8,7 @@ durable ``.forge`` stores instead of from transcript memory.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -117,6 +118,36 @@ class TestCliBoot:
         payload = json.loads(capsys.readouterr().out)
         assert payload["in_flight_task_ids"] == ["task-42"]
         assert payload["in_flight_saga_ids"] == ["saga-42"]
+        # An unleased running saga is in flight but not (yet) presumed dead.
+        assert payload["stale_saga_ids"] == []
+
+    def test_boot_flags_expired_lease_saga_as_stale(
+        self,
+        monkeypatch: Any,
+        tmp_path: Path,
+        capsys: Any,
+    ) -> None:
+        _seed_forge(tmp_path)
+        task_store = SqliteTaskSagaStore(tmp_path / ".forge" / "tasks.db")
+        task_store.put(
+            TaskSaga(
+                task_id="task-dead",
+                saga_id="saga-dead",
+                state=TaskState.RUNNING,
+                issue=7,
+                branch="loop/7",
+                lease_owner="worker-7",
+                lease_expires_at=datetime.now(UTC) - timedelta(minutes=30),
+            )
+        )
+        monkeypatch.setattr(cli, "load", lambda: _cfg(tmp_path))
+
+        rc = cli._cmd_boot(SimpleNamespace(json=True))
+
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["in_flight_saga_ids"] == ["saga-dead"]
+        assert payload["stale_saga_ids"] == ["saga-dead"]
 
     def test_boot_summary_renders_human_text(
         self,
