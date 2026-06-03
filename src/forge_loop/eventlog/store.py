@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from forge_loop.eventlog.models import EventEnvelope, EventId, EventKind
-from forge_loop.eventlog.projections import ProjectionCursor
+from forge_loop.eventlog.projections import ProjectionCursor, ProjectionReplayError
 
 
 class EventLog(Protocol):
@@ -49,6 +49,14 @@ class EventLog(Protocol):
         cursor: ProjectionCursor,
     ) -> None:
         """Persist a projection cursor."""
+        ...
+
+    def advance_projection_cursor(
+        self,
+        projection_name: str,
+        cursor: ProjectionCursor,
+    ) -> None:
+        """Persist a cursor only when it is monotonic and within the log tail."""
         ...
 
     def list_projection_cursors(self) -> Mapping[str, ProjectionCursor]:
@@ -105,6 +113,25 @@ class InMemoryEventLog:
         cursor: ProjectionCursor,
     ) -> None:
         self._projection_cursors[projection_name] = cursor
+
+    def advance_projection_cursor(
+        self,
+        projection_name: str,
+        cursor: ProjectionCursor,
+    ) -> None:
+        current = self.get_projection_cursor(projection_name)
+        if cursor.sequence < current.sequence:
+            raise ProjectionReplayError(
+                f"stale projection cursor for {projection_name}: "
+                f"{cursor.sequence} < {current.sequence}"
+            )
+        latest = self.latest_sequence()
+        if cursor.sequence > latest:
+            raise ProjectionReplayError(
+                f"projection cursor for {projection_name} is past latest event sequence: "
+                f"{cursor.sequence} > {latest}"
+            )
+        self.set_projection_cursor(projection_name, cursor)
 
     def list_projection_cursors(self) -> Mapping[str, ProjectionCursor]:
         return dict(self._projection_cursors)

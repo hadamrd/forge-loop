@@ -8,7 +8,11 @@ control-plane work should use.
 
 from forge_loop.eventlog.legacy_mirror import LegacyEventMirror, LegacyRunnerEventKind
 from forge_loop.eventlog.models import EventEnvelope, EventId, EventKind, EventRef
-from forge_loop.eventlog.projections import ProjectionCursor
+from forge_loop.eventlog.projections import (
+    ProjectionCursor,
+    ProjectionReplayError,
+    replay_projection,
+)
 from forge_loop.eventlog.sqlite import SqliteEventLog
 from forge_loop.eventlog.store import EventLog, InMemoryEventLog
 
@@ -22,5 +26,7 @@ __all__ = [
     "LegacyEventMirror",
     "LegacyRunnerEventKind",
     "ProjectionCursor",
+    "ProjectionReplayError",
     "SqliteEventLog",
+    "replay_projection",
 ]
