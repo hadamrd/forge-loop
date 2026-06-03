@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from forge_loop.eventlog import ProjectionCursor
-from forge_loop.frontier import FrontierCursor
-from forge_loop.memory import MemoryItem, MemoryKind
+from forge_loop.eventlog import ProjectionCursor, SqliteEventLog
+from forge_loop.frontier import FrontierCursor, FrontierStore
+from forge_loop.memory import MemoryItem, MemoryKind, SqliteMemoryStore
 from forge_loop.tasks import TaskSaga
 
 
@@ -173,4 +173,25 @@ def assemble_boot_context(sources: BootSources) -> BootContext:
         in_flight_saga_ids=in_flight_saga_ids,
         latest_event_sequence=latest_event_sequence,
         projection_cursors=projection_cursors,
+    )
+
+
+def build_boot_sources(repo: Path | str) -> BootSources:
+    """Wire the durable boot stores from a repository's ``.forge`` layout.
+
+    Mirrors the canonical paths seeded by ``forge-loop init``. Raises
+    :class:`BootContextError` when the frontier cursor is absent, so an
+    uninitialised repo fails fast instead of materialising empty event/memory
+    stores as a side effect of opening them.
+    """
+    forge_dir = Path(repo) / ".forge"
+    frontier_path = forge_dir / "frontier.yaml"
+    if not frontier_path.exists():
+        raise BootContextError(
+            f"frontier state is required at {frontier_path}; run `forge-loop init` first"
+        )
+    return BootSources(
+        frontier_store=FrontierStore(frontier_path),
+        event_log=SqliteEventLog(forge_dir / "events.db"),
+        memory_store=SqliteMemoryStore(forge_dir / "memory.db"),
     )

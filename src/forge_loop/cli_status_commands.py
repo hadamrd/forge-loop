@@ -321,6 +321,51 @@ class StatusCommandsMixin:
         console.print(Panel(table, title="[bold]forge-loop status[/bold]", title_align="left"))
         return 0
 
+    def _cmd_boot(self, args: SimpleNamespace) -> int:
+        """Reload the maestro reset-recovery context from durable ``.forge`` state.
+
+        This is the operator (and future maestro) entrypoint for booting from
+        explicit durable stores instead of transcript memory: it assembles the
+        frontier cursor, curated memory ids, in-flight tasks, and event-log
+        position into one compact summary.
+        """
+        from forge_loop.control.boot import (
+            BootContextError,
+            assemble_boot_context,
+            build_boot_sources,
+        )
+
+        cfg, _config_error = self.operator_cfg()
+        repo = Path(getattr(cfg, "repo", cfg.state_dir))
+        try:
+            context = assemble_boot_context(build_boot_sources(repo))
+        except BootContextError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 1
+
+        if getattr(args, "json", False):
+            payload = {
+                "frontier": {
+                    "product_goal": context.frontier.product_goal,
+                    "current_problem": context.frontier.current_problem,
+                    "next_expansion": context.frontier.next_expansion,
+                    "why_now": context.frontier.why_now,
+                },
+                "active_memory_ids": list(context.active_memory_ids),
+                "rejected_path_memory_ids": list(context.rejected_path_memory_ids),
+                "in_flight_task_ids": list(context.in_flight_task_ids),
+                "latest_event_sequence": context.latest_event_sequence,
+                "projection_cursors": {
+                    name: {"sequence": status.sequence, "lag": status.lag}
+                    for name, status in context.projection_cursors.items()
+                },
+            }
+            sys.stdout.write(json.dumps(payload, indent=2, default=str) + "\n")
+            return 0
+
+        sys.stdout.write(context.summary() + "\n")
+        return 0
+
     def _cmd_events(self, args: SimpleNamespace) -> int:
         """Tail recent events. Rich-formatted by default; ``--raw`` skips colour."""
         cfg, _config_error = self.operator_cfg()
