@@ -5,7 +5,7 @@ attempt, ``probe_worker_state`` used to fall through to the
 "no PR" path and inspect ``origin/<branch>..HEAD``. With a stale
 tracking ref the count showed commits "ahead" forever, putting the
 iteration loop into a push-forever cycle. Caught dogfooding the loop
-on Titan #1104.
+on a downstream project (#1104).
 
 Fixes:
 - CLOSED PR (state != MERGED, != OPEN) returns the new terminal

@@ -71,7 +71,7 @@ _STATUS_MARKERS = {
 
 app = typer.Typer(
     name="forge-loop",
-    help="Titan sprint-loop runner.",
+    help="forge-loop sprint-loop runner.",
     no_args_is_help=True,
     rich_markup_mode="rich",
     add_completion=True,

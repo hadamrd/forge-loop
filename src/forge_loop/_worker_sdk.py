@@ -351,7 +351,7 @@ async def run_sdk_session(
         base_kwargs["allowed_tools"] = build_allowed_tools_patterns(allow_servers)
     if model:
         base_kwargs["model"] = model
-    # SDK init knobs (issue: Titan dogfood hit "Control request timeout:
+    # SDK init knobs (issue: an early dogfood run hit "Control request timeout:
     # initialize" because the operator's global Claude config had ~10 MCP
     # servers totalling ~250 tools to enumerate at session start).
     #   * ``load_timeout_ms`` extends the SDK's init-handshake window

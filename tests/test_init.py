@@ -69,12 +69,12 @@ def test_init_force_overwrites(tmp_path: Path) -> None:
 
 
 def test_init_scaffold_does_not_leak_project_specific_deploy_task(tmp_path: Path) -> None:
-    """Scaffold MUST NOT default deploy.task to a Titan-specific value.
+    """Scaffold MUST NOT default deploy.task to a project-specific value.
 
     Regression guard for forge-loop#25: the original OSS extraction left
     `task: deploy:k3s:trunk` in the init template, which made every fresh
     `forge-loop init` write a yaml that immediately tripped the deploy_drift
-    safety brake on any non-Titan repo. The scaffold must ship an empty
+    safety brake on any unrelated repo. The scaffold must ship an empty
     string default (skip redeploy) and let operators opt in explicitly.
     """
     init_project(tmp_path, github_repo="example/foo")
@@ -92,7 +92,7 @@ def test_init_scaffold_does_not_leak_project_specific_deploy_task(tmp_path: Path
     assert actual in {'task: ""', "task: ''"}, (
         f"Scaffold's deploy.task must default to an empty string; got: {actual}. "
         "A concrete value (e.g. `deploy:k3s:trunk`) would trip the redeploy "
-        "drift-detector on every fresh `forge-loop init` against a non-Titan repo."
+        "drift-detector on every fresh `forge-loop init` against an unrelated repo."
     )
 
 
