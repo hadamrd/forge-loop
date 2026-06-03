@@ -66,9 +66,7 @@ def test_base_branch_from_yaml(fake_repo: Path) -> None:
     assert cfg.base_branch == "main"
 
 
-def test_base_branch_env_overrides_yaml(
-    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_base_branch_env_overrides_yaml(fake_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (fake_repo / "forge-loop.yaml").write_text(
         dedent("""
         repo:
@@ -306,3 +304,47 @@ def test_unknown_agent_provider_raises_clear_error(
     with pytest.raises(config_mod.ModelConfigError) as excinfo:
         config_mod.load()
     assert "wizard" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# worker_heartbeat_interval_s — first-class scheduling knob.
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_interval_defaults_to_60(fake_repo: Path) -> None:
+    cfg = config_mod.load()
+    assert cfg.worker_heartbeat_interval_s == 60.0
+
+
+def test_heartbeat_interval_from_yaml(fake_repo: Path) -> None:
+    (fake_repo / "forge-loop.yaml").write_text("scheduling:\n  worker_heartbeat_interval_s: 12.5\n")
+    cfg = config_mod.load()
+    assert cfg.worker_heartbeat_interval_s == 12.5
+
+
+def test_heartbeat_interval_env_overrides_yaml(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (fake_repo / "forge-loop.yaml").write_text("scheduling:\n  worker_heartbeat_interval_s: 12.5\n")
+    monkeypatch.setenv("LOOP_WORKER_HEARTBEAT_INTERVAL_S", "30")
+    cfg = config_mod.load()
+    assert cfg.worker_heartbeat_interval_s == 30.0
+
+
+def test_heartbeat_interval_flows_into_dispatch_helper(fake_repo: Path) -> None:
+    from forge_loop.runner import dispatch
+
+    (fake_repo / "forge-loop.yaml").write_text("scheduling:\n  worker_heartbeat_interval_s: 25\n")
+    cfg = config_mod.load()
+    assert dispatch._heartbeat_interval_s(cfg) == 25.0
+
+
+def test_dispatch_helper_floors_sub_one_to_one(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge_loop.runner import dispatch
+
+    monkeypatch.setenv("LOOP_WORKER_HEARTBEAT_INTERVAL_S", "0.25")
+    cfg = config_mod.load()
+    assert cfg.worker_heartbeat_interval_s == 0.25
+    assert dispatch._heartbeat_interval_s(cfg) == 1.0

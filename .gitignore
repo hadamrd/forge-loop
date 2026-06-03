@@ -33,6 +33,7 @@ forge-loop.local.yaml
 !.forge/testing-manifesto.md
 .claude/settings.json
 .claude/settings.local.json
+.claude/worktrees/
 # forge-loop runtime
 loop-runner.pid
 loop-runner.pause

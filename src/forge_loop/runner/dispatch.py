@@ -273,7 +273,16 @@ _HEARTBEAT_LEASE_FACTOR = 5
 
 
 def _heartbeat_interval_s(cfg: Config) -> float:
-    return max(float(getattr(cfg, "worker_heartbeat_interval_s", _HEARTBEAT_INTERVAL_S)), 1.0)
+    """Resolve the worker-heartbeat interval (seconds), floored at 1.0.
+
+    ``worker_heartbeat_interval_s`` is a real, configurable field on
+    :class:`Config` (env/yaml override: LOOP_WORKER_HEARTBEAT_INTERVAL_S /
+    ``scheduling.worker_heartbeat_interval_s``). The ``getattr`` fallback
+    to ``_HEARTBEAT_INTERVAL_S`` is retained only as a safety net for
+    Config-shaped test stubs that predate the field.
+    """
+    interval = getattr(cfg, "worker_heartbeat_interval_s", _HEARTBEAT_INTERVAL_S)
+    return max(float(interval), 1.0)
 
 
 def _lease_worker_saga(
