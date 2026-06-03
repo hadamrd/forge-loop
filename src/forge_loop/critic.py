@@ -41,7 +41,7 @@ VALID_OVERALL = {"approve", "request_changes", "block"}
 VALID_SEVERITY = {"sev1", "sev2", "sev3"}
 VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs", "product"}
 PRECOMMIT_BYPASS_TAG = "precommit_bypass"
-_NO_VERIFY_RE = re.compile(r"\bgit\s+commit\b[^\n]*\s--no-verify\b")
+_NO_VERIFY_RE = re.compile(r"\bgit(?:\s+-c\s+\S+)*\s+commit\b[^\n]*\s--no-verify\b")
 _BODY_NO_VERIFY_ACTION_RE = re.compile(
     r"\b(?:i\s+)?(?:ran|run|used|use|called|call|executed|execute)\s+"
     r"git\s+commit\b[^\n]*\s--no-verify\b",
@@ -171,10 +171,27 @@ def detect_precommit_bypass(commit_text: str, *, pr_body: str) -> CriticReport:
 
 
 def _has_no_verify_command(text: str) -> bool:
-    for line in text.splitlines():
+    for line in _command_segments(text):
         if _NO_VERIFY_RE.search(line) and not _NO_VERIFY_STATIC_CONTEXT_RE.search(line):
             return True
     return False
+
+
+def _command_segments(text: str) -> list[str]:
+    lines = text.splitlines()
+    segments: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        segment = line.rstrip()
+        while segment.endswith("\\") and i + 1 < len(lines):
+            segment = f"{segment[:-1]} {lines[i + 1].strip()}"
+            i += 1
+        segments.append(segment)
+        if i + 1 < len(lines) and "git" in line and "commit" in line:
+            segments.append(f"{line.rstrip()} {lines[i + 1].strip()}")
+        i += 1
+    return segments
 
 
 def _has_no_verify_body_action(text: str) -> bool:

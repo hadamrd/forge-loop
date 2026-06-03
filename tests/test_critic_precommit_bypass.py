@@ -62,3 +62,21 @@ def test_commit_metadata_static_rule_mention_is_not_a_bypass() -> None:
 
     assert not report.has_sev1()
     assert report.findings == []
+
+
+def test_git_config_prefixed_no_verify_is_sev1() -> None:
+    report = detect_precommit_bypass(
+        "git -c user.name=worker commit --no-verify -m repair\n",
+        pr_body="## Summary\nNo justification.\n",
+    )
+
+    assert report.has_sev1()
+
+
+def test_line_continuation_no_verify_is_sev1() -> None:
+    report = detect_precommit_bypass(
+        "git commit -m repair \\\n  --no-verify\n",
+        pr_body="## Summary\nNo justification.\n",
+    )
+
+    assert report.has_sev1()
