@@ -162,7 +162,7 @@ def pr_precommit_context(pr_url: str, cwd: Path) -> tuple[str, str]:
         return "", ""
 
     body = payload.get("body") if isinstance(payload.get("body"), str) else ""
-    commit_chunks: list[str] = [body]
+    commit_chunks: list[str] = []
     commits = payload.get("commits")
     if isinstance(commits, list):
         for commit in commits:
