@@ -24,6 +24,13 @@ class FakeTaskSagaStore:
         existing = self.get(saga.task_id)
         if (
             existing is not None
+            and not existing.is_terminal
+            and _has_lease_metadata(existing)
+            and not _has_same_lease_metadata(existing, saga)
+        ):
+            raise LeaseConflictError(f"task {saga.task_id} lease changed before update")
+        if (
+            existing is not None
             and existing.is_terminal
             and saga != existing
             and not _is_terminal_audit_update(existing, saga)
@@ -44,6 +51,8 @@ class FakeTaskSagaStore:
         worktree: str,
         compensations: tuple[Compensation, ...],
     ) -> TaskSaga:
+        if task_id in self.sagas or any(saga.saga_id == saga_id for saga in self.sagas.values()):
+            raise LeaseConflictError(f"task {task_id} or saga {saga_id} already exists")
         return self.put(
             TaskSaga(
                 task_id=task_id,
@@ -107,7 +116,8 @@ class FakeTaskSagaStore:
             lease_expires_at=expires_at,
             last_heartbeat_at=heartbeat_at,
         )
-        return self.put(heartbeaten)
+        self.sagas[task_id] = heartbeaten
+        return heartbeaten
 
     def list_stale(self, *, now: datetime) -> tuple[TaskSaga, ...]:
         return tuple(
@@ -210,4 +220,20 @@ def _is_terminal_audit_update(existing: TaskSaga, incoming: TaskSaga) -> bool:
         and existing.lease_expires_at == incoming.lease_expires_at
         and existing.last_heartbeat_at == incoming.last_heartbeat_at
         and incoming.terminal_reason is not None
+    )
+
+
+def _has_lease_metadata(saga: TaskSaga) -> bool:
+    return (
+        saga.lease_owner is not None
+        or saga.lease_expires_at is not None
+        or saga.last_heartbeat_at is not None
+    )
+
+
+def _has_same_lease_metadata(existing: TaskSaga, incoming: TaskSaga) -> bool:
+    return (
+        existing.lease_owner == incoming.lease_owner
+        and existing.lease_expires_at == incoming.lease_expires_at
+        and existing.last_heartbeat_at == incoming.last_heartbeat_at
     )

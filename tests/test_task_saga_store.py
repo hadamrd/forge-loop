@@ -164,6 +164,35 @@ class TestTaskSagaLeaseLifecycle:
         assert leased.lease_expires_at == now + timedelta(minutes=30)
         assert leased.last_heartbeat_at == now
 
+    def test_create_rejects_duplicate_task_id_and_preserves_existing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        for store in (
+            SqliteTaskSagaStore(tmp_path / "tasks.db"),
+            FakeTaskSagaStore(),
+        ):
+            created = store.create(
+                task_id="task-168-duplicate-create",
+                saga_id="saga-168-duplicate-create",
+                issue=168,
+                branch="loop/168-original",
+                worktree="/tmp/wt-loop-168-original",
+                compensations=(),
+            )
+
+            with pytest.raises(LeaseConflictError):
+                store.create(
+                    task_id=created.task_id,
+                    saga_id="saga-168-duplicate-create-replacement",
+                    issue=169,
+                    branch="loop/168-replacement",
+                    worktree="/tmp/wt-loop-168-replacement",
+                    compensations=(),
+                )
+
+            assert store.get(created.task_id) == created
+
     def test_heartbeat_extends_lease_before_expiry(self, tmp_path: Path) -> None:
         store = SqliteTaskSagaStore(tmp_path / "tasks.db")
         store.put(_saga("task-168-heartbeat", state=TaskState.DISPATCHED))
@@ -207,6 +236,26 @@ class TestTaskSagaLeaseLifecycle:
             )
 
         assert store.get(task_id) == leased
+
+    def test_stale_put_does_not_clear_active_lease(self, tmp_path: Path) -> None:
+        for store in (
+            SqliteTaskSagaStore(tmp_path / "tasks.db"),
+            FakeTaskSagaStore(),
+        ):
+            task_id = f"task-168-stale-put-{store.__class__.__name__}"
+            stale = store.put(_saga(task_id, state=TaskState.DISPATCHED))
+            acquired_at = datetime(2026, 6, 3, 10, 0, tzinfo=UTC)
+            leased = store.acquire_lease(
+                task_id,
+                owner_id="worker-a",
+                expires_at=acquired_at + timedelta(minutes=10),
+                acquired_at=acquired_at,
+            )
+
+            with pytest.raises(LeaseConflictError):
+                store.put(stale)
+
+            assert store.get(task_id) == leased
 
     def test_heartbeat_does_not_overwrite_concurrent_reclaim(
         self,

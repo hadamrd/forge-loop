@@ -182,7 +182,21 @@ class SqliteTaskSagaStore:
                     lease_expires_at = excluded.lease_expires_at,
                     last_heartbeat_at = excluded.last_heartbeat_at,
                     terminal_reason = excluded.terminal_reason
-                WHERE task_sagas.state NOT IN (?, ?, ?, ?)
+                WHERE (
+                        task_sagas.state NOT IN (?, ?, ?, ?)
+                        AND (
+                            (
+                                task_sagas.lease_owner IS NULL
+                                AND task_sagas.lease_expires_at IS NULL
+                                AND task_sagas.last_heartbeat_at IS NULL
+                            )
+                            OR (
+                                task_sagas.lease_owner IS excluded.lease_owner
+                                AND task_sagas.lease_expires_at IS excluded.lease_expires_at
+                                AND task_sagas.last_heartbeat_at IS excluded.last_heartbeat_at
+                            )
+                        )
+                    )
                     OR (
                         task_sagas.saga_id IS excluded.saga_id
                         AND task_sagas.state IS excluded.state
@@ -251,7 +265,42 @@ class SqliteTaskSagaStore:
             worktree=worktree,
             compensations=compensations,
         )
-        return self.put(saga)
+        try:
+            with self._connection:
+                self._connection.execute(
+                    """
+                    INSERT INTO task_sagas (
+                        task_id,
+                        saga_id,
+                        state,
+                        issue,
+                        branch,
+                        worktree,
+                        compensations_json,
+                        lease_owner,
+                        lease_expires_at,
+                        last_heartbeat_at,
+                        terminal_reason
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        saga.task_id,
+                        saga.saga_id,
+                        saga.state.value,
+                        saga.issue,
+                        saga.branch,
+                        saga.worktree,
+                        _compensations_json(saga.compensations),
+                        saga.lease_owner,
+                        _datetime_to_text(saga.lease_expires_at),
+                        _datetime_to_text(saga.last_heartbeat_at),
+                        saga.terminal_reason,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LeaseConflictError(f"task {task_id} or saga {saga_id} already exists") from exc
+        return saga
 
     def acquire_lease(
         self,
