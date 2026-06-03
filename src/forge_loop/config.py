@@ -25,10 +25,14 @@ from forge_loop.settings import (
     DEFAULT_ALLOWED_MCP_SERVERS,
     ConfigError,
     Settings,
-    get_settings,
 )
 
 ModelConfigError = ConfigError
+
+# Default heartbeat interval (seconds). Mirrors runner.dispatch's
+# _HEARTBEAT_INTERVAL_S; kept here so the field default is documented
+# at its source-of-truth.
+_DEFAULT_HEARTBEAT_INTERVAL_S = 60.0
 
 # Re-export legacy private helpers so test monkeypatches keep targeting
 # ``config._repo_root`` / ``config._yaml_config_path`` etc. The Settings
@@ -130,6 +134,12 @@ class Config:
     tick_interval_s: int = 60
     max_ticks: int = 0
     worker_timeout_s: int = 7200
+    # Interval (seconds) at which the background heartbeat thread renews
+    # each worker's task-saga lease (see runner.dispatch). The lease TTL
+    # is derived as interval * _HEARTBEAT_LEASE_FACTOR. Sourced (env >
+    # yaml > default) from LOOP_WORKER_HEARTBEAT_INTERVAL_S /
+    # ``scheduling.worker_heartbeat_interval_s``.
+    worker_heartbeat_interval_s: float = 60.0
     maintenance_every_n_ticks: int = 0
 
     deploy_task: str = ""
@@ -184,6 +194,41 @@ class Config:
         return self.state_dir / "loop-runner-logs"
 
 
+def _resolve_heartbeat_interval_s() -> float:
+    """Resolve the worker-heartbeat interval with env > yaml > default.
+
+    Mirrors the Settings loader's precedence for neighbouring scheduling
+    knobs (e.g. ``worker_timeout_s``). The value lives under the YAML
+    ``scheduling`` block and the ``LOOP_WORKER_HEARTBEAT_INTERVAL_S`` env
+    var; both are optional and fall back to ``_DEFAULT_HEARTBEAT_INTERVAL_S``.
+    """
+    import os as _os
+
+    raw_env = _os.environ.get("LOOP_WORKER_HEARTBEAT_INTERVAL_S")
+    if raw_env is not None and raw_env != "":
+        try:
+            return float(raw_env)
+        except (TypeError, ValueError) as e:
+            raise ConfigError(f"LOOP_WORKER_HEARTBEAT_INTERVAL_S={raw_env!r}: {e}") from e
+
+    # Resolve via the live settings-module attributes (not the import-time
+    # aliases) so test monkeypatches of ``settings._repo_root`` — which the
+    # Settings loader also honours — apply here too.
+    repo = _settings_mod._repo_root()
+    if path := _settings_mod._yaml_config_path(repo):
+        scheduling = _settings_mod._load_yaml(path).get("scheduling") or {}
+        if "worker_heartbeat_interval_s" in scheduling:
+            try:
+                return float(scheduling["worker_heartbeat_interval_s"])
+            except (TypeError, ValueError) as e:
+                raise ConfigError(
+                    f"scheduling.worker_heartbeat_interval_s="
+                    f"{scheduling['worker_heartbeat_interval_s']!r}: {e}"
+                ) from e
+
+    return _DEFAULT_HEARTBEAT_INTERVAL_S
+
+
 def _from_settings(s: Settings) -> Config:
     """Materialise the legacy Config dataclass from a Settings instance.
 
@@ -207,6 +252,7 @@ def _from_settings(s: Settings) -> Config:
         tick_interval_s=s.scheduling.tick_interval_s,
         max_ticks=s.scheduling.max_ticks,
         worker_timeout_s=s.scheduling.worker_timeout_s,
+        worker_heartbeat_interval_s=_resolve_heartbeat_interval_s(),
         maintenance_every_n_ticks=s.scheduling.maintenance_every_n_ticks,
         deploy_task=s.deploy.task,
         labels=Labels(
