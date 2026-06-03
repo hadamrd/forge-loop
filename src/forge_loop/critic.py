@@ -41,10 +41,10 @@ VALID_OVERALL = {"approve", "request_changes", "block"}
 VALID_SEVERITY = {"sev1", "sev2", "sev3"}
 VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs", "product"}
 PRECOMMIT_BYPASS_TAG = "precommit_bypass"
-_NO_VERIFY_RE = re.compile(r"\bgit(?:\s+-c\s+\S+)*\s+commit\b[^\n]*\s--no-verify\b")
+_NO_VERIFY_RE = re.compile(r"\bgit(?:\s+-[cC]\s+\S+)*\s+commit\b[^\n]*\s(?:--no-verify|-n)\b")
 _BODY_NO_VERIFY_ACTION_RE = re.compile(
     r"\b(?:i\s+)?(?:ran|run|used|use|called|call|executed|execute)\s+"
-    r"git\s+commit\b[^\n]*\s--no-verify\b",
+    r"git(?:\s+-[cC]\s+\S+)*\s+commit\b[^\n]*\s(?:--no-verify|-n)\b",
     re.IGNORECASE,
 )
 _NO_VERIFY_STATIC_CONTEXT_RE = re.compile(
@@ -177,6 +177,30 @@ def _has_no_verify_command(text: str) -> bool:
     return False
 
 
+def _worker_command_context(issue_number: int, logs_dir: Path) -> str:
+    chunks: list[str] = []
+    for pattern in (f"worker-{issue_number}-*.log", f"repair-{issue_number}-*.log"):
+        for path in sorted(logs_dir.glob(pattern)):
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                item = event.get("item")
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != "command_execution":
+                    continue
+                command = item.get("command")
+                if isinstance(command, str):
+                    chunks.append(command)
+    return "\n".join(chunks)
+
+
 def _command_segments(text: str) -> list[str]:
     lines = text.splitlines()
     segments: list[str] = []
@@ -223,8 +247,13 @@ def _with_deterministic_precommit_findings(
     *,
     pr_url: str,
     repo: Path,
+    issue_number: int,
+    logs_dir: Path,
 ) -> CriticReport:
     pr_body, commit_text = _fetch_pr_precommit_context(pr_url, repo)
+    worker_text = _worker_command_context(issue_number, logs_dir)
+    if worker_text:
+        commit_text = f"{commit_text}\n{worker_text}"
     deterministic = detect_precommit_bypass(commit_text, pr_body=pr_body)
     if not deterministic.findings:
         return report
@@ -316,7 +345,13 @@ def review_pr(
                 stdout_tail=tail,
                 error=parse_error or result.error or "critic_parse_failed",
             )
-        report = _with_deterministic_precommit_findings(report, pr_url=pr_url, repo=repo)
+        report = _with_deterministic_precommit_findings(
+            report,
+            pr_url=pr_url,
+            repo=repo,
+            issue_number=issue_number,
+            logs_dir=logs_dir,
+        )
         verdict = _verdict_from_overall(report.overall)
         reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
         return CriticOutcome(
@@ -399,7 +434,13 @@ def review_pr(
             parse_retries=retries,
         )
 
-    report = _with_deterministic_precommit_findings(report, pr_url=pr_url, repo=repo)
+    report = _with_deterministic_precommit_findings(
+        report,
+        pr_url=pr_url,
+        repo=repo,
+        issue_number=issue_number,
+        logs_dir=logs_dir,
+    )
     verdict = _verdict_from_overall(report.overall)
     reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
     return CriticOutcome(

@@ -123,6 +123,50 @@ def test_review_pr_enforces_precommit_bypass_detector(
     assert any("precommit_bypass" in reason for reason in outcome.reasons)
 
 
+def test_review_pr_enforces_precommit_bypass_from_worker_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "forge_loop._critic_sdk.run_critic_sdk",
+        lambda **kw: CriticSdkResult(
+            last_message=json.dumps({"overall": "approve", "findings": []}),
+            duration_s=0.1,
+        ),
+    )
+    monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
+    monkeypatch.setattr(
+        "forge_loop.critic._fetch_pr_precommit_context",
+        lambda _pr_url, _repo: ("ordinary PR body", "ordinary commit"),
+        raising=False,
+    )
+    logs = _mk_logs(tmp_path)
+    (logs / "worker-1-123.log").write_text(
+        json.dumps(
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": "git commit --no-verify -m bypass",
+                },
+            }
+        )
+        + "\n"
+    )
+
+    outcome = critic_mod.review_pr(
+        pr_url="https://github.com/owner/repo/pull/1",
+        issue_number=1,
+        repo=tmp_path,
+        logs_dir=logs,
+        timeout_s=60,
+    )
+
+    assert outcome.verdict == "changes_requested"
+    assert outcome.report is not None
+    assert outcome.report.has_sev1()
+    assert any("precommit_bypass" in reason for reason in outcome.reasons)
+
+
 def test_review_pr_sdk_timeout_returns_error_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

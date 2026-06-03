@@ -73,6 +73,15 @@ def test_git_config_prefixed_no_verify_is_sev1() -> None:
     assert report.has_sev1()
 
 
+def test_git_directory_prefixed_short_no_verify_is_sev1() -> None:
+    report = detect_precommit_bypass(
+        "git -C /tmp/wt-loop-1 commit -n -m repair\n",
+        pr_body="## Summary\nNo justification.\n",
+    )
+
+    assert report.has_sev1()
+
+
 def test_line_continuation_no_verify_is_sev1() -> None:
     report = detect_precommit_bypass(
         "git commit -m repair \\\n  --no-verify\n",
