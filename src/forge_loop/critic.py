@@ -42,6 +42,11 @@ VALID_SEVERITY = {"sev1", "sev2", "sev3"}
 VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs", "product"}
 PRECOMMIT_BYPASS_TAG = "precommit_bypass"
 _NO_VERIFY_RE = re.compile(r"\bgit\s+commit\b[^\n]*\s--no-verify\b")
+_BODY_NO_VERIFY_ACTION_RE = re.compile(
+    r"\b(?:i\s+)?(?:ran|run|used|use|called|call|executed|execute)\s+"
+    r"git\s+commit\b[^\n]*\s--no-verify\b",
+    re.IGNORECASE,
+)
 _BYPASS_HEADING_RE = re.compile(
     r"^##\s+Pre-commit bypass justification\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -139,7 +144,7 @@ class CriticOutcome:
 def detect_precommit_bypass(commit_text: str, *, pr_body: str) -> CriticReport:
     """Flag `git commit --no-verify` unless the PR body justifies it."""
 
-    if not _NO_VERIFY_RE.search(commit_text):
+    if not _NO_VERIFY_RE.search(commit_text) and not _BODY_NO_VERIFY_ACTION_RE.search(pr_body):
         return CriticReport(overall="approve", findings=[])
     if _has_precommit_bypass_justification(pr_body):
         return CriticReport(overall="approve", findings=[])

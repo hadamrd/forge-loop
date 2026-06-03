@@ -29,3 +29,26 @@ def test_no_verify_with_pr_body_justification_is_clean() -> None:
 
     assert not report.has_sev1()
     assert report.findings == []
+
+
+def test_pr_body_action_statement_without_justification_is_sev1() -> None:
+    report = detect_precommit_bypass(
+        "ordinary commit message\n",
+        pr_body="## Summary\nI ran git commit --no-verify -m bad during the repair.\n",
+    )
+
+    assert report.has_sev1()
+    assert "precommit_bypass" in report.findings[0].message
+
+
+def test_pr_body_static_rule_mention_is_not_a_bypass() -> None:
+    report = detect_precommit_bypass(
+        "ordinary commit message\n",
+        pr_body=(
+            "## Summary\n"
+            "Worker briefs state that `git commit --no-verify` requires a justification.\n"
+        ),
+    )
+
+    assert not report.has_sev1()
+    assert report.findings == []
