@@ -87,6 +87,19 @@ class _ControlProjection:
         self.applied_sequences = (*self.applied_sequences, event.sequence)
 
 
+@dataclass
+class _FailingProjection:
+    cursor: ProjectionCursor
+    fail_on_sequence: int
+    applied_sequences: tuple[int, ...] = ()
+
+    def apply(self, event: EventEnvelope) -> None:
+        if event.sequence == self.fail_on_sequence:
+            raise RuntimeError(f"projection boom at {event.sequence}")
+        self.cursor = ProjectionCursor(sequence=event.sequence)
+        self.applied_sequences = (*self.applied_sequences, event.sequence)
+
+
 def _append_interleaved_control_events(log: SqliteEventLog) -> tuple[EventEnvelope, ...]:
     first_frontier = log.append(
         EventKind.FRONTIER_ADVANCED,
@@ -230,3 +243,23 @@ class TestControlRestartReplayInvariants:
             )
 
         assert log.get_projection_cursor("control-boot").sequence == last.sequence
+
+    def test_projection_failure_does_not_advance_stored_cursor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        log = SqliteEventLog(tmp_path / "events.db")
+        appended = _append_interleaved_control_events(log)
+        original_cursor = ProjectionCursor(sequence=appended[0].sequence)
+        log.advance_projection_cursor("control-boot", original_cursor)
+
+        projection = _FailingProjection(
+            cursor=original_cursor,
+            fail_on_sequence=appended[2].sequence,
+        )
+
+        with pytest.raises(RuntimeError, match="projection boom"):
+            replay_projection(log, "control-boot", projection)
+
+        assert projection.applied_sequences == (appended[1].sequence,)
+        assert log.get_projection_cursor("control-boot") == original_cursor
