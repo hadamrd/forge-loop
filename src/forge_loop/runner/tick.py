@@ -103,6 +103,34 @@ def _remove_ready_label(
     _remove_ready_label_impl(cfg, issue, status=status, pr_url=pr_url, unlabel_fn=unlabel)
 
 
+def _record_merged_memory(cfg: Config, merged: list[WorkerOutcome]) -> None:
+    """Best-effort: promote episodic memory from merged outcomes.
+
+    Opens the canonical ``.forge/memory.db`` store and records one EPISODIC
+    item per merged issue. Wrapped so a failure here never breaks the tick: it
+    emits ``memory_promoted`` (count) on success or ``memory_promote_failed``
+    (err) on any error.
+    """
+    if not merged:
+        return
+    try:
+        from forge_loop.control.boot import canonical_task_saga_path
+        from forge_loop.memory.store import SqliteMemoryStore
+        from forge_loop.runner.learning import record_merged_outcomes
+
+        memory_path = canonical_task_saga_path(cfg.repo).parent / "memory.db"
+        store = SqliteMemoryStore(memory_path)
+        promoted = record_merged_outcomes(store, merged)
+        append_event(
+            cfg.events_file,
+            "memory_promoted",
+            count=len(promoted),
+            memory_ids=list(promoted),
+        )
+    except Exception as ex_:  # noqa: BLE001 — best-effort, must not break tick
+        append_event(cfg.events_file, "memory_promote_failed", err=str(ex_)[:200])
+
+
 def _enable_automerge_for_reviewed_outcomes(
     cfg: Config,
     outcomes: list[WorkerOutcome],
@@ -660,6 +688,13 @@ def _tick(cfg: Config, tick: int) -> None:
                 )
 
     merged_nums = [o.issue for o in outcomes if o.status == "merged"]
+
+    # Close the cognition feedback loop: write durable episodic memory from
+    # the real merged outcomes so future ticks/boots know what shipped. This
+    # is strictly best-effort — a memory write failing must NEVER break the
+    # tick, so the whole step is wrapped and only emits an event either way.
+    _record_merged_memory(cfg, [o for o in outcomes if o.status == "merged"])
+
     append_event(
         cfg.events_file,
         "tick_done",
