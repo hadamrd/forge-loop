@@ -121,8 +121,8 @@ class StatusCommandsMixin:
                     )
                 except json.JSONDecodeError:
                     pass
-        runner_stale = state_blob.get("state") == "running" and not pid_alive
         active_workers = list(active_workers_by_issue.values())
+        runner_stale = state_blob.get("state") == "running" and not pid_alive and not active_workers
         if not active_workers and state_blob.get("state") == "running":
             for entry in state_blob.get("dispatched") or []:
                 if (
