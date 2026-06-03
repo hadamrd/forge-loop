@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from forge_loop.sandbox import CapabilityPolicy, FilesystemScope, McpGrant, NetworkPolicy
 from forge_loop.worker import make_brief, make_repair_brief
 
 
@@ -15,6 +16,28 @@ def test_make_brief_includes_issue_number_and_body(tmp_path: Path) -> None:
     assert "Some body text" in brief
     assert str(tmp_path / "wt-947") in brief
     assert "CONTRACT" in brief
+
+
+def test_make_brief_reflects_granted_capabilities(tmp_path: Path) -> None:
+    issue = {"number": 166, "title": "bind worker policy", "body": "Ship it."}
+    policy = CapabilityPolicy(
+        filesystem=FilesystemScope(
+            read_roots=("/repo", str(tmp_path / "wt-166")),
+            write_roots=(str(tmp_path / "wt-166"),),
+        ),
+        network=NetworkPolicy(allow_domains=("github.com", "api.github.com")),
+        mcp=(McpGrant(server="github", tools=("*",)), McpGrant(server="lumen", tools=("search",))),
+        secret_names=("GITHUB_TOKEN",),
+    )
+
+    brief = make_brief(issue, tmp_path / "wt-166", capability_policy=policy)
+
+    assert "CAPABILITY POLICY" in brief
+    assert f"filesystem read: /repo, {tmp_path / 'wt-166'}" in brief
+    assert f"filesystem write: {tmp_path / 'wt-166'}" in brief
+    assert "network: deny-by-default; allow github.com, api.github.com" in brief
+    assert "mcp: github (*), lumen (search)" in brief
+    assert "secrets: GITHUB_TOKEN" in brief
 
 
 def test_make_brief_caps_body_at_6000_chars(tmp_path: Path) -> None:
@@ -80,6 +103,28 @@ def test_make_brief_default_stops_before_automerge(tmp_path: Path) -> None:
     assert "owns merge after critic approval" in brief
     assert "Fixes #942" in brief
     assert '"status": "open|failed"' in brief
+
+
+def test_make_brief_reflects_granted_capability_policy(tmp_path: Path) -> None:
+    issue = {"number": 166, "title": "policy", "body": ""}
+    policy = CapabilityPolicy(
+        filesystem=FilesystemScope(
+            read_roots=("/repo", "/tmp/wt-loop-166"),
+            write_roots=("/tmp/wt-loop-166",),
+        ),
+        network=NetworkPolicy(allow_domains=("github.com", "api.github.com")),
+        mcp=(McpGrant(server="github", tools=("*",)),),
+        secret_names=("GITHUB_TOKEN",),
+    )
+
+    brief = make_brief(issue, tmp_path / "wt-166", capability_policy=policy)
+
+    assert "CAPABILITY POLICY:" in brief
+    assert "- filesystem read: /repo, /tmp/wt-loop-166" in brief
+    assert "- filesystem write: /tmp/wt-loop-166" in brief
+    assert "- network: deny-by-default; allow github.com, api.github.com" in brief
+    assert "- mcp: github (*)" in brief
+    assert "- secrets: GITHUB_TOKEN" in brief
 
 
 def test_make_repair_brief_keeps_same_pr_contract(tmp_path: Path) -> None:

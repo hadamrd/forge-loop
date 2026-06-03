@@ -27,7 +27,10 @@ from typing import Any
 
 import pytest
 
+from forge_loop._testing.task_saga_store import FakeTaskSagaStore
 from forge_loop.runner import persistent_dispatch as pd
+from forge_loop.sandbox import CapabilityPolicy, FilesystemScope, McpGrant, NetworkPolicy
+from forge_loop.tasks import SqliteTaskSagaStore
 from forge_loop.worker import WorkerOutcome
 from forge_loop.worker_sessions import WorkerSessionStore
 from forge_loop.worker_state import WorkerState
@@ -64,6 +67,7 @@ def _make_cfg(tmp_path: Path) -> Any:
         coauthor = ""
         base_branch = "trunk"
         worker = _Worker()
+        task_store = None
 
     cfg = _Cfg()
     cfg.repo.mkdir(parents=True, exist_ok=True)
@@ -292,6 +296,7 @@ def test_dispatch_one_worker_full_success_path(tmp_path, monkeypatch) -> None:
     from forge_loop.runner import dispatch as dispatch_mod
 
     cfg = _make_cfg(tmp_path)
+    cfg.worker.allowed_mcp_tools = ("github", "lumen")
     store = WorkerSessionStore(":memory:")
     issue = _issue(42)
 
@@ -305,6 +310,16 @@ def test_dispatch_one_worker_full_success_path(tmp_path, monkeypatch) -> None:
             break
         else:
             raise AssertionError("no session in store at SDK invocation time")
+        policy = kwargs["capability_policy"]
+        assert policy == CapabilityPolicy(
+            filesystem=FilesystemScope(
+                read_roots=(str(cfg.repo), "/tmp/wt-loop-42"),
+                write_roots=("/tmp/wt-loop-42",),
+            ),
+            network=NetworkPolicy(allow_domains=("github.com", "api.github.com")),
+            mcp=(McpGrant(server="github", tools=("*",)), McpGrant(server="lumen", tools=("*",))),
+            secret_names=(),
+        )
         return WorkerOutcome(
             issue=42,
             title="t",
@@ -331,6 +346,18 @@ def test_dispatch_one_worker_full_success_path(tmp_path, monkeypatch) -> None:
     final = sessions[0]
     assert final.state == WorkerState.AWAITING_CRITIC
     assert final.pr_url == pr_url
+    task_saga = SqliteTaskSagaStore(cfg.state_dir / "task-sagas.db").get("task-42-worker")
+    assert task_saga is not None
+    assert task_saga.worktree == "/tmp/wt-loop-42"
+    assert task_saga.capability_policy == CapabilityPolicy(
+        filesystem=FilesystemScope(
+            read_roots=(str(cfg.repo), "/tmp/wt-loop-42"),
+            write_roots=("/tmp/wt-loop-42",),
+        ),
+        network=NetworkPolicy(allow_domains=("github.com", "api.github.com")),
+        mcp=(McpGrant(server="github", tools=("*",)), McpGrant(server="lumen", tools=("*",))),
+        secret_names=(),
+    )
 
     # Three typed transition events: -> DISPATCHED, -> RUNNING,
     # -> AWAITING_CRITIC.
@@ -338,6 +365,146 @@ def test_dispatch_one_worker_full_success_path(tmp_path, monkeypatch) -> None:
     kinds = [r for r in recs if r["kind"] == "worker_session_transition"]
     states = [r["new_state"] for r in kinds]
     assert states == ["dispatched", "running", "awaiting_critic"]
+
+
+def test_dispatch_one_worker_records_capability_policy_on_task_saga(tmp_path, monkeypatch) -> None:
+    from forge_loop.runner import dispatch as dispatch_mod
+
+    cfg = _make_cfg(tmp_path)
+    cfg.worker.allowed_mcp_tools = ("github",)
+    cfg.task_store = FakeTaskSagaStore()
+    store = WorkerSessionStore(":memory:")
+    issue = _issue(166, "bind worker worktrees")
+
+    def fake_run_worker(*args, **kwargs):
+        return WorkerOutcome(
+            issue=166,
+            title="bind worker worktrees",
+            pr_url="https://github.com/o/r/pull/166",
+            status="open",
+            duration_s=1.0,
+            stdout_tail="",
+        )
+
+    monkeypatch.setattr(dispatch_mod, "run_worker", fake_run_worker)
+
+    dispatch_mod._dispatch_one_worker(
+        cfg,
+        issue,
+        _meta(),
+        tick=1,
+        bus_emit=lambda *a, **k: None,
+        store=store,
+    )
+
+    saga = cfg.task_store.get("task-166-worker")
+    assert saga is not None
+    assert saga.saga_id == "saga-166-worker"
+    assert saga.issue == 166
+    assert saga.worktree == "/tmp/wt-loop-166"
+    assert saga.capability_policy.filesystem.write_roots == ("/tmp/wt-loop-166",)
+    assert saga.capability_policy.mcp == (McpGrant(server="github", tools=("*",)),)
+
+
+def test_dispatch_one_worker_records_policy_in_default_task_saga_store(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from forge_loop.runner import dispatch as dispatch_mod
+
+    cfg = _make_cfg(tmp_path)
+    store = WorkerSessionStore(":memory:")
+
+    def fake_run_worker(*args, **kwargs):
+        return WorkerOutcome(
+            issue=168,
+            title="default store",
+            pr_url="https://github.com/o/r/pull/168",
+            status="open",
+            duration_s=1.0,
+            stdout_tail="",
+        )
+
+    monkeypatch.setattr(dispatch_mod, "run_worker", fake_run_worker)
+
+    dispatch_mod._dispatch_one_worker(
+        cfg,
+        _issue(168, "default store"),
+        _meta(),
+        tick=1,
+        bus_emit=lambda *a, **k: None,
+        store=store,
+    )
+
+    saga = SqliteTaskSagaStore(cfg.state_dir / "task-sagas.db").get("task-168-worker")
+    assert saga is not None
+    assert saga.capability_policy.filesystem.read_roots == (str(cfg.repo), "/tmp/wt-loop-168")
+    assert saga.capability_policy.network.allow_domains == ("github.com", "api.github.com")
+
+
+def test_dispatch_one_worker_refuses_to_run_without_capability_policy(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from forge_loop.runner import dispatch as dispatch_mod
+
+    cfg = _make_cfg(tmp_path)
+    cfg.task_store = FakeTaskSagaStore()
+
+    def no_policy(**kwargs):
+        return None
+
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("worker dispatched without a capability policy")
+
+    monkeypatch.setattr(dispatch_mod, "capability_policy_for_worker", no_policy)
+    monkeypatch.setattr(dispatch_mod, "run_worker", should_not_run)
+
+    with pytest.raises(RuntimeError, match="missing capability policy"):
+        dispatch_mod._dispatch_one_worker(
+            cfg,
+            _issue(167),
+            _meta(),
+            tick=1,
+            bus_emit=lambda *a, **k: None,
+            store=WorkerSessionStore(":memory:"),
+        )
+
+    assert cfg.task_store.sagas == {}
+
+
+def test_dispatch_one_worker_requires_policy_record_before_worker_invocation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from forge_loop.runner import dispatch as dispatch_mod
+
+    cfg = _make_cfg(tmp_path)
+    store = WorkerSessionStore(":memory:")
+    called = False
+
+    def missing_policy(*args, **kwargs):
+        return None
+
+    def fake_run_worker(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("worker should not run without a policy")
+
+    monkeypatch.setattr(dispatch_mod, "capability_policy_for_worker", missing_policy)
+    monkeypatch.setattr(dispatch_mod, "run_worker", fake_run_worker)
+
+    with pytest.raises(RuntimeError, match="capability policy"):
+        dispatch_mod._dispatch_one_worker(
+            cfg,
+            _issue(166),
+            _meta(),
+            tick=1,
+            bus_emit=lambda *a, **k: None,
+            store=store,
+        )
+
+    assert called is False
 
 
 def test_dispatch_one_worker_failure_path(tmp_path, monkeypatch) -> None:

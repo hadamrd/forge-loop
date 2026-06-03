@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from forge_loop.sandbox import CapabilityPolicy
 from forge_loop.tasks.saga import (
     Compensation,
     LeaseConflictError,
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS task_sagas (
     branch TEXT,
     worktree TEXT,
     compensations_json TEXT NOT NULL,
+    capability_policy_json TEXT NOT NULL DEFAULT '{}',
     lease_owner TEXT,
     lease_expires_at TEXT,
     last_heartbeat_at TEXT,
@@ -35,6 +37,7 @@ CREATE TABLE IF NOT EXISTS task_sagas (
 
 _COMPAT_COLUMNS = {
     "lease_owner": "TEXT",
+    "capability_policy_json": "TEXT NOT NULL DEFAULT '{}'",
     "lease_expires_at": "TEXT",
     "last_heartbeat_at": "TEXT",
     "terminal_reason": "TEXT",
@@ -64,6 +67,7 @@ class TaskSagaStore(Protocol):
         branch: str,
         worktree: str,
         compensations: tuple[Compensation, ...],
+        capability_policy: CapabilityPolicy | None = None,
     ) -> TaskSaga:
         """Create a planned, leaseable task saga."""
         ...
@@ -164,12 +168,13 @@ class SqliteTaskSagaStore:
                     branch,
                     worktree,
                     compensations_json,
+                    capability_policy_json,
                     lease_owner,
                     lease_expires_at,
                     last_heartbeat_at,
                     terminal_reason
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id)
                 DO UPDATE SET
                     saga_id = excluded.saga_id,
@@ -178,6 +183,7 @@ class SqliteTaskSagaStore:
                     branch = excluded.branch,
                     worktree = excluded.worktree,
                     compensations_json = excluded.compensations_json,
+                    capability_policy_json = excluded.capability_policy_json,
                     lease_owner = excluded.lease_owner,
                     lease_expires_at = excluded.lease_expires_at,
                     last_heartbeat_at = excluded.last_heartbeat_at,
@@ -204,6 +210,7 @@ class SqliteTaskSagaStore:
                         AND task_sagas.branch IS excluded.branch
                         AND task_sagas.worktree IS excluded.worktree
                         AND task_sagas.compensations_json IS excluded.compensations_json
+                        AND task_sagas.capability_policy_json IS excluded.capability_policy_json
                         AND task_sagas.lease_owner IS excluded.lease_owner
                         AND task_sagas.lease_expires_at IS excluded.lease_expires_at
                         AND task_sagas.last_heartbeat_at IS excluded.last_heartbeat_at
@@ -216,6 +223,7 @@ class SqliteTaskSagaStore:
                         AND task_sagas.branch IS excluded.branch
                         AND task_sagas.worktree IS excluded.worktree
                         AND task_sagas.compensations_json IS excluded.compensations_json
+                        AND task_sagas.capability_policy_json IS excluded.capability_policy_json
                         AND task_sagas.lease_owner IS excluded.lease_owner
                         AND task_sagas.lease_expires_at IS excluded.lease_expires_at
                         AND task_sagas.last_heartbeat_at IS excluded.last_heartbeat_at
@@ -230,6 +238,7 @@ class SqliteTaskSagaStore:
                     saga.branch,
                     saga.worktree,
                     _compensations_json(saga.compensations),
+                    _capability_policy_json(saga.capability_policy),
                     saga.lease_owner,
                     _datetime_to_text(saga.lease_expires_at),
                     _datetime_to_text(saga.last_heartbeat_at),
@@ -255,6 +264,7 @@ class SqliteTaskSagaStore:
         branch: str,
         worktree: str,
         compensations: tuple[Compensation, ...],
+        capability_policy: CapabilityPolicy | None = None,
     ) -> TaskSaga:
         saga = TaskSaga(
             task_id=task_id,
@@ -264,6 +274,7 @@ class SqliteTaskSagaStore:
             branch=branch,
             worktree=worktree,
             compensations=compensations,
+            capability_policy=capability_policy or CapabilityPolicy(),
         )
         try:
             with self._connection:
@@ -277,12 +288,13 @@ class SqliteTaskSagaStore:
                         branch,
                         worktree,
                         compensations_json,
+                        capability_policy_json,
                         lease_owner,
                         lease_expires_at,
                         last_heartbeat_at,
                         terminal_reason
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         saga.task_id,
@@ -292,6 +304,7 @@ class SqliteTaskSagaStore:
                         saga.branch,
                         saga.worktree,
                         _compensations_json(saga.compensations),
+                        _capability_policy_json(saga.capability_policy),
                         saga.lease_owner,
                         _datetime_to_text(saga.lease_expires_at),
                         _datetime_to_text(saga.last_heartbeat_at),
@@ -511,6 +524,19 @@ def _compensations_json(compensations: tuple[Compensation, ...]) -> str:
     )
 
 
+def _capability_policy_json(policy: CapabilityPolicy) -> str:
+    return json.dumps(policy.to_json_obj(), sort_keys=True, separators=(",", ":"))
+
+
+def _load_capability_policy(raw: str | None) -> CapabilityPolicy:
+    if not raw:
+        return CapabilityPolicy()
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("task saga capability policy must be a JSON object")
+    return CapabilityPolicy.from_json_obj(value)
+
+
 def _load_compensations(raw: str) -> tuple[Compensation, ...]:
     values = json.loads(raw)
     if not isinstance(values, list):
@@ -555,6 +581,7 @@ def _replace_saga(
     lease_expires_at: datetime | None = None,
     last_heartbeat_at: datetime | None = None,
     terminal_reason: str | None = None,
+    capability_policy: CapabilityPolicy | None = None,
 ) -> TaskSaga:
     return TaskSaga(
         task_id=saga.task_id,
@@ -572,6 +599,7 @@ def _replace_saga(
             last_heartbeat_at if last_heartbeat_at is not None else saga.last_heartbeat_at
         ),
         terminal_reason=terminal_reason if terminal_reason is not None else saga.terminal_reason,
+        capability_policy=capability_policy or saga.capability_policy,
     )
 
 
@@ -584,6 +612,7 @@ def _is_terminal_audit_update(existing: TaskSaga, incoming: TaskSaga) -> bool:
         and existing.branch == incoming.branch
         and existing.worktree == incoming.worktree
         and existing.compensations == incoming.compensations
+        and existing.capability_policy == incoming.capability_policy
         and existing.lease_owner == incoming.lease_owner
         and existing.lease_expires_at == incoming.lease_expires_at
         and existing.last_heartbeat_at == incoming.last_heartbeat_at
@@ -600,6 +629,7 @@ def _saga_from_row(row: sqlite3.Row) -> TaskSaga:
         branch=row["branch"],
         worktree=row["worktree"],
         compensations=_load_compensations(row["compensations_json"]),
+        capability_policy=_load_capability_policy(row["capability_policy_json"]),
         lease_owner=row["lease_owner"],
         lease_expires_at=_datetime_from_text(row["lease_expires_at"]),
         last_heartbeat_at=_datetime_from_text(row["last_heartbeat_at"]),

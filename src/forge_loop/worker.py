@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from forge_loop.sandbox import CapabilityPolicy
 from forge_loop.worker_brief import (
     brief_template_hash as _brief_template_hash,
 )
@@ -160,6 +161,7 @@ def run_worker(
     mcp_servers: dict[str, Any] | None = None,
     base_branch: str = "trunk",
     brief_override: str | None = None,
+    capability_policy: CapabilityPolicy | None = None,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -236,6 +238,7 @@ def run_worker(
             lumen_test_pattern=lumen_test_pattern,
             coauthor=coauthor,
             manifesto_bundle=manifesto_bundle,
+            capability_policy=capability_policy,
         )
 
     if provider == "codex":
