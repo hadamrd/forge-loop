@@ -13,7 +13,11 @@ DO:
    acceptance criteria. Note any "Acceptance" or "Out of scope" sections.
 2. Read the PR diff: `gh pr diff {pr_url}`.
 3. Read the PR description: `gh pr view {pr_url} --json title,body,additions,deletions`.
-4. Decide overall + per-finding. Use the rubric:
+4. Check worker commit commands / PR text for `git commit --no-verify`.
+   If `--no-verify` appears and the PR body lacks a non-empty
+   `## Pre-commit bypass justification` section, emit a sev1 finding
+   tagged `precommit_bypass`. Pre-commit gates are not optional.
+5. Decide overall + per-finding. Use the rubric:
    - sev1 = correctness/security bug, missing acceptance criterion,
      or test that doesn't actually exercise the change. Blocks merge.
    - sev2 = meaningful concern (untested error path, weak assertion,

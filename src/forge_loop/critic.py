@@ -30,6 +30,7 @@ import json
 import re
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,12 @@ from forge_loop.worker import ensure_subagent_trusted
 VALID_OVERALL = {"approve", "request_changes", "block"}
 VALID_SEVERITY = {"sev1", "sev2", "sev3"}
 VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs", "product"}
+PRECOMMIT_BYPASS_TAG = "precommit_bypass"
+_NO_VERIFY_RE = re.compile(r"\bgit\s+commit\b[^\n]*\s--no-verify\b")
+_BYPASS_HEADING_RE = re.compile(
+    r"^##\s+Pre-commit bypass justification\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 @dataclass
@@ -58,8 +65,10 @@ class ManifestoViolation:
 
     def is_valid(self) -> bool:
         return (
-            isinstance(self.rule_id, str) and bool(self.rule_id.strip())
-            and isinstance(self.manifesto, str) and bool(self.manifesto.strip())
+            isinstance(self.rule_id, str)
+            and bool(self.rule_id.strip())
+            and isinstance(self.manifesto, str)
+            and bool(self.manifesto.strip())
             and isinstance(self.quote, str)
             and isinstance(self.suggested_fix, str)
             and self.severity in VALID_SEVERITY
@@ -103,15 +112,13 @@ class CriticReport:
         return {f.severity for f in self.findings}
 
     def has_sev1(self) -> bool:
-        return (
-            any(f.severity == "sev1" for f in self.findings)
-            or any(v.severity == "sev1" for v in self.manifesto_violations)
+        return any(f.severity == "sev1" for f in self.findings) or any(
+            v.severity == "sev1" for v in self.manifesto_violations
         )
 
     def has_sev2(self) -> bool:
-        return (
-            any(f.severity == "sev2" for f in self.findings)
-            or any(v.severity == "sev2" for v in self.manifesto_violations)
+        return any(f.severity == "sev2" for f in self.findings) or any(
+            v.severity == "sev2" for v in self.manifesto_violations
         )
 
     def has_sev1_manifesto_violation(self) -> bool:
@@ -127,6 +134,39 @@ class CriticOutcome:
     report: CriticReport | None = None
     error: str | None = None
     parse_retries: int = 0
+
+
+def detect_precommit_bypass(commit_text: str, *, pr_body: str) -> CriticReport:
+    """Flag `git commit --no-verify` unless the PR body justifies it."""
+
+    if not _NO_VERIFY_RE.search(commit_text):
+        return CriticReport(overall="approve", findings=[])
+    if _has_precommit_bypass_justification(pr_body):
+        return CriticReport(overall="approve", findings=[])
+    return CriticReport(
+        overall="request_changes",
+        findings=[
+            Finding(
+                severity="sev1",
+                category="correctness",
+                file=None,
+                line=None,
+                message=(
+                    f"{PRECOMMIT_BYPASS_TAG}: `git commit --no-verify` requires a "
+                    "`## Pre-commit bypass justification` section in the PR body."
+                ),
+            )
+        ],
+    )
+
+
+def _has_precommit_bypass_justification(pr_body: str) -> bool:
+    match = _BYPASS_HEADING_RE.search(pr_body)
+    if match is None:
+        return False
+    tail = pr_body[match.end() :]
+    body = tail.split("\n## ", 1)[0].strip()
+    return bool(body)
 
 
 def review_pr(
@@ -237,10 +277,8 @@ def review_pr(
         # Mirror the final assistant text to disk so the existing
         # _tail(log_path, 500) read for stdout_tail keeps working and
         # operators can grep critic-*.log as before.
-        try:
+        with suppress(OSError):
             log_path.write_text(sdk_result.last_message or "")
-        except OSError:
-            pass
         if sdk_result.timed_out:
             return CriticOutcome(
                 verdict="error",

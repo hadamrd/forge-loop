@@ -7,7 +7,14 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+
+from forge_loop.precommit import (
+    PreCommitRunner,
+    ensure_worker_precommit_hook,
+)
 
 _PERMISSIVE_WORKTREE_SETTINGS = """{
   "permissions": {
@@ -67,6 +74,8 @@ def prep_worktree(
     branch: str,
     *,
     base_branch: str = "trunk",
+    emit: Callable[[str, dict[str, Any]], None] | None = None,
+    precommit_runner: PreCommitRunner | None = None,
 ) -> tuple[Path, str | None]:
     wt = Path(f"/tmp/wt-loop-{n}")
     _remove_existing_worktree(repo, wt)
@@ -88,6 +97,12 @@ def prep_worktree(
         return wt, r.stderr
     if wt.exists():
         drop_permissive_settings(wt)
+        method, reason = ensure_worker_precommit_hook(
+            repo,
+            wt,
+            runner=precommit_runner,
+        )
+        _emit_worker_precommit_event(emit, wt, method.value, reason)
     return wt, None
 
 
@@ -112,6 +127,21 @@ def prep_repair_worktree(repo: Path, issue: int, branch: str) -> tuple[Path, str
     if wt.exists():
         drop_permissive_settings(wt)
     return wt, None
+
+
+def _emit_worker_precommit_event(
+    emit: Callable[[str, dict[str, Any]], None] | None,
+    worktree: Path,
+    method: str,
+    reason: str | None,
+) -> None:
+    if emit is None:
+        return
+    payload: dict[str, Any] = {"worktree_path": str(worktree), "method": method}
+    if reason:
+        payload["reason"] = reason
+    with contextlib.suppress(Exception):
+        emit("worker_precommit_installed", payload)
 
 
 def _remove_existing_worktree(repo: Path, wt: Path) -> None:

@@ -8,6 +8,18 @@ exists, not just what it says.
 
 ## Rules
 
+### Q6. No `--no-verify` without a justified reason in the PR body. Pre-commit gates are not optional.
+
+Pre-commit exists to enforce the same quality gates locally that CI will
+enforce later. Bypassing it hides defects from the worker loop and turns
+review into the first real gate. If a bypass is genuinely required, the
+PR body MUST include a `## Pre-commit bypass justification` section that
+explains why the hook could not run.
+
+**Rationale:** see #158. Forge-loop had a pre-commit config but the hook
+was never installed in worker worktrees, so commits silently bypassed
+ruff, mypy, pyright, and formatting until CI or production found them.
+
 ### Q1. No shared mutable module-level state. Use a Container or per-instance State.
 
 Module-level globals (caches, counters, "current run" dicts, singleton

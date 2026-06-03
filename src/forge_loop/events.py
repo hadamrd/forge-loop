@@ -41,6 +41,8 @@ from typing import Any, ClassVar, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from forge_loop.precommit import PreCommitInstallMethod
+
 _DEFAULT_DURABLE_MIRROR = object()
 
 
@@ -287,6 +289,16 @@ class StuckSweepDemotedEvent(EventBase):
     reason: str = ""
 
 
+@register_event
+class WorkerPreCommitInstalledEvent(EventBase):
+    """Pre-commit hook propagation result for one worker worktree."""
+
+    KIND: ClassVar[str] = "worker_precommit_installed"
+    worktree_path: str = ""
+    method: PreCommitInstallMethod
+    reason: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Emit + back-compat shim. ``emit`` is the typed path; ``append_event_with_
 # registry_check`` is the back-compat wrapper called by state.append_event.
@@ -430,6 +442,7 @@ __all__ = [
     "TickStartEvent",
     "WorkerSessionRecoveredEvent",
     "WorkerSessionTransitionEvent",
+    "WorkerPreCommitInstalledEvent",
     "WorktreeReapedEvent",
     "append_event_with_registry_check",
     "emit",
