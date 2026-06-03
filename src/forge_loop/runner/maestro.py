@@ -20,6 +20,8 @@ from typing import Any
 from forge_loop.frontier import FrontierCursor
 
 _WORD = re.compile(r"[a-z0-9]{4,}")
+# Path separators / extension boundary used to split hot-file refs into tokens.
+_PATH_SPLIT = re.compile(r"[\\/]+")
 
 
 @dataclass(frozen=True)
@@ -93,15 +95,16 @@ def build_maestro_plan(
         )
         keywords = set(_WORD.findall(next_expansion.lower()))
         for ref in hot_files:
-            keywords.update(_WORD.findall(ref.lower()))
+            keywords.update(_hot_file_tokens(ref))
 
-    rejected_lower = tuple(idea.lower() for idea in rejected_ideas)
+    rejected_matchers = tuple(_rejected_matcher(idea) for idea in rejected_ideas)
+    rejected_matchers = tuple(m for m in rejected_matchers if m is not None)
 
     def _bucket(issue: dict[str, Any]) -> int:
         text = _issue_text(issue)
-        if any(idea in text for idea in rejected_lower):
+        if any(matcher.search(text) for matcher in rejected_matchers):
             return 2  # known dead end → last
-        if keywords and any(word in text for word in keywords):
+        if keywords and (keywords & _issue_tokens(issue)):
             return 0  # frontier-aligned → first
         return 1  # neutral
 
@@ -125,6 +128,53 @@ def build_maestro_plan(
 def _issue_text(issue: dict[str, Any]) -> str:
     labels = " ".join(lab.get("name", "") for lab in (issue.get("labels") or []))
     return f"{issue.get('title', '')} {issue.get('body', '')} {labels}".lower()
+
+
+def _issue_tokens(issue: dict[str, Any]) -> set[str]:
+    """Word tokens from an issue's title/body plus its ``axis:*`` label names.
+
+    ``axis:foo`` labels contribute the axis name (``foo``) as a token so that
+    frontier keywords can align with an issue purely via its axis labelling,
+    not only via free text.
+    """
+    tokens = set(_WORD.findall(_issue_text(issue)))
+    for lab in issue.get("labels") or []:
+        name = lab.get("name", "")
+        if name.lower().startswith("axis:"):
+            tokens.update(_WORD.findall(name.lower()))
+    return tokens
+
+
+def _hot_file_tokens(ref: str) -> set[str]:
+    """Tokenise a hot-file ref into useful path components.
+
+    ``src/forge_loop/runner/dispatch.py`` -> ``{dispatch, runner}`` (basename
+    without its extension plus the immediate parent dir), in addition to any
+    4+ char tokens the raw ref happens to contain.
+    """
+    lowered = ref.lower()
+    tokens = set(_WORD.findall(lowered))
+    parts = [p for p in _PATH_SPLIT.split(lowered) if p]
+    if parts:
+        basename = parts[-1].rsplit(".", 1)[0]
+        tokens.update(_WORD.findall(basename))
+        if len(parts) >= 2:
+            tokens.update(_WORD.findall(parts[-2]))
+    return tokens
+
+
+def _rejected_matcher(idea: str) -> re.Pattern[str] | None:
+    """Compile a word-boundary matcher for a rejected idea.
+
+    Single tokens match on word boundaries (so ``poll`` does not match
+    ``polling``); multi-word ideas match as a whitespace-flexible phrase. Ideas
+    with no usable tokens yield ``None`` (skipped).
+    """
+    words = re.findall(r"[a-z0-9]+", idea.lower())
+    if not words:
+        return None
+    phrase = r"\s+".join(re.escape(w) for w in words)
+    return re.compile(rf"\b{phrase}\b")
 
 
 def _render_brief_context(

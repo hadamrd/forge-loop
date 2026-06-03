@@ -85,6 +85,69 @@ def test_brief_context_names_goal_and_rejected() -> None:
     assert "polling every second" in ctx
 
 
+def test_axis_label_alignment_prioritizes() -> None:
+    # Issue 2 carries no matching free text, only an axis:recovery label.
+    issues = [
+        {"number": 1, "title": "polish docs", "body": "", "labels": []},
+        {
+            "number": 2,
+            "title": "misc work",
+            "body": "",
+            "labels": [{"name": "axis:recovery"}],
+        },
+    ]
+    plan = build_maestro_plan(
+        issues, frontier=_frontier(next_expansion="recovery"), rejected_path_titles=()
+    )
+    assert plan.prioritized_issue_numbers == (2, 1)
+
+
+def test_hot_file_path_component_match() -> None:
+    # Issue mentions "dispatch" / "runner" but not the full ref string.
+    issues = _issues((1, "unrelated"), (2, "fix the dispatch path"))
+    plan = build_maestro_plan(
+        issues,
+        frontier=_frontier(
+            hot_files=(HotArtifact(ref="src/forge_loop/runner/dispatch.py", why_hot="churny"),)
+        ),
+        rejected_path_titles=(),
+    )
+    assert plan.prioritized_issue_numbers == (2, 1)
+
+
+def test_rejected_word_boundary_avoids_false_positive() -> None:
+    # Rejected idea "poll" must NOT match the word "polling".
+    issues = _issues((1, "polling improvements"), (2, "small fix"))
+    plan = build_maestro_plan(issues, frontier=None, rejected_path_titles=("poll",))
+    # Neither is deprioritised: "polling" is not a "poll" token match.
+    assert plan.deprioritized_issue_numbers == ()
+    assert plan.prioritized_issue_numbers == (1, 2)
+
+
+def test_rejected_word_boundary_matches_real_token() -> None:
+    issues = _issues((1, "add poll support"), (2, "small fix"))
+    plan = build_maestro_plan(issues, frontier=None, rejected_path_titles=("poll",))
+    assert plan.deprioritized_issue_numbers == (1,)
+    assert plan.prioritized_issue_numbers[-1] == 1
+
+
+def test_rejected_multiword_phrase_match() -> None:
+    issues = _issues((1, "rewrite everything in rust now"), (2, "small fix"))
+    plan = build_maestro_plan(
+        issues, frontier=None, rejected_path_titles=("rewrite everything in rust",)
+    )
+    assert plan.deprioritized_issue_numbers == (1,)
+
+
+def test_empty_input_is_byte_identical_no_op() -> None:
+    issues = _issues((5, "alpha"), (3, "beta"), (9, "gamma"))
+    plan = build_maestro_plan(issues, frontier=None, rejected_path_titles=())
+    assert plan.prioritized_issue_numbers == (5, 3, 9)
+    assert plan.deprioritized_issue_numbers == ()
+    assert plan.brief_context == ""
+    assert plan.event_payload()["context_applied"] is False
+
+
 # --- loader (best-effort I/O) -------------------------------------------
 
 
