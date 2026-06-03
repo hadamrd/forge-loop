@@ -55,6 +55,9 @@ CONTRACT (content-grade — NOT the smallest possible diff):
    the discovered ones. Avoid full-suite runs; target the specific tests
    you touched.
 7. Run your project's pre-commit gates (lint, format, type-check).
+   `git commit` MUST run without `--no-verify`. Any `--no-verify` use
+   REQUIRES a justified reason in the PR body under a
+   `## Pre-commit bypass justification` heading.
 8. git add -A; git commit referencing #{n}. {coauthor_line}
    The commit message MUST have a body (the "why"), not just a one-line title.
 9. git push -u origin <branch>.

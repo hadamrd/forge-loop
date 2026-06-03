@@ -181,7 +181,7 @@ def run_worker(
     title = issue["title"]
     branch = _branch_name(n, title)
 
-    worktree, err = _prep_worktree(repo, n, branch, base_branch=base_branch)
+    worktree, err = _prep_worktree(repo, n, branch, base_branch=base_branch, emit=emit)
     if err is not None:
         return WorkerOutcome(
             issue=n,
@@ -347,7 +347,7 @@ def run_repair_worker(
             stdout_tail="missing PR headRefName",
             error="repair-missing-branch",
         )
-    worktree, err = _prep_repair_worktree(repo, n, branch)
+    worktree, err = _prep_repair_worktree(repo, n, branch, emit=emit)
     if err is not None:
         return WorkerOutcome(
             issue=n,

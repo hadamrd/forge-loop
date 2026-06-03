@@ -11,6 +11,7 @@ from pathlib import Path
 from forge_loop.eventlog import SqliteEventLog
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import SqliteMemoryStore
+from forge_loop.precommit import PreCommitRunner, ensure_precommit_hook
 from forge_loop.worker_sessions import WorkerSessionStore
 
 SAMPLE_YAML = """# forge-loop config — tune the loop for THIS project.
@@ -105,6 +106,7 @@ def init_project(
     target_dir: Path,
     github_repo: str = "owner/repo",
     force: bool = False,
+    precommit_runner: PreCommitRunner | None = None,
 ) -> dict[str, list[str]]:
     """Scaffold a fresh forge-loop config in ``target_dir``.
 
@@ -112,6 +114,8 @@ def init_project(
     """
     created: list[str] = []
     skipped: list[str] = []
+    precommit: list[str] = []
+    precommit_hint: list[str] = []
 
     yaml_path = target_dir / "forge-loop.yaml"
     if yaml_path.exists() and not force:
@@ -161,7 +165,20 @@ docs/ops/critic-*.log*
 
     _ensure_control_plane_stores(target_dir, created=created, skipped=skipped, force=force)
 
-    return {"created": created, "skipped": skipped}
+    outcome, hint = ensure_precommit_hook(
+        target_dir,
+        runner=precommit_runner,
+    )
+    precommit.append(outcome.value)
+    if hint:
+        precommit_hint.append(hint)
+
+    return {
+        "created": created,
+        "skipped": skipped,
+        "precommit": precommit,
+        "precommit_hint": precommit_hint,
+    }
 
 
 def _ensure_control_plane_stores(

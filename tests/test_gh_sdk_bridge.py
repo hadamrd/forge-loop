@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
+from collections.abc import Generator
+from pathlib import Path
+
 import pytest
 
 from forge_loop import gh, gh_issues
@@ -9,7 +14,7 @@ from forge_loop.gh_client import GhError, Issue, MockGhClient
 
 
 @pytest.fixture(autouse=True)
-def _reset_client() -> None:
+def _reset_client() -> Generator[None, None, None]:
     gh_issues.set_client(None)
     yield
     gh_issues.set_client(None)
@@ -23,8 +28,7 @@ def test_top_issues_uses_typed_client_not_subprocess(monkeypatch: pytest.MonkeyP
     )
     gh_issues.set_client(client)
     monkeypatch.setattr(
-        gh.subprocess,
-        "run",
+        "forge_loop.gh.subprocess.run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("subprocess must not run")),
     )
 
@@ -82,3 +86,64 @@ def test_create_issue_returns_number_and_none_on_failure() -> None:
 
     client.raise_on_create_titles["bad"] = GhError("create_issue", 422, "bad")
     assert gh.create_issue("bad", "body", repo="owner/repo") is None
+
+
+def test_pr_precommit_context_excludes_body_from_commit_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert args[0] == [
+            "gh",
+            "pr",
+            "view",
+            "https://github.com/o/r/pull/1",
+            "--json",
+            "body,commits",
+        ]
+        assert kwargs["cwd"] == tmp_path
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "body": "Rule text may mention `git commit --no-verify`.",
+                    "commits": [{"messageHeadline": "real commit", "messageBody": "body text"}],
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("forge_loop.gh.subprocess.run", fake_run)
+
+    body, commit_text = gh.pr_precommit_context("https://github.com/o/r/pull/1", tmp_path)
+
+    assert "git commit --no-verify" in body
+    assert "git commit --no-verify" not in commit_text
+    assert "real commit" in commit_text
+    assert "body text" in commit_text
+
+
+def test_pr_precommit_context_returns_empty_on_gh_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "forge_loop.gh.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0], returncode=1, stdout="", stderr="boom"
+        ),
+    )
+
+    assert gh.pr_precommit_context("https://github.com/o/r/pull/1", tmp_path) == ("", "")
+
+
+def test_pr_precommit_context_returns_empty_on_invalid_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "forge_loop.gh.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0], returncode=0, stdout="not-json", stderr=""
+        ),
+    )
+
+    assert gh.pr_precommit_context("https://github.com/o/r/pull/1", tmp_path) == ("", "")

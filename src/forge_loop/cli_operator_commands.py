@@ -70,7 +70,6 @@ class OperatorCommandsMixin:
         )
         return 2
 
-
     def _cmd_doctor(self, _args: SimpleNamespace) -> int:
         """One-shot health check with a Rich table."""
         import glob
@@ -124,7 +123,9 @@ class OperatorCommandsMixin:
 
         tmux_bin = shutil.which("tmux")
         if tmux_bin is None:
-            line("yellow", "tmux not installed", "operator usually runs forge-loop in a tmux session")
+            line(
+                "yellow", "tmux not installed", "operator usually runs forge-loop in a tmux session"
+            )
         else:
             try:
                 r = _sp.run([tmux_bin, "ls"], capture_output=True, text=True, timeout=5)
@@ -276,6 +277,10 @@ class OperatorCommandsMixin:
             typer.echo(f"  + {path}")
         for path in result["skipped"]:
             typer.echo(f"  · skipped (exists; pass --force to overwrite): {path}")
+        for outcome in result.get("precommit", []):
+            typer.echo(f"  · {outcome}")
+        for hint in result.get("precommit_hint", []):
+            typer.echo(f"    hint: {hint}")
 
         if args.create_labels:
             created = _init_mod.ensure_labels_via_gh(repo, _init_mod.DEFAULT_LABELS)

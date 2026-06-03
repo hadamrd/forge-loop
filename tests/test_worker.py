@@ -137,7 +137,12 @@ def test_run_repair_worker_codex_uses_existing_pr_branch(
     worktree = tmp_path / "repair"
     worktree.mkdir()
 
-    def fake_prep(_repo: Path, issue: int, branch: str) -> tuple[Path, None]:
+    def fake_prep(
+        _repo: Path,
+        issue: int,
+        branch: str,
+        **_kwargs: object,
+    ) -> tuple[Path, None]:
         assert issue == 42
         assert branch == "loop/42-fix-blocked-pr"
         return worktree, None

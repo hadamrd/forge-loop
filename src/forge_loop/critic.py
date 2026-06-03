@@ -30,6 +30,7 @@ import json
 import re
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,22 @@ from forge_loop.worker import ensure_subagent_trusted
 VALID_OVERALL = {"approve", "request_changes", "block"}
 VALID_SEVERITY = {"sev1", "sev2", "sev3"}
 VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs", "product"}
+PRECOMMIT_BYPASS_TAG = "precommit_bypass"
+_NO_VERIFY_RE = re.compile(r"\bgit(?:\s+-[cC]\s+\S+)*\s+commit\b[^\n]*\s(?:--no-verify|-n)\b")
+_BODY_NO_VERIFY_ACTION_RE = re.compile(
+    r"\b(?:i\s+)?(?:ran|run|used|use|called|call|executed|execute)\s+"
+    r"git(?:\s+-[cC]\s+\S+)*\s+commit\b[^\n]*\s(?:--no-verify|-n)\b",
+    re.IGNORECASE,
+)
+_NO_VERIFY_STATIC_CONTEXT_RE = re.compile(
+    r"\b(?:flag|detect|test|tests|rule|brief|manifesto|requires|mention|mentions|"
+    r"statement|statements)\b",
+    re.IGNORECASE,
+)
+_BYPASS_HEADING_RE = re.compile(
+    r"^##\s+Pre-commit bypass justification\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 @dataclass
@@ -58,8 +75,10 @@ class ManifestoViolation:
 
     def is_valid(self) -> bool:
         return (
-            isinstance(self.rule_id, str) and bool(self.rule_id.strip())
-            and isinstance(self.manifesto, str) and bool(self.manifesto.strip())
+            isinstance(self.rule_id, str)
+            and bool(self.rule_id.strip())
+            and isinstance(self.manifesto, str)
+            and bool(self.manifesto.strip())
             and isinstance(self.quote, str)
             and isinstance(self.suggested_fix, str)
             and self.severity in VALID_SEVERITY
@@ -103,15 +122,13 @@ class CriticReport:
         return {f.severity for f in self.findings}
 
     def has_sev1(self) -> bool:
-        return (
-            any(f.severity == "sev1" for f in self.findings)
-            or any(v.severity == "sev1" for v in self.manifesto_violations)
+        return any(f.severity == "sev1" for f in self.findings) or any(
+            v.severity == "sev1" for v in self.manifesto_violations
         )
 
     def has_sev2(self) -> bool:
-        return (
-            any(f.severity == "sev2" for f in self.findings)
-            or any(v.severity == "sev2" for v in self.manifesto_violations)
+        return any(f.severity == "sev2" for f in self.findings) or any(
+            v.severity == "sev2" for v in self.manifesto_violations
         )
 
     def has_sev1_manifesto_violation(self) -> bool:
@@ -127,6 +144,134 @@ class CriticOutcome:
     report: CriticReport | None = None
     error: str | None = None
     parse_retries: int = 0
+
+
+def detect_precommit_bypass(commit_text: str, *, pr_body: str) -> CriticReport:
+    """Flag `git commit --no-verify` unless the PR body justifies it."""
+
+    if not _has_no_verify_command(commit_text) and not _has_no_verify_body_action(pr_body):
+        return CriticReport(overall="approve", findings=[])
+    if _has_precommit_bypass_justification(pr_body):
+        return CriticReport(overall="approve", findings=[])
+    return CriticReport(
+        overall="request_changes",
+        findings=[
+            Finding(
+                severity="sev1",
+                category="correctness",
+                file=None,
+                line=None,
+                message=(
+                    f"{PRECOMMIT_BYPASS_TAG}: `git commit --no-verify` requires a "
+                    "`## Pre-commit bypass justification` section in the PR body."
+                ),
+            )
+        ],
+    )
+
+
+def _has_no_verify_command(text: str) -> bool:
+    for line in _command_segments(text):
+        match = _NO_VERIFY_RE.search(line)
+        if match is not None and not _is_static_no_verify_context(line, match):
+            return True
+    return False
+
+
+def _worker_command_context(issue_number: int, logs_dir: Path) -> str:
+    chunks: list[str] = []
+    for pattern in (f"worker-{issue_number}-*.log", f"repair-{issue_number}-*.log"):
+        for path in sorted(logs_dir.glob(pattern)):
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                item = event.get("item")
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != "command_execution":
+                    continue
+                command = item.get("command")
+                if isinstance(command, str):
+                    chunks.append(command)
+    return "\n".join(chunks)
+
+
+def _command_segments(text: str) -> list[str]:
+    lines = text.splitlines()
+    segments: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        segment = line.rstrip()
+        while segment.endswith("\\") and i + 1 < len(lines):
+            segment = f"{segment[:-1]} {lines[i + 1].strip()}"
+            i += 1
+        segments.append(segment)
+        if i + 1 < len(lines) and "git" in line and "commit" in line:
+            segments.append(f"{line.rstrip()} {lines[i + 1].strip()}")
+        i += 1
+    return segments
+
+
+def _has_no_verify_body_action(text: str) -> bool:
+    for line in text.splitlines():
+        match = _BODY_NO_VERIFY_ACTION_RE.search(line)
+        if match is not None and not _is_static_no_verify_context(line, match):
+            return True
+    return False
+
+
+def _is_static_no_verify_context(line: str, match: re.Match[str]) -> bool:
+    return _NO_VERIFY_STATIC_CONTEXT_RE.search(line[: match.start()]) is not None
+
+
+def _has_precommit_bypass_justification(pr_body: str) -> bool:
+    match = _BYPASS_HEADING_RE.search(pr_body)
+    if match is None:
+        return False
+    tail = pr_body[match.end() :]
+    body = tail.split("\n## ", 1)[0].strip()
+    return bool(body)
+
+
+def _fetch_pr_precommit_context(pr_url: str, repo: Path) -> tuple[str, str]:
+    """Return PR body plus commit metadata for deterministic local checks."""
+
+    from forge_loop import gh
+
+    return gh.pr_precommit_context(pr_url, repo)
+
+
+def _with_deterministic_precommit_findings(
+    report: CriticReport,
+    *,
+    pr_url: str,
+    repo: Path,
+    issue_number: int,
+    logs_dir: Path,
+) -> CriticReport:
+    pr_body, commit_text = _fetch_pr_precommit_context(pr_url, repo)
+    worker_text = _worker_command_context(issue_number, logs_dir)
+    if worker_text:
+        commit_text = f"{commit_text}\n{worker_text}"
+    deterministic = detect_precommit_bypass(commit_text, pr_body=pr_body)
+    if not deterministic.findings:
+        return report
+    overall = report.overall
+    if overall == "approve":
+        overall = deterministic.overall
+    return CriticReport(
+        overall=overall,
+        findings=[*report.findings, *deterministic.findings],
+        manifesto_violations=report.manifesto_violations,
+        raw=report.raw,
+    )
 
 
 def review_pr(
@@ -206,6 +351,13 @@ def review_pr(
                 stdout_tail=tail,
                 error=parse_error or result.error or "critic_parse_failed",
             )
+        report = _with_deterministic_precommit_findings(
+            report,
+            pr_url=pr_url,
+            repo=repo,
+            issue_number=issue_number,
+            logs_dir=logs_dir,
+        )
         verdict = _verdict_from_overall(report.overall)
         reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
         return CriticOutcome(
@@ -237,10 +389,8 @@ def review_pr(
         # Mirror the final assistant text to disk so the existing
         # _tail(log_path, 500) read for stdout_tail keeps working and
         # operators can grep critic-*.log as before.
-        try:
+        with suppress(OSError):
             log_path.write_text(sdk_result.last_message or "")
-        except OSError:
-            pass
         if sdk_result.timed_out:
             return CriticOutcome(
                 verdict="error",
@@ -290,6 +440,13 @@ def review_pr(
             parse_retries=retries,
         )
 
+    report = _with_deterministic_precommit_findings(
+        report,
+        pr_url=pr_url,
+        repo=repo,
+        issue_number=issue_number,
+        logs_dir=logs_dir,
+    )
     verdict = _verdict_from_overall(report.overall)
     reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
     return CriticOutcome(

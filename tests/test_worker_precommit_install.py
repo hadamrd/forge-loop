@@ -1,0 +1,226 @@
+"""Tests for pre-commit hook propagation into worker worktrees."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+from forge_loop.precommit import PreCommitInstallMethod, git_hook_path
+from forge_loop.worker_worktree import (
+    _emit_worker_precommit_event,
+    prep_repair_worktree,
+    prep_worktree,
+)
+
+
+def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=False)
+
+
+def _init_fixture_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    assert _run(["git", "init", "-b", "trunk"], repo).returncode == 0
+    assert _run(["git", "config", "user.email", "tester@example.com"], repo).returncode == 0
+    assert _run(["git", "config", "user.name", "Tester"], repo).returncode == 0
+    (repo / "README.md").write_text("seed\n")
+    assert _run(["git", "add", "README.md"], repo).returncode == 0
+    assert _run(["git", "commit", "-m", "seed"], repo).returncode == 0
+    assert _run(["git", "remote", "add", "origin", str(repo)], repo).returncode == 0
+    assert _run(["git", "fetch", "origin", "trunk"], repo).returncode == 0
+    return repo
+
+
+class FakePreCommitRunner:
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self.installs: list[Path] = []
+
+    def is_available(self) -> bool:
+        return self.available
+
+    def install(self, repo: Path) -> int:
+        self.installs.append(repo)
+        hook = git_hook_path(repo)
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#!/bin/sh\necho installed hook\nexit 0\n")
+        hook.chmod(0o755)
+        return 0
+
+
+def test_prep_worktree_installs_precommit_hook_and_emits_install_event(tmp_path: Path) -> None:
+    repo = _init_fixture_repo(tmp_path)
+    (repo / ".pre-commit-config.yaml").write_text("repos: []\n")
+    assert _run(["git", "add", ".pre-commit-config.yaml"], repo).returncode == 0
+    assert _run(["git", "commit", "-m", "add precommit config"], repo).returncode == 0
+    events: list[tuple[str, dict[str, object]]] = []
+    runner = FakePreCommitRunner()
+
+    worktree, err = prep_worktree(
+        repo,
+        8158,
+        "loop/8158-precommit",
+        emit=lambda kind, payload: events.append((kind, payload)),
+        precommit_runner=runner,
+    )
+
+    try:
+        assert err is None
+        hook = git_hook_path(worktree)
+        assert hook.exists()
+        assert runner.installs == [worktree]
+        assert events[-1] == (
+            "worker_precommit_installed",
+            {"worktree_path": str(worktree), "method": "install"},
+        )
+    finally:
+        _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
+
+
+def test_prep_worktree_surfaces_precommit_event_sink_failure(tmp_path: Path) -> None:
+    repo = _init_fixture_repo(tmp_path)
+    (repo / ".pre-commit-config.yaml").write_text("repos: []\n")
+    assert _run(["git", "add", ".pre-commit-config.yaml"], repo).returncode == 0
+    assert _run(["git", "commit", "-m", "add precommit config"], repo).returncode == 0
+
+    def failing_emit(_kind: str, _payload: dict[str, object]) -> None:
+        raise RuntimeError("event sink unavailable")
+
+    with pytest.raises(RuntimeError, match="event sink unavailable"):
+        prep_worktree(
+            repo,
+            8162,
+            "loop/8162-precommit",
+            emit=failing_emit,
+            precommit_runner=FakePreCommitRunner(),
+        )
+
+    _run(["git", "worktree", "remove", "--force", "/tmp/wt-loop-8162"], repo)
+
+
+def test_prep_worktree_copies_main_hook_when_precommit_binary_missing(tmp_path: Path) -> None:
+    repo = _init_fixture_repo(tmp_path)
+    (repo / ".pre-commit-config.yaml").write_text("repos: []\n")
+    main_hook = repo / ".git" / "hooks" / "pre-commit"
+    main_hook.parent.mkdir(parents=True, exist_ok=True)
+    main_hook.write_text("#!/bin/sh\necho copied hook\nexit 0\n")
+    main_hook.chmod(0o755)
+    assert _run(["git", "add", ".pre-commit-config.yaml"], repo).returncode == 0
+    assert _run(["git", "commit", "-m", "add precommit config"], repo).returncode == 0
+    events: list[tuple[str, dict[str, object]]] = []
+
+    worktree, err = prep_worktree(
+        repo,
+        8159,
+        "loop/8159-precommit",
+        emit=lambda kind, payload: events.append((kind, payload)),
+        precommit_runner=FakePreCommitRunner(available=False),
+    )
+
+    try:
+        assert err is None
+        hook = git_hook_path(worktree)
+        assert hook.exists()
+        assert hook.read_text() == main_hook.read_text()
+        assert events[-1] == (
+            "worker_precommit_installed",
+            {
+                "worktree_path": str(worktree),
+                "method": "copy",
+                "reason": "precommit_binary_missing",
+            },
+        )
+    finally:
+        _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
+
+
+def test_prep_repair_worktree_installs_precommit_hook_and_emits_event(tmp_path: Path) -> None:
+    repo = _init_fixture_repo(tmp_path)
+    branch = "loop/8163-precommit-repair"
+    (repo / ".pre-commit-config.yaml").write_text("repos: []\n")
+    assert _run(["git", "add", ".pre-commit-config.yaml"], repo).returncode == 0
+    assert _run(["git", "commit", "-m", "add precommit config"], repo).returncode == 0
+    assert _run(["git", "checkout", "-b", branch], repo).returncode == 0
+    assert _run(["git", "checkout", "trunk"], repo).returncode == 0
+    events: list[tuple[str, dict[str, object]]] = []
+    runner = FakePreCommitRunner()
+
+    worktree, err = prep_repair_worktree(
+        repo,
+        8163,
+        branch,
+        emit=lambda kind, payload: events.append((kind, payload)),
+        precommit_runner=runner,
+    )
+
+    try:
+        assert err is None
+        assert git_hook_path(worktree).exists()
+        assert runner.installs == [worktree]
+        assert events[-1] == (
+            "worker_precommit_installed",
+            {"worktree_path": str(worktree), "method": "install"},
+        )
+    finally:
+        _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
+
+
+def test_worker_precommit_install_event_is_typed(tmp_path: Path) -> None:
+    from forge_loop.events import WorkerPreCommitInstalledEvent, emit
+
+    events_file = tmp_path / "events.jsonl"
+    emit(
+        events_file,
+        WorkerPreCommitInstalledEvent(
+            worktree_path="/tmp/wt-loop-1",
+            method=PreCommitInstallMethod.INSTALL,
+        ),
+    )
+
+    rec = json.loads(events_file.read_text())
+    assert rec["kind"] == "worker_precommit_installed"
+    assert rec["worktree_path"] == "/tmp/wt-loop-1"
+    assert rec["method"] == "install"
+
+
+def test_worker_precommit_install_event_payload_is_validated() -> None:
+    with pytest.raises(ValueError):
+        _emit_worker_precommit_event(
+            lambda _kind, _payload: None,
+            Path("/tmp/wt"),
+            cast(Any, "bogus"),
+            None,
+        )
+
+
+def test_concurrent_workers_against_same_repo_both_get_precommit_hooks(tmp_path: Path) -> None:
+    repo = _init_fixture_repo(tmp_path)
+    (repo / ".pre-commit-config.yaml").write_text("repos: []\n")
+    assert _run(["git", "add", ".pre-commit-config.yaml"], repo).returncode == 0
+    assert _run(["git", "commit", "-m", "add precommit config"], repo).returncode == 0
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def prepare(n: int) -> tuple[Path, str | None]:
+        return prep_worktree(
+            repo,
+            n,
+            f"loop/{n}-precommit",
+            emit=lambda kind, payload: events.append((kind, payload)),
+            precommit_runner=FakePreCommitRunner(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(prepare, [8160, 8161]))
+
+    try:
+        assert [err for _, err in results] == [None, None]
+        assert all(git_hook_path(worktree).exists() for worktree, _ in results)
+        assert [kind for kind, _ in events].count("worker_precommit_installed") == 2
+    finally:
+        for worktree, _ in results:
+            _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
