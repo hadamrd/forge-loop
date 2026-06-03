@@ -377,6 +377,47 @@ def test_status_json_reports_active_workers_from_events(
     assert blob["active_workers"][0]["status"] == "running"
 
 
+def test_status_json_does_not_mark_confirmed_foreground_worker_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_cfg = SimpleNamespace(
+        pid_file=tmp_path / "pid",
+        state_dir=tmp_path,
+        stop_file=tmp_path / "stop",
+        state_file=tmp_path / "state.json",
+        events_file=tmp_path / "events.jsonl",
+        github_repo="o/r",
+        labels=SimpleNamespace(ready="loop:ready"),
+    )
+    fake_cfg.state_file.write_text(
+        json.dumps({"state": "running", "tick": 3, "dispatched": [{"issue": 9, "title": "x"}]})
+    )
+    fake_cfg.events_file.write_text(
+        json.dumps(
+            {
+                "ts": "2026-05-30T10:00:00Z",
+                "kind": "worker_start",
+                "issue": 9,
+                "title": "x",
+            }
+        )
+        + "\n"
+    )
+    monkeypatch.setattr(cli, "load", lambda: fake_cfg)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("gh")),
+    )
+
+    rc = cli._cmd_status(SimpleNamespace(json=True))
+
+    assert rc == 0
+    blob = json.loads(capsys.readouterr().out)
+    assert blob["runner_stale"] is False
+    assert blob["active_workers"][0]["status"] == "running"
+
+
 def test_status_json_falls_back_to_dispatched_state_when_worker_events_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
