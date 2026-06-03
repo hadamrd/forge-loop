@@ -21,6 +21,8 @@ docs/ops/loop-runner.HALT
 docs/ops/loop-runner-logs/
 docs/ops/all-nighter.log
 docs/ops/loop-runner.force-retry.json
+docs/ops/worker-sessions.db*
+docs/ops/critic-*.log*
 # Per-operator overrides + multi-repo dir + worker-planted settings
 forge-loop.local.yaml
 .forge/*
@@ -31,3 +33,8 @@ forge-loop.local.yaml
 !.forge/testing-manifesto.md
 .claude/settings.json
 .claude/settings.local.json
+# forge-loop runtime
+loop-runner.pid
+loop-runner.pause
+loop-runner.stop
+loop-runner-logs/

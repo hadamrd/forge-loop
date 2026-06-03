@@ -8,6 +8,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from forge_loop.eventlog import SqliteEventLog
+from forge_loop.frontier import FrontierCursor, FrontierStore
+from forge_loop.memory import SqliteMemoryStore
+from forge_loop.worker_sessions import WorkerSessionStore
+
 SAMPLE_YAML = """# forge-loop config — tune the loop for THIS project.
 # All keys are optional; env vars (LOOP_*) override yaml values.
 
@@ -126,7 +131,24 @@ def init_project(
         created.append(str(sample_md.relative_to(target_dir)))
 
     gitignore = target_dir / ".gitignore"
-    snippet = "\n# forge-loop runtime\nloop-runner.pid\nloop-runner.pause\nloop-runner.stop\nloop-runner-logs/\n"
+    snippet = """
+# forge-loop runtime
+loop-runner.pid
+loop-runner.pause
+loop-runner.stop
+loop-runner-logs/
+docs/ops/loop-runner.json
+docs/ops/loop-runner-events.jsonl
+docs/ops/loop-runner-summaries.jsonl
+docs/ops/loop-runner.pid
+docs/ops/loop-runner.pause
+docs/ops/loop-runner.stop
+docs/ops/loop-runner.HALT
+docs/ops/loop-runner-logs/
+docs/ops/loop-runner.force-retry.json
+docs/ops/worker-sessions.db*
+docs/ops/critic-*.log*
+"""
     if gitignore.exists():
         content = gitignore.read_text()
         if "forge-loop runtime" not in content:
@@ -137,7 +159,72 @@ def init_project(
         # Caller can wire .gitignore separately if needed.
         pass
 
+    _ensure_control_plane_stores(target_dir, created=created, skipped=skipped, force=force)
+
     return {"created": created, "skipped": skipped}
+
+
+def _ensure_control_plane_stores(
+    target_dir: Path,
+    *,
+    created: list[str],
+    skipped: list[str],
+    force: bool,
+) -> None:
+    forge_dir = target_dir / ".forge"
+    ops_dir = target_dir / "docs" / "ops"
+    forge_dir.mkdir(parents=True, exist_ok=True)
+    ops_dir.mkdir(parents=True, exist_ok=True)
+
+    event_log_path = forge_dir / "events.db"
+    _record_path(event_log_path, target_dir, created=created, skipped=skipped, force=force)
+    SqliteEventLog(event_log_path)
+
+    frontier_path = forge_dir / "frontier.yaml"
+    if frontier_path.exists() and not force:
+        skipped.append(str(frontier_path.relative_to(target_dir)))
+    else:
+        FrontierStore(frontier_path).save(_default_frontier_cursor())
+        created.append(str(frontier_path.relative_to(target_dir)))
+
+    memory_path = forge_dir / "memory.db"
+    _record_path(memory_path, target_dir, created=created, skipped=skipped, force=force)
+    SqliteMemoryStore(memory_path)
+
+    sessions_path = ops_dir / "worker-sessions.db"
+    _record_path(sessions_path, target_dir, created=created, skipped=skipped, force=force)
+    WorkerSessionStore(sessions_path).close()
+
+
+def _record_path(
+    path: Path,
+    target_dir: Path,
+    *,
+    created: list[str],
+    skipped: list[str],
+    force: bool,
+) -> None:
+    relative = str(path.relative_to(target_dir))
+    if path.exists() and not force:
+        skipped.append(relative)
+    else:
+        created.append(relative)
+
+
+def _default_frontier_cursor() -> FrontierCursor:
+    return FrontierCursor(
+        product_goal="Make this repository resumable for long-running agent work.",
+        current_problem="Control-plane stores have just been initialized.",
+        next_expansion="Run a bounded milestone and promote durable events, memory, tasks, and frontier facts as real work happens.",
+        why_now="A reset should boot from explicit durable state instead of missing files.",
+        active_decisions=(
+            "Context windows are working memory, not durable project state.",
+            "Workers are disposable; control-plane state must be external and replayable.",
+        ),
+        hot_files=(),
+        hot_tests=(),
+        open_questions=("Which frontier axis should the next milestone advance?",),
+    )
 
 
 def detect_github_repo(target_dir: Path) -> str:
