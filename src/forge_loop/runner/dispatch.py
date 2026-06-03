@@ -315,6 +315,7 @@ def _dispatch_one_worker(
     tick: int,
     bus_emit: Any,
     store: WorkerSessionStore | None,
+    maestro_context: str = "",
 ) -> WorkerOutcome:
     """Run one worker, threading the persistent-worker FSM if enabled.
 
@@ -388,6 +389,7 @@ def _dispatch_one_worker(
                 mcp_servers=cfg.worker.mcp_servers,
                 base_branch=cfg.base_branch,
                 capability_policy=capability_policy,
+                maestro_context=maestro_context,
             )
         except BaseException:
             _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
@@ -427,6 +429,7 @@ def _dispatch_one_worker(
             mcp_servers=cfg.worker.mcp_servers,
             base_branch=cfg.base_branch,
             capability_policy=capability_policy,
+            maestro_context=maestro_context,
         )
     except BaseException as ex_:
         # The subprocess crashed before producing a WorkerOutcome. We
@@ -468,6 +471,8 @@ def _run_workers(
     tick: int,
     master_log_path: Path,
     bus_emit: Any,
+    *,
+    maestro_context: str = "",
 ) -> tuple[list[WorkerOutcome], bool]:
     """Spawn workers (pipeline-driven if enabled, else legacy ThreadPool).
 
@@ -547,6 +552,7 @@ def _run_workers(
                     tick=tick,
                     bus_emit=bus_emit,
                     store=store,
+                    maestro_context=maestro_context,
                 )
                 for i, meta in dispatch
             ]

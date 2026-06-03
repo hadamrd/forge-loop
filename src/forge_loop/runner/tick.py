@@ -385,6 +385,25 @@ def _tick(cfg: Config, tick: int) -> None:
     )
     append_event(cfg.events_file, "tick_start", tick=tick, issues=[i["number"] for i in issues])
 
+    # Maestro step (additive, best-effort): let the durable frontier + curated
+    # memory inform dispatch — reorder candidates (aligned first, rejected last)
+    # and hand each worker an advisory context block. A control-plane read
+    # failure leaves `issues` untouched and dispatch byte-identical to legacy.
+    maestro_context = ""
+    try:
+        from forge_loop.runner.maestro import build_maestro_plan, load_maestro_inputs
+
+        _frontier, _rejected = load_maestro_inputs(cfg)
+        if _frontier is not None or _rejected:
+            plan = build_maestro_plan(issues, frontier=_frontier, rejected_path_titles=_rejected)
+            by_number = {i["number"]: i for i in issues}
+            issues = [by_number[n] for n in plan.prioritized_issue_numbers]
+            maestro_context = plan.brief_context
+            append_event(cfg.events_file, "maestro_plan", tick=tick, **plan.event_payload())
+    except Exception as ex_:  # noqa: BLE001 — the maestro step must never break the tick
+        append_event(cfg.events_file, "maestro_plan_failed", tick=tick, err=str(ex_)[:200])
+        maestro_context = ""
+
     # Per-issue: detect risk-gate + fetch past attempt history (if enabled).
     # Also apply the fingerprint-based skip guards (in-flight / cooldown) so
     # a half-finished prior dispatch doesn't get re-done and dupe a PR.
@@ -500,6 +519,7 @@ def _tick(cfg: Config, tick: int) -> None:
         tick,
         master_log_path=master_log_path,
         bus_emit=_bus_emit,
+        maestro_context=maestro_context,
     )
 
     # Issue #78 — worker iteration loop. For each outcome that didn't reach

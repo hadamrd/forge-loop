@@ -162,6 +162,7 @@ def run_worker(
     base_branch: str = "trunk",
     brief_override: str | None = None,
     capability_policy: CapabilityPolicy | None = None,
+    maestro_context: str = "",
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -240,6 +241,12 @@ def run_worker(
             manifesto_bundle=manifesto_bundle,
             capability_policy=capability_policy,
         )
+
+    # Maestro advisory context (frontier + memory) rides on top of the brief.
+    # Prepended here — downstream of fingerprint/template-hash computation — so
+    # it never perturbs attempt fingerprints or skip-guards. Empty = no-op.
+    if maestro_context:
+        brief = f"{maestro_context}\n\n{brief}"
 
     if provider == "codex":
         outcome = _run_worker_codex(
