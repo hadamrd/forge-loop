@@ -91,7 +91,8 @@ class FakeTaskSagaStore:
             lease_expires_at=expires_at,
             last_heartbeat_at=acquired_at,
         )
-        return self.put(leased)
+        self.sagas[task_id] = leased
+        return leased
 
     def heartbeat(
         self,

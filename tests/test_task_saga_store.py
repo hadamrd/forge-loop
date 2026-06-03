@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -126,6 +126,34 @@ class TestTaskSagaLeaseLifecycle:
         assert persisted is not None
         assert persisted.lease_owner == "worker-b"
         assert persisted.last_heartbeat_at == owner_b_time
+
+    def test_acquire_lease_rejects_mixed_offset_active_lease(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskSagaStore(tmp_path / "tasks.db")
+        task_id = "task-mixed-offset-active-lease"
+        minus_two = timezone(-timedelta(hours=2))
+        store.put(_saga(task_id, state=TaskState.DISPATCHED))
+        store.acquire_lease(
+            task_id,
+            owner_id="worker-b",
+            expires_at=datetime(2026, 6, 3, 7, 0, tzinfo=minus_two),
+            acquired_at=datetime(2026, 6, 3, 6, 0, tzinfo=minus_two),
+        )
+
+        with pytest.raises(LeaseConflictError):
+            store.acquire_lease(
+                task_id,
+                owner_id="worker-a",
+                expires_at=datetime(2026, 6, 3, 9, 30, tzinfo=UTC),
+                acquired_at=datetime(2026, 6, 3, 8, 30, tzinfo=UTC),
+            )
+
+        persisted = store.get(task_id)
+        assert persisted is not None
+        assert persisted.lease_owner == "worker-b"
+        assert persisted.lease_expires_at == datetime(2026, 6, 3, 9, 0, tzinfo=UTC)
 
     def test_new_task_starts_leaseable_and_becomes_running_after_acquisition(
         self,

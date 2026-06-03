@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -535,6 +535,8 @@ def _load_compensations(raw: str) -> tuple[Compensation, ...]:
 def _datetime_to_text(value: datetime | None) -> str | None:
     if value is None:
         return None
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC)
     return value.isoformat()
 
 
