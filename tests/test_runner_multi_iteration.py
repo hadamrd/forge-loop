@@ -23,6 +23,7 @@ from forge_loop.runner.iteration import (
     WorkerState,
     run_iteration_loop,
 )
+from forge_loop.runner.tick import _should_run_worker_iterations
 
 
 @dataclass
@@ -325,6 +326,27 @@ def test_terminal_state_short_circuits(worktree: Path) -> None:
         for k, p in s.events
         if k == "worker_iteration"
     )
+
+
+def test_stop_marker_suppresses_worker_iterations(tmp_path: Path) -> None:
+    stop_file = tmp_path / "loop-runner.stop"
+    pause_file = tmp_path / "loop-runner.pause"
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "worker_max_iterations": 3,
+            "stop_file": stop_file,
+            "pause_file": pause_file,
+        },
+    )()
+    outcomes = [FakeOutcome(status="no_pr")]
+
+    assert _should_run_worker_iterations(cfg, outcomes) is True
+
+    stop_file.write_text("stop")
+
+    assert _should_run_worker_iterations(cfg, outcomes) is False
 
 
 # ---------------------------------------------------------------------------

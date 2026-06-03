@@ -9,6 +9,7 @@ no behaviour change, no signature change.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -43,8 +44,12 @@ from forge_loop.runner.drift import (
 )
 from forge_loop.runner.label_hygiene import remove_ready_label as _remove_ready_label_impl
 from forge_loop.runner.repairs import blocking_pr_repairs as _blocking_pr_repairs_impl
-from forge_loop.runner.repairs import enable_automerge_for_repaired_prs as _enable_automerge_for_repaired_prs
-from forge_loop.runner.repairs import ready_issue_open_pr_repairs as _ready_issue_open_pr_repairs_impl
+from forge_loop.runner.repairs import (
+    enable_automerge_for_repaired_prs as _enable_automerge_for_repaired_prs,
+)
+from forge_loop.runner.repairs import (
+    ready_issue_open_pr_repairs as _ready_issue_open_pr_repairs_impl,
+)
 from forge_loop.runner.rescue import rescue_uncommitted_work as _rescue_uncommitted_work
 from forge_loop.runner.tick_checks import run_codebase_audit as _run_codebase_audit
 from forge_loop.runner.tick_checks import run_maintenance_tick as _run_maintenance_tick
@@ -130,6 +135,13 @@ def _enable_automerge_for_reviewed_outcomes(
                 issue=outcome.issue,
                 pr=outcome.pr_url,
             )
+
+
+def _should_run_worker_iterations(cfg: Any, outcomes: Sequence[object]) -> bool:
+    """Return whether a tick may dispatch follow-up worker iterations."""
+    if cfg.worker_max_iterations <= 1 or not outcomes:
+        return False
+    return not (cfg.stop_file.exists() or cfg.pause_file.exists())
 
 
 def _run_repair_tick(
@@ -497,7 +509,7 @@ def _tick(cfg: Config, tick: int) -> None:
     # focused follow-up worker session — up to ``cfg.worker_max_iterations``
     # attempts. After N attempts without merge, the issue gets labeled
     # ``loop:needs-human``.
-    if cfg.worker_max_iterations > 1 and outcomes:
+    if _should_run_worker_iterations(cfg, outcomes):
         from forge_loop.runner.iteration import run_iteration_loop
 
         issue_by_n = {i["number"]: i for i in issues}
