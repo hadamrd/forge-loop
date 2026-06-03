@@ -51,6 +51,8 @@ A senior engineer writing well-scoped tickets can have forge-loop ship **8–15 
 
 This isn't a "code generator". It is a **harness** — a runner that lets the operator's intent (the issue body) become the contract, and walks an autonomous agent through that contract end-to-end with the same discipline a good engineer would: fingerprint-based retry, drift detection, structured critic, attempts ledger, auto-restart on its own self-upgrade.
 
+The loop is also **resumable**. A hard-killed run (operator `^C` mid-tick, OOM, watchdog SIGKILL) no longer loses its place: `forge-loop run` reboots from a durable `.forge` control plane and self-heals the workers that died with the process — reaping their orphaned worktrees and closing their dead-worker task sagas before the first new dispatch.
+
 ---
 
 ## Stability matrix
@@ -67,6 +69,10 @@ This isn't a "code generator". It is a **harness** — a runner that lets the op
 | **Watchdog** | **stable** | 15 min idle warn / 30 min idle kill |
 | **`forge-loop doctor`** | **stable** | One-shot health check (Rich-rendered) |
 | **MCP introspection tools** | **stable** | `loop_status`, `events_recent`, `worker_logs`, `loop_snapshot`, … |
+| **Durable control plane (`.forge/{events,frontier,memory,tasks}`)** | **stable** | Seeded by `init`; survives a hard kill |
+| **Task-saga lifecycle per dispatch** | **stable** | create → lease RUNNING → terminal; expired lease ⇒ stale (dead-worker) |
+| **Resumable boot recovery** | **stable** | `run` self-heals stale sagas at startup; `forge-loop boot` / `recover` do it on demand |
+| **Boot-context-driven planning (maestro)** | in progress | Boot context is assembled + reported; a maestro that *plans/drives* dispatch from frontier+memory is NOT shipped yet |
 | **Pipeline DAG (`.forge/pipeline.yaml`)** | experimental | Opt-in via `LOOP_PIPELINE_DRIVEN=1` |
 | **Multi-repo (`.forge/repos/*.yaml`)** | experimental | Single host, single loop, N repos |
 | **Async runner** | experimental | `--orchestrator async` |
@@ -296,6 +302,8 @@ Real example: PR #147 hot-fixed a stringly-typed event-boundary bug. The quality
 forge-loop run               # the main loop (foreground)
 forge-loop doctor            # one-shot health check (Rich table)
 forge-loop status            # current state file
+forge-loop boot [--json]     # print reset-recovery context from durable .forge state
+forge-loop recover [--json]  # reconcile dead-worker sagas (reap worktrees + close them)
 forge-loop events [--tail N] # tail loop-runner-events.jsonl (colored)
 forge-loop pause / resume    # touchfile control
 forge-loop stop              # graceful stop at next tick boundary
@@ -445,12 +453,62 @@ runner.tick():
   short_sleep(tick_interval_s)
 ```
 
-State (all file-backed, all gitignored):
+State splits into two tiers. The **operator runtime** under `docs/ops/` is
+ephemeral and gitignored:
 
 - `docs/ops/loop-runner-events.jsonl` — the immutable audit log
 - `docs/ops/loop-runner.json` — current state snapshot
 - `docs/ops/loop-runner-logs/worker-<N>-<ts>.log` — per-worker stream-json
 - `docs/ops/loop-runner.{pid,pause,stop,HALT}` — control touchfiles
+
+The **durable control plane** under `.forge/` is the part that makes a crashed
+run resumable — see the next section.
+
+---
+
+## Durable control plane & resumability
+
+`forge-loop init` seeds a small durable control plane under `.forge/` that
+survives a hard kill:
+
+- `.forge/events.db` — append-only event log with projection cursors
+- `.forge/frontier.yaml` — the frontier cursor (product goal, current problem, next expansion)
+- `.forge/memory.db` — curated memory (active facts + rejected paths)
+- `.forge/tasks.db` — leased, compensatable **task sagas**
+
+Every worker dispatch now records a task-saga lifecycle in `.forge/tasks.db`:
+the saga is **created**, then **leased RUNNING** (lease TTL = the worker wall
+ceiling), then driven to a **terminal** state from the worker outcome
+(`merged`/`open` complete it; anything else fails it, which runs the saga's
+worktree-reap compensation). Saga bookkeeping is best-effort — it never blocks
+a real dispatch or masks a worker outcome.
+
+If the loop process is hard-killed, the workers it leased die with it. Their
+sagas stay RUNNING with a lease that no longer beats; once the lease lapses
+they read as **stale** (an expired-lease, dead-worker saga). On the next
+`forge-loop run`, a boot-recovery pass reconciles every stale saga: it reaps
+the orphaned worktree (the saga's compensation) and marks the saga
+`COMPENSATED`, draining it from the in-flight view. The source issue, if still
+labelled, is re-picked naturally on the next tick. Recovery never touches
+GitHub, so it is safe to run offline.
+
+Two operator commands expose the same machinery on demand:
+
+- `forge-loop boot` assembles and prints the **reset-recovery context** —
+  frontier cursor, active/rejected memory ids, in-flight + stale saga ids, and
+  the event-log position (`--json` for scripts).
+- `forge-loop recover` runs the dead-worker reconciliation sweep itself —
+  the one-shot of what `run` does at boot (`--json` for scripts).
+
+A crash → boot → recover → clean flow:
+
+```bash
+# a run is hard-killed mid-tick (^C / OOM / SIGKILL)
+forge-loop boot              # frontier + ...; "stale (dead-worker leases): saga-42-worker"
+forge-loop recover           # "recovery: reconciled 1 dead-worker saga(s)" — reaps the worktree
+forge-loop boot              # stale list is now empty; clean to restart
+forge-loop run               # would have self-healed at boot anyway; the issue is re-picked
+```
 
 ---
 
