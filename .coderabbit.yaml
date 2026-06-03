@@ -1,0 +1,30 @@
+language: en-US
+tone_instructions: Be direct and concise. Prioritize correctness, security, and runtime behavior.
+
+reviews:
+  profile: assertive
+  review_status: true
+  review_details: true
+  path_filters:
+    - "src/forge_loop/**"
+    - "!tests/**"
+  path_instructions:
+    - path: "src/forge_loop/**"
+      instructions: >-
+        Review forge-loop production code as a second-opinion correctness and
+        security reviewer. Focus on logic bugs, missing edge cases, unsafe I/O,
+        API contract drift, concurrency hazards, and Python idiom issues that
+        can change behavior. Do not leave generic style, naming, formatting,
+        docstring, import-order, or preference comments; Ruff and the
+        manifesto-aware critic own those findings.
+  tools:
+    ruff:
+      enabled: true
+    flake8:
+      enabled: false
+    pylint:
+      enabled: false
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false

@@ -46,6 +46,16 @@ uv run pytest tests/ --cov=src/forge_loop --cov-fail-under=70
 4. Don't lower the coverage floor. If a refactor genuinely needs to, justify it in the PR body.
 5. Adversarial tests preferred — hunt the sad path, not the happy path.
 
+## Reviewers
+
+The manifesto-aware critic is the primary reviewer for forge-loop's style,
+architecture, testing discipline, and project-specific quality rules.
+CodeRabbit runs alongside it as a second-opinion reviewer for correctness,
+security, runtime behavior, and Python API-contract issues that the manifesto
+does not yet encode. When the two disagree, the manifesto wins on style and
+architecture; CodeRabbit wins on correctness unless the critic cites a
+documented manifesto rule.
+
 ## Architecture conventions
 
 - Single source of config: `forge_loop.settings.Settings`. No new `os.environ.get("LOOP_*")` outside `settings.py` — the `test_no_loop_env_reads_outside_settings` regression test enforces this.
