@@ -208,6 +208,48 @@ class TestTaskSagaLeaseLifecycle:
 
         assert store.get(task_id) == leased
 
+    def test_heartbeat_does_not_overwrite_concurrent_reclaim(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db = tmp_path / "tasks.db"
+        task_id = "task-raced-heartbeat"
+        first_acquired_at = datetime(2026, 6, 3, 10, 0, tzinfo=UTC)
+        first_expires_at = first_acquired_at + timedelta(minutes=10)
+        reclaimed_at = first_expires_at + timedelta(seconds=1)
+        store = SqliteTaskSagaStore(db)
+        store.put(_saga(task_id, state=TaskState.DISPATCHED))
+        store.acquire_lease(
+            task_id,
+            owner_id="worker-a",
+            expires_at=first_expires_at,
+            acquired_at=first_acquired_at,
+        )
+
+        class RacingStore(SqliteTaskSagaStore):
+            def _require_mutable(self, task_id: str) -> TaskSaga:
+                stale = super()._require_mutable(task_id)
+                SqliteTaskSagaStore(db).acquire_lease(
+                    task_id,
+                    owner_id="worker-b",
+                    expires_at=reclaimed_at + timedelta(minutes=30),
+                    acquired_at=reclaimed_at,
+                )
+                return stale
+
+        with pytest.raises(LeaseConflictError):
+            RacingStore(db).heartbeat(
+                task_id,
+                owner_id="worker-a",
+                heartbeat_at=first_acquired_at + timedelta(minutes=5),
+                expires_at=first_acquired_at + timedelta(minutes=30),
+            )
+
+        persisted = SqliteTaskSagaStore(db).get(task_id)
+        assert persisted is not None
+        assert persisted.lease_owner == "worker-b"
+        assert persisted.last_heartbeat_at == reclaimed_at
+
     def test_expired_task_is_reported_stale(self, tmp_path: Path) -> None:
         store = SqliteTaskSagaStore(tmp_path / "tasks.db")
         stale = _saga("task-stale", state=TaskState.RUNNING)
@@ -316,6 +358,44 @@ class TestTaskSagaLeaseLifecycle:
         )
 
         assert audited.terminal_reason == "operator recorded cleanup note"
+
+    def test_put_does_not_overwrite_concurrent_terminal_transition(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db = tmp_path / "tasks.db"
+        task_id = "task-raced-terminal-put"
+        SqliteTaskSagaStore(db).put(_saga(task_id, state=TaskState.RUNNING))
+
+        class RacingStore(SqliteTaskSagaStore):
+            _raced = False
+
+            def get(self, task_id: str) -> TaskSaga | None:
+                stale = super().get(task_id)
+                if not self._raced and stale is not None:
+                    self._raced = True
+                    SqliteTaskSagaStore(db).mark_completed(
+                        task_id,
+                        reason="completed concurrently",
+                    )
+                return stale
+
+        with pytest.raises(TerminalTaskMutationError):
+            RacingStore(db).put(
+                TaskSaga(
+                    task_id=task_id,
+                    saga_id=f"saga-{task_id}",
+                    state=TaskState.RUNNING,
+                    issue=165,
+                    branch="loop/mutated",
+                    worktree=f"/tmp/{task_id}",
+                )
+            )
+
+        persisted = SqliteTaskSagaStore(db).get(task_id)
+        assert persisted is not None
+        assert persisted.state is TaskState.COMPLETED
+        assert persisted.terminal_reason == "completed concurrently"
 
     def test_failed_task_requires_or_preserves_compensation_record(
         self,

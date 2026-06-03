@@ -40,6 +40,13 @@ _COMPAT_COLUMNS = {
     "terminal_reason": "TEXT",
 }
 
+_TERMINAL_STATE_VALUES = (
+    TaskState.COMPLETED.value,
+    TaskState.FAILED.value,
+    TaskState.COMPENSATED.value,
+    TaskState.QUARANTINED.value,
+)
+
 
 class TaskSagaStore(Protocol):
     """Persistence boundary for task saga lifecycle state."""
@@ -145,7 +152,7 @@ class SqliteTaskSagaStore:
                 f"task {saga.task_id} is terminal: {existing.state.value}"
             )
         with self._connection:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """
                 INSERT INTO task_sagas (
                     task_id,
@@ -173,6 +180,31 @@ class SqliteTaskSagaStore:
                     lease_expires_at = excluded.lease_expires_at,
                     last_heartbeat_at = excluded.last_heartbeat_at,
                     terminal_reason = excluded.terminal_reason
+                WHERE task_sagas.state NOT IN (?, ?, ?, ?)
+                    OR (
+                        task_sagas.saga_id IS excluded.saga_id
+                        AND task_sagas.state IS excluded.state
+                        AND task_sagas.issue IS excluded.issue
+                        AND task_sagas.branch IS excluded.branch
+                        AND task_sagas.worktree IS excluded.worktree
+                        AND task_sagas.compensations_json IS excluded.compensations_json
+                        AND task_sagas.lease_owner IS excluded.lease_owner
+                        AND task_sagas.lease_expires_at IS excluded.lease_expires_at
+                        AND task_sagas.last_heartbeat_at IS excluded.last_heartbeat_at
+                        AND task_sagas.terminal_reason IS excluded.terminal_reason
+                    )
+                    OR (
+                        task_sagas.saga_id IS excluded.saga_id
+                        AND task_sagas.state IS excluded.state
+                        AND task_sagas.issue IS excluded.issue
+                        AND task_sagas.branch IS excluded.branch
+                        AND task_sagas.worktree IS excluded.worktree
+                        AND task_sagas.compensations_json IS excluded.compensations_json
+                        AND task_sagas.lease_owner IS excluded.lease_owner
+                        AND task_sagas.lease_expires_at IS excluded.lease_expires_at
+                        AND task_sagas.last_heartbeat_at IS excluded.last_heartbeat_at
+                        AND excluded.terminal_reason IS NOT NULL
+                    )
                 """,
                 (
                     saga.task_id,
@@ -186,8 +218,16 @@ class SqliteTaskSagaStore:
                     _datetime_to_text(saga.lease_expires_at),
                     _datetime_to_text(saga.last_heartbeat_at),
                     saga.terminal_reason,
+                    *_TERMINAL_STATE_VALUES,
                 ),
             )
+        if cursor.rowcount != 1:
+            current = self.get(saga.task_id)
+            if current is not None and current.is_terminal:
+                raise TerminalTaskMutationError(
+                    f"task {saga.task_id} is terminal: {current.state.value}"
+                )
+            raise LeaseConflictError(f"task {saga.task_id} update conflicted")
         return saga
 
     def create(
@@ -246,10 +286,7 @@ class SqliteTaskSagaStore:
                     _datetime_to_text(expires_at),
                     _datetime_to_text(acquired_at),
                     task_id,
-                    TaskState.COMPLETED.value,
-                    TaskState.FAILED.value,
-                    TaskState.COMPENSATED.value,
-                    TaskState.QUARANTINED.value,
+                    *_TERMINAL_STATE_VALUES,
                     _datetime_to_text(acquired_at),
                 ),
             )
@@ -277,13 +314,39 @@ class SqliteTaskSagaStore:
             raise LeaseConflictError(f"task {task_id} lease expired before heartbeat")
         if expires_at <= saga.lease_expires_at:
             raise LeaseConflictError(f"task {task_id} heartbeat did not extend lease")
-        heartbeaten = _replace_saga(
-            saga,
-            state=TaskState.RUNNING,
-            lease_expires_at=expires_at,
-            last_heartbeat_at=heartbeat_at,
-        )
-        return self.put(heartbeaten)
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE task_sagas
+                SET
+                    state = ?,
+                    lease_expires_at = ?,
+                    last_heartbeat_at = ?
+                WHERE task_id = ?
+                    AND state NOT IN (?, ?, ?, ?)
+                    AND lease_owner = ?
+                    AND lease_expires_at IS ?
+                    AND lease_expires_at > ?
+                    AND lease_expires_at < ?
+                """,
+                (
+                    TaskState.RUNNING.value,
+                    _datetime_to_text(expires_at),
+                    _datetime_to_text(heartbeat_at),
+                    task_id,
+                    *_TERMINAL_STATE_VALUES,
+                    owner_id,
+                    _datetime_to_text(saga.lease_expires_at),
+                    _datetime_to_text(heartbeat_at),
+                    _datetime_to_text(expires_at),
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise LeaseConflictError(f"task {task_id} lease changed before heartbeat")
+        heartbeaten = self.get(task_id)
+        if heartbeaten is None:
+            raise KeyError(task_id)
+        return heartbeaten
 
     def get(self, task_id: str) -> TaskSaga | None:
         row = self._connection.execute(
