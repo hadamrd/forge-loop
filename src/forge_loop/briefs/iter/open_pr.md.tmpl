@@ -4,7 +4,7 @@ Branch `{branch}` is pushed to origin but no PR exists.
 
 Your ONLY job is to open the PR. Do NOT edit any code.
 
-1. `cd /tmp/wt-loop-{issue_n}`.
+1. `cd {worktree}`.
 2. `gh pr create --base {base_branch} --head {branch} --title "..." --body "Closes #{issue_n}. <restate acceptance criteria>"`.
 3. `gh pr merge <N> --squash --auto --delete-branch`.
 

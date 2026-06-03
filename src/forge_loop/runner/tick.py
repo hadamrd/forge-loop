@@ -573,7 +573,9 @@ def _tick(cfg: Config, tick: int) -> None:
             issue_for_iteration = issue_by_n.get(o.issue)
             if issue_for_iteration is None:
                 continue
-            wt = Path(f"/tmp/wt-loop-{o.issue}")
+            from forge_loop.worker_worktree import worktree_path
+
+            wt = worktree_path(cfg.repo, o.issue)
 
             def _dispatch_follow_up(_issue: dict[str, Any], brief: str) -> WorkerOutcome:
                 """Dispatch one follow-up worker session reusing the worktree."""
@@ -754,7 +756,9 @@ def _tick(cfg: Config, tick: int) -> None:
         else:
             # Preserve for operator inspection (rescue declined the work —
             # e.g. no uncommitted changes, or push failed).
-            wt_path = f"/tmp/wt-loop-{o.issue}"
+            from forge_loop.worker_worktree import worktree_path
+
+            wt_path = str(worktree_path(cfg.repo, o.issue))
             append_event(
                 cfg.events_file,
                 "worktree_preserved",

@@ -407,7 +407,9 @@ def _dispatch_one_worker(
     RUNNING row whose subprocess died. The original exception is then
     re-raised so the ThreadPoolExecutor surfaces it to the caller.
     """
-    worktree_path = f"/tmp/wt-loop-{issue['number']}"
+    from forge_loop.worker_worktree import worktree_path as _worktree_path
+
+    worktree_path = str(_worktree_path(cfg.repo, issue["number"]))
     capability_policy = capability_policy_for_worker(
         repo=cfg.repo,
         worktree_path=worktree_path,

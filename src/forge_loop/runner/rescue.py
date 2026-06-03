@@ -29,7 +29,9 @@ _TEST_FILE_GLOBS = (
 
 def rescue_uncommitted_work(outcome: WorkerOutcome, cfg: Config) -> str | None:
     """Commit, push, and open a PR for dirty worker output. Never raises."""
-    worktree = Path(f"/tmp/wt-loop-{outcome.issue}")
+    from forge_loop.worker_worktree import worktree_path
+
+    worktree = worktree_path(cfg.repo, outcome.issue)
     if not worktree.exists() or not _has_uncommitted_changes(worktree):
         return None
 

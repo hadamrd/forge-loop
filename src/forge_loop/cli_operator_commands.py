@@ -141,11 +141,17 @@ class OperatorCommandsMixin:
             except _sp.SubprocessError:
                 line("yellow", "tmux probe failed")
 
-        orphans = sorted(glob.glob("/tmp/wt-loop-*"))
+        if cfg_ok:
+            from forge_loop.worker_worktree import worktree_base
+
+            orphan_glob = str(worktree_base(cfg.repo) / "wt-loop-*")
+        else:
+            orphan_glob = "/tmp/wt-loop-*"
+        orphans = sorted(glob.glob(orphan_glob))
         if orphans:
             line(
                 "yellow",
-                f"{len(orphans)} orphan worktree(s) under /tmp/wt-loop-*",
+                f"{len(orphans)} orphan worktree(s) under {orphan_glob}",
                 "the runner reaps these at next boot",
             )
         else:

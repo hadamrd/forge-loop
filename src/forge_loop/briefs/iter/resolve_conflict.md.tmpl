@@ -2,7 +2,7 @@ You are resuming work on issue #{issue_n}: {title}
 
 PR {pr_url} has merge CONFLICTS against `{base_branch}`. Your ONLY job is to resolve them.
 
-1. `cd /tmp/wt-loop-{issue_n}`.
+1. `cd {worktree}`.
 2. `git fetch origin {base_branch}`.
 3. `git merge origin/{base_branch}` (or `git rebase origin/{base_branch}` if the branch is clean).
 4. Resolve conflicts. Run the affected tests.
@@ -10,6 +10,6 @@ PR {pr_url} has merge CONFLICTS against `{base_branch}`. Your ONLY job is to res
 6. `git push origin {branch}` (force-with-lease if rebased).
 
 If conflicts are genuinely irresolvable without product input, exit with status="failed"
-and write a short summary to /tmp/wt-loop-{issue_n}/CONFLICT_NOTES.md.
+and write a short summary to {worktree}/CONFLICT_NOTES.md.
 
 Then exit. Attempt {attempt} of {max_attempts}.

@@ -4,7 +4,7 @@ Prior worker session exited DIRTY: files were edited but `git commit` was never 
 
 Your ONLY job is to ship what is already on disk. Do NOT explore. Do NOT add features.
 
-1. `cd /tmp/wt-loop-{issue_n}` (already on branch `{branch}`).
+1. `cd {worktree}` (already on branch `{branch}`).
 2. `git status --short` — review the dirty files.
 3. `git add -A && git commit -m "..."` referencing #{issue_n} with a body explaining why.
    Sign as: `Co-Authored-By: {coauthor}`
