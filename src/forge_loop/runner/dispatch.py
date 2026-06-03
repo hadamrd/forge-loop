@@ -7,6 +7,7 @@ no behaviour change, no signature change.
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -261,18 +262,32 @@ def _worker_task_id(issue_number: int) -> str:
     return f"task-{issue_number}-worker"
 
 
+# Liveness: the lease TTL is a small multiple of the heartbeat interval, NOT
+# the (hours-long) worker wall ceiling. A live worker keeps it fresh by
+# heartbeating; a hard-killed one goes stale within ~interval*factor, so
+# recovery reaps it in minutes instead of hours. The factor is a grace margin —
+# several consecutive missed beats are tolerated before a live worker could be
+# mistaken for dead.
+_HEARTBEAT_INTERVAL_S = 60
+_HEARTBEAT_LEASE_FACTOR = 5
+
+
+def _heartbeat_interval_s(cfg: Config) -> float:
+    return max(float(getattr(cfg, "worker_heartbeat_interval_s", _HEARTBEAT_INTERVAL_S)), 1.0)
+
+
 def _lease_worker_saga(
     task_store: TaskSagaStore | None,
     *,
     task_id: str,
     owner_id: str,
-    timeout_s: int,
+    lease_ttl_s: float,
 ) -> None:
-    """Mark the saga RUNNING under a lease so a dead worker becomes stale.
+    """Mark the saga RUNNING under a short, heartbeat-renewed lease.
 
-    The lease TTL is the worker wall ceiling: if the process dies, the lease
-    expires and ``boot`` / ``list_stale`` flag it as dead-worker work. All
-    best-effort — saga state must never break dispatch.
+    The lease lapses ``lease_ttl_s`` after the last heartbeat; a dead worker
+    (no more beats) then reads as stale for recovery. All best-effort — saga
+    state must never break dispatch.
     """
     if task_store is None:
         return
@@ -281,9 +296,55 @@ def _lease_worker_saga(
         task_store.acquire_lease(
             task_id,
             owner_id=owner_id,
-            expires_at=now + timedelta(seconds=max(timeout_s, 1)),
+            expires_at=now + timedelta(seconds=max(lease_ttl_s, 1.0)),
             acquired_at=now,
         )
+
+
+def _start_worker_heartbeat(
+    cfg: Config,
+    *,
+    task_id: str,
+    owner_id: str,
+    interval_s: float,
+    lease_ttl_s: float,
+) -> tuple[threading.Event, threading.Thread]:
+    """Renew the saga lease on a timer so a *live* worker never reads as stale.
+
+    Runs in its own daemon thread with its OWN store connection (WAL handles
+    cross-connection writes; sqlite forbids sharing one connection across
+    threads). It beats on a wall-clock timer independent of worker activity, so
+    even a worker silent for 10+ minutes of extended thinking stays leased.
+    Fully best-effort: a heartbeat failure never touches the worker.
+    """
+    stop = threading.Event()
+
+    def _beat() -> None:
+        try:
+            store = SqliteTaskSagaStore(canonical_task_saga_path(cfg.repo))
+        except Exception:  # noqa: BLE001 - no store, no heartbeat; worker runs on
+            return
+        while not stop.wait(interval_s):
+            now = datetime.now(UTC)
+            with contextlib.suppress(Exception):
+                store.heartbeat(
+                    task_id,
+                    owner_id=owner_id,
+                    heartbeat_at=now,
+                    expires_at=now + timedelta(seconds=max(lease_ttl_s, 1.0)),
+                )
+
+    thread = threading.Thread(target=_beat, name=f"hb-{task_id}", daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def _stop_worker_heartbeat(handle: tuple[threading.Event, threading.Thread] | None) -> None:
+    if handle is None:
+        return
+    stop, thread = handle
+    stop.set()
+    thread.join(timeout=2.0)
 
 
 def _finalize_worker_saga(
@@ -358,13 +419,56 @@ def _dispatch_one_worker(
             worktree_path=worktree_path,
             capability_policy=capability_policy,
         )
-    _lease_worker_saga(
-        saga_store,
-        task_id=task_id,
-        owner_id=f"worker-{n}-tick-{tick}",
-        timeout_s=cfg.worker_timeout_s,
-    )
+    owner_id = f"worker-{n}-tick-{tick}"
+    interval_s = _heartbeat_interval_s(cfg)
+    lease_ttl_s = interval_s * _HEARTBEAT_LEASE_FACTOR
+    _lease_worker_saga(saga_store, task_id=task_id, owner_id=owner_id, lease_ttl_s=lease_ttl_s)
 
+    heartbeat: tuple[threading.Event, threading.Thread] | None = None
+    if saga_store is not None:
+        heartbeat = _start_worker_heartbeat(
+            cfg,
+            task_id=task_id,
+            owner_id=owner_id,
+            interval_s=interval_s,
+            lease_ttl_s=lease_ttl_s,
+        )
+
+    try:
+        return _run_worker_with_saga(
+            cfg,
+            issue,
+            meta,
+            tick=tick,
+            bus_emit=bus_emit,
+            store=store,
+            saga_store=saga_store,
+            task_id=task_id,
+            capability_policy=capability_policy,
+            worktree_path=worktree_path,
+            branch=branch,
+            maestro_context=maestro_context,
+        )
+    finally:
+        _stop_worker_heartbeat(heartbeat)
+
+
+def _run_worker_with_saga(
+    cfg: Config,
+    issue: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    tick: int,
+    bus_emit: Any,
+    store: WorkerSessionStore | None,
+    saga_store: TaskSagaStore | None,
+    task_id: str,
+    capability_policy: CapabilityPolicy,
+    worktree_path: str,
+    branch: str,
+    maestro_context: str,
+) -> WorkerOutcome:
+    """Invoke the worker and drive the saga terminal edge (legacy + FSM paths)."""
     if store is None:
         try:
             legacy_outcome = run_worker(
