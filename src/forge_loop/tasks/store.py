@@ -224,14 +224,41 @@ class SqliteTaskSagaStore:
         saga = self._require_mutable(task_id)
         if saga.lease_expires_at is not None and saga.lease_expires_at > acquired_at:
             raise LeaseConflictError(f"task {task_id} already has an active lease")
-        leased = _replace_saga(
-            saga,
-            state=TaskState.RUNNING,
-            lease_owner=owner_id,
-            lease_expires_at=expires_at,
-            last_heartbeat_at=acquired_at,
-        )
-        return self.put(leased)
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE task_sagas
+                SET
+                    state = ?,
+                    lease_owner = ?,
+                    lease_expires_at = ?,
+                    last_heartbeat_at = ?
+                WHERE task_id = ?
+                    AND state NOT IN (?, ?, ?, ?)
+                    AND (
+                        lease_expires_at IS NULL
+                        OR lease_expires_at <= ?
+                    )
+                """,
+                (
+                    TaskState.RUNNING.value,
+                    owner_id,
+                    _datetime_to_text(expires_at),
+                    _datetime_to_text(acquired_at),
+                    task_id,
+                    TaskState.COMPLETED.value,
+                    TaskState.FAILED.value,
+                    TaskState.COMPENSATED.value,
+                    TaskState.QUARANTINED.value,
+                    _datetime_to_text(acquired_at),
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise LeaseConflictError(f"task {task_id} lease was claimed concurrently")
+        leased = self.get(task_id)
+        if leased is None:
+            raise KeyError(task_id)
+        return leased
 
     def heartbeat(
         self,

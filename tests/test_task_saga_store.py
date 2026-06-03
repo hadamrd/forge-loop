@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from forge_loop._testing.task_saga_store import FakeTaskSagaStore
 from forge_loop.tasks import (
     Compensation,
@@ -91,6 +93,40 @@ def test_fake_and_real_task_saga_stores_return_same_in_flight_shape(
 
 
 class TestTaskSagaLeaseLifecycle:
+    def test_acquire_lease_does_not_overwrite_concurrent_claim(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db = tmp_path / "tasks.db"
+        task_id = "task-raced-lease"
+        owner_a_time = datetime(2026, 6, 3, 10, 0, tzinfo=UTC)
+        owner_b_time = owner_a_time + timedelta(seconds=1)
+        SqliteTaskSagaStore(db).put(_saga(task_id, state=TaskState.DISPATCHED))
+
+        class RacingStore(SqliteTaskSagaStore):
+            def _require_mutable(self, task_id: str) -> TaskSaga:
+                stale = super()._require_mutable(task_id)
+                SqliteTaskSagaStore(db).acquire_lease(
+                    task_id,
+                    owner_id="worker-b",
+                    expires_at=owner_b_time + timedelta(minutes=30),
+                    acquired_at=owner_b_time,
+                )
+                return stale
+
+        with pytest.raises(LeaseConflictError):
+            RacingStore(db).acquire_lease(
+                task_id,
+                owner_id="worker-a",
+                expires_at=owner_a_time + timedelta(minutes=30),
+                acquired_at=owner_a_time,
+            )
+
+        persisted = SqliteTaskSagaStore(db).get(task_id)
+        assert persisted is not None
+        assert persisted.lease_owner == "worker-b"
+        assert persisted.last_heartbeat_at == owner_b_time
+
     def test_new_task_starts_leaseable_and_becomes_running_after_acquisition(
         self,
         tmp_path: Path,
@@ -150,6 +186,28 @@ class TestTaskSagaLeaseLifecycle:
         assert extended.lease_expires_at == heartbeat_at + timedelta(minutes=20)
         assert extended.last_heartbeat_at == heartbeat_at
 
+    def test_heartbeat_wrong_owner_preserves_existing_lease(self, tmp_path: Path) -> None:
+        store = SqliteTaskSagaStore(tmp_path / "tasks.db")
+        task_id = "task-168-wrong-owner"
+        store.put(_saga(task_id, state=TaskState.DISPATCHED))
+        acquired_at = datetime(2026, 6, 3, 10, 0, tzinfo=UTC)
+        leased = store.acquire_lease(
+            task_id,
+            owner_id="worker-a",
+            expires_at=acquired_at + timedelta(minutes=10),
+            acquired_at=acquired_at,
+        )
+
+        with pytest.raises(LeaseConflictError):
+            store.heartbeat(
+                task_id,
+                owner_id="worker-b",
+                heartbeat_at=acquired_at + timedelta(minutes=5),
+                expires_at=acquired_at + timedelta(minutes=20),
+            )
+
+        assert store.get(task_id) == leased
+
     def test_expired_task_is_reported_stale(self, tmp_path: Path) -> None:
         store = SqliteTaskSagaStore(tmp_path / "tasks.db")
         stale = _saga("task-stale", state=TaskState.RUNNING)
@@ -188,6 +246,36 @@ class TestTaskSagaLeaseLifecycle:
             assert "task-terminal" in str(exc)
         else:  # pragma: no cover - assertion guard
             raise AssertionError("completed task was leased again")
+
+    def test_terminal_markers_record_state_reason_and_reject_later_lease(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        cases = (
+            ("task-complete-marker", TaskState.COMPLETED, "done"),
+            ("task-compensated-marker", TaskState.COMPENSATED, "worktree removed"),
+            ("task-quarantined-marker", TaskState.QUARANTINED, "manual review"),
+        )
+        store = SqliteTaskSagaStore(tmp_path / "tasks.db")
+        for task_id, _state, _reason in cases:
+            store.put(_saga(task_id, state=TaskState.RUNNING))
+
+        marked = (
+            store.mark_completed("task-complete-marker", reason="done"),
+            store.mark_compensated("task-compensated-marker", reason="worktree removed"),
+            store.mark_quarantined("task-quarantined-marker", reason="manual review"),
+        )
+
+        for saga, (_task_id, state, reason) in zip(marked, cases, strict=True):
+            assert saga.state is state
+            assert saga.terminal_reason == reason
+            with pytest.raises(TerminalTaskMutationError):
+                store.acquire_lease(
+                    saga.task_id,
+                    owner_id="worker-a",
+                    expires_at=datetime(2026, 6, 3, 10, 30, tzinfo=UTC),
+                    acquired_at=datetime(2026, 6, 3, 10, 0, tzinfo=UTC),
+                )
 
     def test_terminal_task_cannot_be_mutated_except_audit_reason(
         self,
