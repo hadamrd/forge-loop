@@ -7,6 +7,8 @@ import inspect
 from pathlib import Path
 from typing import Any
 
+from forge_loop.sandbox import CapabilityPolicy, render_capability_policy
+
 
 def make_brief(
     issue: dict[str, Any],
@@ -20,6 +22,7 @@ def make_brief(
     coauthor: str = "",
     dry_run: bool = False,
     manifesto_bundle: Any | None = None,
+    capability_policy: CapabilityPolicy | None = None,
 ) -> str:
     """Render the worker brief for an issue."""
     body = (issue.get("body") or "")[:6000]
@@ -72,6 +75,9 @@ def make_brief(
         else f'{{"issue": {n}, "pr": "<url-or-null>", "status": "open|failed", "note": "<short>"}}'
     )
     coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
+    capability_policy_section = (
+        "\n" + render_capability_policy(capability_policy) if capability_policy is not None else ""
+    )
 
     from forge_loop.briefs import render_brief
 
@@ -88,6 +94,7 @@ def make_brief(
         lumen_total=lumen_total,
         coauthor_line=coauthor_line,
         final_status=final_status,
+        capability_policy_section=capability_policy_section,
     )
     if dry_run:
         from forge_loop.replay import apply_dry_run_to_brief

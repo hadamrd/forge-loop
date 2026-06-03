@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from forge_loop.sandbox import CapabilityPolicy
 from forge_loop.tasks.saga import (
     Compensation,
     LeaseConflictError,
@@ -50,6 +51,7 @@ class FakeTaskSagaStore:
         branch: str,
         worktree: str,
         compensations: tuple[Compensation, ...],
+        capability_policy: CapabilityPolicy | None = None,
     ) -> TaskSaga:
         if task_id in self.sagas or any(saga.saga_id == saga_id for saga in self.sagas.values()):
             raise LeaseConflictError(f"task {task_id} or saga {saga_id} already exists")
@@ -62,6 +64,7 @@ class FakeTaskSagaStore:
                 branch=branch,
                 worktree=worktree,
                 compensations=compensations,
+                capability_policy=capability_policy or CapabilityPolicy(),
             )
         )
 
@@ -188,6 +191,7 @@ def _replace_saga(
     lease_expires_at: datetime | None = None,
     last_heartbeat_at: datetime | None = None,
     terminal_reason: str | None = None,
+    capability_policy: CapabilityPolicy | None = None,
 ) -> TaskSaga:
     return TaskSaga(
         task_id=saga.task_id,
@@ -205,6 +209,7 @@ def _replace_saga(
             last_heartbeat_at if last_heartbeat_at is not None else saga.last_heartbeat_at
         ),
         terminal_reason=terminal_reason if terminal_reason is not None else saga.terminal_reason,
+        capability_policy=capability_policy or saga.capability_policy,
     )
 
 
@@ -217,6 +222,7 @@ def _is_terminal_audit_update(existing: TaskSaga, incoming: TaskSaga) -> bool:
         and existing.branch == incoming.branch
         and existing.worktree == incoming.worktree
         and existing.compensations == incoming.compensations
+        and existing.capability_policy == incoming.capability_policy
         and existing.lease_owner == incoming.lease_owner
         and existing.lease_expires_at == incoming.lease_expires_at
         and existing.last_heartbeat_at == incoming.last_heartbeat_at

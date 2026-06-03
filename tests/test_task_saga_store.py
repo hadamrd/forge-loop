@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from forge_loop._testing.task_saga_store import FakeTaskSagaStore
+from forge_loop.sandbox import CapabilityPolicy, FilesystemScope, McpGrant, NetworkPolicy
 from forge_loop.tasks import (
     Compensation,
     LeaseConflictError,
@@ -47,6 +48,48 @@ def test_task_saga_store_round_trips_saga_after_reopen(tmp_path: Path) -> None:
 
     reopened = SqliteTaskSagaStore(db)
     assert reopened.get("task-165-a") == expected
+
+
+def test_create_without_policy_records_explicit_empty_policy() -> None:
+    store = FakeTaskSagaStore()
+
+    created = store.create(
+        task_id="task-166-without-policy",
+        saga_id="saga-166-without-policy",
+        issue=166,
+        branch="loop/166-policy",
+        worktree="/tmp/wt-loop-166",
+        compensations=(),
+    )
+
+    assert created.capability_policy == CapabilityPolicy()
+
+
+def test_task_saga_store_persists_capability_policy_after_reopen(tmp_path: Path) -> None:
+    db = tmp_path / "tasks.db"
+    policy = CapabilityPolicy(
+        filesystem=FilesystemScope(
+            read_roots=("/repo", "/tmp/wt-loop-166"),
+            write_roots=("/tmp/wt-loop-166",),
+        ),
+        network=NetworkPolicy(allow_domains=("github.com", "api.github.com")),
+        mcp=(McpGrant(server="github", tools=("*",)), McpGrant(server="lumen", tools=("search",))),
+        secret_names=("GITHUB_TOKEN", "ANTHROPIC_API_KEY"),
+    )
+
+    SqliteTaskSagaStore(db).create(
+        task_id="task-166-policy",
+        saga_id="saga-166-policy",
+        issue=166,
+        branch="loop/166-policy",
+        worktree="/tmp/wt-loop-166",
+        compensations=(),
+        capability_policy=policy,
+    )
+
+    persisted = SqliteTaskSagaStore(db).get("task-166-policy")
+    assert persisted is not None
+    assert persisted.capability_policy == policy
 
 
 def test_task_saga_store_get_missing_task_returns_none_after_reopen(

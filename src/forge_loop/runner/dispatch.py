@@ -35,7 +35,9 @@ from forge_loop.runner.persistent_dispatch import (
     persistent_worker_enabled,
     record_outcome,
 )
+from forge_loop.sandbox import CapabilityPolicy, FilesystemScope, McpGrant, NetworkPolicy
 from forge_loop.state import append_event
+from forge_loop.tasks import Compensation, SqliteTaskSagaStore, TaskSaga, TaskSagaStore, TaskState
 from forge_loop.worker import WorkerOutcome, run_repair_worker, run_worker
 from forge_loop.worker_sessions import WorkerSessionStore
 
@@ -142,6 +144,103 @@ def _branch_for_issue(issue: dict[str, Any]) -> str:
     return _branch_name(issue["number"], issue["title"])
 
 
+def capability_policy_for_worker(
+    *,
+    repo: Path,
+    worktree_path: str,
+    allowed_mcp_servers: tuple[str, ...] | None,
+) -> CapabilityPolicy:
+    """Build the explicit capability record bound to one worker worktree."""
+    return CapabilityPolicy(
+        filesystem=FilesystemScope(
+            read_roots=(str(repo), worktree_path),
+            write_roots=(worktree_path,),
+        ),
+        network=NetworkPolicy(
+            allow_domains=("github.com", "api.github.com"),
+            deny_by_default=True,
+        ),
+        mcp=tuple(McpGrant(server=server, tools=("*",)) for server in (allowed_mcp_servers or ())),
+        secret_names=(),
+    )
+
+
+def record_worker_task_policy(
+    *,
+    state_dir: Path,
+    task_id: str,
+    saga_id: str,
+    issue: int,
+    branch: str,
+    worktree_path: str,
+    capability_policy: CapabilityPolicy,
+) -> TaskSaga:
+    store = SqliteTaskSagaStore(state_dir / "task-sagas.db")
+    existing = store.get(task_id)
+    if existing is not None:
+        return existing
+    return store.put(
+        TaskSaga(
+            task_id=task_id,
+            saga_id=saga_id,
+            state=TaskState.DISPATCHED,
+            issue=issue,
+            branch=branch,
+            worktree=worktree_path,
+            compensations=(
+                Compensation(
+                    kind="remove-worktree",
+                    target=worktree_path,
+                    reason="cleanup worker worktree after task terminal state",
+                ),
+            ),
+            capability_policy=capability_policy,
+        )
+    )
+
+
+def _record_worker_task_saga(
+    task_store: TaskSagaStore | None,
+    *,
+    state_dir: Path,
+    issue: dict[str, Any],
+    branch: str,
+    worktree_path: str,
+    capability_policy: CapabilityPolicy,
+) -> None:
+    n = int(issue["number"])
+    task_id = f"task-{n}-worker"
+    saga_id = f"saga-{n}-worker"
+    if task_store is None:
+        record_worker_task_policy(
+            state_dir=state_dir,
+            task_id=task_id,
+            saga_id=saga_id,
+            issue=n,
+            branch=branch,
+            worktree_path=worktree_path,
+            capability_policy=capability_policy,
+        )
+        return
+    if task_store.get(task_id) is not None:
+        return
+    task_store.create(
+        task_id=task_id,
+        saga_id=saga_id,
+        issue=n,
+        branch=branch,
+        worktree=worktree_path,
+        compensations=(
+            Compensation(
+                kind="remove-worktree",
+                target=worktree_path,
+                reason="cleanup after worker task terminal state",
+            ),
+        ),
+        capability_policy=capability_policy,
+    )
+
+
 def _dispatch_one_worker(
     cfg: Config,
     issue: dict[str, Any],
@@ -171,6 +270,24 @@ def _dispatch_one_worker(
     RUNNING row whose subprocess died. The original exception is then
     re-raised so the ThreadPoolExecutor surfaces it to the caller.
     """
+    worktree_path = f"/tmp/wt-loop-{issue['number']}"
+    capability_policy = capability_policy_for_worker(
+        repo=cfg.repo,
+        worktree_path=worktree_path,
+        allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+    )
+    if capability_policy is None:
+        raise RuntimeError(f"worker {issue['number']} missing capability policy record")
+    branch = _branch_for_issue(issue)
+    _record_worker_task_saga(
+        getattr(cfg, "task_store", None),
+        state_dir=cfg.state_dir,
+        issue=issue,
+        branch=branch,
+        worktree_path=worktree_path,
+        capability_policy=capability_policy,
+    )
+
     if store is None:
         return run_worker(
             issue,
@@ -193,10 +310,9 @@ def _dispatch_one_worker(
             strict_mcp_config=cfg.worker.strict_mcp_config,
             mcp_servers=cfg.worker.mcp_servers,
             base_branch=cfg.base_branch,
+            capability_policy=capability_policy,
         )
 
-    branch = _branch_for_issue(issue)
-    worktree_path = f"/tmp/wt-loop-{issue['number']}"
     sess, _resumed = get_or_resume_session(
         store,
         issue=issue["number"],
@@ -228,6 +344,7 @@ def _dispatch_one_worker(
             strict_mcp_config=cfg.worker.strict_mcp_config,
             mcp_servers=cfg.worker.mcp_servers,
             base_branch=cfg.base_branch,
+            capability_policy=capability_policy,
         )
     except BaseException as ex_:
         # The subprocess crashed before producing a WorkerOutcome. We

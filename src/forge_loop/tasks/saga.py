@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
+from forge_loop.sandbox import CapabilityPolicy
+
 
 class TaskState(StrEnum):
     """High-level task saga states."""
@@ -55,6 +57,7 @@ class TaskSaga:
     lease_expires_at: datetime | None = None
     last_heartbeat_at: datetime | None = None
     terminal_reason: str | None = None
+    capability_policy: CapabilityPolicy = field(default_factory=CapabilityPolicy)
 
     @property
     def is_terminal(self) -> bool:
