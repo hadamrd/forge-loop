@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -165,9 +166,28 @@ def capability_policy_for_worker(
     )
 
 
+def canonical_task_saga_path(repo: Path) -> Path:
+    """The one durable task-saga store ``init`` seeds and ``boot`` reads."""
+    return repo / ".forge" / "tasks.db"
+
+
+def _resolve_task_saga_store(cfg: Config) -> TaskSagaStore | None:
+    """Per-thread saga store at the canonical path (or an injected override).
+
+    Best-effort: never let saga bookkeeping break worker dispatch.
+    """
+    explicit = getattr(cfg, "task_store", None)
+    if explicit is not None:
+        return explicit
+    try:
+        return SqliteTaskSagaStore(canonical_task_saga_path(cfg.repo))
+    except Exception:  # noqa: BLE001 - saga state is advisory, dispatch must go on
+        return None
+
+
 def record_worker_task_policy(
     *,
-    state_dir: Path,
+    repo: Path,
     task_id: str,
     saga_id: str,
     issue: int,
@@ -175,7 +195,7 @@ def record_worker_task_policy(
     worktree_path: str,
     capability_policy: CapabilityPolicy,
 ) -> TaskSaga:
-    store = SqliteTaskSagaStore(state_dir / "task-sagas.db")
+    store = SqliteTaskSagaStore(canonical_task_saga_path(repo))
     existing = store.get(task_id)
     if existing is not None:
         return existing
@@ -199,21 +219,21 @@ def record_worker_task_policy(
     )
 
 
-def _record_worker_task_saga(
+def _seed_worker_saga(
     task_store: TaskSagaStore | None,
     *,
-    state_dir: Path,
+    repo: Path,
     issue: dict[str, Any],
     branch: str,
     worktree_path: str,
     capability_policy: CapabilityPolicy,
 ) -> None:
     n = int(issue["number"])
-    task_id = f"task-{n}-worker"
+    task_id = _worker_task_id(n)
     saga_id = f"saga-{n}-worker"
     if task_store is None:
         record_worker_task_policy(
-            state_dir=state_dir,
+            repo=repo,
             task_id=task_id,
             saga_id=saga_id,
             issue=n,
@@ -239,6 +259,56 @@ def _record_worker_task_saga(
         ),
         capability_policy=capability_policy,
     )
+
+
+def _worker_task_id(issue_number: int) -> str:
+    return f"task-{issue_number}-worker"
+
+
+def _lease_worker_saga(
+    task_store: TaskSagaStore | None,
+    *,
+    task_id: str,
+    owner_id: str,
+    timeout_s: int,
+) -> None:
+    """Mark the saga RUNNING under a lease so a dead worker becomes stale.
+
+    The lease TTL is the worker wall ceiling: if the process dies, the lease
+    expires and ``boot`` / ``list_stale`` flag it as dead-worker work. All
+    best-effort — saga state must never break dispatch.
+    """
+    if task_store is None:
+        return
+    now = datetime.now(UTC)
+    with contextlib.suppress(Exception):
+        task_store.acquire_lease(
+            task_id,
+            owner_id=owner_id,
+            expires_at=now + timedelta(seconds=max(timeout_s, 1)),
+            acquired_at=now,
+        )
+
+
+def _finalize_worker_saga(
+    task_store: TaskSagaStore | None,
+    *,
+    task_id: str,
+    status: str,
+) -> None:
+    """Drive the saga to a terminal state from the worker outcome.
+
+    ``merged``/``open`` complete the saga; everything else fails it (the
+    remove-worktree compensation rides along from seeding). Best-effort so a
+    saga-store hiccup never masks the real worker outcome.
+    """
+    if task_store is None:
+        return
+    with contextlib.suppress(Exception):
+        if status in ("merged", "open"):
+            task_store.mark_completed(task_id, reason=f"worker outcome: {status}")
+        else:
+            task_store.mark_failed(task_id, reason=f"worker outcome: {status}")
 
 
 def _dispatch_one_worker(
@@ -279,39 +349,55 @@ def _dispatch_one_worker(
     if capability_policy is None:
         raise RuntimeError(f"worker {issue['number']} missing capability policy record")
     branch = _branch_for_issue(issue)
-    _record_worker_task_saga(
-        getattr(cfg, "task_store", None),
-        state_dir=cfg.state_dir,
-        issue=issue,
-        branch=branch,
-        worktree_path=worktree_path,
-        capability_policy=capability_policy,
+    n = int(issue["number"])
+    task_id = _worker_task_id(n)
+    saga_store = _resolve_task_saga_store(cfg)
+    with contextlib.suppress(Exception):
+        _seed_worker_saga(
+            saga_store,
+            repo=cfg.repo,
+            issue=issue,
+            branch=branch,
+            worktree_path=worktree_path,
+            capability_policy=capability_policy,
+        )
+    _lease_worker_saga(
+        saga_store,
+        task_id=task_id,
+        owner_id=f"worker-{n}-tick-{tick}",
+        timeout_s=cfg.worker_timeout_s,
     )
 
     if store is None:
-        return run_worker(
-            issue,
-            cfg.repo,
-            cfg.logs_dir,
-            cfg.worker_timeout_s,
-            risk_gated=meta["risk_gated"],
-            past_attempts=meta["past_attempts"],
-            blocking_comments=meta.get("blocking_comments") or [],
-            emit=bus_emit,
-            lumen_top_k=cfg.lumen.top_k,
-            lumen_test_pattern=cfg.lumen_test_pattern,
-            coauthor=cfg.coauthor,
-            tick=tick,
-            model=cfg.worker.model,
-            thinking=cfg.worker.thinking,
-            provider=getattr(cfg.worker, "provider", "claude"),
-            allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
-            load_timeout_ms=cfg.worker.load_timeout_ms,
-            strict_mcp_config=cfg.worker.strict_mcp_config,
-            mcp_servers=cfg.worker.mcp_servers,
-            base_branch=cfg.base_branch,
-            capability_policy=capability_policy,
-        )
+        try:
+            legacy_outcome = run_worker(
+                issue,
+                cfg.repo,
+                cfg.logs_dir,
+                cfg.worker_timeout_s,
+                risk_gated=meta["risk_gated"],
+                past_attempts=meta["past_attempts"],
+                blocking_comments=meta.get("blocking_comments") or [],
+                emit=bus_emit,
+                lumen_top_k=cfg.lumen.top_k,
+                lumen_test_pattern=cfg.lumen_test_pattern,
+                coauthor=cfg.coauthor,
+                tick=tick,
+                model=cfg.worker.model,
+                thinking=cfg.worker.thinking,
+                provider=getattr(cfg.worker, "provider", "claude"),
+                allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+                load_timeout_ms=cfg.worker.load_timeout_ms,
+                strict_mcp_config=cfg.worker.strict_mcp_config,
+                mcp_servers=cfg.worker.mcp_servers,
+                base_branch=cfg.base_branch,
+                capability_policy=capability_policy,
+            )
+        except BaseException:
+            _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
+            raise
+        _finalize_worker_saga(saga_store, task_id=task_id, status=legacy_outcome.status)
+        return legacy_outcome
 
     sess, _resumed = get_or_resume_session(
         store,
@@ -366,6 +452,7 @@ def _dispatch_one_worker(
                 outcome=synthetic,
                 events_file=cfg.events_file,
             )
+        _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
         raise
 
     record_outcome(
@@ -374,6 +461,7 @@ def _dispatch_one_worker(
         outcome=outcome,
         events_file=cfg.events_file,
     )
+    _finalize_worker_saga(saga_store, task_id=task_id, status=outcome.status)
     return outcome
 
 
