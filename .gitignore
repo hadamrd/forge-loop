@@ -25,16 +25,14 @@ docs/ops/worker-sessions.db*
 docs/ops/critic-*.log*
 # Per-operator overrides + multi-repo dir + worker-planted settings
 forge-loop.local.yaml
-.forge/*
-# ...except the durable cognition, which IS committed (single-maintainer .forge,
-# dogfood #135): the seed manifestos + the frontier cursor (the maestro's
-# direction). The runtime stores stay ignored: events.db (append-only journal,
-# rotates at 10MB) and tasks.db (transient in-flight sagas) are local state.
-!.forge/product-vision.md
-!.forge/axes.yaml
-!.forge/quality-manifesto.md
-!.forge/testing-manifesto.md
-!.forge/frontier.yaml
+# .forge is the maintainer's durable control plane — the loop BOOTS from it, so
+# it MUST survive a fresh clone. Track all of it: manifestos, frontier cursor,
+# curated memory, the event log, and task sagas. Only the volatile SQLite
+# sidecar files are ignored — they're write-ahead scratch, regenerated on every
+# write, and must never be committed.
+.forge/*.db-wal
+.forge/*.db-shm
+.forge/*.db-journal
 .claude/settings.json
 .claude/settings.local.json
 .claude/worktrees/
