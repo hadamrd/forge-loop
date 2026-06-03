@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from forge_loop.gh_client import GhError, Issue, MockGhClient
 
 
 @pytest.fixture(autouse=True)
-def _reset_client() -> None:
+def _reset_client() -> Generator[None, None, None]:
     gh_issues.set_client(None)
     yield
     gh_issues.set_client(None)
@@ -27,8 +28,7 @@ def test_top_issues_uses_typed_client_not_subprocess(monkeypatch: pytest.MonkeyP
     )
     gh_issues.set_client(client)
     monkeypatch.setattr(
-        gh.subprocess,
-        "run",
+        "forge_loop.gh.subprocess.run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("subprocess must not run")),
     )
 
@@ -113,7 +113,7 @@ def test_pr_precommit_context_excludes_body_from_commit_text(
             stderr="",
         )
 
-    monkeypatch.setattr(gh.subprocess, "run", fake_run)
+    monkeypatch.setattr("forge_loop.gh.subprocess.run", fake_run)
 
     body, commit_text = gh.pr_precommit_context("https://github.com/o/r/pull/1", tmp_path)
 
@@ -127,8 +127,7 @@ def test_pr_precommit_context_returns_empty_on_gh_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        gh.subprocess,
-        "run",
+        "forge_loop.gh.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args=args[0], returncode=1, stdout="", stderr="boom"
         ),
@@ -141,8 +140,7 @@ def test_pr_precommit_context_returns_empty_on_invalid_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        gh.subprocess,
-        "run",
+        "forge_loop.gh.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args=args[0], returncode=0, stdout="not-json", stderr=""
         ),

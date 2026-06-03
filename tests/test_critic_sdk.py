@@ -60,9 +60,9 @@ def test_review_pr_uses_sdk_path_no_subprocess(
     """The claude-provider critic path goes through run_critic_sdk, not
     subprocess. The regression we're pinning: a future contributor must
     not reintroduce subprocess.run('claude', ...) under any branch."""
-    called: dict = {}
+    called: dict[str, object] = {}
 
-    def fake_sdk(**kwargs) -> CriticSdkResult:
+    def fake_sdk(**kwargs: object) -> CriticSdkResult:
         called.update(kwargs)
         return CriticSdkResult(
             last_message=_approve_payload(),
@@ -231,7 +231,7 @@ def test_review_pr_unparseable_text_retries_then_errors(
         ),
     )
     monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
-    emitted: list[tuple[str, dict]] = []
+    emitted: list[tuple[str, dict[str, object]]] = []
     outcome = critic_mod.review_pr(
         pr_url="https://github.com/owner/repo/pull/1",
         issue_number=1,
@@ -251,9 +251,9 @@ def test_review_pr_unparseable_text_retries_then_errors(
 
 
 def test_po_uses_sdk_path_no_subprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: dict = {}
+    captured: dict[str, object] = {}
 
-    def fake_sdk(**kwargs) -> CriticSdkResult:
+    def fake_sdk(**kwargs: object) -> CriticSdkResult:
         captured.update(kwargs)
         return CriticSdkResult(
             last_message=json.dumps(
