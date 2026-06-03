@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from forge_loop.eventlog.models import EventEnvelope, EventId, EventKind, EventRef
-from forge_loop.eventlog.projections import ProjectionCursor
+from forge_loop.eventlog.projections import ProjectionCursor, ProjectionReplayError
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -177,6 +177,27 @@ class SqliteEventLog:
                 """,
                 (projection_name, cursor.sequence),
             )
+
+    def advance_projection_cursor(
+        self,
+        projection_name: str,
+        cursor: ProjectionCursor,
+    ) -> None:
+        """Persist a cursor only when it advances monotonically within the log."""
+
+        current = self.get_projection_cursor(projection_name)
+        if cursor.sequence < current.sequence:
+            raise ProjectionReplayError(
+                f"stale projection cursor for {projection_name}: "
+                f"{cursor.sequence} < {current.sequence}"
+            )
+        latest = self.latest_sequence()
+        if cursor.sequence > latest:
+            raise ProjectionReplayError(
+                f"projection cursor for {projection_name} is past latest event sequence: "
+                f"{cursor.sequence} > {latest}"
+            )
+        self.set_projection_cursor(projection_name, cursor)
 
     def list_projection_cursors(self) -> Mapping[str, ProjectionCursor]:
         """Return saved projection cursors by projection name."""
