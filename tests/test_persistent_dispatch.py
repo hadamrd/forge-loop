@@ -34,6 +34,7 @@ from forge_loop.tasks import SqliteTaskSagaStore
 from forge_loop.worker import WorkerOutcome
 from forge_loop.worker_sessions import WorkerSessionStore
 from forge_loop.worker_state import WorkerState
+from forge_loop.worker_worktree import worktree_path
 
 # ---------------------------------------------------------------------------
 # Helpers — a small Config stub that exposes only the fields the dispatch
@@ -311,10 +312,11 @@ def test_dispatch_one_worker_full_success_path(tmp_path, monkeypatch) -> None:
         else:
             raise AssertionError("no session in store at SDK invocation time")
         policy = kwargs["capability_policy"]
+        wt42 = str(worktree_path(cfg.repo, 42))
         assert policy == CapabilityPolicy(
             filesystem=FilesystemScope(
-                read_roots=(str(cfg.repo), "/tmp/wt-loop-42"),
-                write_roots=("/tmp/wt-loop-42",),
+                read_roots=(str(cfg.repo), wt42),
+                write_roots=(wt42,),
             ),
             network=NetworkPolicy(allow_domains=("github.com", "api.github.com")),
             mcp=(McpGrant(server="github", tools=("*",)), McpGrant(server="lumen", tools=("*",))),
@@ -348,11 +350,12 @@ def test_dispatch_one_worker_full_success_path(tmp_path, monkeypatch) -> None:
     assert final.pr_url == pr_url
     task_saga = SqliteTaskSagaStore(cfg.repo / ".forge" / "tasks.db").get("task-42-worker")
     assert task_saga is not None
-    assert task_saga.worktree == "/tmp/wt-loop-42"
+    wt42 = str(worktree_path(cfg.repo, 42))
+    assert task_saga.worktree == wt42
     assert task_saga.capability_policy == CapabilityPolicy(
         filesystem=FilesystemScope(
-            read_roots=(str(cfg.repo), "/tmp/wt-loop-42"),
-            write_roots=("/tmp/wt-loop-42",),
+            read_roots=(str(cfg.repo), wt42),
+            write_roots=(wt42,),
         ),
         network=NetworkPolicy(allow_domains=("github.com", "api.github.com")),
         mcp=(McpGrant(server="github", tools=("*",)), McpGrant(server="lumen", tools=("*",))),
@@ -401,8 +404,9 @@ def test_dispatch_one_worker_records_capability_policy_on_task_saga(tmp_path, mo
     assert saga is not None
     assert saga.saga_id == "saga-166-worker"
     assert saga.issue == 166
-    assert saga.worktree == "/tmp/wt-loop-166"
-    assert saga.capability_policy.filesystem.write_roots == ("/tmp/wt-loop-166",)
+    wt166 = str(worktree_path(cfg.repo, 166))
+    assert saga.worktree == wt166
+    assert saga.capability_policy.filesystem.write_roots == (wt166,)
     assert saga.capability_policy.mcp == (McpGrant(server="github", tools=("*",)),)
 
 
@@ -438,7 +442,10 @@ def test_dispatch_one_worker_records_policy_in_default_task_saga_store(
 
     saga = SqliteTaskSagaStore(cfg.repo / ".forge" / "tasks.db").get("task-168-worker")
     assert saga is not None
-    assert saga.capability_policy.filesystem.read_roots == (str(cfg.repo), "/tmp/wt-loop-168")
+    assert saga.capability_policy.filesystem.read_roots == (
+        str(cfg.repo),
+        str(worktree_path(cfg.repo, 168)),
+    )
     assert saga.capability_policy.network.allow_domains == ("github.com", "api.github.com")
 
 

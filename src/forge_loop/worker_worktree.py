@@ -29,6 +29,25 @@ _PERMISSIVE_WORKTREE_SETTINGS = """{
 """
 
 
+def worktree_base(repo: Path) -> Path:
+    """Per-repo worktree root: ``/tmp/forge-<repo-dir-name>/``.
+
+    Worker worktrees are namespaced by repo so two loops running against
+    different checkouts never share a ``wt-loop-<issue>`` path or reap each
+    other's in-flight worktrees at boot. The issue number alone is NOT
+    unique across repositories (repo A's #155 and repo B's #155 would have
+    collided under the old flat ``/tmp/wt-loop-<issue>`` scheme), and the
+    boot-time orphan reaper globbed ``/tmp/wt-loop-*`` indiscriminately —
+    so starting one loop wiped another loop's live worktrees.
+    """
+    return Path("/tmp") / f"forge-{repo.name}"
+
+
+def worktree_path(repo: Path, issue: int | str) -> Path:
+    """Canonical worktree path for ``issue`` under ``repo``'s namespace."""
+    return worktree_base(repo) / f"wt-loop-{issue}"
+
+
 def ensure_subagent_trusted(target_dir: Path) -> None:
     """Plant `.claude/settings.json` in target_dir if missing."""
     cdir = target_dir / ".claude"
@@ -78,7 +97,8 @@ def prep_worktree(
     emit: Callable[[str, dict[str, Any]], None] | None = None,
     precommit_runner: PreCommitRunner | None = None,
 ) -> tuple[Path, str | None]:
-    wt = Path(f"/tmp/wt-loop-{n}")
+    wt = worktree_path(repo, n)
+    wt.parent.mkdir(parents=True, exist_ok=True)
     _remove_existing_worktree(repo, wt)
     quarantine_if_blocking(wt)
     subprocess.run(["git", "branch", "-D", branch], cwd=repo, capture_output=True)
@@ -112,7 +132,8 @@ def prep_repair_worktree(
     emit: Callable[[str, dict[str, Any]], None] | None = None,
     precommit_runner: PreCommitRunner | None = None,
 ) -> tuple[Path, str | None]:
-    wt = Path(f"/tmp/wt-loop-{issue}")
+    wt = worktree_path(repo, issue)
+    wt.parent.mkdir(parents=True, exist_ok=True)
     _remove_existing_worktree(repo, wt)
     quarantine_if_blocking(wt)
     remote_ref = f"refs/remotes/origin/{branch}"

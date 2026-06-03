@@ -2,7 +2,7 @@ You are resuming work on issue #{issue_n}: {title}
 
 PR {pr_url} is OPEN but CI is RED. Your ONLY job is to make CI green.
 
-1. `cd /tmp/wt-loop-{issue_n}`.
+1. `cd {worktree}`.
 2. `gh pr checks {pr_url}` to identify the failing jobs.
 3. `gh run view <run-id> --log-failed` to read the failure.
 4. Fix the failing tests / lint / type errors. Do NOT add unrelated changes.

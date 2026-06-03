@@ -4,7 +4,7 @@ Prior worker session committed locally but never pushed.
 
 Your ONLY job is to push and open the PR. Do NOT edit any code.
 
-1. `cd /tmp/wt-loop-{issue_n}`.
+1. `cd {worktree}`.
 2. `git push -u origin {branch}`.
 3. `gh pr create --base {base_branch} --title "..." --body "Closes #{issue_n}..."` if no PR exists.
 4. `gh pr merge <N> --squash --auto --delete-branch`.

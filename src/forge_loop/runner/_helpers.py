@@ -60,11 +60,14 @@ def reap_worktree(repo: Path, issue: int, container: Any = None) -> None:
     legacy callers; new code passes an explicit Container so tests can
     substitute fakes.
     """
-    wt = Path(f"/tmp/wt-loop-{issue}")
+    from forge_loop.worker_worktree import worktree_path
+
+    wt = worktree_path(repo, issue)
     if not wt.exists():
         return
     if container is None:
         from forge_loop.container import get_container
+
         container = get_container()
     # The planted .claude/ is locked read-only (chmod 555). Unlock first.
     claude_dir = wt / ".claude"
@@ -77,14 +80,20 @@ def reap_worktree(repo: Path, issue: int, container: Any = None) -> None:
 
 
 def reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
-    """Boot-time cleanup of stale /tmp/wt-loop-* worktrees.
+    """Boot-time cleanup of THIS repo's stale ``wt-loop-*`` worktrees.
 
-    Any /tmp/wt-loop-* on disk at boot is by definition stale — the loop
-    is the sole owner of those paths and we haven't started any worker
-    yet. Returns the count reaped (for telemetry).
+    Any ``wt-loop-*`` under this repo's namespace
+    (:func:`forge_loop.worker_worktree.worktree_base`) on disk at boot is
+    by definition stale — the loop is the sole owner of those paths and we
+    haven't started any worker yet. The glob is scoped to the per-repo
+    base so a loop on one repo never reaps another repo's *live*
+    worktrees. Returns the count reaped (for telemetry).
     """
+    from forge_loop.worker_worktree import worktree_base
+
     reaped = 0
-    for path in sorted(glob.glob("/tmp/wt-loop-*")):
+    base = worktree_base(repo)
+    for path in sorted(glob.glob(str(base / "wt-loop-*"))):
         name = Path(path).name
         # Quarantined dirs (wt-loop-<N>.stale-<ts>) from failed cleanups —
         # try to rm them at boot. If still un-removable due to uid
@@ -92,6 +101,7 @@ def reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
         if ".stale-" in name:
             try:
                 import shutil
+
                 shutil.rmtree(path, ignore_errors=True)
             except Exception:  # noqa: BLE001 — best-effort boot cleanup
                 pass
@@ -114,6 +124,7 @@ def reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
     # dir (accumulate when a worktree is rm -rf'd without `git worktree
     # remove`). Routed through the adapter (issue #86).
     from forge_loop.container import get_container
+
     get_container().git.worktree_prune(repo)
     return reaped
 
@@ -131,6 +142,7 @@ def installed_version() -> str:
     """
     try:
         from importlib.metadata import PackageNotFoundError, version
+
         return version("forge-loop")
     except (ImportError, PackageNotFoundError):
         return ""

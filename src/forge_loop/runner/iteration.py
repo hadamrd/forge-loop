@@ -79,10 +79,12 @@ class WorkerState(StrEnum):
 
 
 # Terminal: do not dispatch a follow-up worker session.
-TERMINAL_STATES = frozenset({
-    WorkerState.DONE_MERGED,
-    WorkerState.CLOSED_PR_ABANDONED,
-})
+TERMINAL_STATES = frozenset(
+    {
+        WorkerState.DONE_MERGED,
+        WorkerState.CLOSED_PR_ABANDONED,
+    }
+)
 
 # Non-LLM action: probe sets up ``gh pr merge --auto`` and exits without dispatch.
 NON_LLM_STATES = frozenset({WorkerState.PR_OPEN_HEALTHY})
@@ -349,6 +351,7 @@ def next_brief(
     base_branch: str = "trunk",
     coauthor: str = "",
     pr_url: str | None = None,
+    worktree: str | Path | None = None,
 ) -> str | None:
     """Return the focused follow-up brief for ``state``, or None if terminal.
 
@@ -372,8 +375,13 @@ def next_brief(
         branch = getattr(prior_outcome, "branch", "") or ""
     if not branch:
         branch = f"loop/{issue['number']}-iter"
+    # Worktree path for the worker to `cd` into. Defaults to the legacy
+    # flat path only when the caller didn't supply the real (per-repo
+    # namespaced) worktree — kept for back-compat with direct callers.
+    worktree_str = str(worktree) if worktree is not None else f"/tmp/wt-loop-{issue['number']}"
     return tpl.format(
         issue_n=issue["number"],
+        worktree=worktree_str,
         title=issue.get("title", ""),
         body=(issue.get("body") or "")[:4000],
         branch=branch,
@@ -513,6 +521,7 @@ def run_iteration_loop(
             base_branch=base_branch,
             coauthor=coauthor,
             pr_url=ctx.pr_url,
+            worktree=worktree,
         )
         if brief is None:
             return current
