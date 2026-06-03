@@ -14,7 +14,7 @@ from forge_loop.memory import (
     MemoryProvenance,
     SqliteMemoryStore,
 )
-from forge_loop.tasks import SqliteTaskSagaStore, TaskSaga, TaskState
+from forge_loop.tasks import Compensation, SqliteTaskSagaStore, TaskSaga, TaskState
 
 
 def _frontier() -> FrontierCursor:
@@ -133,6 +133,13 @@ def test_boot_context_accepts_no_active_tasks_after_reopen(tmp_path: Path) -> No
             saga_id="saga-165-failed",
             state=TaskState.FAILED,
             issue=165,
+            compensations=(
+                Compensation(
+                    kind="cleanup-worktree",
+                    target="/tmp/wt-loop-165",
+                    reason="failed terminal tasks must keep their cleanup record",
+                ),
+            ),
         )
     )
 
