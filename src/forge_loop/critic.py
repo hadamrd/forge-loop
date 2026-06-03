@@ -172,7 +172,8 @@ def detect_precommit_bypass(commit_text: str, *, pr_body: str) -> CriticReport:
 
 def _has_no_verify_command(text: str) -> bool:
     for line in _command_segments(text):
-        if _NO_VERIFY_RE.search(line) and not _NO_VERIFY_STATIC_CONTEXT_RE.search(line):
+        match = _NO_VERIFY_RE.search(line)
+        if match is not None and not _is_static_no_verify_context(line, match):
             return True
     return False
 
@@ -220,9 +221,14 @@ def _command_segments(text: str) -> list[str]:
 
 def _has_no_verify_body_action(text: str) -> bool:
     for line in text.splitlines():
-        if _BODY_NO_VERIFY_ACTION_RE.search(line) and not _NO_VERIFY_STATIC_CONTEXT_RE.search(line):
+        match = _BODY_NO_VERIFY_ACTION_RE.search(line)
+        if match is not None and not _is_static_no_verify_context(line, match):
             return True
     return False
+
+
+def _is_static_no_verify_context(line: str, match: re.Match[str]) -> bool:
+    return _NO_VERIFY_STATIC_CONTEXT_RE.search(line[: match.start()]) is not None
 
 
 def _has_precommit_bypass_justification(pr_body: str) -> bool:

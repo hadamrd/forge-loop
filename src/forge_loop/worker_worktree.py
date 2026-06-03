@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from forge_loop.precommit import (
+    PreCommitInstallMethod,
     PreCommitRunner,
     ensure_worker_precommit_hook,
 )
@@ -148,20 +149,27 @@ def _install_and_emit_worker_precommit_hook(
         worktree,
         runner=precommit_runner,
     )
-    _emit_worker_precommit_event(emit, worktree, method.value, reason)
+    _emit_worker_precommit_event(emit, worktree, method, reason)
 
 
 def _emit_worker_precommit_event(
     emit: Callable[[str, dict[str, Any]], None] | None,
     worktree: Path,
-    method: str,
+    method: PreCommitInstallMethod,
     reason: str | None,
 ) -> None:
     if emit is None:
         return
-    payload: dict[str, Any] = {"worktree_path": str(worktree), "method": method}
-    if reason:
-        payload["reason"] = reason
+    from forge_loop.events import WorkerPreCommitInstalledEvent
+
+    event = WorkerPreCommitInstalledEvent.model_validate(
+        {
+            "worktree_path": str(worktree),
+            "method": method,
+            "reason": reason,
+        }
+    )
+    payload = event.model_dump(mode="json", exclude_none=True)
     emit("worker_precommit_installed", payload)
 
 

@@ -6,11 +6,16 @@ import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from forge_loop.precommit import PreCommitInstallMethod, git_hook_path
-from forge_loop.worker_worktree import prep_repair_worktree, prep_worktree
+from forge_loop.worker_worktree import (
+    _emit_worker_precommit_event,
+    prep_repair_worktree,
+    prep_worktree,
+)
 
 
 def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -181,6 +186,16 @@ def test_worker_precommit_install_event_is_typed(tmp_path: Path) -> None:
     assert rec["kind"] == "worker_precommit_installed"
     assert rec["worktree_path"] == "/tmp/wt-loop-1"
     assert rec["method"] == "install"
+
+
+def test_worker_precommit_install_event_payload_is_validated() -> None:
+    with pytest.raises(ValueError):
+        _emit_worker_precommit_event(
+            lambda _kind, _payload: None,
+            Path("/tmp/wt"),
+            cast(Any, "bogus"),
+            None,
+        )
 
 
 def test_concurrent_workers_against_same_repo_both_get_precommit_hooks(tmp_path: Path) -> None:
