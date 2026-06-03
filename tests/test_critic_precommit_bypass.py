@@ -52,3 +52,13 @@ def test_pr_body_static_rule_mention_is_not_a_bypass() -> None:
 
     assert not report.has_sev1()
     assert report.findings == []
+
+
+def test_commit_metadata_static_rule_mention_is_not_a_bypass() -> None:
+    report = detect_precommit_bypass(
+        "Flag PR-body action statements that say a worker ran git commit --no-verify\n",
+        pr_body="## Summary\nNo bypass was used.\n",
+    )
+
+    assert not report.has_sev1()
+    assert report.findings == []

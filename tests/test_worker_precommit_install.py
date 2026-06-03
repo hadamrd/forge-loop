@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -182,22 +183,29 @@ def test_worker_precommit_install_event_is_typed(tmp_path: Path) -> None:
     assert rec["method"] == "install"
 
 
-@pytest.mark.parametrize("n", [8160, 8161])
-def test_concurrent_workers_both_get_precommit_hooks(tmp_path: Path, n: int) -> None:
-    repo = _init_fixture_repo(tmp_path / str(n))
+def test_concurrent_workers_against_same_repo_both_get_precommit_hooks(tmp_path: Path) -> None:
+    repo = _init_fixture_repo(tmp_path)
     (repo / ".pre-commit-config.yaml").write_text("repos: []\n")
     assert _run(["git", "add", ".pre-commit-config.yaml"], repo).returncode == 0
     assert _run(["git", "commit", "-m", "add precommit config"], repo).returncode == 0
+    events: list[tuple[str, dict[str, object]]] = []
 
-    worktree, err = prep_worktree(
-        repo,
-        n,
-        f"loop/{n}-precommit",
-        precommit_runner=FakePreCommitRunner(),
-    )
+    def prepare(n: int) -> tuple[Path, str | None]:
+        return prep_worktree(
+            repo,
+            n,
+            f"loop/{n}-precommit",
+            emit=lambda kind, payload: events.append((kind, payload)),
+            precommit_runner=FakePreCommitRunner(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(prepare, [8160, 8161]))
 
     try:
-        assert err is None
-        assert git_hook_path(worktree).exists()
+        assert [err for _, err in results] == [None, None]
+        assert all(git_hook_path(worktree).exists() for worktree, _ in results)
+        assert [kind for kind, _ in events].count("worker_precommit_installed") == 2
     finally:
-        _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
+        for worktree, _ in results:
+            _run(["git", "worktree", "remove", "--force", str(worktree)], repo)

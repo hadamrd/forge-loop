@@ -47,6 +47,11 @@ _BODY_NO_VERIFY_ACTION_RE = re.compile(
     r"git\s+commit\b[^\n]*\s--no-verify\b",
     re.IGNORECASE,
 )
+_NO_VERIFY_STATIC_CONTEXT_RE = re.compile(
+    r"\b(?:flag|detect|test|tests|rule|brief|manifesto|requires|mention|mentions|"
+    r"statement|statements)\b",
+    re.IGNORECASE,
+)
 _BYPASS_HEADING_RE = re.compile(
     r"^##\s+Pre-commit bypass justification\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -144,7 +149,7 @@ class CriticOutcome:
 def detect_precommit_bypass(commit_text: str, *, pr_body: str) -> CriticReport:
     """Flag `git commit --no-verify` unless the PR body justifies it."""
 
-    if not _NO_VERIFY_RE.search(commit_text) and not _BODY_NO_VERIFY_ACTION_RE.search(pr_body):
+    if not _has_no_verify_command(commit_text) and not _has_no_verify_body_action(pr_body):
         return CriticReport(overall="approve", findings=[])
     if _has_precommit_bypass_justification(pr_body):
         return CriticReport(overall="approve", findings=[])
@@ -163,6 +168,20 @@ def detect_precommit_bypass(commit_text: str, *, pr_body: str) -> CriticReport:
             )
         ],
     )
+
+
+def _has_no_verify_command(text: str) -> bool:
+    for line in text.splitlines():
+        if _NO_VERIFY_RE.search(line) and not _NO_VERIFY_STATIC_CONTEXT_RE.search(line):
+            return True
+    return False
+
+
+def _has_no_verify_body_action(text: str) -> bool:
+    for line in text.splitlines():
+        if _BODY_NO_VERIFY_ACTION_RE.search(line) and not _NO_VERIFY_STATIC_CONTEXT_RE.search(line):
+            return True
+    return False
 
 
 def _has_precommit_bypass_justification(pr_body: str) -> bool:
