@@ -436,6 +436,26 @@ class TestTaskSagaLeaseLifecycle:
         )
         assert failed_with_new_compensation.compensations == (compensation,)
 
+    def test_direct_failed_saga_persistence_requires_compensation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        failed_without_compensation = TaskSaga(
+            task_id="task-direct-failed-without-comp",
+            saga_id="saga-task-direct-failed-without-comp",
+            state=TaskState.FAILED,
+            issue=168,
+            branch="loop/168-feat-tasks-persist-saga-leases",
+            worktree="/tmp/task-direct-failed-without-comp",
+        )
+
+        for store in (
+            SqliteTaskSagaStore(tmp_path / "tasks.db"),
+            FakeTaskSagaStore(),
+        ):
+            with pytest.raises(LeaseConflictError):
+                store.put(failed_without_compensation)
+
     def test_reopening_store_preserves_lease_and_compensations(
         self,
         tmp_path: Path,

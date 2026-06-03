@@ -19,6 +19,8 @@ class FakeTaskSagaStore:
     sagas: dict[str, TaskSaga] = field(default_factory=dict)
 
     def put(self, saga: TaskSaga) -> TaskSaga:
+        if saga.state is TaskState.FAILED and not saga.compensations:
+            raise LeaseConflictError(f"task {saga.task_id} failure requires compensation")
         existing = self.get(saga.task_id)
         if (
             existing is not None
