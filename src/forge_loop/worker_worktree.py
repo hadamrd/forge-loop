@@ -97,16 +97,20 @@ def prep_worktree(
         return wt, r.stderr
     if wt.exists():
         drop_permissive_settings(wt)
-        method, reason = ensure_worker_precommit_hook(
-            repo,
-            wt,
-            runner=precommit_runner,
+        _install_and_emit_worker_precommit_hook(
+            repo, wt, emit=emit, precommit_runner=precommit_runner
         )
-        _emit_worker_precommit_event(emit, wt, method.value, reason)
     return wt, None
 
 
-def prep_repair_worktree(repo: Path, issue: int, branch: str) -> tuple[Path, str | None]:
+def prep_repair_worktree(
+    repo: Path,
+    issue: int,
+    branch: str,
+    *,
+    emit: Callable[[str, dict[str, Any]], None] | None = None,
+    precommit_runner: PreCommitRunner | None = None,
+) -> tuple[Path, str | None]:
     wt = Path(f"/tmp/wt-loop-{issue}")
     _remove_existing_worktree(repo, wt)
     quarantine_if_blocking(wt)
@@ -126,7 +130,25 @@ def prep_repair_worktree(repo: Path, issue: int, branch: str) -> tuple[Path, str
         return wt, r.stderr
     if wt.exists():
         drop_permissive_settings(wt)
+        _install_and_emit_worker_precommit_hook(
+            repo, wt, emit=emit, precommit_runner=precommit_runner
+        )
     return wt, None
+
+
+def _install_and_emit_worker_precommit_hook(
+    repo: Path,
+    worktree: Path,
+    *,
+    emit: Callable[[str, dict[str, Any]], None] | None,
+    precommit_runner: PreCommitRunner | None,
+) -> None:
+    method, reason = ensure_worker_precommit_hook(
+        repo,
+        worktree,
+        runner=precommit_runner,
+    )
+    _emit_worker_precommit_event(emit, worktree, method.value, reason)
 
 
 def _emit_worker_precommit_event(
@@ -140,8 +162,7 @@ def _emit_worker_precommit_event(
     payload: dict[str, Any] = {"worktree_path": str(worktree), "method": method}
     if reason:
         payload["reason"] = reason
-    with contextlib.suppress(Exception):
-        emit("worker_precommit_installed", payload)
+    emit("worker_precommit_installed", payload)
 
 
 def _remove_existing_worktree(repo: Path, wt: Path) -> None:

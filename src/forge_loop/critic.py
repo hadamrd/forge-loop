@@ -169,6 +169,35 @@ def _has_precommit_bypass_justification(pr_body: str) -> bool:
     return bool(body)
 
 
+def _fetch_pr_precommit_context(pr_url: str, repo: Path) -> tuple[str, str]:
+    """Return PR body plus commit metadata for deterministic local checks."""
+
+    from forge_loop import gh
+
+    return gh.pr_precommit_context(pr_url, repo)
+
+
+def _with_deterministic_precommit_findings(
+    report: CriticReport,
+    *,
+    pr_url: str,
+    repo: Path,
+) -> CriticReport:
+    pr_body, commit_text = _fetch_pr_precommit_context(pr_url, repo)
+    deterministic = detect_precommit_bypass(commit_text, pr_body=pr_body)
+    if not deterministic.findings:
+        return report
+    overall = report.overall
+    if overall == "approve":
+        overall = deterministic.overall
+    return CriticReport(
+        overall=overall,
+        findings=[*report.findings, *deterministic.findings],
+        manifesto_violations=report.manifesto_violations,
+        raw=report.raw,
+    )
+
+
 def review_pr(
     pr_url: str,
     issue_number: int,
@@ -246,6 +275,7 @@ def review_pr(
                 stdout_tail=tail,
                 error=parse_error or result.error or "critic_parse_failed",
             )
+        report = _with_deterministic_precommit_findings(report, pr_url=pr_url, repo=repo)
         verdict = _verdict_from_overall(report.overall)
         reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
         return CriticOutcome(
@@ -328,6 +358,7 @@ def review_pr(
             parse_retries=retries,
         )
 
+    report = _with_deterministic_precommit_findings(report, pr_url=pr_url, repo=repo)
     verdict = _verdict_from_overall(report.overall)
     reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
     return CriticOutcome(

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from forge_loop.precommit import PreCommitInstallMethod, git_hook_path
-from forge_loop.worker_worktree import prep_worktree
+from forge_loop.worker_worktree import prep_repair_worktree, prep_worktree
 
 
 def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -76,6 +76,27 @@ def test_prep_worktree_installs_precommit_hook_and_emits_install_event(tmp_path:
         _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
 
 
+def test_prep_worktree_surfaces_precommit_event_sink_failure(tmp_path: Path) -> None:
+    repo = _init_fixture_repo(tmp_path)
+    (repo / ".pre-commit-config.yaml").write_text("repos: []\n")
+    assert _run(["git", "add", ".pre-commit-config.yaml"], repo).returncode == 0
+    assert _run(["git", "commit", "-m", "add precommit config"], repo).returncode == 0
+
+    def failing_emit(_kind: str, _payload: dict[str, object]) -> None:
+        raise RuntimeError("event sink unavailable")
+
+    with pytest.raises(RuntimeError, match="event sink unavailable"):
+        prep_worktree(
+            repo,
+            8162,
+            "loop/8162-precommit",
+            emit=failing_emit,
+            precommit_runner=FakePreCommitRunner(),
+        )
+
+    _run(["git", "worktree", "remove", "--force", "/tmp/wt-loop-8162"], repo)
+
+
 def test_prep_worktree_copies_main_hook_when_precommit_binary_missing(tmp_path: Path) -> None:
     repo = _init_fixture_repo(tmp_path)
     (repo / ".pre-commit-config.yaml").write_text("repos: []\n")
@@ -107,6 +128,37 @@ def test_prep_worktree_copies_main_hook_when_precommit_binary_missing(tmp_path: 
                 "method": "copy",
                 "reason": "precommit_binary_missing",
             },
+        )
+    finally:
+        _run(["git", "worktree", "remove", "--force", str(worktree)], repo)
+
+
+def test_prep_repair_worktree_installs_precommit_hook_and_emits_event(tmp_path: Path) -> None:
+    repo = _init_fixture_repo(tmp_path)
+    branch = "loop/8163-precommit-repair"
+    (repo / ".pre-commit-config.yaml").write_text("repos: []\n")
+    assert _run(["git", "add", ".pre-commit-config.yaml"], repo).returncode == 0
+    assert _run(["git", "commit", "-m", "add precommit config"], repo).returncode == 0
+    assert _run(["git", "checkout", "-b", branch], repo).returncode == 0
+    assert _run(["git", "checkout", "trunk"], repo).returncode == 0
+    events: list[tuple[str, dict[str, object]]] = []
+    runner = FakePreCommitRunner()
+
+    worktree, err = prep_repair_worktree(
+        repo,
+        8163,
+        branch,
+        emit=lambda kind, payload: events.append((kind, payload)),
+        precommit_runner=runner,
+    )
+
+    try:
+        assert err is None
+        assert git_hook_path(worktree).exists()
+        assert runner.installs == [worktree]
+        assert events[-1] == (
+            "worker_precommit_installed",
+            {"worktree_path": str(worktree), "method": "install"},
         )
     finally:
         _run(["git", "worktree", "remove", "--force", str(worktree)], repo)

@@ -20,7 +20,6 @@ from forge_loop import critic as critic_mod
 from forge_loop import po as po_mod
 from forge_loop._critic_sdk import CriticSdkResult
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -34,12 +33,20 @@ def _mk_logs(tmp_path: Path) -> Path:
 
 def _approve_payload(reason: str = "looks good") -> str:
     """Build a minimal valid CriticReport JSON payload."""
-    return json.dumps({
-        "overall": "approve",
-        "findings": [
-            {"severity": "sev3", "category": "style", "file": None, "line": None, "message": reason},
-        ],
-    })
+    return json.dumps(
+        {
+            "overall": "approve",
+            "findings": [
+                {
+                    "severity": "sev3",
+                    "category": "style",
+                    "file": None,
+                    "line": None,
+                    "message": reason,
+                },
+            ],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +92,37 @@ def test_review_pr_uses_sdk_path_no_subprocess(
     assert called["timeout_s"] == 60
 
 
+def test_review_pr_enforces_precommit_bypass_detector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "forge_loop._critic_sdk.run_critic_sdk",
+        lambda **kw: CriticSdkResult(
+            last_message=json.dumps({"overall": "approve", "findings": []}),
+            duration_s=0.1,
+        ),
+    )
+    monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
+    monkeypatch.setattr(
+        "forge_loop.critic._fetch_pr_precommit_context",
+        lambda _pr_url, _repo: ("ordinary PR body", "git commit --no-verify -m bad"),
+        raising=False,
+    )
+
+    outcome = critic_mod.review_pr(
+        pr_url="https://github.com/owner/repo/pull/1",
+        issue_number=1,
+        repo=tmp_path,
+        logs_dir=_mk_logs(tmp_path),
+        timeout_s=60,
+    )
+
+    assert outcome.verdict == "changes_requested"
+    assert outcome.report is not None
+    assert outcome.report.has_sev1()
+    assert any("precommit_bypass" in reason for reason in outcome.reasons)
+
+
 def test_review_pr_sdk_timeout_returns_error_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -92,9 +130,7 @@ def test_review_pr_sdk_timeout_returns_error_verdict(
     doesn't auto-approve nor auto-block a PR the critic never reviewed."""
     monkeypatch.setattr(
         "forge_loop._critic_sdk.run_critic_sdk",
-        lambda **kw: CriticSdkResult(
-            last_message="", duration_s=60.0, timed_out=True, error=None
-        ),
+        lambda **kw: CriticSdkResult(last_message="", duration_s=60.0, timed_out=True, error=None),
     )
     monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
 
@@ -117,7 +153,9 @@ def test_review_pr_sdk_error_returns_error_verdict(
     monkeypatch.setattr(
         "forge_loop._critic_sdk.run_critic_sdk",
         lambda **kw: CriticSdkResult(
-            last_message="", duration_s=0.5, timed_out=False,
+            last_message="",
+            duration_s=0.5,
+            timed_out=False,
             error="sdk_auth_failed: 401",
         ),
     )
@@ -144,7 +182,8 @@ def test_review_pr_unparseable_text_retries_then_errors(
     monkeypatch.setattr(
         "forge_loop._critic_sdk.run_critic_sdk",
         lambda **kw: CriticSdkResult(
-            last_message="this is not json", duration_s=0.1,
+            last_message="this is not json",
+            duration_s=0.1,
         ),
     )
     monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
@@ -167,19 +206,19 @@ def test_review_pr_unparseable_text_retries_then_errors(
 # ---------------------------------------------------------------------------
 
 
-def test_po_uses_sdk_path_no_subprocess(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_po_uses_sdk_path_no_subprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
     def fake_sdk(**kwargs) -> CriticSdkResult:
         captured.update(kwargs)
         return CriticSdkResult(
-            last_message=json.dumps({
-                "skipped": False,
-                "reason": "expanded",
-                "sections_added": ["Acceptance criteria"],
-            }),
+            last_message=json.dumps(
+                {
+                    "skipped": False,
+                    "reason": "expanded",
+                    "sections_added": ["Acceptance criteria"],
+                }
+            ),
             duration_s=2.0,
         )
 
@@ -201,13 +240,13 @@ def test_po_uses_sdk_path_no_subprocess(
     assert captured["model"] == "claude-opus-4-7"
 
 
-def test_po_sdk_timeout_returns_po_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_po_sdk_timeout_returns_po_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "forge_loop._critic_sdk.run_po_sdk",
         lambda **kw: CriticSdkResult(
-            last_message="", duration_s=120.0, timed_out=True,
+            last_message="",
+            duration_s=120.0,
+            timed_out=True,
         ),
     )
     monkeypatch.setattr("forge_loop.po.ensure_subagent_trusted", lambda _p: None)
@@ -240,6 +279,4 @@ def test_no_subprocess_claude_in_critic_or_po() -> None:
         assert "subprocess.run" not in text, (
             f"{fname} still calls subprocess.run — migrate via _critic_sdk"
         )
-        assert "import subprocess" not in text, (
-            f"{fname} still imports subprocess directly"
-        )
+        assert "import subprocess" not in text, f"{fname} still imports subprocess directly"

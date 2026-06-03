@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from forge_loop import gh_issues
@@ -141,6 +142,37 @@ def pr_changed_lines(pr: int | str, repo: str | None = None) -> int:
         return int(obj.get("additions", 0)) + int(obj.get("deletions", 0))
     except (json.JSONDecodeError, ValueError, TypeError):
         return 0
+
+
+def pr_precommit_context(pr_url: str, cwd: Path) -> tuple[str, str]:
+    """Return PR body and commit metadata text for local deterministic checks."""
+
+    r = subprocess.run(
+        ["gh", "pr", "view", pr_url, "--json", "body,commits"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        return "", ""
+    try:
+        payload = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return "", ""
+
+    body = payload.get("body") if isinstance(payload.get("body"), str) else ""
+    commit_chunks: list[str] = [body]
+    commits = payload.get("commits")
+    if isinstance(commits, list):
+        for commit in commits:
+            if not isinstance(commit, dict):
+                continue
+            for key in ("messageHeadline", "messageBody", "message"):
+                value = commit.get(key)
+                if isinstance(value, str) and value.strip():
+                    commit_chunks.append(value)
+    return body, "\n".join(commit_chunks)
 
 
 def prs_by_label(label: str, limit: int, repo: str | None = None) -> list[dict[str, Any]]:
