@@ -22,6 +22,7 @@ Subcommands:
   run             Run the loop in the foreground.
   status          Operator-facing health surface (or ``--json``).
   boot            Reload the maestro reset-recovery context from durable state.
+  recover         Reconcile dead-worker sagas (reap worktrees + close them).
   doctor          One-shot health check.
   events          Tail the events log (Rich by default, ``--raw`` for jq).
   pause/resume/stop  Touch the corresponding marker files.
@@ -195,6 +196,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _cmd_doctor,
     _cmd_status,
     _cmd_boot,
+    _cmd_recover,
     _cmd_events,
     _cmd_pause,
     _cmd_resume,
@@ -222,6 +224,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _make_cmd("doctor"),
     _make_cmd("status"),
     _make_cmd("boot"),
+    _make_cmd("recover"),
     _make_cmd("events"),
     _make_cmd("pause"),
     _make_cmd("resume"),
@@ -308,6 +311,16 @@ def cmd_boot(
     json_: bool = typer.Option(False, "--json", help="Emit raw JSON for scripts."),
 ) -> None:
     _exit(_cmd_boot(SimpleNamespace(json=json_)))
+
+
+@app.command(
+    "recover",
+    help="Reconcile dead-worker sagas: reap orphaned worktrees and close them.",
+)
+def cmd_recover(
+    json_: bool = typer.Option(False, "--json", help="Emit raw JSON for scripts."),
+) -> None:
+    _exit(_cmd_recover(SimpleNamespace(json=json_)))
 
 
 @app.command("doctor", help="One-shot health check (config-independent checks still run).")

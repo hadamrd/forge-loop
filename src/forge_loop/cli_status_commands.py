@@ -368,6 +368,49 @@ class StatusCommandsMixin:
         sys.stdout.write(context.summary() + "\n")
         return 0
 
+    def _cmd_recover(self, args: SimpleNamespace) -> int:
+        """Reconcile dead-worker sagas: compensate (reap worktrees) + close.
+
+        The operator one-shot of what the runner now does at boot — turns the
+        stale work ``forge-loop boot`` reports into reaped worktrees and
+        COMPENSATED sagas. Never touches GitHub, safe to run offline.
+        """
+        from functools import partial
+
+        from forge_loop.control.boot import canonical_task_saga_path
+        from forge_loop.control.recovery import reconcile_stale_sagas
+        from forge_loop.runner._helpers import reap_worktree
+        from forge_loop.tasks import SqliteTaskSagaStore
+
+        cfg, _config_error = self.operator_cfg()
+        repo = Path(getattr(cfg, "repo", cfg.state_dir))
+        path = canonical_task_saga_path(repo)
+        if not path.exists():
+            sys.stderr.write(f"no task-saga store at {path}; run `forge-loop init` first\n")
+            return 1
+
+        store = SqliteTaskSagaStore(path)
+        report = reconcile_stale_sagas(store, reap_worktree=partial(reap_worktree, repo))
+
+        if getattr(args, "json", False):
+            payload = {
+                "recovered_count": report.recovered_count,
+                "recovered": [
+                    {
+                        "task_id": item.task_id,
+                        "saga_id": item.saga_id,
+                        "issue": item.issue,
+                        "worktrees_reaped": list(item.worktrees_reaped),
+                    }
+                    for item in report.recovered
+                ],
+                "errors": list(report.errors),
+            }
+            sys.stdout.write(json.dumps(payload, indent=2, default=str) + "\n")
+        else:
+            sys.stdout.write(report.summary() + "\n")
+        return 1 if report.errors else 0
+
     def _cmd_events(self, args: SimpleNamespace) -> int:
         """Tail recent events. Rich-formatted by default; ``--raw`` skips colour."""
         cfg, _config_error = self.operator_cfg()

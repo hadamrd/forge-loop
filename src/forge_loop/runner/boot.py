@@ -49,6 +49,41 @@ def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
     return _reap_orphan_worktrees_impl(repo, events_file)
 
 
+def _run_boot_recovery(cfg: Config) -> Any:
+    """Reconcile dead-worker sagas at boot so the loop resumes cleanly.
+
+    Reads the canonical task-saga store; if it does not exist (repo never
+    ``init``'d a control plane), this is a no-op. Compensations reuse the
+    same worktree reaper as the success path. All best-effort: any failure
+    is recorded as a ``boot_recovery_failed`` event and swallowed so the
+    loop still starts.
+    """
+    from functools import partial
+
+    from forge_loop.control.boot import canonical_task_saga_path
+    from forge_loop.control.recovery import reconcile_stale_sagas
+    from forge_loop.runner._helpers import reap_worktree
+    from forge_loop.tasks import SqliteTaskSagaStore
+
+    path = canonical_task_saga_path(cfg.repo)
+    if not path.exists():
+        return None
+    try:
+        store = SqliteTaskSagaStore(path)
+        report = reconcile_stale_sagas(store, reap_worktree=partial(reap_worktree, cfg.repo))
+    except Exception as exc:  # noqa: BLE001 - recovery must never block boot
+        append_event(cfg.events_file, "boot_recovery_failed", error=str(exc))
+        return None
+    if report.recovered or report.errors:
+        append_event(
+            cfg.events_file,
+            "boot_recovery",
+            recovered=report.recovered_count,
+            errors=len(report.errors),
+        )
+    return report
+
+
 def _install_signal_handlers(cfg: Config, state: RunnerState | None = None) -> None:
     """Install SIGTERM/SIGINT/SIGUSR1 handlers bound to ``state``.
 
@@ -224,6 +259,11 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     # the previous tmux mid-tick, crash, etc.) they would otherwise
     # accumulate forever. The runner is the only owner of these paths.
     _reap_orphan_worktrees(cfg.repo, cfg.events_file)
+
+    # Resume from durable state: reconcile any dead-worker sagas a crashed
+    # prior process left behind (expired leases). Best-effort — a recovery
+    # hiccup must never block the loop from starting.
+    _run_boot_recovery(cfg)
 
     # Stamp the installed version so we can detect a self-upgrade
     # (a merged PR bumped our own packaging) and gracefully restart.

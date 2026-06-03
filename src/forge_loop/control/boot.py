@@ -192,6 +192,15 @@ def assemble_boot_context(sources: BootSources, *, now: datetime | None = None) 
     )
 
 
+def canonical_task_saga_path(repo: Path | str) -> Path:
+    """The one durable task-saga store ``init`` seeds and ``boot`` reads.
+
+    Single source of truth for the saga store location, shared by ``init``,
+    the runner dispatch path, boot assembly, and recovery.
+    """
+    return Path(repo) / ".forge" / "tasks.db"
+
+
 def build_boot_sources(repo: Path | str) -> BootSources:
     """Wire the durable boot stores from a repository's ``.forge`` layout.
 
@@ -209,7 +218,7 @@ def build_boot_sources(repo: Path | str) -> BootSources:
     # Gate the saga store on existence so repos seeded before the task store
     # was canonical (or that never ran a recent `init`) still boot — and so a
     # missing store is not silently materialised on open.
-    tasks_path = forge_dir / "tasks.db"
+    tasks_path = canonical_task_saga_path(repo)
     task_store = SqliteTaskSagaStore(tasks_path) if tasks_path.exists() else None
     return BootSources(
         frontier_store=FrontierStore(frontier_path),

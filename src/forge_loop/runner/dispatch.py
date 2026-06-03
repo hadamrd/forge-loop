@@ -16,6 +16,7 @@ from typing import Any
 from forge_loop import gh as _gh
 from forge_loop import master_log as _mlog
 from forge_loop.config import Config
+from forge_loop.control.boot import canonical_task_saga_path
 from forge_loop.critic import review_pr as _critic_review
 from forge_loop.critic_actions import apply_critic_report
 from forge_loop.runner.critic_flow import (
@@ -164,11 +165,6 @@ def capability_policy_for_worker(
         mcp=tuple(McpGrant(server=server, tools=("*",)) for server in (allowed_mcp_servers or ())),
         secret_names=(),
     )
-
-
-def canonical_task_saga_path(repo: Path) -> Path:
-    """The one durable task-saga store ``init`` seeds and ``boot`` reads."""
-    return repo / ".forge" / "tasks.db"
 
 
 def _resolve_task_saga_store(cfg: Config) -> TaskSagaStore | None:

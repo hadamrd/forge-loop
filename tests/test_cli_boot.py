@@ -183,3 +183,46 @@ class TestCliBoot:
         # The failed boot must not materialise empty durable stores.
         assert not (tmp_path / ".forge" / "events.db").exists()
         assert not (tmp_path / ".forge" / "memory.db").exists()
+
+    def test_recover_reconciles_stale_saga(
+        self,
+        monkeypatch: Any,
+        tmp_path: Path,
+        capsys: Any,
+    ) -> None:
+        _seed_forge(tmp_path)
+        store = SqliteTaskSagaStore(tmp_path / ".forge" / "tasks.db")
+        store.create(
+            task_id="task-7-worker", saga_id="saga-7-worker", issue=7,
+            branch="loop/7", worktree="/tmp/wt-loop-7", compensations=(),
+        )
+        acquired = datetime.now(UTC) - timedelta(minutes=10)
+        store.acquire_lease(
+            "task-7-worker", owner_id="w",
+            expires_at=acquired + timedelta(minutes=1), acquired_at=acquired,
+        )
+        monkeypatch.setattr(cli, "load", lambda: _cfg(tmp_path))
+
+        rc = cli._cmd_recover(SimpleNamespace(json=True))
+
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["recovered_count"] == 1
+        assert payload["recovered"][0]["saga_id"] == "saga-7-worker"
+        # Boot now shows nothing stale — recovery drained it.
+        boot_rc = cli._cmd_boot(SimpleNamespace(json=True))
+        assert boot_rc == 0
+        assert json.loads(capsys.readouterr().out)["stale_saga_ids"] == []
+
+    def test_recover_without_store_fails_fast(
+        self,
+        monkeypatch: Any,
+        tmp_path: Path,
+        capsys: Any,
+    ) -> None:
+        monkeypatch.setattr(cli, "load", lambda: _cfg(tmp_path))
+
+        rc = cli._cmd_recover(SimpleNamespace(json=False))
+
+        assert rc == 1
+        assert "forge-loop init" in capsys.readouterr().err
