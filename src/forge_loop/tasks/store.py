@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from forge_loop.sandbox import CapabilityPolicy
+from forge_loop.sandbox import CapabilityPolicy, canonical_policy_json
 from forge_loop.tasks.saga import (
     Compensation,
     LeaseConflictError,
@@ -525,7 +525,7 @@ def _compensations_json(compensations: tuple[Compensation, ...]) -> str:
 
 
 def _capability_policy_json(policy: CapabilityPolicy) -> str:
-    return json.dumps(policy.to_json_obj(), sort_keys=True, separators=(",", ":"))
+    return canonical_policy_json(policy)
 
 
 def _load_capability_policy(raw: str | None) -> CapabilityPolicy:

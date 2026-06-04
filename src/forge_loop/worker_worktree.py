@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import subprocess
@@ -16,7 +17,13 @@ from forge_loop.precommit import (
     PreCommitRunner,
     ensure_worker_precommit_hook,
 )
+from forge_loop.sandbox import CapabilityPolicy, policy_hash
 
+# Operator-trusted contexts (critic/PO subagents running against the operator's
+# OWN checkout via ``ensure_subagent_trusted``) keep the historical permissive
+# blob — they are not leased workers and run with the operator's full surface.
+# Worker WORKTREES no longer use this; they get a deny-by-default settings file
+# rendered from their CapabilityPolicy lease (see ``render_worker_settings``).
 _PERMISSIVE_WORKTREE_SETTINGS = """{
   "permissions": {
     "defaultMode": "bypassPermissions",
@@ -27,6 +34,81 @@ _PERMISSIVE_WORKTREE_SETTINGS = """{
   "hasCompletedProjectOnboarding": true
 }
 """
+
+# Read-capable tools scoped to ``read_roots`` and write-capable tools scoped to
+# ``write_roots``. Bash is intentionally NOT path-templated: Claude's Bash
+# permission grammar matches command strings, not paths, so a path glob would
+# silently match nothing. We instead gate Bash on the presence of any write
+# grant (a worker with write access must run git/tests) and rely on the SDK
+# sandbox profile (see ``worker_permissions``) for host-level Bash confinement.
+_READ_TOOLS: tuple[str, ...] = ("Read", "Grep", "Glob")
+_WRITE_TOOLS: tuple[str, ...] = ("Write", "Edit")
+
+
+def _mcp_allow_entries(policy: CapabilityPolicy) -> list[str]:
+    """Allow-list entries for the granted MCP servers/tools.
+
+    A grant with no tools (or an explicit ``*``) yields ``mcp__<server>__*``;
+    a tool allowlist yields one ``mcp__<server>__<tool>`` per tool. A server
+    that is not in ``policy.mcp`` produces NO entry — never a blanket
+    ``mcp__*``.
+    """
+    entries: list[str] = []
+    for grant in policy.mcp:
+        server = grant.server
+        if not server:
+            continue
+        tools = tuple(tool for tool in grant.tools if tool)
+        if not tools or "*" in tools:
+            entries.append(f"mcp__{server}__*")
+            continue
+        entries.extend(f"mcp__{server}__{tool}" for tool in tools)
+    return entries
+
+
+def _fs_allow_entries(policy: CapabilityPolicy) -> list[str]:
+    """Allow-list entries scoping Read/Grep/Glob and Write/Edit to roots."""
+    entries: list[str] = []
+    for root in policy.filesystem.write_roots:
+        if not root:
+            continue
+        glob = f"{root.rstrip('/')}/**"
+        entries.extend(f"{tool}({glob})" for tool in _WRITE_TOOLS)
+    if any(root for root in policy.filesystem.write_roots):
+        # See ``_WRITE_TOOLS`` note: Bash cannot be path-scoped in settings, so
+        # we grant it only when the lease includes write access at all.
+        entries.append("Bash(*)")
+    for root in policy.filesystem.read_roots:
+        if not root:
+            continue
+        glob = f"{root.rstrip('/')}/**"
+        entries.extend(f"{tool}({glob})" for tool in _READ_TOOLS)
+    return entries
+
+
+def render_worker_settings(policy: CapabilityPolicy) -> str:
+    """Render a deny-by-default ``.claude/settings.json`` from ``policy``.
+
+    The effective tool/path/server surface EQUALS the lease (#200):
+
+    * ``defaultMode`` is ``"default"`` — never ``bypassPermissions``.
+    * ``allow`` lists only what ``policy`` grants — MCP servers/tools and
+      filesystem roots. An empty :class:`CapabilityPolicy` renders an empty
+      ``allow`` (fail safe, not open).
+    * ``deny`` stays empty: confinement comes from the absence of grants in
+      ``allow`` plus ``defaultMode`` requiring approval for anything else.
+    """
+    allow = _mcp_allow_entries(policy) + _fs_allow_entries(policy)
+    settings = {
+        "permissions": {
+            "defaultMode": "default",
+            "allow": allow,
+            "deny": [],
+        },
+        "hasTrustDialogAccepted": True,
+        "hasCompletedProjectOnboarding": True,
+    }
+    return json.dumps(settings, indent=2, sort_keys=True) + "\n"
 
 
 def worktree_base(repo: Path) -> Path:
@@ -66,14 +148,51 @@ def subagent_env() -> dict[str, str]:
     return env
 
 
-def drop_permissive_settings(worktree: Path) -> None:
-    """Plant a read-only trust file in the worktree for worker subprocesses."""
+def plant_worker_settings(
+    worktree: Path,
+    capability_policy: CapabilityPolicy | None,
+    *,
+    events_file: Path | None = None,
+) -> None:
+    """Plant the read-only deny-by-default worker trust file (#200).
+
+    Supersedes the old ``drop_permissive_settings`` blob. The settings are
+    rendered from ``capability_policy`` so the worktree's effective surface
+    equals the lease. A ``None`` policy falls back to an empty
+    :class:`CapabilityPolicy` — a CLOSED file, never the old permissive blob
+    (fail safe, not open).
+
+    The file stays read-only (``0o444``) and its ``.claude`` dir ``0o555`` so
+    the worker can't widen its own grant. When ``events_file`` is provided, a
+    typed :class:`~forge_loop.events.WorkerPolicyEnforcedEvent` is appended so
+    boot/replay can confirm the worker ran within its grant.
+    """
+    policy = capability_policy or CapabilityPolicy()
     cdir = worktree / ".claude"
     cdir.mkdir(parents=True, exist_ok=True)
     settings_path = cdir / "settings.json"
-    settings_path.write_text(_PERMISSIVE_WORKTREE_SETTINGS)
+    settings_path.write_text(render_worker_settings(policy))
     settings_path.chmod(0o444)
     cdir.chmod(0o555)
+    _emit_worker_policy_event(events_file, worktree, policy)
+
+
+def _emit_worker_policy_event(
+    events_file: Path | None,
+    worktree: Path,
+    policy: CapabilityPolicy,
+) -> None:
+    if events_file is None:
+        return
+    from forge_loop.events import WorkerPolicyEnforcedEvent, emit
+
+    emit(
+        events_file,
+        WorkerPolicyEnforcedEvent(
+            worktree_path=str(worktree),
+            policy_hash=policy_hash(policy),
+        ),
+    )
 
 
 def quarantine_if_blocking(wt: Path) -> Path | None:
@@ -96,6 +215,8 @@ def prep_worktree(
     base_branch: str = "trunk",
     emit: Callable[[str, dict[str, Any]], None] | None = None,
     precommit_runner: PreCommitRunner | None = None,
+    capability_policy: CapabilityPolicy | None = None,
+    events_file: Path | None = None,
 ) -> tuple[Path, str | None]:
     wt = worktree_path(repo, n)
     wt.parent.mkdir(parents=True, exist_ok=True)
@@ -117,7 +238,7 @@ def prep_worktree(
     if r.returncode != 0:
         return wt, r.stderr
     if wt.exists():
-        drop_permissive_settings(wt)
+        plant_worker_settings(wt, capability_policy, events_file=events_file)
         _install_and_emit_worker_precommit_hook(
             repo, wt, emit=emit, precommit_runner=precommit_runner
         )
@@ -131,6 +252,8 @@ def prep_repair_worktree(
     *,
     emit: Callable[[str, dict[str, Any]], None] | None = None,
     precommit_runner: PreCommitRunner | None = None,
+    capability_policy: CapabilityPolicy | None = None,
+    events_file: Path | None = None,
 ) -> tuple[Path, str | None]:
     wt = worktree_path(repo, issue)
     wt.parent.mkdir(parents=True, exist_ok=True)
@@ -151,7 +274,7 @@ def prep_repair_worktree(
     if r.returncode != 0:
         return wt, r.stderr
     if wt.exists():
-        drop_permissive_settings(wt)
+        plant_worker_settings(wt, capability_policy, events_file=events_file)
         _install_and_emit_worker_precommit_hook(
             repo, wt, emit=emit, precommit_runner=precommit_runner
         )

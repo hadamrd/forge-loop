@@ -5,6 +5,8 @@ from forge_loop.sandbox.policy import (
     FilesystemScope,
     McpGrant,
     NetworkPolicy,
+    canonical_policy_json,
+    policy_hash,
     render_capability_policy,
 )
 
@@ -13,5 +15,7 @@ __all__ = [
     "FilesystemScope",
     "McpGrant",
     "NetworkPolicy",
+    "canonical_policy_json",
+    "policy_hash",
     "render_capability_policy",
 ]
