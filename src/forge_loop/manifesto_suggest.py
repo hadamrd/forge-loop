@@ -31,10 +31,9 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -73,14 +72,14 @@ _log = get_logger("forge_loop.manifesto_suggest")
 # ---------------------------------------------------------------------------
 
 
-class ManifestoTarget(str, Enum):
+class ManifestoTarget(StrEnum):
     """Which manifesto a proposed rule belongs to."""
 
     QUALITY = "quality"
     TESTING = "testing"
 
 
-class EditKind(str, Enum):
+class EditKind(StrEnum):
     """Whether the proposal adds a brand-new rule or edits an existing one."""
 
     ADD = "add"
@@ -570,9 +569,7 @@ def open_manifesto_pr(
     guard) or :class:`RuntimeError` when a step fails.
     """
     if not github_repo:
-        raise ValueError(
-            "manifesto suggest --apply requires a configured github_repo (owner/name)"
-        )
+        raise ValueError("manifesto suggest --apply requires a configured github_repo (owner/name)")
     if plan.is_empty:
         raise ValueError("manifesto suggest --apply: nothing to apply (empty suggestion)")
 
