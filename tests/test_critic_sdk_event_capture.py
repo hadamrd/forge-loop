@@ -6,6 +6,11 @@ but forge_loop._worker_sdk actually emits ``event["kind"]`` with the
 session-end kind ``"final_result"``. The mismatch silently ate every
 assistant text, breaking critic + PO + brainstormer SDK paths in
 production with the symptom ``empty SDK output``.
+
+Post-#148 the boundary is a typed discriminated union: the capture parses
+each raw event into :data:`forge_loop._sdk_events.SdkEvent` and compares
+``event.kind is SdkEventKind.FINAL_RESULT``. These regression pins now use
+the enum constants instead of string literals (acceptance criterion).
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from forge_loop._critic_sdk import run_critic_sdk
+from forge_loop._sdk_events import SdkEventKind
 
 
 @dataclass
@@ -42,11 +48,14 @@ def test_capture_picks_up_final_result_kind(tmp_path: Path) -> None:
     def patched_run_sdk_session(*args, **kwargs):
         on_event = kwargs.get("on_event")
         if on_event:
-            # Drive the same event shape forge_loop._worker_sdk uses today.
-            on_event({"kind": "assistant_text", "text": "thinking out loud"})
-            on_event({"kind": "tool_use", "tool": "Bash"})
-            on_event({"kind": "tool_result", "is_error": False})
-            on_event({"kind": "final_result", "text": captured_text})
+            # Drive the same event shape forge_loop._worker_sdk uses today,
+            # keyed by the enum value (the on-the-wire ``kind`` string).
+            on_event({"kind": SdkEventKind.ASSISTANT_TEXT.value, "text": "thinking out loud"})
+            on_event({"kind": SdkEventKind.TOOL_USE.value, "tool": "Bash", "tool_use_id": "t1"})
+            on_event(
+                {"kind": SdkEventKind.TOOL_RESULT.value, "tool_use_id": "t1", "is_error": False}
+            )
+            on_event({"kind": SdkEventKind.FINAL_RESULT.value, "result": captured_text})
 
         async def _fake_session():
             return _FakeResult(final_result_text="")  # mimic missing fallback
@@ -95,16 +104,26 @@ def test_capture_falls_back_to_final_result_text_attr(tmp_path: Path) -> None:
     assert result.last_message == "from-result-attribute"
 
 
-def test_legacy_type_field_still_tolerated(tmp_path: Path) -> None:
-    """Defensive: if a future SDK version reverts to ``event['type']``,
-    the capture should still work — we accept either field name."""
+def test_legacy_type_field_is_ignored_not_silently_eaten(tmp_path: Path) -> None:
+    """Adversarial: the legacy ``event['type']`` shape (and any unparseable
+    event) is IGNORED by the typed capture rather than crashing the stream.
+
+    Pre-#147 the bug was the OPPOSITE direction (consumer looked for ``type``,
+    producer emitted ``kind``). #148 kills that whole class: a typed
+    discriminated union only recognises ``kind``-keyed events. A stray
+    ``type``-keyed dict simply doesn't parse, so the capture falls back to the
+    SDKRunResult's canonical ``final_result_text``. The key property: no
+    crash, and no string-literal tolerance hack lurking in production.
+    """
     def patched_run_sdk_session(*args, **kwargs):
         on_event = kwargs.get("on_event")
         if on_event:
+            # Legacy/foreign shapes the typed union must NOT misinterpret.
             on_event({"type": "final_result", "text": "legacy-typed"})
+            on_event({"kind": "totally_unknown_kind", "text": "nope"})
 
         async def _fake_session():
-            return _FakeResult()
+            return _FakeResult(final_result_text="canonical-from-result")
         return _fake_session()
 
     from forge_loop import _worker_sdk as worker_sdk_mod
@@ -117,4 +136,6 @@ def test_legacy_type_field_still_tolerated(tmp_path: Path) -> None:
     finally:
         worker_sdk_mod.run_sdk_session = orig  # type: ignore[assignment]
 
-    assert result.last_message == "legacy-typed"
+    # The bogus events were ignored; the canonical result field wins.
+    assert result.last_message == "canonical-from-result"
+    assert result.error is None

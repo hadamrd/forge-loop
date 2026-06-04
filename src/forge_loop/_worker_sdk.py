@@ -23,9 +23,29 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from forge_loop._sdk_events import (
+    AssistantTextEvent,
+    CostTelemetryEvent,
+    ErrorEvent,
+    FinalResultEvent,
+    SdkEvent,
+    ToolResultEvent,
+    ToolUseEvent,
+    TurnStartEvent,
+    WorkerMcpFilteredEvent,
+    WorkerMcpFilterNoMatchEvent,
+    event_to_record,
+)
+
 # NOTE: do NOT import `subprocess` here. The new SDK worker path must be
 # subprocess-free (issue #2 acceptance criterion); a unit test enforces it.
 
+# The on-the-wire / on-disk contract stays a JSON dict (one line per event in
+# ``events.jsonl``): ``on_event`` receives the serialised record so tailers,
+# DuckDB (:mod:`forge_loop.eventdb`) and the worker log keep working unchanged.
+# The discriminator is now constructed exclusively through the typed
+# :data:`forge_loop._sdk_events.SdkEvent` models (issue #148) — a producer typo
+# fails at construction instead of silently shipping a bad ``kind`` string.
 EventEmitter = Callable[[dict[str, Any]], None]
 
 # Hard cap on tool definitions injected into the SDK init message
@@ -89,12 +109,13 @@ def resolve_mcp_filter(
     matched = [s for s in allow if s in actual]
     if actual and allow and not matched:
         emit(
-            {
-                "kind": "worker_mcp_filter_no_match",
-                "configured": list(allow),
-                "available": actual,
-                "fallback": list(default),
-            }
+            event_to_record(
+                WorkerMcpFilterNoMatchEvent(
+                    configured=list(allow),
+                    available=actual,
+                    fallback=list(default),
+                )
+            )
         )
         resolved = tuple(dict.fromkeys(default))
         kept = [s for s in resolved if s in actual]
@@ -104,12 +125,13 @@ def resolve_mcp_filter(
         kept = [s for s in resolved if (not actual) or s in actual]
         dropped = [s for s in actual if s not in resolved]
     emit(
-        {
-            "kind": "worker_mcp_filtered",
-            "kept": list(kept),
-            "dropped": list(dropped),
-            "configured": list(allow),
-        }
+        event_to_record(
+            WorkerMcpFilteredEvent(
+                kept=list(kept),
+                dropped=list(dropped),
+                configured=list(allow),
+            )
+        )
     )
     return resolved
 
@@ -319,13 +341,30 @@ async def run_sdk_session(
     error_str: str | None = None
     sdk_session_id: str | None = None
 
-    def emit(ev: dict[str, Any]) -> None:
+    def emit_record(ev: dict[str, Any]) -> None:
+        """Stamp the seq/ts envelope and fan a serialised record out.
+
+        Kept dict-shaped because that is the on-disk / ``on_event`` contract
+        (DuckDB + log tailers read JSON lines). Everything inside this session
+        constructs a typed :data:`SdkEvent` first and serialises through
+        :func:`emit`; ``resolve_mcp_filter`` is the one external caller that
+        passes an already-serialised record (it has its own typed models).
+        """
         nonlocal seq
         seq += 1
         ev = {"seq": seq, "ts": _utc_now(), **ev}
         events.append(ev)
         if on_event is not None:
             on_event(ev)
+
+    def emit(event: SdkEvent) -> None:
+        """Typed emission path — the ONLY way session code produces events.
+
+        The model validates ``kind`` (a ``Literal`` enum member) at
+        construction, so a producer typo is a hard error here instead of a
+        silent string that no consumer matches (issue #148 / #147).
+        """
+        emit_record(event_to_record(event))
 
     # Build ClaudeAgentOptions. ``model`` is well-supported across SDK
     # versions; ``thinking_budget`` is newer — if the installed SDK does
@@ -432,12 +471,7 @@ async def run_sdk_session(
                     _sid = init_data.get("session_id")
                     if isinstance(_sid, str) and _sid:
                         sdk_session_id = _sid
-                    emit(
-                        {
-                            "kind": "turn_start",
-                            "data": init_data,
-                        }
-                    )
+                    emit(TurnStartEvent(data=init_data))
                     # Surface which MCP servers survived the allow-list
                     # filter (issue #60). The init payload's
                     # ``mcp_servers`` is a list of {name, status} dicts in
@@ -454,22 +488,21 @@ async def run_sdk_session(
                     resolve_mcp_filter(
                         actual_servers=actual_names,
                         allow_list=allow_servers,
-                        emit=emit,
+                        emit=emit_record,
                     )
                 continue
             if isinstance(message, AssistantMessage):
                 model_seen = getattr(message, "model", "") or model_seen
                 for block in getattr(message, "content", []) or []:
                     if isinstance(block, TextBlock):
-                        emit({"kind": "assistant_text", "text": block.text})
+                        emit(AssistantTextEvent(text=block.text))
                     elif isinstance(block, ToolUseBlock):
                         emit(
-                            {
-                                "kind": "tool_use",
-                                "tool": block.name,
-                                "input": _safe_input(block.input),
-                                "tool_use_id": block.id,
-                            }
+                            ToolUseEvent(
+                                tool=block.name,
+                                input=_safe_input(block.input),
+                                tool_use_id=block.id,
+                            )
                         )
                 continue
             if isinstance(message, UserMessage):
@@ -478,12 +511,11 @@ async def run_sdk_session(
                 for block in blocks:
                     if isinstance(block, ToolResultBlock):
                         emit(
-                            {
-                                "kind": "tool_result",
-                                "tool_use_id": block.tool_use_id,
-                                "is_error": bool(block.is_error),
-                                "content": _stringify_tool_result(block.content)[:2000],
-                            }
+                            ToolResultEvent(
+                                tool_use_id=block.tool_use_id,
+                                is_error=bool(block.is_error),
+                                content=_stringify_tool_result(block.content)[:2000],
+                            )
                         )
                 continue
             if isinstance(message, ResultMessage):
@@ -499,16 +531,15 @@ async def run_sdk_session(
                     sdk_session_id = _rsid
                 cache_ratio = compute_cache_hit_ratio(usage)
                 emit(
-                    {
-                        "kind": "final_result",
-                        "result": final_text,
-                        "cost_usd": cost_usd,
-                        "usage": usage,
-                        "model": model_seen,
-                        "num_turns": num_turns,
-                        "is_error": is_error,
-                        "sdk_session_id": sdk_session_id,
-                    }
+                    FinalResultEvent(
+                        result=final_text,
+                        cost_usd=cost_usd,
+                        usage=usage,
+                        model=model_seen,
+                        num_turns=num_turns,
+                        is_error=is_error,
+                        sdk_session_id=sdk_session_id,
+                    )
                 )
                 # Cost-telemetry event (issue #109 acceptance criterion):
                 # operators see input/output token counts and the
@@ -516,22 +547,21 @@ async def run_sdk_session(
                 # cheaper is observable in the event bus, not just the
                 # billing dashboard.
                 emit(
-                    {
-                        "kind": "cost_telemetry",
-                        "input_tokens": int(usage.get("input_tokens", 0) or 0),
-                        "output_tokens": int(usage.get("output_tokens", 0) or 0),
-                        "cache_read_input_tokens": int(
+                    CostTelemetryEvent(
+                        input_tokens=int(usage.get("input_tokens", 0) or 0),
+                        output_tokens=int(usage.get("output_tokens", 0) or 0),
+                        cache_read_input_tokens=int(
                             usage.get("cache_read_input_tokens", 0) or 0
                         ),
-                        "cache_creation_input_tokens": int(
+                        cache_creation_input_tokens=int(
                             usage.get("cache_creation_input_tokens", 0) or 0
                         ),
-                        "cache_hit_ratio": round(cache_ratio, 4),
-                        "cost_usd": cost_usd,
-                        "model": model_seen,
-                        "sdk_session_id": sdk_session_id,
-                        "resumed": bool(resume),
-                    }
+                        cache_hit_ratio=round(cache_ratio, 4),
+                        cost_usd=cost_usd,
+                        model=model_seen,
+                        sdk_session_id=sdk_session_id,
+                        resumed=bool(resume),
+                    )
                 )
                 continue
     except BaseException as exc:  # noqa: BLE001
@@ -540,12 +570,11 @@ async def run_sdk_session(
         error_type, hint = _classify_error(exc)
         error_str = f"{error_type}: {exc}"
         emit(
-            {
-                "kind": "error",
-                "error_type": error_type,
-                "message": str(exc)[:500],
-                "retry_hint": hint,
-            }
+            ErrorEvent(
+                error_type=error_type,
+                message=str(exc)[:500],
+                retry_hint=hint,
+            )
         )
 
     duration = time.time() - started

@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from forge_loop._sdk_events import SdkEventKind, parse_sdk_event
+
 # Canonical manifesto location. Can be overridden by LOOP_MANIFESTOS_DIR
 # (operator escape hatch — primarily for tests). The default tracks the
 # project layout: ``docs/manifestos/*.md`` at the repo root.
@@ -118,20 +120,22 @@ def run_critic_sdk(
 
         def _capture(event: dict[str, Any]) -> None:
             nonlocal last_text
-            # forge_loop._worker_sdk emits events with the field name
-            # "kind" (NOT "type") and the session-end kind is
-            # "final_result" (NOT "result"). The original capture used
-            # the wrong field names and silently never saw the assistant
-            # text, leading to empty SDK outputs that broke the critic +
-            # PO + brainstormer paths in production. Dogfood-caught
-            # running the brainstormer against a large downstream project.
-            kind = event.get("kind") or event.get("type")  # tolerate both
-            if kind == "final_result":
-                msg = event.get("text") or event.get("result") or event.get("last_message") or ""
+            # Typed boundary (issue #148). ``_worker_sdk`` emits records whose
+            # ``kind`` is a :class:`SdkEventKind` member; we parse the raw dict
+            # into the discriminated :data:`SdkEvent` union and compare with
+            # ``is`` — no string literals, no field-name drift. This is the
+            # exact boundary the #147 hot-fix patched by hand: the producer
+            # said ``kind="final_result"`` while this consumer looked for
+            # ``type="result"``, silently eating every assistant text.
+            parsed = parse_sdk_event(event)
+            if parsed is None:
+                return
+            if parsed.kind is SdkEventKind.FINAL_RESULT:
+                msg = getattr(parsed, "result", "")
                 if msg:
                     last_text = msg
-            elif kind == "assistant_text":
-                msg = event.get("text", "")
+            elif parsed.kind is SdkEventKind.ASSISTANT_TEXT:
+                msg = getattr(parsed, "text", "")
                 if msg:
                     last_text = msg
 
@@ -155,15 +159,10 @@ def run_critic_sdk(
             )
         except asyncio.TimeoutError:
             return last_text, "timeout"
-        # Prefer the SDK's own final-text field if our capture missed it.
-        # SDKRunResult uses ``final_result_text``; legacy paths used
-        # ``last_message``. Check both so this stays correct if the
-        # SDK result shape evolves.
-        final_text = (
-            getattr(result, "final_result_text", "")
-            or getattr(result, "last_message", "")
-            or last_text
-        )
+        # Prefer the SDK's own canonical final-text field if our capture
+        # missed it. ``SDKRunResult.final_result_text`` is the single source
+        # of truth (issue #148 removed the legacy ``last_message`` alias).
+        final_text = getattr(result, "final_result_text", "") or last_text
         return final_text, getattr(result, "error", None)
 
     try:
