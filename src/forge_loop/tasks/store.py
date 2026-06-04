@@ -52,6 +52,19 @@ _TERMINAL_STATE_VALUES = (
     TaskState.QUARANTINED.value,
 )
 
+# Process-level guard so schema creation + compat migration run **at most once
+# per database path per process** (#227 AC2: "guard or memoize"), not merely
+# once per tick. A run's saga DB path is stable, so once this process has
+# created the table + back-filled the compat columns for a path, every later
+# store on that same path skips the (idempotent but PRAGMA/ALTER-probing) work.
+# Keyed by resolved absolute path. ``:memory:`` is never memoized: each
+# in-memory connection is a *distinct* database that must build its own schema.
+# The lock guards this shared module cache only (a different concern from the
+# per-instance saga-op ``RLock``); construction is rare, so holding it across
+# the one-time migration is cheap.
+_MIGRATED_PATHS: set[str] = set()
+_MIGRATION_LOCK = threading.Lock()
+
 
 class TaskSagaStore(Protocol):
     """Persistence boundary for task saga lifecycle state."""
@@ -182,12 +195,14 @@ class SqliteTaskSagaStore:
             self._connection.execute("PRAGMA journal_mode=WAL")
         # Schema creation + compat migration are the expensive part of
         # construction; running them on *every* store __init__ was
-        # schema-migration work per worker per tick (#227). The fix is to open
-        # the store ONCE per tick and reuse it across dispatch + heartbeat +
-        # policy recording (see runner/dispatch.py), so this runs once per tick
-        # rather than per worker.
-        self._connection.executescript(_SCHEMA)
-        self._ensure_compat_columns()
+        # schema-migration work per worker per tick (#227). Two layers fix it:
+        #   1. the store is opened ONCE per tick and reused across dispatch +
+        #      heartbeat + policy recording (see runner/dispatch.py), and
+        #   2. a process-level memoize (``_MIGRATED_PATHS``) makes the schema +
+        #      compat work run at most ONCE per database path per process, so a
+        #      long-running loop with frequent ticks does not repeat it each
+        #      tick either (#227 AC2: "at most once per process").
+        self._migrate_schema_once()
 
     def close(self) -> None:
         """Close the shared connection.
@@ -199,6 +214,25 @@ class SqliteTaskSagaStore:
         """
         with self._lock:
             self._connection.close()
+
+    def _migrate_schema_once(self) -> None:
+        """Create the schema + back-fill compat columns at most once per process.
+
+        Keyed by resolved absolute path in the module-level ``_MIGRATED_PATHS``
+        cache (#227 AC2). ``:memory:`` is always migrated: each in-memory
+        connection is its own database, so there is nothing to memoize. The
+        ``executescript(_SCHEMA)`` uses ``CREATE TABLE IF NOT EXISTS`` and the
+        compat probe is idempotent, so skipping them for an already-migrated
+        path is safe — the table and columns already exist on disk.
+        """
+        migrate_key = None if str(self.path) == ":memory:" else str(self.path.resolve())
+        with _MIGRATION_LOCK:
+            if migrate_key is not None and migrate_key in _MIGRATED_PATHS:
+                return
+            self._connection.executescript(_SCHEMA)
+            self._ensure_compat_columns()
+            if migrate_key is not None:
+                _MIGRATED_PATHS.add(migrate_key)
 
     @_synchronized
     def put(self, saga: TaskSaga) -> TaskSaga:

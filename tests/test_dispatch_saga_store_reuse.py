@@ -215,6 +215,43 @@ def test_injected_task_store_is_not_closed_by_run_workers(monkeypatch: Any, tmp_
 # ---------------------------------------------------------------------------
 
 
+def test_schema_migration_memoized_once_per_process_for_a_path(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    """Schema/compat run at most once **per process** per path (#227 AC2).
+
+    Constructing a second ``SqliteTaskSagaStore`` on the *same* file path — e.g.
+    a fresh tick reopening the canonical saga DB after the prior tick closed it —
+    skips the schema script + compat ALTER probing entirely thanks to the
+    process-level ``_MIGRATED_PATHS`` memoize. The adversarial arm proves the
+    memoize is real and not a global no-op: two distinct ``:memory:`` databases
+    each migrate, because there is nothing to memoize across them.
+    """
+    migrations = _spy_migrations(monkeypatch)
+    db = tmp_path / "sagas.db"
+
+    first = SqliteTaskSagaStore(db)
+    assert migrations["n"] == 1
+    second = SqliteTaskSagaStore(db)  # later tick reopens the same path
+    assert migrations["n"] == 1, "process-level memoize: not re-migrated per tick"
+
+    # Both connections are fully usable against the one migrated schema.
+    saga = first.create(
+        task_id="t", saga_id="s", issue=1, branch="b", worktree="w", compensations=()
+    )
+    assert second.get("t") == saga
+    first.close()
+    second.close()
+
+    # Adversarial: each ``:memory:`` store is a distinct DB, so the memoize must
+    # NOT skip their migrations — proving the guard keys on real paths, not a
+    # blanket "already ran once anywhere" flag.
+    migrations["n"] = 0
+    SqliteTaskSagaStore(":memory:")
+    SqliteTaskSagaStore(":memory:")
+    assert migrations["n"] == 2
+
+
 def test_shared_store_is_thread_safe_across_concurrent_dispatches(
     monkeypatch: Any, tmp_path: Any
 ) -> None:

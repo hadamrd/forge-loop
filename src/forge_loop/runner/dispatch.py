@@ -7,6 +7,7 @@ no behaviour change, no signature change.
 from __future__ import annotations
 
 import contextlib
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -740,14 +741,20 @@ def _run_workers(
                 for fut in futures:
                     outcomes.append(fut.result())
         finally:
-            # By here the ThreadPool has drained and every worker's heartbeat
-            # thread is stopped (each ``_dispatch_one_worker`` joins its own in
-            # ``finally``), so no other thread holds the shared connection.
-            # Close it to avoid leaking one sqlite connection per tick (#227).
+            # By here the ThreadPool has drained and each worker has *requested*
+            # its heartbeat thread stop (``_dispatch_one_worker`` joins its own
+            # in ``finally``). That join is best-effort with a 2.0s timeout
+            # (``_stop_worker_heartbeat``), so a heartbeat blocked on the shared
+            # lock could in theory outlive the join — worst case a single
+            # ``sqlite3.Error`` on a beat that lands after close. Both this
+            # close and the heartbeat op suppress that, so it is harmless; we
+            # close here to avoid leaking one sqlite connection per tick (#227).
             if isinstance(tick_saga_store, SqliteTaskSagaStore) and (
                 tick_saga_store is not injected_store
             ):
-                with contextlib.suppress(Exception):
+                # Narrowed to ``sqlite3.Error`` (not bare ``Exception``) per
+                # EH-001: only sqlite close failures are expected/best-effort.
+                with contextlib.suppress(sqlite3.Error):
                     tick_saga_store.close()
 
     for o in outcomes:
