@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from forge_loop._testing.memory_store import FakeMemoryStore
 from forge_loop.brainstormer import (
     Brainstormer,
     BrainstormReport,
@@ -16,8 +17,16 @@ from forge_loop.brainstormer import (
     _parse_sdk_payload,
     _render_axes_block,
     _render_backlog_block,
+    _render_rejected_paths_block,
 )
 from forge_loop.gh_client import Issue, MockGhClient, OpenBacklog, list_open_backlog
+from forge_loop.memory.models import (
+    REJECTED_PATH_TAG,
+    MemoryItem,
+    MemoryKind,
+    MemoryProvenance,
+    axis_tag,
+)
 from forge_loop.product_vision import Axis, ProductVision, discover
 
 FIXTURES = Path(__file__).parent / "fixtures" / "product_vision"
@@ -201,18 +210,25 @@ def test_cosmetic_filter_drops_only_the_cosmetic(monkeypatch) -> None:
             drops.append({"event": event, **kw})
 
         # other levels are no-ops for this assertion.
-        def warning(self, *a, **kw): pass
-        def error(self, *a, **kw): pass
-        def debug(self, *a, **kw): pass
+        def warning(self, *a, **kw):
+            pass
+
+        def error(self, *a, **kw):
+            pass
+
+        def debug(self, *a, **kw):
+            pass
 
     from forge_loop import brainstormer as bs_mod
+
     monkeypatch.setattr(bs_mod, "_log", _RecLogger())
 
     report = Brainstormer(sdk_fn=_stub_sdk(payload)).run(_vision())
     assert len(report.proposed_tickets) == 1
     assert "cost telemetry" in report.proposed_tickets[0].title
-    assert any(d["event"] == "brainstormer_dropped" and d.get("reason") == "cosmetic_match"
-               for d in drops)
+    assert any(
+        d["event"] == "brainstormer_dropped" and d.get("reason") == "cosmetic_match" for d in drops
+    )
 
 
 def test_missing_citation_filters_drop_both() -> None:
@@ -403,7 +419,9 @@ def test_list_open_backlog_partitions_epics_and_tickets() -> None:
 def test_render_backlog_block_handles_empty_and_populated() -> None:
     empty = _render_backlog_block(OpenBacklog())
     assert "(none)" in empty
-    full = _render_backlog_block(OpenBacklog(epics=[Issue(number=1, title="E")], tickets=[Issue(number=2, title="T")]))
+    full = _render_backlog_block(
+        OpenBacklog(epics=[Issue(number=1, title="E")], tickets=[Issue(number=2, title="T")])
+    )
     assert "#1: E" in full and "#2: T" in full
 
 
@@ -422,3 +440,216 @@ def test_parse_sdk_payload_rejects_empty_message() -> None:
 def test_parse_sdk_payload_rejects_non_object_json() -> None:
     with pytest.raises(ValueError):
         _parse_sdk_payload("[1, 2, 3]")
+
+
+# ---------------------------------------------------------------------------
+# Rejected-path memory: anti-relitigation feedback (issue #203)
+# ---------------------------------------------------------------------------
+
+
+class _RecLogger:
+    """Captures ``_log.info`` calls so drop-reason provenance is assertable."""
+
+    def __init__(self) -> None:
+        self.records: list[dict] = []
+
+    def info(self, event, **kw):
+        self.records.append({"event": event, **kw})
+
+    def warning(self, *a, **kw):
+        self.records.append({"event": a[0] if a else "warning", "_level": "warning", **kw})
+
+    def error(self, *a, **kw):
+        pass
+
+    def debug(self, *a, **kw):
+        pass
+
+
+def _rejected_item(
+    *,
+    title: str,
+    axis: str,
+    rationale: str = "out of axis — websockets are not a value axis",
+    memory_id: str | None = None,
+) -> MemoryItem:
+    return MemoryItem(
+        memory_id=memory_id or f"rejpath-{abs(hash((title, axis)))}",
+        kind=MemoryKind.SEMANTIC,
+        title=title,
+        body=rationale,
+        tags=(REJECTED_PATH_TAG, axis_tag(axis)),
+        provenance=MemoryProvenance(
+            source_event=None,
+            authored_by="brainstorm-apply",
+            source_task_ref="brainstorm-apply:report-abc",
+        ),
+    )
+
+
+def test_rejected_paths_block_empty_renders_none() -> None:
+    assert _render_rejected_paths_block(()) == "  (none)"
+    assert _render_rejected_paths_block(None) == "  (none)"
+
+
+def test_rejected_paths_block_populated_shows_idea_and_why() -> None:
+    block = _render_rejected_paths_block(
+        [
+            _rejected_item(
+                title="Stream worker logs over websockets",
+                axis="throughput",
+                rationale="rejected as out-of-axis",
+            )
+        ]
+    )
+    assert "Stream worker logs over websockets" in block
+    assert "[throughput]" in block
+    assert "rejected as out-of-axis" in block
+
+
+def test_candidate_matching_rejected_path_is_dropped_with_provenance(monkeypatch) -> None:
+    rec = _RecLogger()
+    from forge_loop import brainstormer as bs_mod
+
+    monkeypatch.setattr(bs_mod, "_log", rec)
+
+    store = FakeMemoryStore()
+    store.put(
+        _rejected_item(
+            title="Stream worker logs over websockets",
+            axis="throughput",
+            rationale="out-of-axis: realtime streaming is not a value axis",
+        )
+    )
+    payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [
+            {
+                "title": "Stream worker logs over websockets",
+                "body": "Push logs live.",
+                "axis": "throughput",
+                "customer_story": "operator: I want live logs",
+            },
+            {
+                "title": "Ship cost telemetry widget",
+                "body": "real win",
+                "axis": "throughput",
+                "customer_story": "operator wants live $/hr",
+            },
+        ],
+    }
+    report = Brainstormer(sdk_fn=_stub_sdk(payload), memory_store=store).run(_vision())
+
+    assert [t.title for t in report.proposed_tickets] == ["Ship cost telemetry widget"]
+    drop = next(
+        r
+        for r in rec.records
+        if r["event"] == "brainstormer_dropped" and r.get("reason") == "rejected_path"
+    )
+    # Drop reason cites the prior verdict's provenance: axis + rationale.
+    assert drop["prior_axis"] == "throughput"
+    assert "out-of-axis" in drop["prior_rationale"]
+    assert drop["prior_source"] == "brainstorm-apply:report-abc"
+
+
+def test_non_matching_candidate_survives_untouched() -> None:
+    store = FakeMemoryStore()
+    store.put(_rejected_item(title="Some rejected idea", axis="reliability"))
+    payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [
+            {
+                "title": "A wholly different idea",
+                "body": "x",
+                "axis": "throughput",
+                "customer_story": "operator: I need this",
+            }
+        ],
+    }
+    report = Brainstormer(sdk_fn=_stub_sdk(payload), memory_store=store).run(_vision())
+    assert [t.title for t in report.proposed_tickets] == ["A wholly different idea"]
+
+
+def test_rejected_path_match_is_whitespace_and_case_insensitive() -> None:
+    """Adversarial: a re-proposal differing only by whitespace/case must still
+    match via ``normalize_candidate_key`` — guards against silent re-litigation."""
+    store = FakeMemoryStore()
+    store.put(_rejected_item(title="Stream Worker Logs", axis="throughput"))
+    payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [
+            {
+                "title": "  stream   worker  logs ",
+                "body": "x",
+                "axis": "throughput",
+                "customer_story": "operator: I need this",
+            }
+        ],
+    }
+    report = Brainstormer(sdk_fn=_stub_sdk(payload), memory_store=store).run(_vision())
+    assert report.proposed_tickets == []
+
+
+def test_store_raising_on_list_rejected_paths_degrades_gracefully() -> None:
+    """Sad path: a store that raises must not blow up ``run`` — mirror the
+    ``_scan_backlog`` degrade pattern: empty block, no filtering, no crash."""
+
+    class _ExplodingStore:
+        def list_rejected_paths(self):
+            raise RuntimeError("sqlite is corrupt")
+
+    payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [
+            {
+                "title": "survivor",
+                "body": "x",
+                "axis": "throughput",
+                "customer_story": "operator: I need this",
+            }
+        ],
+    }
+    report = Brainstormer(sdk_fn=_stub_sdk(payload), memory_store=_ExplodingStore()).run(_vision())
+    assert [t.title for t in report.proposed_tickets] == ["survivor"]
+
+
+def test_no_store_behaves_identically_to_today() -> None:
+    payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [
+            {
+                "title": "survivor",
+                "body": "x",
+                "axis": "throughput",
+                "customer_story": "operator: I need this",
+            }
+        ],
+    }
+    report = Brainstormer(sdk_fn=_stub_sdk(payload), memory_store=None).run(_vision())
+    assert [t.title for t in report.proposed_tickets] == ["survivor"]
+
+
+def test_rejected_paths_rendered_into_prompt() -> None:
+    store = FakeMemoryStore()
+    store.put(
+        _rejected_item(
+            title="Stream worker logs over websockets",
+            axis="throughput",
+            rationale="out-of-axis verdict",
+        )
+    )
+    fn = _stub_sdk({"proposed_epics": [], "proposed_tickets": []})
+    Brainstormer(sdk_fn=fn, memory_store=store).run(_vision())
+    prompt = fn.captured["prompt"]  # type: ignore[attr-defined]
+    assert "Previously rejected paths" in prompt
+    assert "Stream worker logs over websockets" in prompt
+    assert "out-of-axis verdict" in prompt
+
+
+def test_no_store_renders_none_rejected_block() -> None:
+    fn = _stub_sdk({"proposed_epics": [], "proposed_tickets": []})
+    Brainstormer(sdk_fn=fn, memory_store=None).run(_vision())
+    prompt = fn.captured["prompt"]  # type: ignore[attr-defined]
+    assert "Previously rejected paths" in prompt
+    # The block degrades to "(none)" with no store wired.
+    assert "(none)" in prompt
