@@ -49,6 +49,31 @@ def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
     return _reap_orphan_worktrees_impl(repo, events_file)
 
 
+def _check_environment_poison(cfg: Config) -> Any:
+    """Inspect the operator's Python for a worktree-editable poison (#144).
+
+    Best-effort and side-effect-free against the operator's site-packages:
+    it only *reads* ``pip show`` metadata. The worktree-root prefix is taken
+    from ``cfg.worktree_root`` so the check tracks however the operator
+    configured worker worktrees. Any unexpected failure degrades to
+    "not poisoned" so a healthy operator is never blocked by a guard bug.
+    """
+    from forge_loop.runner.poison_guard import (
+        PoisonResult,
+        SubprocessPipShowReader,
+        check_environment_not_poisoned,
+    )
+
+    try:
+        return check_environment_not_poisoned(
+            SubprocessPipShowReader(),
+            worktree_root=getattr(cfg, "worktree_root", None),
+            reinstall_target=str(cfg.repo),
+        )
+    except Exception:  # noqa: BLE001 — a guard bug must never block a clean boot
+        return PoisonResult(poisoned=False)
+
+
 def _run_boot_recovery(cfg: Config) -> Any:
     """Reconcile dead-worker sagas at boot so the loop resumes cleanly.
 
@@ -234,11 +259,27 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     Runners in the same process or to ``stop()`` one without affecting
     another.
     """
+    import sys as _sys
+
     from forge_loop.runner.tick import _tick
 
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     cfg.events_file.touch()
+
+    # Issue #144 — refuse to start if a previous worker poisoned the operator
+    # Python with an editable ``pip install -e`` pointing into a worktree. The
+    # guard reports + refuses (exit 3); it never mutates the operator's
+    # site-packages. Runs before any worker dispatch.
+    poison = _check_environment_poison(cfg)
+    if poison.poisoned:
+        append_event(
+            cfg.events_file,
+            "boot_environment_poisoned",
+            offending_path=poison.offending_path,
+        )
+        _sys.stderr.write(poison.render_error())
+        return 3
 
     if state is None:
         state = get_default_state()
