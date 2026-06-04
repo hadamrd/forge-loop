@@ -163,6 +163,7 @@ def run_worker(
     brief_override: str | None = None,
     capability_policy: CapabilityPolicy | None = None,
     maestro_context: str = "",
+    permissions: str = "full",
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -248,6 +249,8 @@ def run_worker(
     if maestro_context:
         brief = f"{maestro_context}\n\n{brief}"
 
+    from forge_loop.worker_permissions import claude_permission_options, codex_sandbox_args
+
     if provider == "codex":
         outcome = _run_worker_codex(
             issue=issue,
@@ -256,6 +259,7 @@ def run_worker(
             brief=brief,
             timeout_s=timeout_s,
             model=model,
+            sandbox_args=codex_sandbox_args(permissions),
         )
         outcome.manifesto_sha = manifesto_sha
         _emit_worker_event(
@@ -273,6 +277,7 @@ def run_worker(
         )
         return outcome
 
+    _claude_opts = claude_permission_options(permissions)
     try:
         outcome = _run_worker_sdk(
             issue=issue,
@@ -288,6 +293,8 @@ def run_worker(
             load_timeout_ms=load_timeout_ms,
             strict_mcp_config=strict_mcp_config,
             mcp_servers=mcp_servers,
+            permission_mode=_claude_opts["permission_mode"],
+            sandbox=_claude_opts.get("sandbox"),
         )
         outcome.manifesto_sha = manifesto_sha
         _emit_worker_event(
@@ -338,6 +345,7 @@ def run_repair_worker(
     load_timeout_ms: int | None = None,
     strict_mcp_config: bool = False,
     mcp_servers: dict[str, Any] | None = None,
+    permissions: str = "full",
 ) -> WorkerOutcome:
     """Repair an existing blocked PR by pushing to its head branch."""
     n = issue["number"]
@@ -376,6 +384,8 @@ def run_repair_worker(
         lumen_test_pattern=lumen_test_pattern,
         coauthor=coauthor,
     )
+    from forge_loop.worker_permissions import claude_permission_options, codex_sandbox_args
+
     if provider == "codex":
         return _run_worker_codex(
             issue=issue,
@@ -384,7 +394,9 @@ def run_repair_worker(
             brief=brief,
             timeout_s=timeout_s,
             model=model,
+            sandbox_args=codex_sandbox_args(permissions),
         )
+    _claude_opts = claude_permission_options(permissions)
     return _run_worker_sdk(
         issue=issue,
         worktree=worktree,
@@ -399,6 +411,8 @@ def run_repair_worker(
         load_timeout_ms=load_timeout_ms,
         strict_mcp_config=strict_mcp_config,
         mcp_servers=mcp_servers,
+        permission_mode=_claude_opts["permission_mode"],
+        sandbox=_claude_opts.get("sandbox"),
     )
 
 
@@ -410,6 +424,7 @@ def _run_worker_codex(
     brief: str,
     timeout_s: int,
     model: str | None = None,
+    sandbox_args: list[str] | None = None,
 ) -> WorkerOutcome:
     """Drive a worker through ``codex exec`` and map it to WorkerOutcome."""
     from forge_loop.agent_backend import (
@@ -427,6 +442,7 @@ def _run_worker_codex(
         timeout_s=timeout_s,
         model=model,
         add_dirs=[worktree],
+        sandbox_args=sandbox_args,
     )
     if result.timed_out:
         return WorkerOutcome(
@@ -480,6 +496,8 @@ def _run_worker_sdk(
     load_timeout_ms: int | None = None,
     strict_mcp_config: bool = False,
     mcp_servers: dict[str, Any] | None = None,
+    permission_mode: str = "bypassPermissions",
+    sandbox: dict[str, Any] | None = None,
 ) -> WorkerOutcome:
     """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
 
@@ -507,7 +525,8 @@ def _run_worker_sdk(
                 cwd=worktree,
                 max_turns=120,
                 add_dirs=[worktree],
-                permission_mode="bypassPermissions",
+                permission_mode=permission_mode,
+                sandbox=sandbox,
                 on_event=_on_event,
                 model=model,
                 thinking_budget=thinking,

@@ -57,6 +57,9 @@ worker:
   provider: claude
   model: claude-opus-4-7
   thinking: medium
+  # Worker power: full (default, full host access) | standard (sandboxed to
+  # the worktree) | readonly (planning/triage only). See docs/design.
+  permissions: full
 
 po:
   provider: claude

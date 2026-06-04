@@ -40,12 +40,20 @@ def build_codex_exec_argv(
     last_message_path: Path,
     model: str | None = None,
     add_dirs: list[Path] | None = None,
+    sandbox_args: list[str] | None = None,
 ) -> list[str]:
     """Build the noninteractive Codex CLI argv.
 
     The prompt is supplied on stdin via ``-`` to avoid argv-size limits on large
     issue bodies and rendered briefs.
+
+    ``sandbox_args`` are the Codex sandbox flags for the worker's permission
+    profile (see ``forge_loop.worker_permissions.codex_sandbox_args``). The
+    ``None`` default reproduces the historical full-access flags, so existing
+    callers are byte-for-byte unchanged.
     """
+    if sandbox_args is None:
+        sandbox_args = ["-s", "danger-full-access", "--dangerously-bypass-approvals-and-sandbox"]
     argv = [
         "codex",
         "exec",
@@ -53,9 +61,7 @@ def build_codex_exec_argv(
         "--json",
         "-C",
         str(cwd),
-        "-s",
-        "danger-full-access",
-        "--dangerously-bypass-approvals-and-sandbox",
+        *sandbox_args,
         "--skip-git-repo-check",
         "--output-last-message",
         str(last_message_path),
@@ -75,6 +81,7 @@ def run_codex_exec(
     timeout_s: int,
     model: str | None = None,
     add_dirs: list[Path] | None = None,
+    sandbox_args: list[str] | None = None,
 ) -> AgentRunResult:
     """Run Codex in noninteractive mode and capture JSONL plus final text."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +92,7 @@ def run_codex_exec(
         last_message_path=last_message_path,
         model=model,
         add_dirs=add_dirs,
+        sandbox_args=sandbox_args,
     )
     try:
         with open(log_path, "w", encoding="utf-8") as logf:

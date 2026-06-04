@@ -243,6 +243,10 @@ class WorkerSettings(BaseSettings):
     load_timeout_ms: int = 180000
     strict_mcp_config: bool = True
     mcp_servers: dict[str, Any] = Field(default_factory=dict)
+    # Permission profile: full (default) | standard | readonly. See
+    # forge_loop.worker_permissions. 'full' = today's behaviour (full host
+    # access, no sandbox); the others are opt-in confinement.
+    permissions: str = "full"
 
     @field_validator("provider")
     @classmethod
@@ -250,6 +254,16 @@ class WorkerSettings(BaseSettings):
         if v not in _AGENT_PROVIDERS:
             raise ConfigError(f"worker.provider={v!r} — expected one of {sorted(_AGENT_PROVIDERS)}")
         return str(v)
+
+    @field_validator("permissions", mode="before")
+    @classmethod
+    def _permissions_known(cls, v: Any) -> str:
+        from forge_loop.worker_permissions import PROFILES
+
+        s = str(v or "full").strip().lower()
+        if s not in PROFILES:
+            raise ConfigError(f"worker.permissions={v!r} — expected one of {sorted(PROFILES)}")
+        return s
 
     @field_validator("thinking", mode="before")
     @classmethod

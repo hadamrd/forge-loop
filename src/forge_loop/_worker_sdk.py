@@ -266,6 +266,7 @@ async def run_sdk_session(
     env: dict[str, str] | None = None,
     add_dirs: Iterable[Path] = (),
     permission_mode: str = "bypassPermissions",
+    sandbox: dict[str, Any] | None = None,
     on_event: EventEmitter | None = None,
     query_fn: Any = None,
     options_cls: Any = None,
@@ -337,6 +338,12 @@ async def run_sdk_session(
         "add_dirs": [str(p) for p in add_dirs],
         "env": env if env is not None else _clean_sdk_env(),
     }
+    # Host-level confinement for the worker (permission profiles 'standard' /
+    # 'readonly' — see forge_loop.worker_permissions). A SandboxSettings dict.
+    # Omitted for 'full' so the options are byte-identical to the historical
+    # no-sandbox path. Degraded via _OPTIONAL_KNOBS on SDKs too old to accept it.
+    if sandbox is not None:
+        base_kwargs["sandbox"] = sandbox
     # MCP server allow-list (issue #60). The default bundled allow-list
     # lives in :mod:`forge_loop.config`; if the caller passes ``None`` we
     # still apply the bundled default so a forgetful caller doesn't
@@ -389,6 +396,7 @@ async def run_sdk_session(
             "strict_mcp_config",
             "mcp_servers",
             "resume",
+            "sandbox",
         )
         try:
             return options_cls(**kwargs)
