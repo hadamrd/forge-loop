@@ -44,9 +44,7 @@ _WT_LOOP_SEGMENT_RE = re.compile(r"(?:^|/)wt-loop-[^/]*(?:/|$)")
 # ``pip show`` emits ``Location:`` for every package; modern pip (>=21.3) adds
 # ``Editable project location:`` for editable installs. We prefer the editable
 # line when present, else fall back to ``Location:``.
-_EDITABLE_LOCATION_RE = re.compile(
-    r"^Editable project location:\s*(?P<path>.+?)\s*$", re.MULTILINE
-)
+_EDITABLE_LOCATION_RE = re.compile(r"^Editable project location:\s*(?P<path>.+?)\s*$", re.MULTILINE)
 _LOCATION_RE = re.compile(r"^Location:\s*(?P<path>.+?)\s*$", re.MULTILINE)
 
 DEFAULT_PACKAGE = "forge-loop"
@@ -145,7 +143,10 @@ def _cleanup_commands(
     site_packages: str | None,
     reinstall_target: str,
 ) -> tuple[str, ...]:
-    site = site_packages or "$(python -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])')"
+    site = (
+        site_packages
+        or "$(python -c 'import sysconfig; print(sysconfig.get_paths()[\"purelib\"])')"
+    )
     return (
         f"python -m pip uninstall -y {package}",
         f"rm -rf {site}/forge_loop {site}/roles",

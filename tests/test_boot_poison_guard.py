@@ -113,9 +113,7 @@ def test_none_worktree_root_only_matches_wt_loop_shape() -> None:
         is True
     )
     assert (
-        detect_poisoned_environment(
-            _payload("/opt/elsewhere/src"), worktree_root=None
-        ).poisoned
+        detect_poisoned_environment(_payload("/opt/elsewhere/src"), worktree_root=None).poisoned
         is False
     )
 

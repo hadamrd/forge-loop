@@ -141,9 +141,7 @@ def _install_signal_handlers(cfg: Config, state: RunnerState | None = None) -> N
     signal.signal(signal.SIGUSR1, _pause_toggle)
 
 
-def _short_sleep(
-    seconds: int, cfg: Config, state: RunnerState | None = None
-) -> None:
+def _short_sleep(seconds: int, cfg: Config, state: RunnerState | None = None) -> None:
     """Sleep but stay responsive to stop/pause signals + touchfiles."""
     if state is None:
         state = get_default_state()
@@ -173,7 +171,8 @@ def _run_crash_recovery(cfg: Config) -> None:
         s = _Settings.load()
     except Exception as ex:  # noqa: BLE001 — boundary
         append_event(
-            cfg.events_file, "crash_recovery_skipped",
+            cfg.events_file,
+            "crash_recovery_skipped",
             reason=f"settings_load_failed: {type(ex).__name__}",
         )
         return
@@ -183,7 +182,8 @@ def _run_crash_recovery(cfg: Config) -> None:
 
     if not cfg.github_repo or "/" not in cfg.github_repo:
         append_event(
-            cfg.events_file, "crash_recovery_skipped",
+            cfg.events_file,
+            "crash_recovery_skipped",
             reason="github_repo not configured",
         )
         return
@@ -205,13 +205,15 @@ def _run_crash_recovery(cfg: Config) -> None:
             events_file=cfg.events_file,
         )
         append_event(
-            cfg.events_file, "crash_recovery_done",
+            cfg.events_file,
+            "crash_recovery_done",
             count=len(decisions),
             actions={d.action: 1 for d in decisions},  # shape-aware summary
         )
     except Exception as ex:  # noqa: BLE001 — boundary
         append_event(
-            cfg.events_file, "crash_recovery_failed",
+            cfg.events_file,
+            "crash_recovery_failed",
             error=f"{type(ex).__name__}: {ex!s:.200}",
         )
 
@@ -343,9 +345,7 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     if _axes:
         import logging as _logging
 
-        _logging.getLogger("forge_loop.runner").info(
-            "axis filter active: %s", ",".join(_axes)
-        )
+        _logging.getLogger("forge_loop.runner").info("axis filter active: %s", ",".join(_axes))
     write_state(cfg.state_file, {"state": "starting", "tick": 0, "parallel": cfg.parallel})
 
     # Issue #18 — if `.forge/pipeline.yaml` exists, validate it at startup so

@@ -219,10 +219,7 @@ def detect_pip_editable_poison(worker_text: str, *, changed_files: list[str]) ->
 
 
 def _has_pip_editable_install(text: str) -> bool:
-    for line in _command_segments(text):
-        if _PIP_EDITABLE_RE.search(line) is not None:
-            return True
-    return False
+    return any(_PIP_EDITABLE_RE.search(line) is not None for line in _command_segments(text))
 
 
 def _has_no_verify_command(text: str) -> bool:

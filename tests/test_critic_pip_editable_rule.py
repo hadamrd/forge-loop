@@ -60,9 +60,7 @@ def test_root_pip_install_dot_is_flagged() -> None:
 
 
 def test_editable_install_with_setup_py_diff_is_flagged() -> None:
-    report = detect_pip_editable_poison(
-        "pip install -e /tmp/wt-loop-1", changed_files=["setup.py"]
-    )
+    report = detect_pip_editable_poison("pip install -e /tmp/wt-loop-1", changed_files=["setup.py"])
     assert report.has_sev1()
 
 
@@ -80,9 +78,7 @@ def test_non_editable_commands_never_flag(command: str) -> None:
 
 
 def test_setup_cfg_path_with_subdir_matches_on_basename() -> None:
-    report = detect_pip_editable_poison(
-        "pip install -e .", changed_files=["packages/x/setup.cfg"]
-    )
+    report = detect_pip_editable_poison("pip install -e .", changed_files=["packages/x/setup.cfg"])
     assert report.has_sev1()
 
 
