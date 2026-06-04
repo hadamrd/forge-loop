@@ -464,6 +464,29 @@ def _dispatch_one_worker(
         _stop_worker_heartbeat(heartbeat)
 
 
+def _recover_orphan_pr_url(cfg: Config, issue_number: int, worktree_path: str) -> str | None:
+    """Recover a PR URL for a worker that crashed/was cancelled (issue #213).
+
+    Looks first at the worktree's ``sprint-events.jsonl`` (the worker emits a
+    ``pr_opened`` event there), then at the most recent ``worker-<n>-*.log``
+    under ``cfg.logs_dir``. Best-effort: any failure yields ``None`` so the
+    existing ``pr_url=None`` semantics are preserved.
+    """
+    from forge_loop.worker import recover_orphaned_pr_url
+
+    worktree = Path(worktree_path)
+    latest_log: Path | None = None
+    try:
+        logs = sorted(cfg.logs_dir.glob(f"worker-{issue_number}-*.log"))
+        latest_log = logs[-1] if logs else None
+    except OSError:
+        latest_log = None
+    try:
+        return recover_orphaned_pr_url(worktree, latest_log)
+    except Exception:  # noqa: BLE001 — recovery must never mask the real crash
+        return None
+
+
 def _run_worker_with_saga(
     cfg: Config,
     issue: dict[str, Any],
@@ -553,10 +576,17 @@ def _run_worker_with_saga(
         # The subprocess crashed before producing a WorkerOutcome. We
         # MUST close out the FSM row — otherwise a recovery walk would
         # treat this as a still-RUNNING session and try to resume it.
+        #
+        # Issue #213: the crash/cancellation may have landed AFTER the
+        # worker opened its PR. Recover the URL from the worktree's
+        # sprint-events / worker log so the synthetic outcome carries it
+        # and the next tick's adoption scan can re-critic + merge the PR
+        # instead of orphaning it.
+        recovered_pr = _recover_orphan_pr_url(cfg, issue["number"], worktree_path)
         synthetic = WorkerOutcome(
             issue=issue["number"],
             title=issue.get("title", ""),
-            pr_url=None,
+            pr_url=recovered_pr,
             status="failed",
             duration_s=0.0,
             stdout_tail="",

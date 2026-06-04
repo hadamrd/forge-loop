@@ -27,6 +27,7 @@ __all__ = [
     "ensure_subagent_trusted",
     "make_brief",
     "make_repair_brief",
+    "recover_orphaned_pr_url",
     "run_repair_worker",
     "run_worker",
 ]
@@ -106,6 +107,62 @@ def _extract_outcome(log_path: Path) -> tuple[str | None, str]:
             pr_url = m.group(0)
             status = "open"
     return pr_url, status
+
+
+_PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+
+
+def _recover_pr_url_from_events(events: list[dict[str, Any]]) -> str | None:
+    """Scan subagent sprint-events for a PR URL (newest first).
+
+    The worker subagent emits ``pr_opened`` events (and a trailing result
+    object) carrying the PR it created. When the worker is cancelled at the
+    deadline *after* opening the PR, those events are the most reliable
+    surviving record of the URL — the SDK ResultMessage never arrived.
+    """
+    for ev in reversed(events):
+        if not isinstance(ev, dict):
+            continue
+        for key in ("pr", "pr_url", "url", "detail"):
+            value = ev.get(key)
+            if isinstance(value, str):
+                match = _PR_URL_RE.search(value)
+                if match:
+                    return match.group(0)
+    return None
+
+
+def _recover_pr_url_from_log(log_path: Path) -> str | None:
+    """Scan a worker stream-json log for the last PR URL it printed."""
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    matches = _PR_URL_RE.findall(text)
+    return matches[-1] if matches else None
+
+
+def recover_orphaned_pr_url(
+    worktree: Path | None = None,
+    log_path: Path | None = None,
+) -> str | None:
+    """Best-effort recovery of a PR URL after a worker was cancelled.
+
+    Issue #213: a worker can open its PR and then hit ``worker_timeout_s``
+    (``CancelledError``/``TimeoutError``) before reporting the URL on its
+    ``WorkerOutcome``. The PR is then orphaned — no tick learns it exists.
+    This recovers the URL from the structured sprint-events first (most
+    reliable) and falls back to scanning the raw worker log. Returns
+    ``None`` when nothing PR-shaped is found — callers keep their existing
+    ``pr_url=None`` semantics in that case.
+    """
+    if worktree is not None:
+        url = _recover_pr_url_from_events(_read_subagent_events(worktree))
+        if url:
+            return url
+    if log_path is not None and log_path.exists():
+        return _recover_pr_url_from_log(log_path)
+    return None
 
 
 def _tail(path: Path, n_chars: int) -> str:
@@ -558,10 +615,17 @@ def _run_worker_sdk(
     if timed_out:
         # Record the *requested* model so the audit trail is informative
         # even when no response ever arrived (issue #34).
+        #
+        # Issue #213: a worker can open its PR and THEN trip the deadline
+        # before the SDK ResultMessage arrives. Recover the URL from the
+        # worker log / sprint-events so the next tick's adoption scan can
+        # re-critic + merge it instead of orphaning the PR forever. The
+        # status stays ``timeout`` (the truth) — only ``pr_url`` is filled.
+        recovered_pr = recover_orphaned_pr_url(worktree, log_path)
         return WorkerOutcome(
             issue=n,
             title=title,
-            pr_url=None,
+            pr_url=recovered_pr,
             status="timeout",
             duration_s=duration,
             stdout_tail="(timeout)",

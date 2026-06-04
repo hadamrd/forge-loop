@@ -187,6 +187,7 @@ class AsyncOrchestrator:
         po_timeout_s: float = 600.0,
         worker_timeout_s: float = 7200.0,
         critic_timeout_s: float = 600.0,
+        pr_recover_fn: Callable[[Issue], str | None] | None = None,
     ) -> None:
         self.pools = pools
         self.caps = caps
@@ -194,6 +195,13 @@ class AsyncOrchestrator:
         self.worker_fn = worker_fn
         self.critic_fn = critic_fn
         self.emit: EmitFn = emit or (lambda _k, _p: None)
+        # Issue #213: when a worker is cancelled at the deadline AFTER opening
+        # its PR, this recovers the PR URL (from the worktree log / events) so
+        # the synthetic timeout/error result carries ``pr_url`` instead of
+        # ``None`` — otherwise the PR is orphaned and never revisited. Default
+        # ``None`` preserves the legacy ``pr_url=None`` behaviour for callers
+        # that don't wire a recoverer.
+        self.pr_recover_fn: Callable[[Issue], str | None] | None = pr_recover_fn
         self.po_timeout_s = po_timeout_s
         self.worker_timeout_s = worker_timeout_s
         self.critic_timeout_s = critic_timeout_s
@@ -266,6 +274,26 @@ class AsyncOrchestrator:
         self._tasks.clear()
         self._started = False
 
+    # -------- helpers --------
+
+    def _recover_pr(self, issue: Issue) -> str | None:
+        """Recover an orphaned PR URL for a cancelled/failed worker (#213).
+
+        Best-effort: a missing or throwing ``pr_recover_fn`` yields ``None``
+        so the worker stage degrades to the legacy ``pr_url=None`` behaviour
+        rather than crashing the pipeline.
+        """
+        if self.pr_recover_fn is None:
+            return None
+        try:
+            url = self.pr_recover_fn(issue)
+        except Exception as ex:  # noqa: BLE001 — recovery must never kill the stage
+            self.emit("orphan_pr_recover_failed", {
+                "issue": issue.get("number"), "err": str(ex)[:200],
+            })
+            return None
+        return url if isinstance(url, str) and url else None
+
     # -------- stage workers --------
 
     async def _po_worker(self, slot: int) -> None:
@@ -328,7 +356,7 @@ class AsyncOrchestrator:
                     })
                     wr = {
                         "issue": issue.get("number"), "status": "timeout",
-                        "pr_url": None, "error": "worker_timeout",
+                        "pr_url": self._recover_pr(issue), "error": "worker_timeout",
                     }
                 except Exception as ex:
                     self.stats.worker.errors += 1
@@ -338,7 +366,7 @@ class AsyncOrchestrator:
                     })
                     wr = {
                         "issue": issue.get("number"), "status": "failed",
-                        "pr_url": None, "error": str(ex)[:200],
+                        "pr_url": self._recover_pr(issue), "error": str(ex)[:200],
                     }
                 self.stats.worker.processed += 1
                 # Only PRs that opened/merged need a critic. Failed/no-pr
@@ -410,6 +438,7 @@ async def run_async_tick(
     po_timeout_s: float = 600.0,
     worker_timeout_s: float = 7200.0,
     critic_timeout_s: float = 600.0,
+    pr_recover_fn: Callable[[Issue], str | None] | None = None,
 ) -> tuple[list[CriticResult], AsyncOrchestratorStats]:
     """One-shot helper: build orchestrator, submit, drain, return results."""
     orch = AsyncOrchestrator(
@@ -419,6 +448,7 @@ async def run_async_tick(
         po_timeout_s=po_timeout_s,
         worker_timeout_s=worker_timeout_s,
         critic_timeout_s=critic_timeout_s,
+        pr_recover_fn=pr_recover_fn,
     )
     orch.start()
     await orch.submit_many(issues)
