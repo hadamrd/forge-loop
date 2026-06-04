@@ -229,7 +229,10 @@ def current_site_packages() -> str | None:
     """Best-effort purelib of the running interpreter, for cleanup commands."""
     try:
         return sysconfig.get_paths()["purelib"]
-    except Exception:  # noqa: BLE001 — best-effort hint only
+    except KeyError:
+        # ``purelib`` absent from this interpreter's install scheme — a
+        # display-only hint, so degrade to the generic sysconfig snippet in
+        # the cleanup command rather than failing (error-handling.md#EH-001).
         return None
 
 

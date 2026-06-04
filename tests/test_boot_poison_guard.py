@@ -264,3 +264,45 @@ def test_run_does_not_block_clean_environment(
 
     events = cfg.events_file.read_text(encoding="utf-8") if cfg.events_file.exists() else ""
     assert "boot_environment_poisoned" not in events
+
+
+# --------------------------------------------------------------------------
+# Guard error is surfaced, not swallowed (error-handling.md#EH-001, #144)
+# --------------------------------------------------------------------------
+
+
+def test_guard_error_fails_open_but_appends_boot_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bug inside the guard must not block a clean boot, but it must be
+    observable: ``_check_environment_poison`` fails open (``poisoned=False``)
+    *and* appends a ``boot_poison_guard_error`` event with the error detail."""
+    from forge_loop.runner import boot
+
+    cfg = _make_cfg(tmp_path)
+
+    def _explode(*_a: object, **_k: object) -> PoisonResult:
+        raise RuntimeError("synthetic guard bug")
+
+    # boot imports the symbol locally from poison_guard, so patch it there.
+    monkeypatch.setattr("forge_loop.runner.poison_guard.check_environment_not_poisoned", _explode)
+
+    result = boot._check_environment_poison(cfg)  # type: ignore[arg-type]
+
+    assert result.poisoned is False
+    events = cfg.events_file.read_text(encoding="utf-8")
+    assert "boot_poison_guard_error" in events
+    assert "synthetic guard bug" in events
+    assert "RuntimeError" in events
+
+
+def test_current_site_packages_missing_purelib_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``current_site_packages`` is a display-only hint: a ``purelib``-less
+    install scheme degrades to ``None`` (so the cleanup command falls back to
+    the generic sysconfig snippet) rather than raising."""
+    from forge_loop.runner import poison_guard
+
+    monkeypatch.setattr(poison_guard.sysconfig, "get_paths", lambda: {})
+    assert poison_guard.current_site_packages() is None

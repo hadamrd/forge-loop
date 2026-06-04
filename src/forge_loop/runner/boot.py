@@ -70,7 +70,16 @@ def _check_environment_poison(cfg: Config) -> Any:
             worktree_root=getattr(cfg, "worktree_root", None),
             reinstall_target=str(cfg.repo),
         )
-    except Exception:  # noqa: BLE001 — a guard bug must never block a clean boot
+    except Exception as exc:  # noqa: BLE001 — a guard bug must never block a clean boot
+        # Fail open (a guard bug must not block a healthy operator), but
+        # surface the failure as a boot event — matching the crash_recovery
+        # convention above — so a silently broken guard is observable rather
+        # than swallowed (manifesto error-handling.md#EH-001, #144).
+        append_event(
+            cfg.events_file,
+            "boot_poison_guard_error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
         return PoisonResult(poisoned=False)
 
 
