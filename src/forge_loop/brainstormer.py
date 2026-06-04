@@ -35,6 +35,7 @@ __all__ = [
     "Brainstormer",
     "ProposedEpic",
     "ProposedTicket",
+    "_render_rejected_paths_block",
     "filter_report_for_vision",
 ]
 
@@ -112,6 +113,27 @@ def _render_axes_block(vision: ProductVision) -> str:
         ]
     }
     return yaml.safe_dump(payload, sort_keys=False).strip()
+
+
+def _render_rejected_paths_block(items: Any) -> str:
+    """Render the stored rejected-path memory as a prompt-friendly block.
+
+    Each entry shows the idea (memory title), the axis it was filed under, and
+    *why* it was rejected (the memory body / rationale) so the session knows
+    which paths were already settled and does not re-litigate them. An empty or
+    missing store renders ``(none)`` — identical to the backlog block's degrade
+    behaviour.
+    """
+    from forge_loop.memory.models import axis_from_tags
+
+    lines: list[str] = []
+    for item in items or []:
+        title = getattr(item, "title", "") or ""
+        axis = axis_from_tags(tuple(getattr(item, "tags", ()) or ()))
+        rationale = (getattr(item, "body", "") or "").strip() or "(no rationale recorded)"
+        axis_part = f"[{axis}] " if axis else ""
+        lines.append(f"  - {axis_part}{title} — {rationale}")
+    return "\n".join(lines) if lines else "  (none)"
 
 
 def _render_backlog_block(backlog: Any) -> str:
@@ -274,6 +296,7 @@ class Brainstormer:
     timeout_s: int = 300
     model: str | None = None
     provider: str = "claude"
+    memory_store: Any = None
 
     def run(self, vision: ProductVision) -> BrainstormReport:
         """Entry point — see module docstring."""
@@ -284,7 +307,8 @@ class Brainstormer:
 
         # 1. Build the prompt.
         backlog = self._scan_backlog()
-        prompt = self._render_prompt(vision, backlog)
+        rejected_paths = self._load_rejected_paths()
+        prompt = self._render_prompt(vision, backlog, rejected_paths)
 
         # 2. Drive the SDK session.
         sdk_fn = self.sdk_fn or self._default_sdk_fn()
@@ -307,10 +331,75 @@ class Brainstormer:
                 f"brainstormer SDK returned malformed output ({exc}); last_message={last_message!r}"
             ) from exc
 
-        # 4. Apply the anti-cosmetic guardrail.
-        return filter_report_for_vision(raw, vision)[0]
+        # 4. Apply the anti-cosmetic guardrail, then drop anything that
+        #    matches a previously-rejected path (anti-relitigation).
+        filtered = filter_report_for_vision(raw, vision)[0]
+        return self._filter_rejected_paths(filtered, rejected_paths)
 
     # -- helpers --------------------------------------------------------
+
+    def _load_rejected_paths(self) -> tuple[Any, ...]:
+        """Return stored rejected-path memory items, degrading to ``()``.
+
+        When no store is wired, or the store raises (corrupt db, transient
+        sqlite error), the brainstormer behaves exactly as it did before
+        memory existed: no block, no filtering — mirroring ``_scan_backlog``.
+        """
+        store = self.memory_store
+        if store is None:
+            return ()
+        try:
+            return tuple(store.list_rejected_paths())
+        except Exception:  # noqa: BLE001 — boundary; degrade gracefully
+            _log.warning("brainstormer_rejected_paths_unavailable")
+            return ()
+
+    def _filter_rejected_paths(
+        self, report: BrainstormReport, rejected_paths: tuple[Any, ...]
+    ) -> BrainstormReport:
+        """Drop candidates whose normalized key matches a stored rejected path.
+
+        The drop is logged with ``reason="rejected_path"`` and cites the prior
+        verdict's provenance (axis + rationale + source) so the operator can see
+        *why* a generated idea was suppressed.
+        """
+        if not rejected_paths:
+            return report
+
+        from forge_loop.frontier.decisions import normalize_candidate_key
+        from forge_loop.memory.models import axis_from_tags
+
+        index: dict[tuple[str, str], Any] = {}
+        for item in rejected_paths:
+            axis = axis_from_tags(tuple(getattr(item, "tags", ()) or ()))
+            key = normalize_candidate_key(getattr(item, "title", "") or "", axis)
+            index[key] = item
+
+        def _keep(proposal: Any, kind: str) -> bool:
+            key = normalize_candidate_key(proposal.title, proposal.axis)
+            prior = index.get(key)
+            if prior is None:
+                return True
+            prior_axis = axis_from_tags(tuple(getattr(prior, "tags", ()) or ()))
+            provenance = getattr(prior, "provenance", None)
+            prior_source = (
+                getattr(provenance, "source_task_ref", None) if provenance is not None else None
+            )
+            _log.info(
+                "brainstormer_dropped",
+                kind=kind,
+                title=proposal.title,
+                axis=proposal.axis,
+                reason="rejected_path",
+                prior_axis=prior_axis,
+                prior_rationale=(getattr(prior, "body", "") or ""),
+                prior_source=prior_source,
+            )
+            return False
+
+        epics = [e for e in report.proposed_epics if _keep(e, "epic")]
+        tickets = [t for t in report.proposed_tickets if _keep(t, "ticket")]
+        return BrainstormReport(proposed_epics=epics, proposed_tickets=tickets)
 
     def _scan_backlog(self) -> Any:
         """Return open backlog via gh_client (or an empty stand-in)."""
@@ -324,14 +413,18 @@ class Brainstormer:
                 from forge_loop.gh_client import GithubkitClient
 
                 client = GithubkitClient()
-            except Exception:  # noqa: BLE001 — boundary; degrade gracefully
+            except Exception as exc:  # noqa: BLE001 — boundary; degrade gracefully
+                _log.warning("brainstormer_backlog_unavailable", error=str(exc))
                 return OpenBacklog()
         try:
             return list_open_backlog(client, self.owner, self.repo)
-        except Exception:  # noqa: BLE001 — boundary; degrade gracefully
+        except Exception as exc:  # noqa: BLE001 — boundary; degrade gracefully
+            _log.warning("brainstormer_backlog_unavailable", error=str(exc))
             return OpenBacklog()
 
-    def _render_prompt(self, vision: ProductVision, backlog: Any) -> str:
+    def _render_prompt(
+        self, vision: ProductVision, backlog: Any, rejected_paths: tuple[Any, ...] = ()
+    ) -> str:
         from forge_loop.briefs import render_brief
 
         return render_brief(
@@ -339,6 +432,7 @@ class Brainstormer:
             vision_markdown=vision.vision_markdown,
             axes_block=_render_axes_block(vision),
             backlog_block=_render_backlog_block(backlog),
+            rejected_paths_block=_render_rejected_paths_block(rejected_paths),
         )
 
     def _default_sdk_fn(self) -> Callable[..., Any]:

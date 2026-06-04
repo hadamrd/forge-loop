@@ -23,9 +23,11 @@ import yaml
 from typer.testing import CliRunner
 
 from forge_loop import cli
+from forge_loop._testing.memory_store import FakeMemoryStore
 from forge_loop.brainstormer import BrainstormReport, ProposedEpic, ProposedTicket
 from forge_loop.frontier.decisions import FrontierDecisionLedger, FrontierDecisionOutcome
 from forge_loop.gh_client import GhError, Issue, MockGhClient
+from forge_loop.memory.models import REJECTED_PATH_TAG, axis_from_tags
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -553,3 +555,237 @@ def test_brainstorm_default_never_writes(
     # Confirm zero write-shaped calls of ANY kind.
     write_methods = {"create_issue", "add_comment", "add_labels", "remove_label"}
     assert not any(c[0] in write_methods for c in gh.calls)
+
+
+# ---------------------------------------------------------------------------
+# Rejected-path / decision memory provenance (issue #203)
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_store(monkeypatch: pytest.MonkeyPatch) -> FakeMemoryStore:
+    store = FakeMemoryStore()
+    monkeypatch.setattr(cli, "_memory_store_factory", lambda _repo_path: store)
+    return store
+
+
+def _write_report(repo: Path, report: BrainstormReport) -> Path:
+    path = repo / "reviewed.yaml"
+    path.write_text(
+        yaml.safe_dump(report.model_dump(mode="json"), sort_keys=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _explode_brainstormer(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _explode(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("brainstormer SDK must not run when applying a report")
+
+    monkeypatch.setattr(cli, "_brainstormer_factory", _explode)
+
+
+def _dup_report() -> BrainstormReport:
+    return BrainstormReport(
+        proposed_epics=[],
+        proposed_tickets=[
+            ProposedTicket(
+                title="Wire Stripe SDK",
+                body="Already exists",
+                axis="billing",
+                customer_story="Operator wants invoicing",
+            ),
+            ProposedTicket(
+                title="File deterministic report",
+                body="Fresh item",
+                axis="billing",
+                customer_story="Operator wants deterministic backlog filing",
+            ),
+        ],
+    )
+
+
+def test_apply_report_writes_reject_and_accept_memory(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A duplicate drop writes a REJECTED_PATH_TAG item with axis+rationale
+    provenance; an accepted item writes a durable decision record carrying the
+    filed issue number and axis."""
+    store = _install_fake_store(monkeypatch)
+    report_path = _write_report(cwd_repo, _dup_report())
+    gh = MockGhClient(
+        create_issue_responses=[777],
+        issues_by_label_response=[Issue(number=42, title="Wire Stripe SDK")],
+    )
+    _explode_brainstormer(monkeypatch)
+    monkeypatch.setattr(cli, "_gh_client_factory", lambda: gh)
+
+    result = runner.invoke(cli.app, ["brainstorm", "--apply", "--report", str(report_path)])
+    assert result.exit_code == 0, result.stdout + result.stderr
+
+    rejected = store.list_rejected_paths()
+    assert [item.title for item in rejected] == ["Wire Stripe SDK"]
+    rej = rejected[0]
+    assert REJECTED_PATH_TAG in rej.tags
+    assert axis_from_tags(rej.tags) == "billing"
+    assert "billing" in rej.body and "rejected" in rej.body.lower()
+    assert rej.provenance.authored_by == "brainstorm-apply"
+    assert rej.provenance.source_task_ref  # non-empty when no source event
+
+    active = store.list_active()
+    accepted = [i for i in active if REJECTED_PATH_TAG not in i.tags]
+    assert [i.title for i in accepted] == ["File deterministic report"]
+    assert "#777" in accepted[0].body
+    assert axis_from_tags(accepted[0].tags) == "billing"
+
+    # Ledger still records both verdicts — memory is an additive sink.
+    decisions = FrontierDecisionLedger(cwd_repo / ".forge" / "frontier-decisions.yaml").list()
+    assert {(d.proposal_title, d.outcome) for d in decisions} == {
+        ("Wire Stripe SDK", FrontierDecisionOutcome.REJECTED),
+        ("File deterministic report", FrontierDecisionOutcome.ACCEPTED),
+    }
+
+
+def test_apply_report_twice_is_idempotent_for_memory(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-running apply over the same report (same source_report_hash) must not
+    duplicate memory items — memory_id is derived from the stable source key."""
+    store = _install_fake_store(monkeypatch)
+    report_path = _write_report(cwd_repo, _dup_report())
+    _explode_brainstormer(monkeypatch)
+
+    def _run() -> None:
+        gh = MockGhClient(
+            create_issue_responses=[777],
+            issues_by_label_response=[Issue(number=42, title="Wire Stripe SDK")],
+        )
+        monkeypatch.setattr(cli, "_gh_client_factory", lambda: gh)
+        res = runner.invoke(cli.app, ["brainstorm", "--apply", "--report", str(report_path)])
+        assert res.exit_code == 0, res.stdout + res.stderr
+
+    _run()
+    rejected_after_first = len(store.list_rejected_paths())
+    active_after_first = len(store.list_active())
+    _run()
+
+    assert len(store.list_rejected_paths()) == rejected_after_first == 1
+    assert len(store.list_active()) == active_after_first  # 1 rejected + 1 accepted = 2
+
+
+def test_two_run_loop_rejected_path_feeds_back_and_filters(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run A rejects X (duplicate) → persisted to the shared store. Run B is a
+    fresh generation wired to the SAME store: X is rendered into the prompt's
+    rejected-path block AND filtered before output if the SDK re-proposes it."""
+    store = _install_fake_store(monkeypatch)
+
+    # --- Run A: report-apply rejects "Wire Stripe SDK" as a duplicate. ---
+    report_path = _write_report(cwd_repo, _dup_report())
+    gh_a = MockGhClient(
+        create_issue_responses=[777],
+        issues_by_label_response=[Issue(number=42, title="Wire Stripe SDK")],
+    )
+    _explode_brainstormer(monkeypatch)
+    monkeypatch.setattr(cli, "_gh_client_factory", lambda: gh_a)
+    res_a = runner.invoke(cli.app, ["brainstorm", "--apply", "--report", str(report_path)])
+    assert res_a.exit_code == 0, res_a.stdout + res_a.stderr
+    assert [i.title for i in store.list_rejected_paths()] == ["Wire Stripe SDK"]
+
+    # --- Run B: fresh generation wired to the SAME store, SDK re-proposes X. ---
+    import json as _json
+    from dataclasses import dataclass
+
+    from forge_loop.brainstormer import Brainstormer
+
+    captured: dict[str, Any] = {}
+
+    @dataclass
+    class _SdkResult:
+        last_message: str
+        timed_out: bool = False
+        error: Any = None
+
+    # Re-propose the already-rejected idea (case/space mangled) + a new one.
+    _payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [
+            {
+                "title": "  wire   stripe sdk ",
+                "body": "x",
+                "axis": "billing",
+                "customer_story": "Operator wants invoicing",
+            },
+            {
+                "title": "A brand new idea",
+                "body": "x",
+                "axis": "billing",
+                "customer_story": "Operator wants something new",
+            },
+        ],
+    }
+
+    def _sdk(prompt: str, *, cwd: Any, timeout_s: int, model: Any = None, **_kw: Any) -> Any:
+        captured["prompt"] = prompt
+        return _SdkResult(last_message=_json.dumps(_payload))
+
+    def _factory(*_a: Any, **_k: Any) -> Brainstormer:
+        return Brainstormer(sdk_fn=_sdk, memory_store=store)
+
+    monkeypatch.setattr(cli, "_brainstormer_factory", _factory)
+
+    res_b = runner.invoke(cli.app, ["brainstorm"])
+    assert res_b.exit_code == 0, res_b.stdout + res_b.stderr
+    parsed = yaml.safe_load(res_b.stdout)
+    titles = [t["title"] for t in parsed["proposed_tickets"]]
+    # X filtered (whitespace/case-insensitive match); only the new idea survives.
+    assert titles == ["A brand new idea"]
+    # The prompt fed to run B's session cited the rejected path.
+    assert "Wire Stripe SDK" in captured["prompt"]
+    assert "Previously rejected paths" in captured["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# Factory degrade surfacing (review sev1: silent broad except — issue #203)
+# ---------------------------------------------------------------------------
+
+
+def test_brainstormer_factory_logs_and_degrades_when_store_construction_fails(
+    cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the memory db exists but the store cannot be constructed, the
+    factory must surface a warning (not swallow it silently) and degrade to a
+    ``None`` store — mirroring the logged degrade in sibling boundaries.
+    Regression guard for the sev1 silent-broad-except review finding."""
+    db = cwd_repo / ".forge" / "memory.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    db.write_text("corrupt", encoding="utf-8")
+
+    def _boom(_repo_path: Any) -> Any:
+        raise RuntimeError("corrupt sqlite header")
+
+    monkeypatch.setattr(cli, "_memory_store_factory", _boom)
+
+    warnings: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(cli._log, "warning", lambda event, **kw: warnings.append((event, kw)))
+
+    bs = cli._brainstormer_factory(cwd_repo, "acme", "widgets")
+
+    assert bs.memory_store is None
+    assert warnings, "construction failure must surface a warning, not be swallowed"
+    event, kw = warnings[0]
+    assert event == "memory_store_unavailable"
+    assert "corrupt sqlite header" in kw.get("error", "")
+
+
+def test_brainstormer_factory_no_db_degrades_silently(
+    cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No db on disk → no store, no warning (identical to pre-memory behaviour)."""
+    warnings: list[Any] = []
+    monkeypatch.setattr(cli._log, "warning", lambda *a, **k: warnings.append((a, k)))
+
+    bs = cli._brainstormer_factory(cwd_repo, "acme", "widgets")
+
+    assert bs.memory_store is None
+    assert warnings == []

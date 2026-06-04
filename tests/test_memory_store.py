@@ -12,6 +12,9 @@ from forge_loop.memory.models import (
     MemoryItem,
     MemoryKind,
     MemoryProvenance,
+    axis_from_tags,
+    axis_tag,
+    derive_memory_id,
 )
 from forge_loop.memory.store import SqliteMemoryStore
 
@@ -220,6 +223,20 @@ def test_sqlite_store_creates_parent_directories(tmp_path: Path) -> None:
     assert SqliteMemoryStore(db).get("mem-parent") is not None
 
 
+def test_open_memory_store_resolves_canonical_forge_path(tmp_path: Path) -> None:
+    """The consolidated helper resolves the single ``.forge/memory.db`` path and
+    constructs a working store, so the three CLI factories cannot drift."""
+    from forge_loop.memory import memory_db_path, open_memory_store
+
+    assert memory_db_path(tmp_path) == tmp_path / ".forge" / "memory.db"
+
+    store = open_memory_store(tmp_path)
+    assert isinstance(store, SqliteMemoryStore)
+    assert store.path == tmp_path / ".forge" / "memory.db"
+    store.put(_item("mem-helper", MemoryKind.SEMANTIC))
+    assert open_memory_store(tmp_path).get("mem-helper") is not None
+
+
 def test_superseding_missing_memory_raises_keyerror_for_real_and_fake_stores(
     tmp_path: Path,
 ) -> None:
@@ -246,6 +263,54 @@ def test_superseding_to_missing_replacement_raises_without_mutating(
         unchanged = store.get("mem-old")
         assert unchanged is not None
         assert unchanged.is_active
+
+
+def test_derive_memory_id_is_stable_and_prefix_scoped() -> None:
+    """Idempotency hinge (issue #203): the same source key always maps to the
+    same id, and the prefix namespaces reject vs decision memory so a given
+    candidate yields exactly one of each."""
+    key = "reporthashabc:ticket:throughput:stream worker logs"
+    assert derive_memory_id(key, prefix="rejpath") == derive_memory_id(key, prefix="rejpath")
+    # Different source keys → different ids.
+    assert derive_memory_id(key, prefix="rejpath") != derive_memory_id(
+        key + ":other", prefix="rejpath"
+    )
+    # Same key, different prefix → different (namespaced) ids.
+    assert derive_memory_id(key, prefix="rejpath") != derive_memory_id(key, prefix="decision")
+    assert derive_memory_id(key, prefix="rejpath").startswith("rejpath-")
+
+
+def test_derive_memory_id_idempotent_put_creates_no_duplicates(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    key = "reporthashabc:ticket:throughput:stream worker logs"
+
+    def _make() -> MemoryItem:
+        return MemoryItem(
+            memory_id=derive_memory_id(key, prefix="rejpath"),
+            kind=MemoryKind.SEMANTIC,
+            title="Stream worker logs",
+            body="[throughput] rejected: out of axis",
+            tags=(REJECTED_PATH_TAG, axis_tag("throughput")),
+            provenance=MemoryProvenance(
+                source_event=None,
+                authored_by="brainstorm-apply",
+                source_task_ref="brainstorm-apply:reporthashabc",
+            ),
+        )
+
+    store.put(_make())
+    store.put(_make())  # re-run apply: ON CONFLICT update, not a second row.
+
+    assert len(store.list_rejected_paths()) == 1
+    assert len(store.list_active()) == 1
+
+
+def test_axis_tag_round_trips_and_missing_axis_is_empty() -> None:
+    assert axis_from_tags((REJECTED_PATH_TAG, axis_tag("throughput"))) == "throughput"
+    assert axis_tag(" throughput ") == "axis:throughput"
+    # No axis tag present → empty string (degrade, no crash).
+    assert axis_from_tags((REJECTED_PATH_TAG,)) == ""
+    assert axis_from_tags(()) == ""
 
 
 def test_fake_memory_store_matches_real_shape(tmp_path: Path) -> None:

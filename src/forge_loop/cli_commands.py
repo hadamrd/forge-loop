@@ -12,6 +12,13 @@ from forge_loop.cli_status_commands import StatusCommandsMixin
 from forge_loop.cli_workflow_commands import WorkflowCommandsMixin
 
 
+def _default_memory_store_factory(repo_path: Any) -> Any:
+    """Construct the durable memory store at ``.forge/memory.db``."""
+    from forge_loop.memory import open_memory_store
+
+    return open_memory_store(repo_path)
+
+
 class CliCommands(
     OperatorCommandsMixin,
     StatusCommandsMixin,
@@ -30,10 +37,12 @@ class CliCommands(
         brainstormer_factory: Callable[..., Any],
         gh_client_factory: Callable[[], Any],
         subprocess_module: Any,
+        memory_store_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.load = load_fn
         self.run_loop = run_loop_fn
         self.operator_cfg = operator_cfg_fn
         self.brainstormer_factory = brainstormer_factory
         self.gh_client_factory = gh_client_factory
+        self.memory_store_factory = memory_store_factory or _default_memory_store_factory
         self.subprocess = subprocess_module

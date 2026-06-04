@@ -56,8 +56,11 @@ import typer
 
 from forge_loop.cli_commands import CliCommands
 from forge_loop.config import load
+from forge_loop.log import get_logger
 from forge_loop.runner import run as run_loop
 from forge_loop.settings import Settings
+
+_log = get_logger("forge_loop.cli")
 
 _STATUS_MARKERS = {
     "green": "[green]✓[/green]",
@@ -152,8 +155,27 @@ def _brainstormer_factory(
     model: str | None = None,
     timeout_s: int = 300,
 ) -> Any:
-    """Construct the default Brainstormer. Tests monkeypatch this."""
+    """Construct the default Brainstormer. Tests monkeypatch this.
+
+    Wires the durable memory store from ``.forge/memory.db`` when it exists so
+    the generation path can render previously-rejected paths into the prompt and
+    filter re-litigations (issue #203). When the db is absent the store is left
+    ``None`` and the brainstormer degrades to its pre-memory behaviour.
+    """
     from forge_loop.brainstormer import Brainstormer
+    from forge_loop.memory import memory_db_path
+
+    memory_store: Any = None
+    if memory_db_path(repo_path).exists():
+        try:
+            memory_store = _memory_store_factory(repo_path)
+        except Exception as exc:  # noqa: BLE001 — memory is optional; degrade gracefully
+            # Surface before degrading, mirroring the logged degrade in
+            # ``Brainstormer._load_rejected_paths`` and the stderr echoes in
+            # ``cli_product_commands``. Swallowing this silently would let the
+            # whole anti-relitigation feature no-op with zero signal.
+            _log.warning("memory_store_unavailable", error=str(exc))
+            memory_store = None
 
     return Brainstormer(
         repo_path=repo_path,
@@ -162,6 +184,7 @@ def _brainstormer_factory(
         provider=provider,
         model=model,
         timeout_s=timeout_s,
+        memory_store=memory_store,
     )
 
 
@@ -172,6 +195,16 @@ def _gh_client_factory() -> Any:
     return GithubkitClient()
 
 
+def _memory_store_factory(repo_path: Path) -> Any:
+    """Construct the default memory store at ``.forge/memory.db``.
+
+    Tests monkeypatch this to inject a ``FakeMemoryStore``.
+    """
+    from forge_loop.memory import open_memory_store
+
+    return open_memory_store(repo_path)
+
+
 def _commands() -> CliCommands:
     return CliCommands(
         load_fn=load,
@@ -179,6 +212,7 @@ def _commands() -> CliCommands:
         operator_cfg_fn=_operator_cfg,
         brainstormer_factory=_brainstormer_factory,
         gh_client_factory=_gh_client_factory,
+        memory_store_factory=_memory_store_factory,
         subprocess_module=subprocess,
     )
 

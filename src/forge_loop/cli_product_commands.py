@@ -20,6 +20,7 @@ class ProductCommandsMixin:
     load: Any
     brainstormer_factory: Any
     gh_client_factory: Any
+    memory_store_factory: Any
 
     def _cmd_brainstorm(self, args: SimpleNamespace) -> int:
         """`forge-loop brainstorm` — dry-run by default, files issues with --apply.
@@ -220,6 +221,91 @@ class ProductCommandsMixin:
                 source_report_hash=source_report_hash,
             )
 
+        # Memory is an *additional* sink mirroring the frontier ledger: each
+        # reject/accept verdict is persisted as a provenanced ``MemoryItem`` so
+        # future brainstorm runs do not re-litigate settled ground. The store is
+        # resolved from ``.forge/memory.db`` on the apply path only.
+        memory_store: Any | None = None
+        if args.apply and source_report_path is not None:
+            try:
+                memory_store = self.memory_store_factory(repo_path)
+            except Exception as exc:  # noqa: BLE001 — additive sink; never block filing
+                typer.echo(
+                    f"brainstorm: warning — memory store unavailable, "
+                    f"decisions not persisted to memory: {exc}",
+                    err=True,
+                )
+                memory_store = None
+
+        def _decision_memory(decision: FrontierDecision) -> Any:
+            from forge_loop.memory.models import (
+                REJECTED_PATH_TAG,
+                MemoryItem,
+                MemoryKind,
+                MemoryProvenance,
+                axis_tag,
+                derive_memory_id,
+            )
+
+            src = decision.source_report_hash or decision.source_report_path or "live"
+            evidence = tuple(
+                ref
+                for ref in (
+                    f"source_report_hash:{decision.source_report_hash}"
+                    if decision.source_report_hash
+                    else None,
+                    f"source_report_path:{decision.source_report_path}"
+                    if decision.source_report_path
+                    else None,
+                    f"issue:#{decision.issue_number}"
+                    if decision.issue_number is not None
+                    else None,
+                    f"duplicate_of:#{decision.duplicate_of_issue}"
+                    if decision.duplicate_of_issue is not None
+                    else None,
+                )
+                if ref
+            )
+            provenance = MemoryProvenance(
+                source_event=None,
+                authored_by="brainstorm-apply",
+                source_task_ref=f"brainstorm-apply:{src}",
+                confidence=1.0,
+                evidence_refs=evidence,
+            )
+            if decision.outcome is FrontierDecisionOutcome.REJECTED:
+                return MemoryItem(
+                    memory_id=derive_memory_id(decision.source_key, prefix="rejpath"),
+                    kind=MemoryKind.SEMANTIC,
+                    title=decision.proposal_title,
+                    body=f"[{decision.axis}] rejected: {decision.rationale}",
+                    tags=(REJECTED_PATH_TAG, axis_tag(decision.axis)),
+                    provenance=provenance,
+                )
+            return MemoryItem(
+                memory_id=derive_memory_id(decision.source_key, prefix="decision"),
+                kind=MemoryKind.SEMANTIC,
+                title=decision.proposal_title,
+                body=(
+                    f"[{decision.axis}] accepted and filed as "
+                    f"#{decision.issue_number}: {decision.rationale}"
+                ),
+                tags=(axis_tag(decision.axis), "frontier-decision"),
+                provenance=provenance,
+            )
+
+        def _persist_memory(decision: FrontierDecision) -> None:
+            if memory_store is None:
+                return
+            try:
+                memory_store.put(_decision_memory(decision))
+            except Exception as exc:  # noqa: BLE001 — additive sink; never block filing
+                typer.echo(
+                    f"brainstorm: warning — failed to persist decision memory "
+                    f"for {decision.proposal_title!r}: {exc}",
+                    err=True,
+                )
+
         dropped_count = 0
         if report_path_arg:
             try:
@@ -277,6 +363,7 @@ class ProductCommandsMixin:
                 ledger = FrontierDecisionLedger(repo_path / ".forge" / "frontier-decisions.yaml")
                 for decision in duplicate_decisions:
                     ledger.record(decision)
+                    _persist_memory(decision)
             typer.echo("brainstorm: no proposals — nothing to file.")
             return 0
 
@@ -291,6 +378,7 @@ class ProductCommandsMixin:
         if decision_ledger is not None:
             for decision in duplicate_decisions:
                 decision_ledger.record(decision)
+                _persist_memory(decision)
 
         def _render_epic_body(epic: ProposedEpic) -> str:
             parts = [epic.body.strip()] if epic.body else []
@@ -323,9 +411,9 @@ class ProductCommandsMixin:
                 epic_axis_to_number[epic.axis] = issue.number
                 succeeded.append((epic.title, issue.number))
                 if decision_ledger is not None:
-                    decision_ledger.record(
-                        _accepted_decision(epic, ProposalKind.EPIC, issue.number)
-                    )
+                    accepted = _accepted_decision(epic, ProposalKind.EPIC, issue.number)
+                    decision_ledger.record(accepted)
+                    _persist_memory(accepted)
             except Exception as exc:  # noqa: BLE001
                 failed.append((epic.title, str(exc)))
 
@@ -344,9 +432,9 @@ class ProductCommandsMixin:
                 )
                 succeeded.append((ticket.title, issue.number))
                 if decision_ledger is not None:
-                    decision_ledger.record(
-                        _accepted_decision(ticket, ProposalKind.TICKET, issue.number)
-                    )
+                    accepted = _accepted_decision(ticket, ProposalKind.TICKET, issue.number)
+                    decision_ledger.record(accepted)
+                    _persist_memory(accepted)
             except Exception as exc:  # noqa: BLE001
                 failed.append((ticket.title, str(exc)))
 
