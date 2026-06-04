@@ -1,4 +1,4 @@
-[← Limitations](./07-limitations.md) · [Index](./README.md)
+[← Limitations](./08-limitations.md) · [Index](./README.md)
 
 ---
 
@@ -32,7 +32,7 @@ forge-loop instantiates this principle as three coupled control surfaces:
   into an executable admission policy, which an agent-tended codebase
   requires because its own code is its next training example.
 
-Composed as ordered gates on a single tick (Section 6), these surfaces
+Composed as ordered gates on a single tick (Section 7), these surfaces
 deliver the property an ungoverned system cannot have: **bounded,
 non-decreasing value over an unbounded number of unsupervised actions** —
 bought with an upfront specification cost that amortizes while per-action
@@ -55,7 +55,7 @@ regime it targets.
 The forge-loop *product* competes in a crowded and fast-converging space;
 platform-native "assign an issue, get a PR" features may well absorb the
 dispatch loop. We are explicit about that, and about the artifact's own
-unevenness (Section 7).
+unevenness (Section 8).
 
 But the **idea** is more durable than the product. The proposition that
 autonomous agents should be governed by *machine-checkable value and
@@ -84,4 +84,4 @@ gates are the contribution. Everything else is plumbing.
 
 ---
 
-[← Limitations](./07-limitations.md) · [Index](./README.md)
+[← Limitations](./08-limitations.md) · [Index](./README.md)

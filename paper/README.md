@@ -40,14 +40,17 @@ design, built around three coupled control surfaces:
 3. **Code-quality imperatives as a control surface** — manifestos and a
    severity rubric that turn "good code" from a matter of taste into an
    executable admission policy (see
-   [Code-Quality Imperatives](./05-code-quality-imperatives.md)).
+   [Code-Quality Imperatives](./05-code-quality-imperatives.md)). Its active,
+   adversarial form is a standing hunt for AI code pathologies — reinvention,
+   non-reuse, convoluted logic, non-performant code, stale docs — named and
+   gated on every loop (see [The Slop Daemon](./06-hunting-sloppy-patterns.md)).
 
 We make the case that this triad is a *good tradeoff* — that the cost it
 imposes (operator effort to write specifications and rules upfront) buys
 the one property an autonomous system cannot otherwise have: **bounded,
 non-decreasing value over an unbounded number of unsupervised actions.** We
 also state, honestly, where the current implementation falls short of the
-thesis it embodies (see [Limitations & Threats to Validity](./07-limitations.md)).
+thesis it embodies (see [Limitations & Threats to Validity](./08-limitations.md)).
 
 ---
 
@@ -60,9 +63,10 @@ thesis it embodies (see [Limitations & Threats to Validity](./07-limitations.md)
 | 3 | [Product Articulation & Value Axes](./03-product-articulation-axes.md) | Making "is this worth doing?" machine-checkable. |
 | 4 | [Reinforcement Feedback Loops](./04-reinforcement-feedback-loops.md) | The critic gate and the bug→rule→gate ratchet. |
 | 5 | [Code-Quality Imperatives](./05-code-quality-imperatives.md) | Quality as an executable admission policy, not taste. |
-| 6 | [System Architecture: The Tick](./06-system-architecture.md) | How the three surfaces compose into one control loop. |
-| 7 | [Limitations & Threats to Validity](./07-limitations.md) | Where implementation diverges from thesis. |
-| 8 | [Conclusion](./08-conclusion.md) | The governance triad as the durable contribution. |
+| 6 | [The Slop Daemon](./06-hunting-sloppy-patterns.md) | Naming AI code pathologies and hunting them on every loop. |
+| 7 | [System Architecture: The Tick](./07-system-architecture.md) | How the three surfaces compose into one control loop. |
+| 8 | [Limitations & Threats to Validity](./08-limitations.md) | Where implementation diverges from thesis. |
+| 9 | [Conclusion](./09-conclusion.md) | The governance triad as the durable contribution. |
 
 ---
 

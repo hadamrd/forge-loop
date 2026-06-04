@@ -1,4 +1,4 @@
-[← System Architecture](./06-system-architecture.md) · [Index](./README.md) · [Next: Conclusion →](./08-conclusion.md)
+[← System Architecture](./07-system-architecture.md) · [Index](./README.md) · [Next: Conclusion →](./09-conclusion.md)
 
 ---
 
@@ -101,4 +101,4 @@ read as one.
 
 ---
 
-[← System Architecture](./06-system-architecture.md) · [Index](./README.md) · [Next: Conclusion →](./08-conclusion.md)
+[← System Architecture](./07-system-architecture.md) · [Index](./README.md) · [Next: Conclusion →](./09-conclusion.md)
