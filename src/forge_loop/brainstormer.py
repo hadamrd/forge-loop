@@ -413,11 +413,13 @@ class Brainstormer:
                 from forge_loop.gh_client import GithubkitClient
 
                 client = GithubkitClient()
-            except Exception:  # noqa: BLE001 — boundary; degrade gracefully
+            except Exception as exc:  # noqa: BLE001 — boundary; degrade gracefully
+                _log.warning("brainstormer_backlog_unavailable", error=str(exc))
                 return OpenBacklog()
         try:
             return list_open_backlog(client, self.owner, self.repo)
-        except Exception:  # noqa: BLE001 — boundary; degrade gracefully
+        except Exception as exc:  # noqa: BLE001 — boundary; degrade gracefully
+            _log.warning("brainstormer_backlog_unavailable", error=str(exc))
             return OpenBacklog()
 
     def _render_prompt(

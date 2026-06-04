@@ -613,6 +613,50 @@ def test_store_raising_on_list_rejected_paths_degrades_gracefully() -> None:
     assert [t.title for t in report.proposed_tickets] == ["survivor"]
 
 
+def test_scan_backlog_logs_warning_on_failure(monkeypatch) -> None:
+    """Parity sad-path: a gh_client that raises must degrade to an empty
+    backlog AND surface a ``_log.warning`` — matching the new memory-store
+    degrades in this feature, no longer swallowing silently."""
+    warnings: list[dict] = []
+
+    class _RecLogger:
+        def info(self, *a, **kw):
+            pass
+
+        def warning(self, event, **kw):
+            warnings.append({"event": event, **kw})
+
+        def error(self, *a, **kw):
+            pass
+
+        def debug(self, *a, **kw):
+            pass
+
+    class _ExplodingClient:
+        pass
+
+    from forge_loop import brainstormer as bs_mod
+    from forge_loop import gh_client as gh_mod
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("github unreachable")
+
+    monkeypatch.setattr(bs_mod, "_log", _RecLogger())
+    # _scan_backlog imports list_open_backlog locally, so patch the source module.
+    monkeypatch.setattr(gh_mod, "list_open_backlog", _boom)
+
+    bs = Brainstormer(
+        sdk_fn=_stub_sdk({"proposed_epics": [], "proposed_tickets": []}),
+        owner="acme",
+        repo="widgets",
+        gh_client=_ExplodingClient(),
+    )
+    backlog = bs._scan_backlog()
+    # Degrades to an empty backlog (no epics/tickets) without raising.
+    assert not getattr(backlog, "epics", []) and not getattr(backlog, "tickets", [])
+    assert any(w["event"] == "brainstormer_backlog_unavailable" for w in warnings)
+
+
 def test_no_store_behaves_identically_to_today() -> None:
     payload = {
         "proposed_epics": [],
