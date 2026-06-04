@@ -6,13 +6,12 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from dataclasses import dataclass
-
-from forge_loop.eventlog.guard import LoadBearingGuardError, guard_prune
+from forge_loop.eventlog.guard import guard_prune
 from forge_loop.eventlog.models import (
     EventEnvelope,
     EventId,
@@ -31,6 +30,7 @@ class CompactionResult:
     pruned: int
     preserved_load_bearing: int
     high_water_sequence: int
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (

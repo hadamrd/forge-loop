@@ -109,3 +109,54 @@ def test_boot_does_not_rotate_small_file(tmp_path: Path) -> None:
     # File unchanged, no archive.
     assert events.read_text() == '{"kind":"tick_start"}\n'
     assert not (tmp_path / "loop-runner-events.jsonl.1").exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #210: load-bearing guard at boot rotation
+# ---------------------------------------------------------------------------
+
+
+def _seed_big_cascade_with_decision(tmp_path: Path) -> Path:
+    """Threshold-tripping live file + full ring whose ``.3`` holds a decision."""
+    events = tmp_path / "loop-runner-events.jsonl"
+    events.write_bytes(b"q" * (10 * 1024 * 1024))
+    (tmp_path / "loop-runner-events.jsonl.1").write_text("a\n")
+    (tmp_path / "loop-runner-events.jsonl.2").write_text("b\n")
+    (tmp_path / "loop-runner-events.jsonl.3").write_text(
+        json.dumps({"kind": "decision.made", "choice": "x"}) + "\n"
+    )
+    return events
+
+
+def test_boot_rotation_preserves_load_bearing_decision(tmp_path: Path) -> None:
+    events = _seed_big_cascade_with_decision(tmp_path)
+
+    result = rotate_events_file_at_boot(events)
+
+    assert result is not None and result["rotated"] is True
+    assert result["preserved_load_bearing"] == 1
+    preserved = tmp_path / "loop-runner-events.jsonl.preserved"
+    kinds = [json.loads(line)["kind"] for line in preserved.read_text().splitlines()]
+    assert "decision.made" in kinds
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses mode bits")
+def test_boot_rotation_guard_failure_does_not_raise_through_boot(tmp_path: Path) -> None:
+    # Adversarial: the preserved-tier sidecar cannot be written (locked dir).
+    # The guard must swallow the OSError; boot must not raise and rotation
+    # telemetry is still produced.
+    events = _seed_big_cascade_with_decision(tmp_path)
+
+    # Make the directory read-only so the sidecar write (and rename) fail.
+    original_mode = tmp_path.stat().st_mode
+    os.chmod(tmp_path, stat.S_IRUSR | stat.S_IXUSR)  # r-x------
+    try:
+        result = rotate_events_file_at_boot(events)  # must NOT raise
+    finally:
+        os.chmod(tmp_path, original_mode)
+
+    assert result is not None
+    # Either rotation failed cleanly (telemetry) or preservation degraded to 0,
+    # but in no case did boot raise.
+    assert "preserved_load_bearing" in result
+    assert events.exists()

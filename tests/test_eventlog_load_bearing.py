@@ -84,7 +84,7 @@ class TestIsLoadBearingTable:
 
     def test_load_bearing_and_telemetry_sets_partition_the_enum(self) -> None:
         assert LOAD_BEARING_EVENT_KINDS.isdisjoint(TELEMETRY_EVENT_KINDS)
-        assert LOAD_BEARING_EVENT_KINDS | TELEMETRY_EVENT_KINDS == set(EventKind)
+        assert set(EventKind) == LOAD_BEARING_EVENT_KINDS | TELEMETRY_EVENT_KINDS
 
 
 class TestIsLoadBearingEdges:

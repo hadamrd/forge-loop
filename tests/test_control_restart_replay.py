@@ -263,3 +263,181 @@ class TestControlRestartReplayInvariants:
 
         assert projection.applied_sequences == (appended[1].sequence,)
         assert log.get_projection_cursor("control-boot") == original_cursor
+
+
+@dataclass
+class _GapTolerantProjection:
+    """Frontier+memory projection that tolerates pruned (non-contiguous) logs.
+
+    Issue #210: after compaction removes noise rows, ``since()`` yields gaps.
+    A genuine boot replay of the *surviving* (load-bearing) tail must still
+    reach the same frontier/memory state.
+    """
+
+    frontier_store: FrontierStore
+    memory_store: SqliteMemoryStore
+    cursor: ProjectionCursor = ProjectionCursor()
+
+    def apply(self, event: EventEnvelope) -> None:
+        if event.kind is EventKind.FRONTIER_ADVANCED:
+            self.frontier_store.save(
+                FrontierCursor(
+                    product_goal=event.payload["product_goal"],
+                    current_problem=event.payload["current_problem"],
+                    next_expansion=event.payload["next_expansion"],
+                    why_now=event.payload["why_now"],
+                    active_decisions=tuple(event.payload.get("active_decisions", ())),
+                )
+            )
+        elif event.kind is EventKind.MEMORY_PROMOTED:
+            self.memory_store.put(
+                MemoryItem(
+                    memory_id=event.payload["memory_id"],
+                    kind=MemoryKind(event.payload["kind"]),
+                    title=event.payload["title"],
+                    body=event.payload["body"],
+                    tags=tuple(event.payload.get("tags", ())),
+                    provenance=MemoryProvenance(
+                        source_event=event.ref,
+                        authored_by="boot-equivalence-test",
+                        source_task_ref=event.task_id,
+                        confidence=event.payload["confidence"],
+                    ),
+                )
+            )
+        # Noise (tick/observation/heartbeat) is intentionally ignored.
+        self.cursor = ProjectionCursor(sequence=event.sequence)
+
+
+class TestCompactionBootEquivalence:
+    """The headline invariant: compaction does not change boot reconstruction."""
+
+    def _seed_log_with_noise(self, log: SqliteEventLog) -> None:
+        log.append(
+            EventKind.FRONTIER_ADVANCED,
+            {
+                "product_goal": "ship resumable loop",
+                "current_problem": "early problem",
+                "next_expansion": "x",
+                "why_now": "y",
+                "active_decisions": ["decide once"],
+            },
+            idempotency_key="f1",
+        )
+        log.append(EventKind.TICK_STARTED, {"tick": 1}, idempotency_key="t1")
+        log.append(
+            EventKind.MEMORY_PROMOTED,
+            {
+                "memory_id": "mem-keep",
+                "kind": MemoryKind.SEMANTIC.value,
+                "title": "keep me",
+                "body": "load-bearing memory",
+                "tags": [REJECTED_PATH_TAG],
+                "confidence": 0.9,
+            },
+            idempotency_key="m1",
+        )
+        log.append(EventKind.WORKER_OBSERVATION, {"issue": 1}, idempotency_key="o1")
+        log.append(EventKind.TASK_HEARTBEAT, {"issue": 1}, idempotency_key="h1")
+        # Final event is load-bearing → also the high-water mark.
+        log.append(
+            EventKind.FRONTIER_ADVANCED,
+            {
+                "product_goal": "ship resumable loop",
+                "current_problem": "final problem",
+                "next_expansion": "close the learning loop",
+                "why_now": "amnesia must be impossible",
+                "active_decisions": ["project from durable events only"],
+            },
+            idempotency_key="f2",
+        )
+
+    def _boot(
+        self, eventlog_path: Path, frontier_path: Path, memory_path: Path, task_path: Path
+    ) -> object:
+        return assemble_boot_context(
+            BootSources(
+                frontier_store=FrontierStore(frontier_path),
+                event_log=SqliteEventLog(eventlog_path),
+                memory_store=SqliteMemoryStore(memory_path),
+                task_store=SqliteTaskSagaStore(task_path),
+            )
+        )
+
+    def test_boot_context_identical_before_and_after_compaction(self, tmp_path: Path) -> None:
+        eventlog_path = tmp_path / "events.db"
+        frontier_path = tmp_path / "frontier.yaml"
+        memory_path = tmp_path / "memory.db"
+        task_path = tmp_path / "tasks.db"
+
+        log = SqliteEventLog(eventlog_path)
+        self._seed_log_with_noise(log)
+
+        # Independent saga store, written directly as the dispatcher does.
+        task_store = SqliteTaskSagaStore(task_path)
+        task_store.put(
+            TaskSaga(
+                task_id="task-210",
+                saga_id="saga-210",
+                state=TaskState.RUNNING,
+                issue=210,
+                branch="loop/210",
+                worktree="/tmp/wt-loop-210",
+            )
+        )
+
+        # Derive frontier/memory by replaying the FULL log; record a cursor.
+        replay_projection(
+            SqliteEventLog(eventlog_path),
+            "control-boot",
+            _GapTolerantProjection(FrontierStore(frontier_path), SqliteMemoryStore(memory_path)),
+        )
+
+        boot_before = self._boot(eventlog_path, frontier_path, memory_path, task_path)
+        summary_before = boot_before.summary()  # type: ignore[attr-defined]
+        cursors_before = {
+            name: (status.sequence, status.lag)
+            for name, status in boot_before.projection_cursors.items()  # type: ignore[attr-defined]
+        }
+
+        # --- Force a compaction that drops the noise rows. ---
+        result = SqliteEventLog(eventlog_path).compact_noise(emit_marker=False)
+        assert result.pruned == 3  # tick_started, worker_observation, task_heartbeat
+
+        # Re-derive frontier/memory from the PRUNED log into FRESH stores; the
+        # surviving load-bearing tail must reconstruct identical state.
+        frontier_after = tmp_path / "frontier_after.yaml"
+        memory_after = tmp_path / "memory_after.db"
+        replay_projection(
+            SqliteEventLog(eventlog_path),
+            "control-boot-after",
+            _GapTolerantProjection(FrontierStore(frontier_after), SqliteMemoryStore(memory_after)),
+        )
+
+        boot_after = self._boot(eventlog_path, frontier_after, memory_after, task_path)
+        summary_after = boot_after.summary()  # type: ignore[attr-defined]
+        cursors_after = {
+            name: (status.sequence, status.lag)
+            for name, status in boot_after.projection_cursors.items()  # type: ignore[attr-defined]
+        }
+
+        # The boot summaries reference different projection-cursor NAMES only
+        # because the test uses fresh stores; normalise that out and compare
+        # the load-bearing reconstruction.
+        assert boot_after.frontier == boot_before.frontier  # type: ignore[attr-defined]
+        assert boot_after.active_memory_ids == boot_before.active_memory_ids  # type: ignore[attr-defined]
+        assert boot_after.rejected_path_memory_ids == boot_before.rejected_path_memory_ids  # type: ignore[attr-defined]
+        assert boot_after.in_flight_task_ids == boot_before.in_flight_task_ids  # type: ignore[attr-defined]
+        assert boot_after.in_flight_saga_ids == boot_before.in_flight_saga_ids  # type: ignore[attr-defined]
+        # High-water sequence is invariant across compaction.
+        assert boot_after.latest_event_sequence == boot_before.latest_event_sequence  # type: ignore[attr-defined]
+        # Both cursors are caught up (lag 0) at the same high-water sequence.
+        assert {seq for seq, _ in cursors_before.values()} == {
+            seq for seq, _ in cursors_after.values()
+        }
+        assert all(lag == 0 for _, lag in cursors_before.values())
+        assert all(lag == 0 for _, lag in cursors_after.values())
+        # Sanity: active memory genuinely survived the prune.
+        assert boot_after.active_memory_ids == ("mem-keep",)  # type: ignore[attr-defined]
+        # Frontier/memory boot lines are byte-identical pre/post.
+        assert summary_before.splitlines()[0] == summary_after.splitlines()[0]
