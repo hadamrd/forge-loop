@@ -13,6 +13,7 @@ backward-compat parsers and never touch the SDK call path.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -294,6 +295,28 @@ def _clean_sdk_env() -> dict[str, str]:
     return env
 
 
+async def _aclose_stream(stream: Any) -> None:
+    """Close the SDK message stream so its subprocess transport is torn down
+    *before* the event loop closes.
+
+    The SDK ``query()`` async-generator owns the worker's claude subprocess. If
+    it is abandoned — e.g. the worker is cancelled at its deadline — the
+    transport's ``__del__`` later calls ``call_soon`` on the already-closed loop
+    and prints ``RuntimeError: Event loop is closed`` (and the subprocess can be
+    orphaned). Closing on every exit path (normal, error, cancellation) prevents
+    both. Shielded so the close survives the ambient timeout cancellation;
+    best-effort so a stream without ``aclose`` (or one that errors closing) never
+    masks the real outcome.
+    """
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    import anyio
+
+    with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
+        await aclose()
+
+
 async def run_sdk_session(
     prompt: str,
     *,
@@ -478,8 +501,10 @@ async def run_sdk_session(
     else:
         options = _instantiate()
 
+    # Hoist the stream to a name so it can be closed on EVERY exit path below.
+    stream = query_fn(prompt=prompt, options=options)
     try:
-        async for message in query_fn(prompt=prompt, options=options):
+        async for message in stream:
             if isinstance(message, SystemMessage):
                 if getattr(message, "subtype", "") == "init":
                     init_data = dict(getattr(message, "data", {}) or {})
@@ -613,6 +638,11 @@ async def run_sdk_session(
                 retry_hint=hint,
             )
         )
+    finally:
+        # Always tear the SDK stream (and its subprocess) down before the loop
+        # closes — see _aclose_stream. This is the fix for the overnight
+        # "Event loop is closed" teardown noise from deadline-cancelled workers.
+        await _aclose_stream(stream)
 
     duration = time.time() - started
     pr_url, status = _extract_pr_status(final_text)
