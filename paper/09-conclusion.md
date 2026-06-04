@@ -2,9 +2,9 @@
 
 ---
 
-# 8. Conclusion
+# 9. Conclusion
 
-## 8.1 The argument, restated
+## 9.1 The argument, restated
 
 We began with an inversion: in an era where language models can reliably
 generate correct code, the hard problem of autonomous software development
@@ -38,7 +38,7 @@ non-decreasing value over an unbounded number of unsupervised actions** —
 bought with an upfront specification cost that amortizes while per-action
 review cost never does (Section 2).
 
-## 8.2 Why the tradeoff is favorable
+## 9.2 Why the tradeoff is favorable
 
 The economic core of the argument is an asymmetry. Specification is a fixed
 cost that an unbounded number of future actions draw against; per-PR review
@@ -50,7 +50,7 @@ sense in which the architecture is "scientifically a good tradeoff": not
 that it is free, but that its cost structure is the right shape for the
 regime it targets.
 
-## 8.3 What is durable here
+## 9.3 What is durable here
 
 The forge-loop *product* competes in a crowded and fast-converging space;
 platform-native "assign an issue, get a PR" features may well absorb the
@@ -68,7 +68,7 @@ on the thing that changes fastest (the model); they depend on the thing
 that changes slowest (what the operator actually values and refuses to
 ship).
 
-## 8.4 Closing
+## 9.4 Closing
 
 If there is a single sentence to carry away, it is this:
 
