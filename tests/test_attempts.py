@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from forge_loop import attempts as _attempts
 from forge_loop.attempts import (
     MARKER,
     AttemptRecord,
     classify_skip,
     compute_fingerprint,
     cooldown_from_env,
+    fetch_issue_attempts,
     parse_blocking_comments,
     parse_history,
     parse_history_strict,
@@ -37,12 +39,22 @@ def test_render_includes_marker_and_payload() -> None:
 
 
 def test_parse_history_extracts_attempts_in_order() -> None:
-    rec1 = AttemptRecord(ts="2026-05-26T10:00:00Z", status="failed",
-                         pr_url=None, duration_s=42.0, note="brief unclear",
-                         event_count=1)
-    rec2 = AttemptRecord(ts="2026-05-26T11:00:00Z", status="merged",
-                         pr_url="https://x/p/1", duration_s=58.0, note="",
-                         event_count=2)
+    rec1 = AttemptRecord(
+        ts="2026-05-26T10:00:00Z",
+        status="failed",
+        pr_url=None,
+        duration_s=42.0,
+        note="brief unclear",
+        event_count=1,
+    )
+    rec2 = AttemptRecord(
+        ts="2026-05-26T11:00:00Z",
+        status="merged",
+        pr_url="https://x/p/1",
+        duration_s=58.0,
+        note="",
+        event_count=2,
+    )
     comments = [render_comment(rec1), "some other comment without marker", render_comment(rec2)]
     history = parse_history(comments)
     assert len(history) == 2
@@ -80,8 +92,9 @@ def test_parse_history_skips_malformed_json_blocks() -> None:
 
 
 def test_render_skips_pr_line_when_no_pr() -> None:
-    rec = AttemptRecord(ts="t", status="failed", pr_url=None,
-                        duration_s=10.0, note="", event_count=0)
+    rec = AttemptRecord(
+        ts="t", status="failed", pr_url=None, duration_s=10.0, note="", event_count=0
+    )
     body = render_comment(rec)
     assert "PR:" not in body
 
@@ -89,6 +102,7 @@ def test_render_skips_pr_line_when_no_pr() -> None:
 # ---------------------------------------------------------------------------
 # Fingerprint
 # ---------------------------------------------------------------------------
+
 
 def test_fingerprint_stable_for_identical_inputs() -> None:
     fp1 = compute_fingerprint(42, "body", "tmpl-hash")
@@ -117,9 +131,15 @@ def test_fingerprint_changes_when_issue_changes() -> None:
 
 
 def test_record_persists_fingerprint_in_json_block() -> None:
-    rec = AttemptRecord(ts="2026-05-26T10:00:00Z", status="open",
-                        pr_url="https://x/p/9", duration_s=30.0, note="",
-                        event_count=0, brief_fingerprint="deadbeef" * 8)
+    rec = AttemptRecord(
+        ts="2026-05-26T10:00:00Z",
+        status="open",
+        pr_url="https://x/p/9",
+        duration_s=30.0,
+        note="",
+        event_count=0,
+        brief_fingerprint="deadbeef" * 8,
+    )
     body = render_comment(rec)
     parsed = parse_history([body])
     assert parsed[0]["brief_fingerprint"] == "deadbeef" * 8
@@ -134,8 +154,9 @@ OTHER_FP = "b" * 64
 NOW = datetime(2026, 5, 26, 12, 0, 0, tzinfo=UTC)
 
 
-def _rec(status: str, *, ts: datetime, fp: str = FP,
-         pr_url: str | None = None) -> dict[str, object]:
+def _rec(
+    status: str, *, ts: datetime, fp: str = FP, pr_url: str | None = None
+) -> dict[str, object]:
     return {
         "ts": ts.isoformat(timespec="seconds"),
         "status": status,
@@ -145,8 +166,7 @@ def _rec(status: str, *, ts: datetime, fp: str = FP,
 
 
 def test_skip_in_flight_fires_when_open_pr_for_same_fingerprint() -> None:
-    history = [_rec("open", ts=NOW - timedelta(minutes=5),
-                    pr_url="https://github.com/o/r/pull/7")]
+    history = [_rec("open", ts=NOW - timedelta(minutes=5), pr_url="https://github.com/o/r/pull/7")]
     d = classify_skip(history, FP, cooldown_s=3600, now=NOW)
     assert d.kind == "in_flight"
     assert d.pr_url == "https://github.com/o/r/pull/7"
@@ -166,8 +186,7 @@ def test_skip_cooldown_releases_after_window() -> None:
 
 
 def test_skip_ignores_attempts_with_different_fingerprint() -> None:
-    history = [_rec("open", ts=NOW - timedelta(minutes=1), fp=OTHER_FP,
-                    pr_url="https://x/p/1")]
+    history = [_rec("open", ts=NOW - timedelta(minutes=1), fp=OTHER_FP, pr_url="https://x/p/1")]
     d = classify_skip(history, FP, cooldown_s=3600, now=NOW)
     assert d.kind == ""
 
@@ -177,8 +196,7 @@ def test_skip_uses_latest_matching_attempt_not_oldest() -> None:
     # should classify based on the most recent matching record.
     history = [
         _rec("failed", ts=NOW - timedelta(hours=5)),
-        _rec("open", ts=NOW - timedelta(minutes=2),
-             pr_url="https://x/p/9"),
+        _rec("open", ts=NOW - timedelta(minutes=2), pr_url="https://x/p/9"),
     ]
     d = classify_skip(history, FP, cooldown_s=3600, now=NOW)
     assert d.kind == "in_flight"
@@ -210,17 +228,91 @@ def test_skip_timeout_treated_as_failure_for_cooldown() -> None:
 # Corruption surface
 # ---------------------------------------------------------------------------
 
+
 def test_parse_history_strict_counts_corrupt_rows() -> None:
-    good = render_comment(AttemptRecord(
-        ts="2026-05-26T10:00:00Z", status="merged",
-        pr_url="https://x/p/1", duration_s=1.0, note="",
-        event_count=0, brief_fingerprint=FP,
-    ))
+    good = render_comment(
+        AttemptRecord(
+            ts="2026-05-26T10:00:00Z",
+            status="merged",
+            pr_url="https://x/p/1",
+            duration_s=1.0,
+            note="",
+            event_count=0,
+            brief_fingerprint=FP,
+        )
+    )
     bad = MARKER + "\n```json\n{not valid json\n```"
     no_block = MARKER + " marker but no fenced block at all"
     records, corrupt = parse_history_strict([good, bad, no_block, "untagged"])
     assert len(records) == 1
     assert corrupt == 2
+
+
+# ---------------------------------------------------------------------------
+# fetch_issue_attempts: single fetch feeds both parsers (issue #226)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_issue_attempts_fetches_payload_once(monkeypatch) -> None:
+    """The comment payload is fetched ONCE and fed to both the history parser
+    and the blocking-comment parser — not two ``gh issue view`` round-trips."""
+    rec = AttemptRecord(
+        ts="2026-05-26T10:00:00Z",
+        status="failed",
+        pr_url=None,
+        duration_s=1.0,
+        note="brief unclear",
+        event_count=1,
+        brief_fingerprint="f" * 64,
+    )
+    bodies = [
+        render_comment(rec),
+        "Critic found AR5 incomplete.\nRemaining blocker: add a native test.",
+        "ordinary chatter",
+    ]
+    calls: list[tuple[int, str | None]] = []
+
+    def fake_bodies(issue: int, repo: str | None = None) -> list[str]:
+        calls.append((issue, repo))
+        return bodies
+
+    monkeypatch.setattr(_attempts._gh, "issue_comment_bodies", fake_bodies)
+
+    view = fetch_issue_attempts(99, repo="o/r")
+
+    # Exactly one fetch — the core acceptance criterion of #226.
+    assert calls == [(99, "o/r")]
+    # Both views derived from that single payload.
+    assert len(view.history) == 1
+    assert view.history[0]["status"] == "failed"
+    assert view.corrupt == 0
+    assert len(view.blocking_comments) == 1
+    assert "Remaining blocker" in view.blocking_comments[0]
+
+
+def test_fetch_issue_attempts_requires_repo() -> None:
+    """Adversarial: missing repo raises rather than silently shelling out."""
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        fetch_issue_attempts(1, repo=None)
+
+
+def test_fetch_issue_attempts_empty_payload(monkeypatch) -> None:
+    """Adversarial: empty comment list ⇒ empty views, still one fetch."""
+    calls: list[int] = []
+
+    def fake_bodies(issue: int, repo: str | None = None) -> list[str]:
+        calls.append(issue)
+        return []
+
+    monkeypatch.setattr(_attempts._gh, "issue_comment_bodies", fake_bodies)
+
+    view = fetch_issue_attempts(7, repo="o/r")
+    assert view.history == []
+    assert view.corrupt == 0
+    assert view.blocking_comments == []
+    assert calls == [7]
 
 
 def test_cooldown_from_env_default(monkeypatch) -> None:

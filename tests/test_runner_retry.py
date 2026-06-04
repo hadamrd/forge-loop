@@ -42,6 +42,7 @@ from forge_loop.worker import WorkerOutcome
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_cfg(tmp_path: Path) -> Config:
     return Config(
         repo=tmp_path,
@@ -78,6 +79,7 @@ def _kinds(events: list[dict[str, Any]]) -> list[str]:
 
 class _State:
     """Mutable shared state for fakes — history per-issue + dispatch count."""
+
     def __init__(self) -> None:
         self.history: dict[int, list[dict[str, Any]]] = {}
         self.corrupt: dict[int, int] = {}
@@ -116,44 +118,57 @@ def fake_world(monkeypatch, tmp_path: Path):
     def fake_top_issues(label: str, limit: int, repo: str | None = None):
         return [dict(issue)]
 
-    def fake_fetch_history_strict(num: int, repo: str | None = None):
-        return list(state.history.get(num, [])), state.corrupt.get(num, 0)
+    def fake_fetch_issue_attempts(num: int, repo: str | None = None, **_kw):
+        # Issue #226: the tick now fetches the comment payload once and derives
+        # both views. The fake mirrors that single-fetch contract.
+        return _attempts.IssueAttempts(
+            history=list(state.history.get(num, [])),
+            corrupt=state.corrupt.get(num, 0),
+            blocking_comments=list(state.blocking_comments.get(num, [])),
+        )
 
-    def fake_fetch_blocking_comments(num: int, repo: str | None = None):
-        return list(state.blocking_comments.get(num, []))
-
-    def fake_record(num: int, *, status, pr_url, duration_s, note, event_count,
-                    repo=None, brief_fingerprint=""):
-        state.history.setdefault(num, []).append({
-            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-            "status": status,
-            "pr_url": pr_url,
-            "duration_s": duration_s,
-            "note": note,
-            "event_count": event_count,
-            "brief_fingerprint": brief_fingerprint,
-        })
+    def fake_record(
+        num: int, *, status, pr_url, duration_s, note, event_count, repo=None, brief_fingerprint=""
+    ):
+        state.history.setdefault(num, []).append(
+            {
+                "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+                "status": status,
+                "pr_url": pr_url,
+                "duration_s": duration_s,
+                "note": note,
+                "event_count": event_count,
+                "brief_fingerprint": brief_fingerprint,
+            }
+        )
 
     def fake_run_worker(issue_, repo, logs_dir, timeout_s, **kwargs):
         from forge_loop.worker import WorkerOutcome
+
         state.dispatched.append(issue_["number"])
         state.worker_kwargs.append(kwargs)
         return WorkerOutcome(
-            issue=issue_["number"], title=issue_["title"],
-            pr_url=state.scripted_pr, status=state.scripted_status,
-            duration_s=1.0, stdout_tail="",
-            error=state.scripted_error, events=[],
+            issue=issue_["number"],
+            title=issue_["title"],
+            pr_url=state.scripted_pr,
+            status=state.scripted_status,
+            duration_s=1.0,
+            stdout_tail="",
+            error=state.scripted_error,
+            events=[],
         )
 
     def fake_unlabel(num: int, label: str, repo: str | None = None) -> None:
         state.unlabeled.append((num, label, repo))
 
-    # Patch points: top_issues + attempts.fetch_history_strict +
+    # Patch points: top_issues + attempts.fetch_issue_attempts +
     # attempts.record + ThreadPoolExecutor's task (run_worker is captured by
     # name in runner via `from forge_loop.worker import run_worker`).
+    # The tick loop only calls fetch_issue_attempts now (issue #226 single
+    # fetch), so the legacy fetch_history_strict / fetch_blocking_comments
+    # seams are intentionally not patched here.
     monkeypatch.setattr(_runner, "top_issues", fake_top_issues)
-    monkeypatch.setattr(_attempts, "fetch_history_strict", fake_fetch_history_strict)
-    monkeypatch.setattr(_attempts, "fetch_blocking_comments", fake_fetch_blocking_comments)
+    monkeypatch.setattr(_attempts, "fetch_issue_attempts", fake_fetch_issue_attempts)
     monkeypatch.setattr(_attempts, "record", fake_record)
     monkeypatch.setattr(_runner, "run_worker", fake_run_worker)
     monkeypatch.setattr(_runner, "unlabel", fake_unlabel)
@@ -163,6 +178,7 @@ def fake_world(monkeypatch, tmp_path: Path):
         "enable_pr_auto_merge",
         lambda pr, repo=None: state.automerge_calls.append((pr, repo)) is None,
     )
+
     # Issue #213 — orphaned-PR adoption scan fakes. By default no open PRs, so
     # the scan is a no-op for legacy tests. Adoption tests populate
     # ``state.open_prs`` / ``state.issue_states`` to exercise the path.
@@ -219,6 +235,7 @@ def fake_world(monkeypatch, tmp_path: Path):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 def test_first_tick_dispatches_and_records_fingerprint(fake_world) -> None:
     state, cfg, _ = fake_world
@@ -327,14 +344,18 @@ def test_in_flight_skip_emits_pr_url(fake_world) -> None:
     state, cfg, issue = fake_world
     # Seed history with an "open" attempt that matches today's fingerprint.
     fp = _attempts.compute_fingerprint(
-        issue["number"], issue["body"], _worker.brief_template_hash(),
+        issue["number"],
+        issue["body"],
+        _worker.brief_template_hash(),
     )
-    state.history[99] = [{
-        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-        "status": "open",
-        "pr_url": "https://github.com/o/r/pull/777",
-        "brief_fingerprint": fp,
-    }]
+    state.history[99] = [
+        {
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+            "status": "open",
+            "pr_url": "https://github.com/o/r/pull/777",
+            "brief_fingerprint": fp,
+        }
+    ]
     _runner._tick(cfg, tick=1)
     assert state.dispatched == []
     events = _read_events(cfg)
@@ -357,12 +378,14 @@ def test_body_change_invalidates_in_flight_skip(fake_world) -> None:
     """
     state, cfg, _ = fake_world
     # Stale fingerprint that no longer matches the issue body.
-    state.history[99] = [{
-        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-        "status": "open",
-        "pr_url": "https://x/p/1",
-        "brief_fingerprint": "stale" * 13,  # 65 chars, distinct from current
-    }]
+    state.history[99] = [
+        {
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+            "status": "open",
+            "pr_url": "https://x/p/1",
+            "brief_fingerprint": "stale" * 13,  # 65 chars, distinct from current
+        }
+    ]
     _runner._tick(cfg, tick=1)
     assert state.dispatched == [99]
 
@@ -371,23 +394,27 @@ def test_ready_issue_existing_open_pr_repairs_instead_of_redispatch(
     fake_world, monkeypatch
 ) -> None:
     state, cfg, _ = fake_world
-    state.history[99] = [{
-        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-        "status": "open",
-        "pr_url": "https://github.com/o/r/pull/777",
-        "brief_fingerprint": "stale",
-    }]
+    state.history[99] = [
+        {
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+            "status": "open",
+            "pr_url": "https://github.com/o/r/pull/777",
+            "brief_fingerprint": "stale",
+        }
+    ]
     repair_calls: list[tuple[int, int, str]] = []
     pr_url = "https://github.com/o/r/pull/777"
 
     monkeypatch.setattr(
         _tick_mod,
         "prs_by_label",
-        lambda *_a, **_k: [{
-            "number": 777,
-            "url": pr_url,
-            "headRefName": "loop/99-retarget-existing-pr",
-        }],
+        lambda *_a, **_k: [
+            {
+                "number": 777,
+                "url": pr_url,
+                "headRefName": "loop/99-retarget-existing-pr",
+            }
+        ],
     )
     monkeypatch.setattr(_tick_mod, "pr_review_context", lambda *_a, **_k: "review context")
     monkeypatch.setattr(_gh, "unresolved_review_threads", lambda *_a, **_k: [])
@@ -420,14 +447,18 @@ def test_blocking_comment_invalidates_cooldown_and_reaches_worker(fake_world, mo
     state, cfg, issue = fake_world
     monkeypatch.setenv("LOOP_RETRY_COOLDOWN_S", "3600")
     stale_fp = _attempts.compute_fingerprint(
-        issue["number"], issue["body"], _worker.brief_template_hash(),
+        issue["number"],
+        issue["body"],
+        _worker.brief_template_hash(),
     )
-    state.history[99] = [{
-        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-        "status": "no_pr",
-        "pr_url": None,
-        "brief_fingerprint": stale_fp,
-    }]
+    state.history[99] = [
+        {
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+            "status": "no_pr",
+            "pr_url": None,
+            "brief_fingerprint": stale_fp,
+        }
+    ]
     state.blocking_comments[99] = [
         "Post-merge critic found this incomplete.\n"
         "Required repair: add the exact native proof, not an adjacent edge test."
@@ -444,14 +475,18 @@ def test_force_marker_bypasses_both_guards(fake_world) -> None:
     state, cfg, issue = fake_world
     # Seed an in-flight attempt that would normally skip.
     fp = _attempts.compute_fingerprint(
-        issue["number"], issue["body"], _worker.brief_template_hash(),
+        issue["number"],
+        issue["body"],
+        _worker.brief_template_hash(),
     )
-    state.history[99] = [{
-        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-        "status": "open",
-        "pr_url": "https://x/p/1",
-        "brief_fingerprint": fp,
-    }]
+    state.history[99] = [
+        {
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+            "status": "open",
+            "pr_url": "https://x/p/1",
+            "brief_fingerprint": fp,
+        }
+    ]
     # Write the force-retry marker (what `forge-loop retry --force` does).
     marker = _runner._force_retry_file(cfg)
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -466,6 +501,7 @@ def test_force_marker_bypasses_both_guards(fake_world) -> None:
 # ---------------------------------------------------------------------------
 # Issue #213 — orphaned clean PR adoption (integration)
 # ---------------------------------------------------------------------------
+
 
 def _adoptable_pr(num: int, *, labels=None, merge_state="CLEAN") -> dict[str, Any]:
     return {
@@ -545,13 +581,15 @@ def test_orphan_adoption_skips_closed_issue(fake_world, monkeypatch) -> None:
 def test_orphan_adoption_ignores_human_pr(fake_world, monkeypatch) -> None:
     state, cfg, _ = fake_world
     cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
-    state.open_prs = [{
-        "number": 300,
-        "url": "https://github.com/o/r/pull/300",
-        "headRefName": "feature/manual-fix",
-        "labels": [],
-        "mergeStateStatus": "CLEAN",
-    }]
+    state.open_prs = [
+        {
+            "number": 300,
+            "url": "https://github.com/o/r/pull/300",
+            "headRefName": "feature/manual-fix",
+            "labels": [],
+            "mergeStateStatus": "CLEAN",
+        }
+    ]
     monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", state.fake_critic)
 
     _runner._tick(cfg, tick=1)
@@ -574,7 +612,8 @@ def test_orphan_adoption_unresolved_threads_blocks_automerge(fake_world, monkeyp
     assert state.critic_runs == [pr_url]  # critic still runs
     assert state.automerge_calls == []  # but auto-merge is NOT enabled
     skip = [
-        e for e in _read_events(cfg)
+        e
+        for e in _read_events(cfg)
         if e["kind"] == "orphan_pr_skipped" and e.get("reason") == "unresolved_review_threads"
     ]
     assert skip

@@ -123,8 +123,11 @@ def record(
     """Append an attempt record as a GH comment on the issue."""
     rec = AttemptRecord(
         ts=datetime.now(UTC).isoformat(timespec="seconds"),
-        status=status, pr_url=pr_url, duration_s=duration_s,
-        note=note, event_count=event_count,
+        status=status,
+        pr_url=pr_url,
+        duration_s=duration_s,
+        note=note,
+        event_count=event_count,
         brief_fingerprint=brief_fingerprint,
     )
     _gh.comment(issue, render_comment(rec), repo=repo)
@@ -200,24 +203,16 @@ def fetch_history_strict(
     issue: int,
     repo: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Like ``fetch_history`` but also returns the count of corrupt rows."""
-    import subprocess
+    """Like ``fetch_history`` but also returns the count of corrupt rows.
 
+    Reuses :func:`forge_loop.gh.issue_comment_bodies` for the single
+    ``gh issue view --comments`` round-trip instead of shelling out to an
+    identical subprocess of its own (issue #226 — the inline duplicate was a
+    second copy of the same fetch).
+    """
     if not repo:
         raise RuntimeError("fetch_history requires repo='owner/name'")
-    r = subprocess.run(
-        ["gh", "issue", "view", str(issue), "--repo", repo, "--comments",
-         "--json", "comments"],
-        capture_output=True, text=True, check=False,
-    )
-    if r.returncode != 0:
-        return [], 0
-    try:
-        payload = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return [], 0
-    bodies = [c.get("body", "") for c in payload.get("comments", [])]
-    return parse_history_strict(bodies)
+    return parse_history_strict(_gh.issue_comment_bodies(issue, repo=repo))
 
 
 def fetch_blocking_comments(issue: int, repo: str | None = None) -> list[str]:
@@ -227,9 +222,49 @@ def fetch_blocking_comments(issue: int, repo: str | None = None) -> list[str]:
     return parse_blocking_comments(_gh.issue_comment_bodies(issue, repo=repo))
 
 
+@dataclass
+class IssueAttempts:
+    """The full per-issue comment-derived view, computed from ONE fetch.
+
+    ``fetch_history_strict`` and ``fetch_blocking_comments`` each shell the
+    identical ``gh issue view <n> --comments`` subprocess; calling both per
+    issue per tick fetched the same payload twice (issue #226). This bundles
+    the single fetch + both parses so the tick loop pays one round-trip.
+    """
+
+    history: list[dict[str, Any]]
+    corrupt: int
+    blocking_comments: list[str]
+
+
+def fetch_issue_attempts(
+    issue: int,
+    repo: str | None = None,
+    *,
+    blocking_limit: int = 3,
+    blocking_max_chars: int = 4000,
+) -> IssueAttempts:
+    """Fetch an issue's comment payload ONCE and derive both views from it.
+
+    Collapses the two identical ``gh issue view --comments`` round-trips that
+    ``fetch_history_strict`` + ``fetch_blocking_comments`` made into a single
+    fetch per issue per tick. The parse functions (``parse_history_strict`` /
+    ``parse_blocking_comments``) are pure and reused unchanged, so the derived
+    history / corrupt-count / blocking-comment results are byte-identical to
+    calling the two fetchers separately.
+    """
+    if not repo:
+        raise RuntimeError("fetch_issue_attempts requires repo='owner/name'")
+    bodies = _gh.issue_comment_bodies(issue, repo=repo)
+    history, corrupt = parse_history_strict(bodies)
+    blocking = parse_blocking_comments(bodies, limit=blocking_limit, max_chars=blocking_max_chars)
+    return IssueAttempts(history=history, corrupt=corrupt, blocking_comments=blocking)
+
+
 # ---------------------------------------------------------------------------
 # Skip classification
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SkipDecision:
@@ -240,6 +275,7 @@ class SkipDecision:
         - ``"in_flight"``  — latest matching attempt is still ``open``
         - ``"cooldown"``   — latest matching attempt ``failed`` within window
     """
+
     kind: str = ""
     pr_url: str | None = None
     cooldown_remaining_s: int = 0
@@ -321,6 +357,7 @@ __all__ = [
     "AttemptRecord",
     "MARKER",
     "DEFAULT_RETRY_COOLDOWN_S",
+    "IssueAttempts",
     "SkipDecision",
     "classify_skip",
     "compute_fingerprint",
@@ -328,6 +365,7 @@ __all__ = [
     "fetch_history",
     "fetch_history_strict",
     "fetch_blocking_comments",
+    "fetch_issue_attempts",
     "parse_blocking_comments",
     "parse_history",
     "parse_history_strict",
