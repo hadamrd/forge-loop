@@ -175,6 +175,27 @@ def pr_precommit_context(pr_url: str, cwd: Path) -> tuple[str, str]:
     return body, "\n".join(commit_chunks)
 
 
+def pr_diff(pr_url: str, cwd: Path) -> str:
+    """Return the unified diff for a PR. Empty string on failure.
+
+    Mirrors the swallow-and-return-empty convention used throughout this
+    module (``pr_precommit_context``, ``pr_changed_files``): a closed /
+    non-existent / network-failing PR yields ``""`` rather than raising,
+    so the manifesto-suggest context assembly (#134) degrades gracefully
+    instead of crashing the command.
+    """
+    r = subprocess.run(
+        ["gh", "pr", "diff", pr_url],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        return ""
+    return r.stdout or ""
+
+
 def pr_changed_files(pr_url: str, cwd: Path) -> list[str]:
     """Return the list of file paths a PR touches. Empty list on failure.
 

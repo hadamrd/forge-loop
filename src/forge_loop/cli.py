@@ -130,6 +130,10 @@ replay_app = typer.Typer(
 )
 roles_app = typer.Typer(help="Pluggable roles.", no_args_is_help=True)
 cluster_app = typer.Typer(help="Cluster-mode commands.", no_args_is_help=True)
+manifesto_app = typer.Typer(
+    help="Manifesto feedback loop: turn fixed bugs into permanent house rules.",
+    no_args_is_help=True,
+)
 
 app.add_typer(config_app, name="config", invoke_without_command=True)
 app.add_typer(pipeline_app, name="pipeline")
@@ -138,6 +142,7 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(replay_app, name="replay")
 app.add_typer(roles_app, name="roles")
 app.add_typer(cluster_app, name="cluster")
+app.add_typer(manifesto_app, name="manifesto")
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +210,37 @@ def _memory_store_factory(repo_path: Path) -> Any:
     return open_memory_store(repo_path)
 
 
+def _manifesto_suggester_factory(
+    repo_path: Path,
+    owner: str,
+    repo: str,
+    *,
+    gh_client: Any = None,
+    model: str | None = None,
+    timeout_s: int = 300,
+) -> Any:
+    """Construct the default ManifestoSuggester (#134). Tests monkeypatch this."""
+    from forge_loop import gh as gh_module
+    from forge_loop.manifesto_suggest import ManifestoSuggester
+
+    return ManifestoSuggester(
+        repo_path=repo_path,
+        owner=owner,
+        repo=repo,
+        gh_client=gh_client,
+        gh_module=gh_module,
+        timeout_s=timeout_s,
+        model=model,
+    )
+
+
+def _manifesto_pr_opener(plan: Any, **kwargs: Any) -> str:
+    """Open the manifesto-suggest PR (#134). Tests monkeypatch this."""
+    from forge_loop.manifesto_suggest import open_manifesto_pr
+
+    return open_manifesto_pr(plan, **kwargs)
+
+
 def _commands() -> CliCommands:
     return CliCommands(
         load_fn=load,
@@ -213,6 +249,8 @@ def _commands() -> CliCommands:
         brainstormer_factory=_brainstormer_factory,
         gh_client_factory=_gh_client_factory,
         memory_store_factory=_memory_store_factory,
+        manifesto_suggester_factory=_manifesto_suggester_factory,
+        manifesto_pr_opener=_manifesto_pr_opener,
         subprocess_module=subprocess,
     )
 
@@ -240,6 +278,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _cmd_init,
     _cmd_brainstorm,
     _cmd_audit,
+    _cmd_manifesto_suggest,
     _cmd_record_session,
     _cmd_retry,
     _cmd_brief,
@@ -268,6 +307,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _make_cmd("init"),
     _make_cmd("brainstorm"),
     _make_cmd("audit"),
+    _make_cmd("manifesto_suggest"),
     _make_cmd("record_session"),
     _make_cmd("retry"),
     _make_cmd("brief"),
@@ -458,6 +498,26 @@ def cmd_audit(
     ),
 ) -> None:
     _exit(_cmd_audit(SimpleNamespace(apply=apply, json=json_)))
+
+
+@manifesto_app.command(
+    "suggest",
+    help=(
+        "Propose manifesto rule(s) from a fixed bug PR (dry-run by default; "
+        "--apply opens a PR against .forge/*-manifesto.md)."
+    ),
+)
+def cmd_manifesto_suggest(
+    from_pr: int = typer.Option(
+        ..., "--from-pr", help="The fixed bug PR number to derive a house rule from."
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Open a reviewable PR carrying the manifesto delta (requires github_repo).",
+    ),
+) -> None:
+    _exit(_cmd_manifesto_suggest(SimpleNamespace(from_pr=from_pr, apply=apply)))
 
 
 @app.command("record-session", help="Record a real SDK session to a JSONL fixture.")

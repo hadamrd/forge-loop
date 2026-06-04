@@ -13,7 +13,10 @@ from typing import Any
 
 import typer
 
+from forge_loop.log import get_logger
 from forge_loop.state import tail_events
+
+_log = get_logger("forge_loop.cli_product_commands")
 
 
 class ProductCommandsMixin:
@@ -21,6 +24,149 @@ class ProductCommandsMixin:
     brainstormer_factory: Any
     gh_client_factory: Any
     memory_store_factory: Any
+    manifesto_suggester_factory: Any
+    manifesto_pr_opener: Any
+    subprocess: Any
+
+    def _cmd_manifesto_suggest(self, args: SimpleNamespace) -> int:
+        """`forge-loop manifesto suggest --from-pr <N>` (issue #134).
+
+        Closes the manifesto feedback loop: read a fixed bug PR, ask one
+        SDK session what house rule would have caught it, and emit a
+        structured :class:`ManifestoSuggestion`.
+
+        Contract:
+          * Dry-run by default: print the suggestion (human-readable +
+            recoverable YAML), exit 0, ZERO GitHub writes.
+          * ``--apply``: open a PR against the relevant ``.forge/*-manifesto.md``
+            file(s) carrying the markdown delta. Without a configured
+            ``github_repo`` → clear error, non-zero exit (mirrors
+            ``brainstorm --apply``).
+          * Unreadable PR / insufficient context → clear message, exit 1,
+            nothing written.
+          * Malformed / empty SDK output → fail closed, exit 1, no PR.
+        """
+        import yaml
+
+        from forge_loop.manifesto_suggest import (
+            InsufficientContextError,
+            SuggestionParseError,
+            build_pr_plan,
+            render_suggestion_text,
+        )
+        from forge_loop.manifestos import discover_manifestos
+        from forge_loop.settings import ConfigError
+
+        pr_number = getattr(args, "from_pr", None)
+        if pr_number is None:
+            typer.echo("manifesto suggest: --from-pr <N> is required", err=True)
+            return 2
+
+        apply = bool(getattr(args, "apply", False))
+
+        # Resolve repo path + GitHub coordinates — same accessor pattern as
+        # ``_cmd_brainstorm`` / ``_cmd_audit``.
+        repo_path = Path.cwd()
+        owner = ""
+        repo_name = ""
+        model: Any = None
+        timeout_s = 300
+        try:
+            cfg = self.load()
+            repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path
+            gh_repo = getattr(cfg, "github_repo", "") or ""
+            if "/" in gh_repo:
+                owner, repo_name = gh_repo.split("/", 1)
+            po_cfg = getattr(cfg, "po", None)
+            model = getattr(po_cfg, "model", model)
+            timeout_s = getattr(po_cfg, "timeout_s", timeout_s)
+        except ConfigError as exc:
+            # Command must work even without a config (dry-run still runs the
+            # SDK against cwd). Log the specific failure rather than swallowing
+            # it silently, so a genuinely broken config is diagnosable.
+            _log.warning(
+                "manifesto_suggest: config load failed; using defaults",
+                repo_path=str(repo_path),
+                error=str(exc),
+            )
+
+        github_repo = f"{owner}/{repo_name}" if owner and repo_name else ""
+
+        # --apply guard: require a configured repo BEFORE running the SDK so we
+        # never burn a session we can't act on (mirrors ``brainstorm --apply``).
+        if apply and not github_repo:
+            typer.echo(
+                "manifesto suggest: --apply requires a configured GitHub repo (owner/name).",
+                err=True,
+            )
+            return 2
+
+        # A read-only gh client is needed even on the dry-run path (linked-issue
+        # body). Construction failure must not crash the command — we degrade to
+        # no linked-issue context.
+        gh_client: Any = None
+        try:
+            gh_client = self.gh_client_factory()
+        except Exception as exc:  # noqa: BLE001 — read client is best-effort
+            typer.echo(
+                f"manifesto suggest: warning — GitHub client unavailable, "
+                f"linked-issue context skipped: {exc}",
+                err=True,
+            )
+
+        suggester = self.manifesto_suggester_factory(
+            repo_path,
+            owner,
+            repo_name,
+            gh_client=gh_client,
+            model=model,
+            timeout_s=timeout_s,
+        )
+
+        try:
+            suggestion = suggester.run(int(pr_number))
+        except InsufficientContextError as exc:
+            typer.echo(f"manifesto suggest: {exc}", err=True)
+            return 1
+        except SuggestionParseError as exc:
+            typer.echo(f"manifesto suggest: {exc}", err=True)
+            return 1
+        except Exception as exc:  # noqa: BLE001 — surface as runtime error
+            typer.echo(f"manifesto suggest: run failed: {exc}", err=True)
+            return 1
+
+        # Dry-run: print human-readable + recoverable structured YAML; exit 0.
+        if not apply:
+            typer.echo(render_suggestion_text(suggestion, pr_number=int(pr_number)))
+            typer.echo("")
+            typer.echo("# structured (recoverable):")
+            typer.echo(yaml.safe_dump(suggestion.model_dump(mode="json"), sort_keys=False).rstrip())
+            return 0
+
+        # --apply: build the markdown delta and open ONE reviewable PR.
+        if suggestion.is_empty:
+            typer.echo("manifesto suggest: no rule proposed — nothing to apply.")
+            return 0
+
+        manifestos = discover_manifestos(repo_path, required=False)
+        plan = build_pr_plan(suggestion, manifestos, pr_number=int(pr_number))
+        if plan.is_empty:
+            typer.echo("manifesto suggest: no manifesto delta produced — nothing to apply.")
+            return 0
+
+        try:
+            url = self.manifesto_pr_opener(
+                plan,
+                repo_path=repo_path,
+                github_repo=github_repo,
+                runner=self.subprocess.run,
+            )
+        except Exception as exc:  # noqa: BLE001 — clear operator-facing failure
+            typer.echo(f"manifesto suggest: --apply failed to open PR: {exc}", err=True)
+            return 1
+
+        typer.echo(f"manifesto suggest: opened PR {url or '(url unavailable)'}")
+        return 0
 
     def _cmd_brainstorm(self, args: SimpleNamespace) -> int:
         """`forge-loop brainstorm` — dry-run by default, files issues with --apply.

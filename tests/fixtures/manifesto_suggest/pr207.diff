@@ -1,0 +1,21 @@
+diff --git a/src/forge_loop/worker.py b/src/forge_loop/worker.py
+index 1111111..2222222 100644
+--- a/src/forge_loop/worker.py
++++ b/src/forge_loop/worker.py
+@@ -42,7 +42,7 @@ def summarise_pr(payload: dict) -> str:
+-    commits = payload["commits"]
++    commits = payload.get("commits") or []
+     return f"{len(commits)} commits"
+diff --git a/tests/test_worker_summary.py b/tests/test_worker_summary.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/tests/test_worker_summary.py
+@@ -0,0 +1,8 @@
++def test_summarise_pr_handles_missing_commits():
++    # Regression for #199: gh JSON omits "commits" on API failure.
++    assert summarise_pr({}) == "0 commits"
++
++
++def test_summarise_pr_counts_commits():
++    assert summarise_pr({"commits": [1, 2]}) == "2 commits"
