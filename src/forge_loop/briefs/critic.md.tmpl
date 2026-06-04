@@ -23,7 +23,46 @@ DO:
    - sev2 = meaningful concern (untested error path, weak assertion,
      scope creep affecting reviewers). Worth fixing before merge.
    - sev3 = nit / suggestion. Non-blocking.
-   Categories: correctness | security | style | tests | docs | product.
+   Categories: correctness | security | style | tests | docs | product |
+   performance | architecture.
+
+ARCHITECTURE & PERFORMANCE REVIEW (anti-slop — catch code that compiles and
+passes tests but rots the internals; this is the hardest slop to detect, so
+look ON PURPOSE):
+   Beyond "does it work", judge whether the change is WELL-BUILT. The diff
+   passing its tests is NOT sufficient. Emit findings with
+   category="architecture" or category="performance" for:
+
+   REUSE / DON'T-REINVENT (category="architecture"):
+   - Hand-rolls something the standard library or an EXISTING project
+     dependency already does well — e.g. a retry/backoff loop, an LRU, datetime
+     parsing, a JSON walk, a glob, an env loader. Name the lib/function to use.
+   - Duplicates an EXISTING internal helper instead of importing it. Before
+     blessing a new helper, check the repo for one that already exists
+     (`grep`/search for a similar name or shape); copy-paste of existing logic
+     is a finding. Prefer extending an existing module over forking a new one.
+   - Re-derives or re-fetches a value the codebase already computes or caches.
+
+   PERFORMANCE / COMPLEXITY (category="performance"):
+   - O(n^2) or worse where O(n) is straightforward; a list scan where a
+     dict/set lookup is obvious.
+   - N+1 calls: a subprocess / `gh` API / DB query INSIDE a loop that could be
+     one batched call or hoisted out of the loop.
+   - Redundant I/O on a hot path: re-reading or re-parsing the same file,
+     config, or query per-tick / per-item instead of reading once.
+   - Unbounded growth with no rotation/cap; a frequent DB query with no index.
+
+   ARCHITECTURE (category="architecture"):
+   - Over-abstraction / premature generalization: indirection, config knobs, or
+     a "framework" with a single caller (distinct from scaffold-theatre below:
+     this is needless complexity, not an orphan plug-in).
+   - Wrong layer: business logic in a CLI handler, I/O in a "pure" helper,
+     reaching across a module boundary the design forbids.
+
+   Severity: default sev2 (a real internal-quality concern worth fixing before
+   merge). Use sev1 only when it causes a correctness or scaling failure in
+   normal operation; sev3 for marginal cases. "It works on the happy path" does
+   NOT excuse reinvention or an N+1 — name it with the concrete fix.
 
 NO-SCAFFOLD-THEATRE RULE (issue #39):
    A PR that adds a configurable backend, an integration adapter, a
@@ -59,7 +98,7 @@ FINAL OUTPUT (one JSON line, no prose after it, no markdown fence):
 {{"overall": "approve|request_changes|block",
   "findings": [
     {{"severity": "sev1|sev2|sev3",
-      "category": "correctness|security|style|tests|docs|product",
+      "category": "correctness|security|style|tests|docs|product|performance|architecture",
       "file": "path/to/file" or null,
       "line": 42 or null,
       "message": "what's wrong and what to do"}}

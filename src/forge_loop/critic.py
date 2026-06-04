@@ -39,7 +39,19 @@ from forge_loop.worker import ensure_subagent_trusted
 
 VALID_OVERALL = {"approve", "request_changes", "block"}
 VALID_SEVERITY = {"sev1", "sev2", "sev3"}
-VALID_CATEGORY = {"correctness", "security", "style", "tests", "docs", "product"}
+VALID_CATEGORY = {
+    "correctness",
+    "security",
+    "style",
+    "tests",
+    "docs",
+    "product",
+    # Anti-slop lenses: internal quality the other categories don't cover —
+    # reinvention / non-reuse / over-abstraction (architecture) and
+    # N+1 / redundant I/O / bad complexity (performance).
+    "performance",
+    "architecture",
+}
 PRECOMMIT_BYPASS_TAG = "precommit_bypass"
 _NO_VERIFY_RE = re.compile(r"\bgit(?:\s+-[cC]\s+\S+)*\s+commit\b[^\n]*\s(?:--no-verify|-n)\b")
 _BODY_NO_VERIFY_ACTION_RE = re.compile(
