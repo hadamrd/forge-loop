@@ -6,6 +6,8 @@ Docker, gVisor, Firecracker, or Kata can implement the policy later.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -86,6 +88,26 @@ class CapabilityPolicy:
             ),
             secret_names=tuple(value.get("secret_names") or ()),
         )
+
+
+def canonical_policy_json(policy: CapabilityPolicy) -> str:
+    """Stable, sorted-keys JSON serialisation of a policy.
+
+    Single source of truth for canonicalisation — both the saga store
+    (``tasks/store.py``) and the worker-settings policy-hash reuse this so
+    two callers can never disagree on the bytes a policy hashes to.
+    """
+    return json.dumps(policy.to_json_obj(), sort_keys=True, separators=(",", ":"))
+
+
+def policy_hash(policy: CapabilityPolicy) -> str:
+    """Stable sha256 over the canonical policy JSON.
+
+    Equal policies hash equal; any granted server/path/tool change flips
+    the digest. Carried on ``WorkerPolicyEnforcedEvent`` so boot/replay can
+    confirm a worker ran within exactly the grant it was leased.
+    """
+    return hashlib.sha256(canonical_policy_json(policy).encode("utf-8")).hexdigest()
 
 
 def render_capability_policy(policy: CapabilityPolicy) -> str:

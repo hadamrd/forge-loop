@@ -299,6 +299,25 @@ class WorkerPreCommitInstalledEvent(EventBase):
     reason: str | None = None
 
 
+@register_event
+class WorkerPolicyEnforcedEvent(EventBase):
+    """Deny-by-default worker settings were planted from the saga grant (#200).
+
+    Emitted when ``plant_worker_settings`` writes the rendered
+    ``CapabilityPolicy`` into a worktree's ``.claude/settings.json``. The
+    effective tool/path/server surface now equals the lease rather than the
+    operator's full surface.
+
+    ``policy_hash`` is the stable sha256 over the canonical policy JSON
+    (``forge_loop.sandbox.policy_hash``). Boot/replay reads this to confirm
+    each worker ran within exactly the grant it was leased.
+    """
+
+    KIND: ClassVar[str] = "worker_policy_enforced"
+    worktree_path: str = ""
+    policy_hash: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Emit + back-compat shim. ``emit`` is the typed path; ``append_event_with_
 # registry_check`` is the back-compat wrapper called by state.append_event.
@@ -443,6 +462,7 @@ __all__ = [
     "WorkerSessionRecoveredEvent",
     "WorkerSessionTransitionEvent",
     "WorkerPreCommitInstalledEvent",
+    "WorkerPolicyEnforcedEvent",
     "WorktreeReapedEvent",
     "append_event_with_registry_check",
     "emit",

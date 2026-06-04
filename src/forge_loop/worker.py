@@ -16,9 +16,6 @@ from forge_loop.worker_brief import (
     brief_template_hash as _brief_template_hash,
 )
 from forge_loop.worker_brief import make_brief, make_repair_brief
-from forge_loop.worker_worktree import (
-    drop_permissive_settings as _worktree_drop_permissive_settings,
-)
 from forge_loop.worker_worktree import ensure_subagent_trusted as _ensure_subagent_trusted
 from forge_loop.worker_worktree import prep_repair_worktree as _prep_repair_worktree
 from forge_loop.worker_worktree import prep_worktree as _prep_worktree
@@ -48,11 +45,6 @@ def ensure_subagent_trusted(target_dir: Path) -> None:
 def _subagent_env() -> dict[str, str]:
     """Compatibility export for legacy subprocess workers."""
     return _worktree_subagent_env()
-
-
-def _drop_permissive_settings(worktree: Path) -> None:
-    """Compatibility export for tests that patch worktree trust setup."""
-    _worktree_drop_permissive_settings(worktree)
 
 
 @dataclass
@@ -162,6 +154,7 @@ def run_worker(
     base_branch: str = "trunk",
     brief_override: str | None = None,
     capability_policy: CapabilityPolicy | None = None,
+    events_file: Path | None = None,
     maestro_context: str = "",
     permissions: str = "full",
 ) -> WorkerOutcome:
@@ -183,7 +176,15 @@ def run_worker(
     title = issue["title"]
     branch = _branch_name(n, title)
 
-    worktree, err = _prep_worktree(repo, n, branch, base_branch=base_branch, emit=emit)
+    worktree, err = _prep_worktree(
+        repo,
+        n,
+        branch,
+        base_branch=base_branch,
+        emit=emit,
+        capability_policy=capability_policy,
+        events_file=events_file,
+    )
     if err is not None:
         return WorkerOutcome(
             issue=n,
@@ -345,6 +346,8 @@ def run_repair_worker(
     load_timeout_ms: int | None = None,
     strict_mcp_config: bool = False,
     mcp_servers: dict[str, Any] | None = None,
+    capability_policy: CapabilityPolicy | None = None,
+    events_file: Path | None = None,
     permissions: str = "full",
 ) -> WorkerOutcome:
     """Repair an existing blocked PR by pushing to its head branch."""
@@ -362,7 +365,14 @@ def run_repair_worker(
             stdout_tail="missing PR headRefName",
             error="repair-missing-branch",
         )
-    worktree, err = _prep_repair_worktree(repo, n, branch, emit=emit)
+    worktree, err = _prep_repair_worktree(
+        repo,
+        n,
+        branch,
+        emit=emit,
+        capability_policy=capability_policy,
+        events_file=events_file,
+    )
     if err is not None:
         return WorkerOutcome(
             issue=n,

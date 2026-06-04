@@ -504,6 +504,7 @@ def _run_worker_with_saga(
                 mcp_servers=cfg.worker.mcp_servers,
                 base_branch=cfg.base_branch,
                 capability_policy=capability_policy,
+                events_file=cfg.events_file,
                 maestro_context=maestro_context,
             )
         except BaseException:
@@ -544,6 +545,7 @@ def _run_worker_with_saga(
             mcp_servers=cfg.worker.mcp_servers,
             base_branch=cfg.base_branch,
             capability_policy=capability_policy,
+            events_file=cfg.events_file,
             maestro_context=maestro_context,
             permissions=getattr(cfg.worker, "permissions", "full"),
         )
@@ -692,6 +694,8 @@ def _run_repair_workers(
     bus_emit: Any,
 ) -> list[WorkerOutcome]:
     """Spawn workers that repair existing PR branches."""
+    from forge_loop.worker_worktree import worktree_path as _worktree_path
+
     outcomes: list[WorkerOutcome] = []
     with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
         futures = [
@@ -715,6 +719,12 @@ def _run_repair_workers(
                 load_timeout_ms=cfg.worker.load_timeout_ms,
                 strict_mcp_config=cfg.worker.strict_mcp_config,
                 mcp_servers=cfg.worker.mcp_servers,
+                capability_policy=capability_policy_for_worker(
+                    repo=cfg.repo,
+                    worktree_path=str(_worktree_path(cfg.repo, issue["number"])),
+                    allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+                ),
+                events_file=cfg.events_file,
             )
             for issue, pr, review_context in repairs
         ]
