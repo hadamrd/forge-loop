@@ -164,7 +164,7 @@ def _synchronized(
 class SqliteTaskSagaStore:
     """SQLite-backed durable task saga store."""
 
-    def __init__(self, path: str | Path, *, ensure_schema: bool = True) -> None:
+    def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         connect_path: str | Path = ":memory:" if str(path) == ":memory:" else self.path
         if str(path) != ":memory:":
@@ -181,14 +181,24 @@ class SqliteTaskSagaStore:
         if str(path) != ":memory:":
             self._connection.execute("PRAGMA journal_mode=WAL")
         # Schema creation + compat migration are the expensive part of
-        # construction. Running them on *every* store __init__ was
-        # schema-migration work per worker per tick (#227). The tick opens one
-        # store with ``ensure_schema=True``; a sibling connection onto an
-        # already-initialised DB passes ``ensure_schema=False`` to skip it.
-        self._schema_ensured = ensure_schema
-        if ensure_schema:
-            self._connection.executescript(_SCHEMA)
-            self._ensure_compat_columns()
+        # construction; running them on *every* store __init__ was
+        # schema-migration work per worker per tick (#227). The fix is to open
+        # the store ONCE per tick and reuse it across dispatch + heartbeat +
+        # policy recording (see runner/dispatch.py), so this runs once per tick
+        # rather than per worker.
+        self._connection.executescript(_SCHEMA)
+        self._ensure_compat_columns()
+
+    def close(self) -> None:
+        """Close the shared connection.
+
+        Opened once per tick and owned by ``_run_workers`` (#227), which closes
+        it in a ``finally`` after the dispatch ThreadPool drains and every
+        heartbeat thread has stopped — so no other thread touches the
+        connection at close time. Idempotent: a second close is a sqlite no-op.
+        """
+        with self._lock:
+            self._connection.close()
 
     @_synchronized
     def put(self, saga: TaskSaga) -> TaskSaga:

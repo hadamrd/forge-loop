@@ -194,12 +194,13 @@ def record_worker_task_policy(
     branch: str,
     worktree_path: str,
     capability_policy: CapabilityPolicy,
-    store: TaskSagaStore | None = None,
 ) -> TaskSaga:
-    # Reuse the tick-scoped store when one is supplied (#227): only fall back to
-    # opening a fresh connection (re-running schema + compat) when the caller
-    # has none — the legacy "saga store failed to resolve" path.
-    store = store or SqliteTaskSagaStore(canonical_task_saga_path(repo))
+    # Last-resort fallback only: reached when the tick-scoped saga store failed
+    # to resolve (``_seed_worker_saga`` calls this on its ``task_store is None``
+    # branch, where there is no shared store to reuse). The normal #227 reuse
+    # path never gets here — it threads the tick store straight into
+    # ``task_store.create``.
+    store = SqliteTaskSagaStore(canonical_task_saga_path(repo))
     existing = store.get(task_id)
     if existing is not None:
         return existing
@@ -715,24 +716,39 @@ def _run_workers(
         # policy recording, instead of re-``__init__``-ing it (full schema script
         # + compat ALTER probing) 2-3x per worker. Best-effort: a failed open
         # leaves ``saga_store=None`` and each worker falls back to its own.
+        # Own the tick store so we can close it once the tick is done. An
+        # injected ``cfg.task_store`` is owned by the caller, so only close a
+        # store we opened here (the ``isinstance`` + identity guard below).
+        injected_store = getattr(cfg, "task_store", None)
         tick_saga_store = _resolve_task_saga_store(cfg)
-        with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
-            futures = [
-                ex.submit(
-                    _dispatch_one_worker,
-                    cfg,
-                    i,
-                    meta,
-                    tick=tick,
-                    bus_emit=bus_emit,
-                    store=store,
-                    maestro_context=maestro_context,
-                    saga_store=tick_saga_store,
-                )
-                for i, meta in dispatch
-            ]
-            for fut in futures:
-                outcomes.append(fut.result())
+        try:
+            with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
+                futures = [
+                    ex.submit(
+                        _dispatch_one_worker,
+                        cfg,
+                        i,
+                        meta,
+                        tick=tick,
+                        bus_emit=bus_emit,
+                        store=store,
+                        maestro_context=maestro_context,
+                        saga_store=tick_saga_store,
+                    )
+                    for i, meta in dispatch
+                ]
+                for fut in futures:
+                    outcomes.append(fut.result())
+        finally:
+            # By here the ThreadPool has drained and every worker's heartbeat
+            # thread is stopped (each ``_dispatch_one_worker`` joins its own in
+            # ``finally``), so no other thread holds the shared connection.
+            # Close it to avoid leaking one sqlite connection per tick (#227).
+            if isinstance(tick_saga_store, SqliteTaskSagaStore) and (
+                tick_saga_store is not injected_store
+            ):
+                with contextlib.suppress(Exception):
+                    tick_saga_store.close()
 
     for o in outcomes:
         _mlog.info(

@@ -8,7 +8,7 @@ i.e. schema-migration work per worker per tick. These tests pin the fix:
 * the tick opens one store and threads it through dispatch + heartbeat + policy,
 * schema creation + compat migration run once (at tick open), not per worker,
 * the shared single connection is safe across the dispatch ThreadPool's threads,
-* the ``ensure_schema`` guard genuinely skips migration on both branches.
+* the tick-scoped store is closed once the tick drains (no per-tick leak).
 """
 
 from __future__ import annotations
@@ -123,40 +123,91 @@ def test_dispatch_without_shared_store_falls_back_to_its_own(
 
 
 # ---------------------------------------------------------------------------
-# AC: schema creation + compat migration are guarded (ensure_schema) - both arms.
+# AC/review #227: the tick-scoped store is owned by ``_run_workers`` and closed
+# once the tick drains, so a long-running loop does not leak one sqlite
+# connection per tick.
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_schema_true_runs_migration_false_skips_it(monkeypatch: Any, tmp_path: Any) -> None:
-    db = tmp_path / "tasks.db"
-    SqliteTaskSagaStore(db)  # primary creates the schema on disk
+def _disable_dispatch_side_paths(monkeypatch: Any) -> list[dict[str, Any]]:
+    """Force the legacy ThreadPool path and capture each dispatch's kwargs.
 
-    migrations = _spy_migrations(monkeypatch)
-
-    # The false branch: a sibling connection onto the already-initialised DB
-    # skips schema + compat entirely.
-    sibling = SqliteTaskSagaStore(db, ensure_schema=False)
-    assert migrations["n"] == 0
-    assert sibling._schema_ensured is False
-    # It still reads the shared on-disk table (no migration needed).
-    assert sibling.get("task-absent") is None
-
-    # The true branch: an explicit ensure_schema=True does run the migration.
-    primary2 = SqliteTaskSagaStore(db, ensure_schema=True)
-    assert migrations["n"] == 1
-    assert primary2._schema_ensured is True
-
-
-def test_ensure_schema_false_on_fresh_db_leaves_table_uncreated(tmp_path: Any) -> None:
-    """Adversarial: ensure_schema=False truly skips creation.
-
-    On a brand-new DB with no sibling having created the schema, the table does
-    not exist, so an operation must raise rather than silently succeeding —
-    proof the guard is real and not a no-op.
+    Stubs ``_dispatch_one_worker`` so ``_run_workers`` exercises exactly the
+    #227 open-once-and-close-the-tick-store logic without the worker/heartbeat
+    internals, and pins pipeline + persistent-worker gating OFF so the run is
+    deterministic regardless of ambient settings.
     """
-    store = SqliteTaskSagaStore(tmp_path / "fresh.db", ensure_schema=False)
-    with pytest.raises(sqlite3.OperationalError):
-        store.get("task-x")
+    import forge_loop.runner._pipeline_driver as _pdrv
+
+    monkeypatch.setattr(_pdrv, "pipeline_driven_enabled", lambda _cfg: False)
+    monkeypatch.setattr(dispatch_mod, "persistent_worker_enabled", lambda: False)
+
+    seen: list[dict[str, Any]] = []
+
+    def _spy_dispatch(cfg: Any, issue: Any, meta: Any, **kwargs: Any) -> WorkerOutcome:
+        seen.append({"issue": issue, **kwargs})
+        return _ok_worker()
+
+    monkeypatch.setattr(dispatch_mod, "_dispatch_one_worker", _spy_dispatch)
+    return seen
+
+
+def test_run_workers_opens_one_store_and_closes_it(monkeypatch: Any, tmp_path: Any) -> None:
+    """The tick opens one saga store, shares it with every worker, then closes it.
+
+    Proves the leak fix (#227 review): after ``_run_workers`` returns, the
+    shared connection is closed, so operating on it raises
+    ``sqlite3.ProgrammingError``.
+    """
+    cfg = _make_cfg(tmp_path)
+    cfg.parallel = 2  # type: ignore[attr-defined]
+    seen = _disable_dispatch_side_paths(monkeypatch)
+
+    issues = [_issue(7), _issue(8), _issue(9)]
+    metas = [_meta() for _ in issues]
+    dispatch_mod._run_workers(
+        cfg,
+        issues,
+        metas,
+        tick=1,
+        master_log_path=tmp_path / "master.log",
+        bus_emit=lambda *a, **k: None,
+    )
+
+    # Every worker received the SAME store instance: opened once per tick.
+    stores = {id(call["saga_store"]) for call in seen}
+    assert len(seen) == 3
+    assert len(stores) == 1, "all workers share the one tick-scoped store"
+    tick_store = seen[0]["saga_store"]
+    assert isinstance(tick_store, SqliteTaskSagaStore)
+
+    # Closed in the ``finally`` once the ThreadPool drained: no per-tick leak.
+    with pytest.raises(sqlite3.ProgrammingError):
+        tick_store._connection.execute("SELECT 1")
+
+
+def test_injected_task_store_is_not_closed_by_run_workers(monkeypatch: Any, tmp_path: Any) -> None:
+    """A caller-owned ``cfg.task_store`` outlives the tick — never closed here."""
+    cfg = _make_cfg(tmp_path)
+    cfg.parallel = 2  # type: ignore[attr-defined]
+    seen = _disable_dispatch_side_paths(monkeypatch)
+
+    injected = SqliteTaskSagaStore(tmp_path / "injected.db")
+    cfg.task_store = injected  # type: ignore[attr-defined]
+
+    dispatch_mod._run_workers(
+        cfg,
+        [_issue(7)],
+        [_meta()],
+        tick=1,
+        master_log_path=tmp_path / "master.log",
+        bus_emit=lambda *a, **k: None,
+    )
+
+    # The tick reused the injected store...
+    assert seen[0]["saga_store"] is injected
+    # ...and left it open: the caller owns it, so it must still be usable.
+    assert injected.get("task-absent") is None
 
 
 # ---------------------------------------------------------------------------
