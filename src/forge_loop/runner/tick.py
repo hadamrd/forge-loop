@@ -218,13 +218,17 @@ def _enable_automerge_for_adopted_prs(
             )
             continue
         merge_state = str(pr.get("mergeStateStatus") or "").upper()
-        if merge_state and merge_state != "CLEAN":
+        # AC2: require mergeStateStatus == CLEAN. An absent/unknown state must
+        # be treated as NOT mergeable (skip) — never bypass the gate. These
+        # skips are transient: the PR is left UNstamped so the next adoption
+        # scan re-evaluates it once it goes CLEAN (see the stamping rule below).
+        if merge_state != "CLEAN":
             append_event(
                 cfg.events_file,
                 "orphan_pr_skipped",
                 issue=outcome.issue,
                 pr=outcome.pr_url,
-                reason=f"not_mergeable:{merge_state.lower()}",
+                reason=f"not_mergeable:{merge_state.lower() or 'unknown'}",
             )
             continue
         threads = _gh.unresolved_review_threads(outcome.pr_url, repo=cfg.github_repo)
@@ -318,9 +322,18 @@ def _run_adoption_tick(
         emit=bus_emit,
     )
 
-    # Idempotency marker: stamp adopted PRs so the next scan is a no-op.
+    # Idempotency marker: stamp ONLY PRs that reached a terminal adoption
+    # outcome — auto-merged (status=="merged") or critic-blocked (error set;
+    # the critic:blocking label already excludes them and the repair loop owns
+    # them). PRs skipped for TRANSIENT reasons (not_mergeable:<state>,
+    # unresolved_review_threads, automerge enable failed) are left UNstamped so
+    # the next scan re-evaluates them once they go CLEAN / threads resolve —
+    # otherwise the marker would permanently re-orphan the PRs this feature
+    # exists to rescue (issue #213 regression caught in review).
+    refused_set = set(refused)
     for o in outcomes:
-        if o.pr_url and o.issue not in set(refused):
+        terminal = o.status == "merged" or bool(o.error)
+        if o.pr_url and terminal and o.issue not in refused_set:
             _gh.add_pr_label(o.pr_url, [_LOOP_ADOPTED_LABEL], repo=cfg.github_repo)
 
     append_event(

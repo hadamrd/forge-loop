@@ -483,7 +483,16 @@ def _recover_orphan_pr_url(cfg: Config, issue_number: int, worktree_path: str) -
         latest_log = None
     try:
         return recover_orphaned_pr_url(worktree, latest_log)
-    except Exception:  # noqa: BLE001 — recovery must never mask the real crash
+    except Exception as exc:  # noqa: BLE001 — recovery must never mask the real crash
+        # EH-001 / issue #213 AC5: log the boundary with context — never a
+        # silent drop. Mirrors the async sibling's ``orphan_pr_recover_failed``.
+        append_event(
+            cfg.events_file,
+            "orphan_pr_recover_failed",
+            issue=issue_number,
+            worktree=worktree_path,
+            err=str(exc)[:200],
+        )
         return None
 
 
