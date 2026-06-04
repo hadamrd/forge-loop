@@ -157,7 +157,7 @@ def run_critic_sdk(
                 ),
                 timeout=float(timeout_s),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return last_text, "timeout"
         # Prefer the SDK's own canonical final-text field if our capture
         # missed it. ``SDKRunResult.final_result_text`` is the single source
@@ -171,6 +171,7 @@ def run_critic_sdk(
             # Already in an event loop (rare for the sync critic path,
             # but defensive). Schedule on a fresh thread-local loop.
             import concurrent.futures
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                 last_text, err = ex.submit(asyncio.run, _drive()).result()
         except RuntimeError:

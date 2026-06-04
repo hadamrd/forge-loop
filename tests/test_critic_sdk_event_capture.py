@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from forge_loop._critic_sdk import run_critic_sdk
 from forge_loop._sdk_events import SdkEventKind
@@ -26,6 +25,7 @@ from forge_loop._sdk_events import SdkEventKind
 @dataclass
 class _FakeResult:
     """Mimics the SDKRunResult shape (final_result_text, error)."""
+
     final_result_text: str = ""
     error: str | None = None
 
@@ -43,7 +43,8 @@ def test_capture_picks_up_final_result_kind(tmp_path: Path) -> None:
         yield  # pragma: no cover
 
     class _FakeOptions:
-        def __init__(self, **_kw): pass
+        def __init__(self, **_kw):
+            pass
 
     def patched_run_sdk_session(*args, **kwargs):
         on_event = kwargs.get("on_event")
@@ -59,18 +60,24 @@ def test_capture_picks_up_final_result_kind(tmp_path: Path) -> None:
 
         async def _fake_session():
             return _FakeResult(final_result_text="")  # mimic missing fallback
+
         return _fake_session()
 
     import forge_loop._critic_sdk as critic_sdk_mod
+
     critic_sdk_mod.run_critic_sdk.__globals__["run_sdk_session"] = patched_run_sdk_session  # type: ignore[attr-defined]
 
     # Re-import the actual symbol on the module
     from forge_loop import _worker_sdk as worker_sdk_mod
+
     orig = worker_sdk_mod.run_sdk_session
     worker_sdk_mod.run_sdk_session = patched_run_sdk_session  # type: ignore[assignment]
     try:
         result = run_critic_sdk(
-            "test prompt", cwd=tmp_path, timeout_s=10, model="claude-opus-4-7",
+            "test prompt",
+            cwd=tmp_path,
+            timeout_s=10,
+            model="claude-opus-4-7",
         )
     finally:
         worker_sdk_mod.run_sdk_session = orig  # type: ignore[assignment]
@@ -89,14 +96,19 @@ def test_capture_falls_back_to_final_result_text_attr(tmp_path: Path) -> None:
     def patched_run_sdk_session(*args, **kwargs):
         async def _fake_session():
             return _FakeResult(final_result_text="from-result-attribute")
+
         return _fake_session()
 
     from forge_loop import _worker_sdk as worker_sdk_mod
+
     orig = worker_sdk_mod.run_sdk_session
     worker_sdk_mod.run_sdk_session = patched_run_sdk_session  # type: ignore[assignment]
     try:
         result = run_critic_sdk(
-            "test prompt", cwd=tmp_path, timeout_s=10, model="claude-opus-4-7",
+            "test prompt",
+            cwd=tmp_path,
+            timeout_s=10,
+            model="claude-opus-4-7",
         )
     finally:
         worker_sdk_mod.run_sdk_session = orig  # type: ignore[assignment]
@@ -115,6 +127,7 @@ def test_legacy_type_field_is_ignored_not_silently_eaten(tmp_path: Path) -> None
     SDKRunResult's canonical ``final_result_text``. The key property: no
     crash, and no string-literal tolerance hack lurking in production.
     """
+
     def patched_run_sdk_session(*args, **kwargs):
         on_event = kwargs.get("on_event")
         if on_event:
@@ -124,14 +137,19 @@ def test_legacy_type_field_is_ignored_not_silently_eaten(tmp_path: Path) -> None
 
         async def _fake_session():
             return _FakeResult(final_result_text="canonical-from-result")
+
         return _fake_session()
 
     from forge_loop import _worker_sdk as worker_sdk_mod
+
     orig = worker_sdk_mod.run_sdk_session
     worker_sdk_mod.run_sdk_session = patched_run_sdk_session  # type: ignore[assignment]
     try:
         result = run_critic_sdk(
-            "p", cwd=tmp_path, timeout_s=10, model="claude-opus-4-7",
+            "p",
+            cwd=tmp_path,
+            timeout_s=10,
+            model="claude-opus-4-7",
         )
     finally:
         worker_sdk_mod.run_sdk_session = orig  # type: ignore[assignment]

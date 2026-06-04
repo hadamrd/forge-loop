@@ -32,18 +32,18 @@ field-name drift.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from enum import Enum
-from typing import Annotated, Any, Literal, Union
+from enum import StrEnum
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 
-class SdkEventKind(str, Enum):
+class SdkEventKind(StrEnum):
     """Every event kind the worker SDK emits.
 
-    ``str`` mixin so the value round-trips through JSON as a plain string
-    (the on-disk ``events.jsonl`` shape is unchanged) while in-process code
-    gets a real enum it can compare with ``is``.
+    :class:`~enum.StrEnum` so the value round-trips through JSON as a plain
+    string (the on-disk ``events.jsonl`` shape is unchanged) while in-process
+    code gets a real enum it can compare with ``is``.
 
     The members below cover the *actual* emission surface of
     :mod:`forge_loop._worker_sdk`. ``ASSISTANT_THINKING`` and
@@ -73,9 +73,16 @@ class _SdkEventBase(BaseModel):
     forward-compatible field a newer SDK adds) round-trips without tripping
     validation — the discriminator + declared payload fields are still
     type-checked.
+
+    ``kind`` is declared here (widened to the full :class:`SdkEventKind`) so a
+    consumer holding a parsed-but-not-yet-narrowed event can read ``.kind`` and
+    branch on it; each concrete subclass overrides it with a ``Literal`` member
+    so the discriminated union can route a raw dict to exactly one model.
     """
 
     model_config = ConfigDict(extra="allow")
+
+    kind: SdkEventKind
 
 
 class AssistantTextEvent(_SdkEventBase):
@@ -120,9 +127,7 @@ class WorkerMcpFilteredEvent(_SdkEventBase):
 
 
 class WorkerMcpFilterNoMatchEvent(_SdkEventBase):
-    kind: Literal[SdkEventKind.WORKER_MCP_FILTER_NO_MATCH] = (
-        SdkEventKind.WORKER_MCP_FILTER_NO_MATCH
-    )
+    kind: Literal[SdkEventKind.WORKER_MCP_FILTER_NO_MATCH] = SdkEventKind.WORKER_MCP_FILTER_NO_MATCH
     configured: list[str] = Field(default_factory=list)
     available: list[str] = Field(default_factory=list)
     fallback: list[str] = Field(default_factory=list)
@@ -164,19 +169,17 @@ class ErrorEvent(_SdkEventBase):
 # matching model here is caught by ``test_sdk_events`` (the property test that
 # asserts every enum member has a typed subclass).
 SdkEvent = Annotated[
-    Union[
-        AssistantTextEvent,
-        AssistantThinkingEvent,
-        ToolUseEvent,
-        ToolResultEvent,
-        SystemMessageEvent,
-        TurnStartEvent,
-        WorkerMcpFilteredEvent,
-        WorkerMcpFilterNoMatchEvent,
-        FinalResultEvent,
-        CostTelemetryEvent,
-        ErrorEvent,
-    ],
+    AssistantTextEvent
+    | AssistantThinkingEvent
+    | ToolUseEvent
+    | ToolResultEvent
+    | SystemMessageEvent
+    | TurnStartEvent
+    | WorkerMcpFilteredEvent
+    | WorkerMcpFilterNoMatchEvent
+    | FinalResultEvent
+    | CostTelemetryEvent
+    | ErrorEvent,
     Field(discriminator="kind"),
 ]
 
@@ -220,7 +223,7 @@ def parse_sdk_event(data: Mapping[str, Any]) -> _SdkEventBase | None:
     an unparseable event is simply ignored rather than crashing the stream.
     """
     try:
-        return _SDK_EVENT_ADAPTER.validate_python(dict(data))
+        return cast(_SdkEventBase, _SDK_EVENT_ADAPTER.validate_python(dict(data)))
     except ValidationError:
         return None
 

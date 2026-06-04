@@ -550,9 +550,7 @@ async def run_sdk_session(
                     CostTelemetryEvent(
                         input_tokens=int(usage.get("input_tokens", 0) or 0),
                         output_tokens=int(usage.get("output_tokens", 0) or 0),
-                        cache_read_input_tokens=int(
-                            usage.get("cache_read_input_tokens", 0) or 0
-                        ),
+                        cache_read_input_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
                         cache_creation_input_tokens=int(
                             usage.get("cache_creation_input_tokens", 0) or 0
                         ),
