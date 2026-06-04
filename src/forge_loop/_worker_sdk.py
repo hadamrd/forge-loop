@@ -25,10 +25,12 @@ from typing import Any
 
 from forge_loop._sdk_events import (
     AssistantTextEvent,
+    AssistantThinkingEvent,
     CostTelemetryEvent,
     ErrorEvent,
     FinalResultEvent,
     SdkEvent,
+    SystemMessageEvent,
     ToolResultEvent,
     ToolUseEvent,
     TurnStartEvent,
@@ -47,6 +49,18 @@ from forge_loop._sdk_events import (
 # :data:`forge_loop._sdk_events.SdkEvent` models (issue #148) — a producer typo
 # fails at construction instead of silently shipping a bad ``kind`` string.
 EventEmitter = Callable[[dict[str, Any]], None]
+
+
+class _MissingThinkingBlock:
+    """Sentinel type for SDKs that predate ``ThinkingBlock``.
+
+    ``ThinkingBlock`` (the extended-thinking content block) is a newer Claude
+    Agent SDK addition. When the installed SDK — or a unit-test fake module —
+    doesn't declare it, the producer loop falls back to this class so
+    ``isinstance(block, <cls>)`` is always ``False`` and the thinking branch is
+    simply skipped, never crashing on a missing import.
+    """
+
 
 # Hard cap on tool definitions injected into the SDK init message
 # (issue #60). The bundled allow-list (forge-loop + lumen + github) plus
@@ -319,6 +333,10 @@ async def run_sdk_session(
             query_fn = _query
         if options_cls is None:
             options_cls = _Opts
+    # ``ThinkingBlock`` is resolved via getattr so an older SDK pin — or a
+    # unit-test fake ``claude_agent_sdk`` that doesn't declare it — degrades to
+    # the never-matching sentinel above instead of raising ImportError.
+    import claude_agent_sdk as _sdk_mod
     from claude_agent_sdk import (
         AssistantMessage,
         ResultMessage,
@@ -328,6 +346,8 @@ async def run_sdk_session(
         ToolUseBlock,
         UserMessage,
     )
+
+    thinking_block_cls: type = getattr(_sdk_mod, "ThinkingBlock", _MissingThinkingBlock)
 
     started = time.time()
     seq = 0
@@ -490,12 +510,31 @@ async def run_sdk_session(
                         allow_list=allow_servers,
                         emit=emit_record,
                     )
+                else:
+                    # Non-init system messages (compaction notices, mid-session
+                    # status subtypes, etc.) surface as a typed SYSTEM_MESSAGE
+                    # event rather than being silently dropped — the master log
+                    # keeps a record and consumers branch on the enum, never a
+                    # string. ``subtype`` is carried through for downstream
+                    # filtering.
+                    emit(
+                        SystemMessageEvent(
+                            subtype=str(getattr(message, "subtype", "") or ""),
+                            data=dict(getattr(message, "data", {}) or {}),
+                        )
+                    )
                 continue
             if isinstance(message, AssistantMessage):
                 model_seen = getattr(message, "model", "") or model_seen
                 for block in getattr(message, "content", []) or []:
                     if isinstance(block, TextBlock):
                         emit(AssistantTextEvent(text=block.text))
+                    elif isinstance(block, thinking_block_cls):
+                        # Extended-thinking surfaces reasoning as its own block.
+                        # Stream it as a typed ASSISTANT_THINKING event so the
+                        # master log / eventdb can show the worker's reasoning
+                        # trace without consumers re-deriving a string kind.
+                        emit(AssistantThinkingEvent(text=getattr(block, "thinking", "") or ""))
                     elif isinstance(block, ToolUseBlock):
                         emit(
                             ToolUseEvent(

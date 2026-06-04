@@ -45,12 +45,14 @@ class SdkEventKind(StrEnum):
     string (the on-disk ``events.jsonl`` shape is unchanged) while in-process
     code gets a real enum it can compare with ``is``.
 
-    The members below cover the *actual* emission surface of
-    :mod:`forge_loop._worker_sdk`. ``ASSISTANT_THINKING`` and
-    ``SYSTEM_MESSAGE`` are declared ahead of their producers so the typed
-    union is ready when those message types start being surfaced;
-    ``WORKER_MCP_FILTER_NO_MATCH`` is emitted today by
-    :func:`forge_loop._worker_sdk.resolve_mcp_filter`.
+    Every member below has a live producer in
+    :mod:`forge_loop._worker_sdk`: ``ASSISTANT_THINKING`` is emitted from a
+    ``ThinkingBlock`` (extended-thinking surface), ``SYSTEM_MESSAGE`` from any
+    non-``init`` ``SystemMessage``, and ``WORKER_MCP_FILTER_NO_MATCH`` from
+    :func:`forge_loop._worker_sdk.resolve_mcp_filter`. No member is a dormant /
+    forward-declared path — the manifesto rule this module adds bans
+    stringly-typed boundaries, and a bit-rotting enum member is the same
+    drift hazard in slow motion.
     """
 
     ASSISTANT_TEXT = "assistant_text"
@@ -111,6 +113,7 @@ class ToolResultEvent(_SdkEventBase):
 
 class SystemMessageEvent(_SdkEventBase):
     kind: Literal[SdkEventKind.SYSTEM_MESSAGE] = SdkEventKind.SYSTEM_MESSAGE
+    subtype: str = ""
     data: dict[str, Any] = Field(default_factory=dict)
 
 

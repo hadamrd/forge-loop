@@ -25,10 +25,12 @@ from forge_loop import _sdk_events
 from forge_loop._sdk_events import (
     EVENT_MODEL_BY_KIND,
     AssistantTextEvent,
+    AssistantThinkingEvent,
     CostTelemetryEvent,
     ErrorEvent,
     FinalResultEvent,
     SdkEventKind,
+    SystemMessageEvent,
     ToolResultEvent,
     ToolUseEvent,
     TurnStartEvent,
@@ -168,6 +170,8 @@ def test_event_to_record_renders_kind_as_plain_string() -> None:
     "event",
     [
         AssistantTextEvent(text="hi"),
+        AssistantThinkingEvent(text="reasoning"),
+        SystemMessageEvent(subtype="compact_boundary", data={"reason": "context_full"}),
         ToolUseEvent(tool="Bash", input={"command": "ls"}, tool_use_id="t1"),
         ToolResultEvent(tool_use_id="t1", is_error=True, content="boom"),
         TurnStartEvent(data={"session_id": "s1"}),
