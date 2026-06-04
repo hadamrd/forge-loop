@@ -169,11 +169,14 @@ def capability_policy_for_worker(
 
 
 def _resolve_task_saga_store(cfg: Config) -> TaskSagaStore | None:
-    """Per-thread saga store at the canonical path (or an injected override).
+    """Open the saga store at the canonical path (or an injected override).
 
-    Best-effort: never let saga bookkeeping break worker dispatch.
+    Called ONCE per tick (#227); the returned store's single, thread-safe
+    connection is then shared across that tick's worker dispatch + heartbeat +
+    policy recording instead of being re-opened per worker. Best-effort: never
+    let saga bookkeeping break worker dispatch.
     """
-    explicit = getattr(cfg, "task_store", None)
+    explicit: TaskSagaStore | None = getattr(cfg, "task_store", None)
     if explicit is not None:
         return explicit
     try:
@@ -191,8 +194,12 @@ def record_worker_task_policy(
     branch: str,
     worktree_path: str,
     capability_policy: CapabilityPolicy,
+    store: TaskSagaStore | None = None,
 ) -> TaskSaga:
-    store = SqliteTaskSagaStore(canonical_task_saga_path(repo))
+    # Reuse the tick-scoped store when one is supplied (#227): only fall back to
+    # opening a fresh connection (re-running schema + compat) when the caller
+    # has none — the legacy "saga store failed to resolve" path.
+    store = store or SqliteTaskSagaStore(canonical_task_saga_path(repo))
     existing = store.get(task_id)
     if existing is not None:
         return existing
@@ -311,7 +318,7 @@ def _lease_worker_saga(
 
 
 def _start_worker_heartbeat(
-    cfg: Config,
+    saga_store: TaskSagaStore,
     *,
     task_id: str,
     owner_id: str,
@@ -320,23 +327,21 @@ def _start_worker_heartbeat(
 ) -> tuple[threading.Event, threading.Thread]:
     """Renew the saga lease on a timer so a *live* worker never reads as stale.
 
-    Runs in its own daemon thread with its OWN store connection (WAL handles
-    cross-connection writes; sqlite forbids sharing one connection across
-    threads). It beats on a wall-clock timer independent of worker activity, so
+    Runs in its own daemon thread but reuses the **tick-scoped** saga store
+    (#227) instead of opening its own connection: the store's single connection
+    is shared thread-safely (``check_same_thread=False`` + an internal lock), so
+    the heartbeat no longer re-runs schema creation + compat migration per
+    worker. It beats on a wall-clock timer independent of worker activity, so
     even a worker silent for 10+ minutes of extended thinking stays leased.
     Fully best-effort: a heartbeat failure never touches the worker.
     """
     stop = threading.Event()
 
     def _beat() -> None:
-        try:
-            store = SqliteTaskSagaStore(canonical_task_saga_path(cfg.repo))
-        except Exception:  # noqa: BLE001 - no store, no heartbeat; worker runs on
-            return
         while not stop.wait(interval_s):
             now = datetime.now(UTC)
             with contextlib.suppress(Exception):
-                store.heartbeat(
+                saga_store.heartbeat(
                     task_id,
                     owner_id=owner_id,
                     heartbeat_at=now,
@@ -386,6 +391,7 @@ def _dispatch_one_worker(
     bus_emit: Any,
     store: WorkerSessionStore | None,
     maestro_context: str = "",
+    saga_store: TaskSagaStore | None = None,
 ) -> WorkerOutcome:
     """Run one worker, threading the persistent-worker FSM if enabled.
 
@@ -420,7 +426,12 @@ def _dispatch_one_worker(
     branch = _branch_for_issue(issue)
     n = int(issue["number"])
     task_id = _worker_task_id(n)
-    saga_store = _resolve_task_saga_store(cfg)
+    # #227: reuse the tick-scoped saga store when the caller supplies one so the
+    # store (and its schema + compat migration) is opened once per tick, not
+    # re-``__init__``'d per worker. Fall back to a per-call open only when no
+    # shared store was threaded in (direct unit-test calls / legacy callers).
+    if saga_store is None:
+        saga_store = _resolve_task_saga_store(cfg)
     with contextlib.suppress(Exception):
         _seed_worker_saga(
             saga_store,
@@ -438,7 +449,7 @@ def _dispatch_one_worker(
     heartbeat: tuple[threading.Event, threading.Thread] | None = None
     if saga_store is not None:
         heartbeat = _start_worker_heartbeat(
-            cfg,
+            saga_store,
             task_id=task_id,
             owner_id=owner_id,
             interval_s=interval_s,
@@ -699,6 +710,12 @@ def _run_workers(
                 )
                 store = None
 
+        # #227: open the durable saga store ONCE per tick and share the single
+        # (thread-safe) connection across every worker's dispatch + heartbeat +
+        # policy recording, instead of re-``__init__``-ing it (full schema script
+        # + compat ALTER probing) 2-3x per worker. Best-effort: a failed open
+        # leaves ``saga_store=None`` and each worker falls back to its own.
+        tick_saga_store = _resolve_task_saga_store(cfg)
         with ThreadPoolExecutor(max_workers=cfg.parallel) as ex:
             futures = [
                 ex.submit(
@@ -710,6 +727,7 @@ def _run_workers(
                     bus_emit=bus_emit,
                     store=store,
                     maestro_context=maestro_context,
+                    saga_store=tick_saga_store,
                 )
                 for i, meta in dispatch
             ]

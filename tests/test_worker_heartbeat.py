@@ -34,8 +34,10 @@ def test_heartbeat_extends_a_live_lease(tmp_path: Any) -> None:
     store = _seed_leased(cfg, task_id="task-7-worker", owner_id="w", ttl_s=10)
     before = store.get("task-7-worker").lease_expires_at
 
+    # #227: the heartbeat reuses the tick-scoped store rather than opening its
+    # own connection, so it now takes the store directly.
     handle = dispatch_mod._start_worker_heartbeat(
-        cfg, task_id="task-7-worker", owner_id="w", interval_s=0.05, lease_ttl_s=10
+        store, task_id="task-7-worker", owner_id="w", interval_s=0.05, lease_ttl_s=10
     )
     time.sleep(0.25)  # ~4-5 beats
     dispatch_mod._stop_worker_heartbeat(handle)
