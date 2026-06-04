@@ -175,6 +175,37 @@ def pr_precommit_context(pr_url: str, cwd: Path) -> tuple[str, str]:
     return body, "\n".join(commit_chunks)
 
 
+def pr_changed_files(pr_url: str, cwd: Path) -> list[str]:
+    """Return the list of file paths a PR touches. Empty list on failure.
+
+    Used by the #144 critic rule to decide whether a PR's diff touches
+    packaging files (``pyproject.toml`` / ``setup.py`` / ``setup.cfg``).
+    """
+    r = subprocess.run(
+        ["gh", "pr", "view", pr_url, "--json", "files"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        return []
+    try:
+        payload = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return []
+    files = payload.get("files")
+    if not isinstance(files, list):
+        return []
+    paths: list[str] = []
+    for entry in files:
+        if isinstance(entry, dict):
+            path = entry.get("path")
+            if isinstance(path, str) and path:
+                paths.append(path)
+    return paths
+
+
 def prs_by_label(label: str, limit: int, repo: str | None = None) -> list[dict[str, Any]]:
     """Return open PRs carrying ``label`` (oldest updated first)."""
     repo = _require_repo(repo)

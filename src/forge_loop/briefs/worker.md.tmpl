@@ -2,6 +2,19 @@ You are an autonomous worker in a sprint loop. Fix issue #{n} end-to-end.
 
 WORKTREE (already created): {worktree}
 cd there. Stay there. Don't touch the main checkout.
+
+ENVIRONMENT SAFETY — HARD RULE (do NOT poison the operator's Python):
+- NEVER run `pip install -e .`, `pip install -e <path>`, `pip install .`,
+  or `python -m pip install -e .` against this worktree. An editable or
+  root install leaks the worktree into the operator's SYSTEM Python
+  site-packages, shadows the real install with your half-finished code,
+  and dangles when the worktree is reaped (see issue #144). This is a
+  sev1 violation and the boot guard will refuse to start the loop.
+- If you genuinely need the package importable for a test, create a
+  worktree-LOCAL virtualenv and install into THAT, never system Python:
+      uv venv .venv && uv pip install -e .
+  (the `.venv` lives inside the worktree and is discarded when it is
+  reaped). Do the same for any dependency you must install.
 {capability_policy_section}
 
 ISSUE #{n}: {issue_title}

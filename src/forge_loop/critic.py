@@ -170,6 +170,58 @@ def detect_precommit_bypass(commit_text: str, *, pr_body: str) -> CriticReport:
     )
 
 
+PIP_EDITABLE_POISON_TAG = "pip-editable-poison"
+_PACKAGING_FILENAMES = {"pyproject.toml", "setup.py", "setup.cfg"}
+# Matches `pip install -e ...`, `pip install .`/`./`, and the `python -m pip`
+# form (the `pip install` substring is present in all of them). Deliberately
+# narrow: a plain `pip install requests` must NOT match (that is the negative
+# AC case). We only flag an editable (`-e`) install or a bare root install
+# whose target is the current directory.
+_PIP_EDITABLE_RE = re.compile(
+    r"\bpip\s+install\b[^\n]*?(?:\s-e\b|\s\.(?=\s|/|$))",
+)
+
+
+def detect_pip_editable_poison(worker_text: str, *, changed_files: list[str]) -> CriticReport:
+    """Flag a PR that touches packaging files AND ran `pip install -e` (#144).
+
+    Both conditions are required (logical AND): the worker session log must
+    contain an editable/root pip install AND the PR diff must touch
+    ``pyproject.toml`` / ``setup.py`` / ``setup.cfg``. A `pip install
+    requests` on its own — or a packaging change with no editable install —
+    does not trip the rule.
+    """
+    touches_packaging = any(
+        Path(p).name in _PACKAGING_FILENAMES for p in changed_files if isinstance(p, str)
+    )
+    if not touches_packaging:
+        return CriticReport(overall="approve", findings=[])
+    if not _has_pip_editable_install(worker_text):
+        return CriticReport(overall="approve", findings=[])
+    return CriticReport(
+        overall="request_changes",
+        findings=[
+            Finding(
+                severity="sev1",
+                category="correctness",
+                file=None,
+                line=None,
+                message=(
+                    f"{PIP_EDITABLE_POISON_TAG}: worker ran `pip install -e` (or a root "
+                    "`pip install .`) while the PR touches packaging files "
+                    "(pyproject.toml/setup.py/setup.cfg). An editable install leaks the "
+                    "worktree into the operator's system Python (see #144). Use a "
+                    "worktree-local `uv venv` + `uv pip install -e .` instead."
+                ),
+            )
+        ],
+    )
+
+
+def _has_pip_editable_install(text: str) -> bool:
+    return any(_PIP_EDITABLE_RE.search(line) is not None for line in _command_segments(text))
+
+
 def _has_no_verify_command(text: str) -> bool:
     for line in _command_segments(text):
         match = _NO_VERIFY_RE.search(line)
@@ -274,6 +326,64 @@ def _with_deterministic_precommit_findings(
     )
 
 
+def _fetch_pr_changed_files(pr_url: str, repo: Path) -> list[str]:
+    from forge_loop import gh
+
+    return gh.pr_changed_files(pr_url, repo)
+
+
+def _with_deterministic_pip_editable_findings(
+    report: CriticReport,
+    *,
+    pr_url: str,
+    repo: Path,
+    issue_number: int,
+    logs_dir: Path,
+) -> CriticReport:
+    worker_text = _worker_command_context(issue_number, logs_dir)
+    if not worker_text:
+        return report
+    changed_files = _fetch_pr_changed_files(pr_url, repo)
+    deterministic = detect_pip_editable_poison(worker_text, changed_files=changed_files)
+    if not deterministic.findings:
+        return report
+    overall = report.overall
+    if overall == "approve":
+        overall = deterministic.overall
+    return CriticReport(
+        overall=overall,
+        findings=[*report.findings, *deterministic.findings],
+        manifesto_violations=report.manifesto_violations,
+        raw=report.raw,
+    )
+
+
+def _with_deterministic_findings(
+    report: CriticReport,
+    *,
+    pr_url: str,
+    repo: Path,
+    issue_number: int,
+    logs_dir: Path,
+) -> CriticReport:
+    """Apply all deterministic (non-LLM) critic rules to ``report``."""
+    report = _with_deterministic_precommit_findings(
+        report,
+        pr_url=pr_url,
+        repo=repo,
+        issue_number=issue_number,
+        logs_dir=logs_dir,
+    )
+    report = _with_deterministic_pip_editable_findings(
+        report,
+        pr_url=pr_url,
+        repo=repo,
+        issue_number=issue_number,
+        logs_dir=logs_dir,
+    )
+    return report
+
+
 def review_pr(
     pr_url: str,
     issue_number: int,
@@ -351,7 +461,7 @@ def review_pr(
                 stdout_tail=tail,
                 error=parse_error or result.error or "critic_parse_failed",
             )
-        report = _with_deterministic_precommit_findings(
+        report = _with_deterministic_findings(
             report,
             pr_url=pr_url,
             repo=repo,
@@ -440,7 +550,7 @@ def review_pr(
             parse_retries=retries,
         )
 
-    report = _with_deterministic_precommit_findings(
+    report = _with_deterministic_findings(
         report,
         pr_url=pr_url,
         repo=repo,

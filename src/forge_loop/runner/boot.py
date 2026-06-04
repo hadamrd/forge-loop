@@ -49,6 +49,40 @@ def _reap_orphan_worktrees(repo: Path, events_file: Path) -> int:
     return _reap_orphan_worktrees_impl(repo, events_file)
 
 
+def _check_environment_poison(cfg: Config) -> Any:
+    """Inspect the operator's Python for a worktree-editable poison (#144).
+
+    Best-effort and side-effect-free against the operator's site-packages:
+    it only *reads* ``pip show`` metadata. The worktree-root prefix is taken
+    from ``cfg.worktree_root`` so the check tracks however the operator
+    configured worker worktrees. Any unexpected failure degrades to
+    "not poisoned" so a healthy operator is never blocked by a guard bug.
+    """
+    from forge_loop.runner.poison_guard import (
+        PoisonResult,
+        SubprocessPipShowReader,
+        check_environment_not_poisoned,
+    )
+
+    try:
+        return check_environment_not_poisoned(
+            SubprocessPipShowReader(),
+            worktree_root=getattr(cfg, "worktree_root", None),
+            reinstall_target=str(cfg.repo),
+        )
+    except Exception as exc:  # noqa: BLE001 — a guard bug must never block a clean boot
+        # Fail open (a guard bug must not block a healthy operator), but
+        # surface the failure as a boot event — matching the crash_recovery
+        # convention above — so a silently broken guard is observable rather
+        # than swallowed (manifesto error-handling.md#EH-001, #144).
+        append_event(
+            cfg.events_file,
+            "boot_poison_guard_error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return PoisonResult(poisoned=False)
+
+
 def _run_boot_recovery(cfg: Config) -> Any:
     """Reconcile dead-worker sagas at boot so the loop resumes cleanly.
 
@@ -116,9 +150,7 @@ def _install_signal_handlers(cfg: Config, state: RunnerState | None = None) -> N
     signal.signal(signal.SIGUSR1, _pause_toggle)
 
 
-def _short_sleep(
-    seconds: int, cfg: Config, state: RunnerState | None = None
-) -> None:
+def _short_sleep(seconds: int, cfg: Config, state: RunnerState | None = None) -> None:
     """Sleep but stay responsive to stop/pause signals + touchfiles."""
     if state is None:
         state = get_default_state()
@@ -148,7 +180,8 @@ def _run_crash_recovery(cfg: Config) -> None:
         s = _Settings.load()
     except Exception as ex:  # noqa: BLE001 — boundary
         append_event(
-            cfg.events_file, "crash_recovery_skipped",
+            cfg.events_file,
+            "crash_recovery_skipped",
             reason=f"settings_load_failed: {type(ex).__name__}",
         )
         return
@@ -158,7 +191,8 @@ def _run_crash_recovery(cfg: Config) -> None:
 
     if not cfg.github_repo or "/" not in cfg.github_repo:
         append_event(
-            cfg.events_file, "crash_recovery_skipped",
+            cfg.events_file,
+            "crash_recovery_skipped",
             reason="github_repo not configured",
         )
         return
@@ -180,13 +214,15 @@ def _run_crash_recovery(cfg: Config) -> None:
             events_file=cfg.events_file,
         )
         append_event(
-            cfg.events_file, "crash_recovery_done",
+            cfg.events_file,
+            "crash_recovery_done",
             count=len(decisions),
             actions={d.action: 1 for d in decisions},  # shape-aware summary
         )
     except Exception as ex:  # noqa: BLE001 — boundary
         append_event(
-            cfg.events_file, "crash_recovery_failed",
+            cfg.events_file,
+            "crash_recovery_failed",
             error=f"{type(ex).__name__}: {ex!s:.200}",
         )
 
@@ -234,11 +270,27 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     Runners in the same process or to ``stop()`` one without affecting
     another.
     """
+    import sys as _sys
+
     from forge_loop.runner.tick import _tick
 
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     cfg.events_file.touch()
+
+    # Issue #144 — refuse to start if a previous worker poisoned the operator
+    # Python with an editable ``pip install -e`` pointing into a worktree. The
+    # guard reports + refuses (exit 3); it never mutates the operator's
+    # site-packages. Runs before any worker dispatch.
+    poison = _check_environment_poison(cfg)
+    if poison.poisoned:
+        append_event(
+            cfg.events_file,
+            "boot_environment_poisoned",
+            offending_path=poison.offending_path,
+        )
+        _sys.stderr.write(poison.render_error())
+        return 3
 
     if state is None:
         state = get_default_state()
@@ -302,9 +354,7 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     if _axes:
         import logging as _logging
 
-        _logging.getLogger("forge_loop.runner").info(
-            "axis filter active: %s", ",".join(_axes)
-        )
+        _logging.getLogger("forge_loop.runner").info("axis filter active: %s", ",".join(_axes))
     write_state(cfg.state_file, {"state": "starting", "tick": 0, "parallel": cfg.parallel})
 
     # Issue #18 — if `.forge/pipeline.yaml` exists, validate it at startup so
