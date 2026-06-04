@@ -1,4 +1,4 @@
-[← Code-Quality Imperatives](./05-code-quality-imperatives.md) · [Index](./README.md) · [Next: Limitations →](./07-limitations.md)
+[← The Slop Daemon](./06-hunting-sloppy-patterns.md) · [Index](./README.md) · [Next: Limitations →](./08-limitations.md)
 
 ---
 
@@ -112,4 +112,4 @@ well by refusing to depend on the thing that changes fastest.
 
 ---
 
-[← Code-Quality Imperatives](./05-code-quality-imperatives.md) · [Index](./README.md) · [Next: Limitations →](./07-limitations.md)
+[← The Slop Daemon](./06-hunting-sloppy-patterns.md) · [Index](./README.md) · [Next: Limitations →](./08-limitations.md)
