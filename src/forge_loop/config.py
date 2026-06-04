@@ -93,14 +93,14 @@ class POConfig:
     enabled: bool = True
     timeout_s: int = 480
     max_to_expand_per_tick: int = 2
-    model: str = "claude-opus-4-7"
+    model: str = "claude-opus-4-8"
     thinking: str = "high"
     provider: str = "claude"
 
 
 @dataclass(frozen=True)
 class WorkerConfig:
-    model: str = "claude-opus-4-7"
+    model: str = "claude-opus-4-8"
     thinking: str = "medium"
     provider: str = "claude"
     allowed_mcp_tools: tuple[str, ...] = DEFAULT_ALLOWED_MCP_SERVERS

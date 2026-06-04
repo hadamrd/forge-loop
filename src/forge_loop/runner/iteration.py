@@ -386,7 +386,7 @@ def next_brief(
         body=(issue.get("body") or "")[:4000],
         branch=branch,
         base_branch=base_branch,
-        coauthor=coauthor or "Claude Opus 4.7 <noreply@anthropic.com>",
+        coauthor=coauthor or "Claude Opus 4.8 <noreply@anthropic.com>",
         pr_url=pr_url or "",
         critic_report=critic_report or "(no critic report captured)",
         attempt=attempt,

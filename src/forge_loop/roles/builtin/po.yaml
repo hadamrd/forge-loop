@@ -2,7 +2,7 @@
 # Operators override by dropping `.forge/roles/po.yaml` with the same name.
 name: po
 brief_template: forge_loop/briefs/po.md.tmpl
-model: claude-opus-4-7
+model: claude-opus-4-8
 timeout_s: 900
 budget_usd: 3.0
 triggers:
