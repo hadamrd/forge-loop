@@ -140,23 +140,23 @@ def rotate_events_file_if_needed(
             "preserved_load_bearing": preserved_load_bearing,
         }
 
-    # Telemetry for the guard (issue #210): surface how many load-bearing
-    # lines were rescued from the dropped archive. Emitted as a normal event
-    # so it shows up like the existing rotation telemetry.
-    if preserved_load_bearing:
-        _try_append_event(
-            events_path,
-            "events_load_bearing_preserved",
-            preserved=preserved_load_bearing,
-        )
-
-    # Success path: stamp the first event in the fresh file.
+    # Success path: stamp the rotation marker as the first line of the fresh
+    # file (callers rely on line[0] being ``events_file_rotated``).
     _try_append_event(
         events_path,
         "events_file_rotated",
         rotated_size=size,
         archive_count=archive_count,
     )
+
+    # Telemetry for the guard (issue #210): surface how many load-bearing
+    # lines were rescued from the dropped archive into the preserved tier.
+    if preserved_load_bearing:
+        _try_append_event(
+            events_path,
+            "events_load_bearing_preserved",
+            preserved=preserved_load_bearing,
+        )
     return {
         "rotated": True,
         "rotated_size": size,

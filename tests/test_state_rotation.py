@@ -240,3 +240,97 @@ def test_max_archives_is_3() -> None:
 # Use the module to suppress unused-import warning on `state`.
 def test_module_exposes_helper() -> None:
     assert callable(state.rotate_events_file_if_needed)
+
+
+# ---------------------------------------------------------------------------
+# Issue #210: load-bearing guard on the dropped archive
+# ---------------------------------------------------------------------------
+
+
+def _seed_full_cascade(tmp_path: Path, oldest_lines: list[str]) -> Path:
+    """Live file at threshold + full archive ring; ``.3`` holds ``oldest_lines``."""
+    events = tmp_path / "events.jsonl"
+    threshold = 100
+    events.write_bytes(b"L" * threshold)
+    (tmp_path / "events.jsonl.1").write_text("A1\n")
+    (tmp_path / "events.jsonl.2").write_text("A2\n")
+    (tmp_path / "events.jsonl.3").write_text("\n".join(oldest_lines) + "\n")
+    return events
+
+
+def test_load_bearing_line_in_dropped_archive_is_preserved(tmp_path: Path) -> None:
+    # The about-to-be-dropped archive (.3) holds a settled decision among
+    # noise. Rotation MUST rescue it into the preserved sidecar rather than
+    # silently unlink it (the amnesia failure mode #210 exists to prevent).
+    decision = json.dumps({"kind": "decision.made", "choice": "use-sqlite-wal"})
+    noise = json.dumps({"kind": "tick_start", "tick": 7})
+    events = _seed_full_cascade(tmp_path, [noise, decision])
+
+    result = rotate_events_file_if_needed(events, rotate_bytes=100)
+
+    assert result is not None and result["rotated"] is True
+    assert result["preserved_load_bearing"] == 1
+
+    # Old .3 was dropped from the cascade ...
+    # (its content shifted out — .3 now holds what used to be .2).
+    assert (tmp_path / "events.jsonl.3").read_text() == "A2\n"
+
+    # ... but the decision survives in the preserved tier.
+    preserved = tmp_path / "events.jsonl.preserved"
+    assert preserved.exists()
+    preserved_kinds = [json.loads(line)["kind"] for line in preserved.read_text().splitlines()]
+    assert "decision.made" in preserved_kinds
+    # Pure telemetry was NOT carried over.
+    assert "tick_start" not in preserved_kinds
+
+    # A telemetry line records the rescue in the fresh live file.
+    live_kinds = [json.loads(line)["kind"] for line in events.read_text().splitlines()]
+    assert "events_load_bearing_preserved" in live_kinds
+
+
+def test_archive_with_only_noise_preserves_nothing(tmp_path: Path) -> None:
+    noise1 = json.dumps({"kind": "tick_start", "tick": 1})
+    noise2 = json.dumps({"kind": "tick.completed", "tick": 1})
+    events = _seed_full_cascade(tmp_path, [noise1, noise2])
+
+    result = rotate_events_file_if_needed(events, rotate_bytes=100)
+
+    assert result is not None and result["rotated"] is True
+    assert result["preserved_load_bearing"] == 0
+    assert not (tmp_path / "events.jsonl.preserved").exists()
+
+
+def test_unparseable_archive_line_is_preserved_failsafe(tmp_path: Path) -> None:
+    # A corrupt / non-JSON line cannot be classified — preserve it rather than
+    # risk dropping cognition we simply could not read.
+    events = _seed_full_cascade(tmp_path, ["{not valid json", "also-garbage"])
+
+    result = rotate_events_file_if_needed(events, rotate_bytes=100)
+
+    assert result is not None and result["rotated"] is True
+    assert result["preserved_load_bearing"] == 2
+    preserved = (tmp_path / "events.jsonl.preserved").read_text().splitlines()
+    assert preserved == ["{not valid json", "also-garbage"]
+
+
+def test_preservation_failure_does_not_abort_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If reading the archive raises OSError, the guard swallows it (best-effort)
+    # and rotation still proceeds — boot must never raise.
+    decision = json.dumps({"kind": "memory.superseded", "memory_id": "m1"})
+    events = _seed_full_cascade(tmp_path, [decision])
+
+    real_read_text = Path.read_text
+
+    def boom_read(self: Path, *a, **kw):  # type: ignore[no-untyped-def]
+        if self.name == "events.jsonl.3":
+            raise OSError("EIO reading archive")
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", boom_read)
+
+    # Must NOT raise.
+    result = rotate_events_file_if_needed(events, rotate_bytes=100)
+    assert result is not None and result["rotated"] is True
+    assert result["preserved_load_bearing"] == 0
