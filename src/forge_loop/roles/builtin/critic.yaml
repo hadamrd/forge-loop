@@ -1,7 +1,7 @@
 # Default Critic role (issue #17).
 name: critic
 brief_template: forge_loop/briefs/critic.md.tmpl
-model: claude-opus-4-7
+model: claude-opus-4-8
 timeout_s: 1200
 budget_usd: 2.0
 triggers:

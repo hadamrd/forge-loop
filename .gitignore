@@ -44,3 +44,8 @@ loop-runner-logs/
 # Per-operator sprint investigation-log artifact — written when the loop runs
 # from this checkout; never a tracked repo artifact.
 sprint-events.jsonl
+
+# Runtime control-plane sqlite — live-mutating, never commit (frontier rejected-path)
+.forge/*.db
+# operator-local overnight harness (machine paths)
+scripts/overnight-grind.sh

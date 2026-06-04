@@ -12,7 +12,7 @@ Schema (top-level):
                    text if `brief_inline: true`.
   brief_inline     bool, optional (default False). When True, the value of
                    `brief_template` is used directly as the brief body.
-  model            str, required — e.g. "claude-opus-4-7".
+  model            str, required — e.g. "claude-opus-4-8".
   timeout_s        int, required, > 0
   budget_usd       float, optional, >= 0 (omit/None == unlimited)
   triggers         list[Trigger], required, may be empty for manual roles

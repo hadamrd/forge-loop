@@ -55,7 +55,7 @@ agent:
 
 worker:
   provider: claude
-  model: claude-opus-4-7
+  model: claude-opus-4-8
   thinking: medium
   # Worker power: full (default, full host access) | standard (sandboxed to
   # the worktree) | readonly (planning/triage only). See docs/design.
@@ -63,7 +63,7 @@ worker:
 
 po:
   provider: claude
-  model: claude-opus-4-7
+  model: claude-opus-4-8
   thinking: high
 
 # Optional: enable the critic agent. When true, a critic subagent reviews

@@ -98,7 +98,7 @@ def _validate_model_for_provider(model: str, provider: str, field_name: str) -> 
     if not _MODEL_PATTERN.match(model):
         raise ConfigError(
             f"{field_name}={model!r}{hint}: unknown model alias — expected something "
-            "like 'claude-opus-4-7' or 'claude-sonnet-4-6'"
+            "like 'claude-opus-4-8' or 'claude-sonnet-4-6'"
         )
 
 
@@ -204,7 +204,7 @@ class POSettings(BaseSettings):
     enabled: bool = True
     timeout_s: int = 480
     max_to_expand_per_tick: int = 2
-    model: str = "claude-opus-4-7"
+    model: str = "claude-opus-4-8"
     thinking: str = "high"
     provider: str = "claude"
 
@@ -235,7 +235,7 @@ class POSettings(BaseSettings):
 
 class WorkerSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
-    model: str = "claude-opus-4-7"
+    model: str = "claude-opus-4-8"
     thinking: str = "medium"
     provider: str = "claude"
     allowed_mcp_tools: tuple[str, ...] = DEFAULT_ALLOWED_MCP_SERVERS
@@ -480,7 +480,7 @@ class Settings(BaseSettings):
 
         # Codex provider with no explicit model = empty string (CLI default).
         # Without this override, the pydantic class default
-        # ``claude-opus-4-7`` would leak through and the role would try to
+        # ``claude-opus-4-8`` would leak through and the role would try to
         # dispatch a Claude model name to the Codex CLI.
         for role in ("worker", "po", "critic"):
             block = raw[role]
