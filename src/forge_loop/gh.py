@@ -290,6 +290,18 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
     return sorted(repairs, key=lambda p: str(p.get("updatedAt") or ""))[:limit]
 
 
+def open_prs(limit: int, repo: str | None = None) -> list[dict[str, Any]]:
+    """Return all open PRs with the field set the #213 adoption scan needs.
+
+    Unlike :func:`prs_by_label`, this includes ``mergeStateStatus`` so the
+    orphaned-PR adoption scan can gate auto-merge on ``CLEAN``. Sorted oldest
+    updated first so the oldest orphan is adopted first.
+    """
+    repo = _require_repo(repo)
+    prs = _open_prs(limit=limit, repo=repo)
+    return sorted(prs, key=lambda p: str(p.get("updatedAt") or ""))
+
+
 def _open_prs(limit: int, repo: str) -> list[dict[str, Any]]:
     cmd = [
         "gh",

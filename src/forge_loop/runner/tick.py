@@ -21,6 +21,7 @@ from forge_loop.config import Config
 from forge_loop.deploy import redeploy
 from forge_loop.gh import (
     fetch_issue,
+    open_prs,
     pr_review_context,
     prs_by_label,
     prs_requiring_repair,
@@ -46,6 +47,12 @@ from forge_loop.runner.label_hygiene import remove_ready_label as _remove_ready_
 from forge_loop.runner.repairs import blocking_pr_repairs as _blocking_pr_repairs_impl
 from forge_loop.runner.repairs import (
     enable_automerge_for_repaired_prs as _enable_automerge_for_repaired_prs,
+)
+from forge_loop.runner.repairs import (
+    LOOP_ADOPTED_LABEL as _LOOP_ADOPTED_LABEL,
+)
+from forge_loop.runner.repairs import (
+    orphaned_clean_pr_adoptions as _orphaned_clean_pr_adoptions_impl,
 )
 from forge_loop.runner.repairs import (
     ready_issue_open_pr_repairs as _ready_issue_open_pr_repairs_impl,
@@ -90,6 +97,16 @@ def _ready_issue_open_pr_repairs(
         ready_issues,
         open_prs_fn=prs_by_label,
         pr_review_context_fn=pr_review_context,
+    )
+
+
+def _orphaned_clean_pr_adoptions(
+    cfg: Config,
+) -> list[tuple[WorkerOutcome, dict[str, Any]]]:
+    return _orphaned_clean_pr_adoptions_impl(
+        cfg,
+        open_prs_fn=open_prs,
+        fetch_issue_fn=fetch_issue,
     )
 
 
@@ -163,6 +180,179 @@ def _enable_automerge_for_reviewed_outcomes(
                 issue=outcome.issue,
                 pr=outcome.pr_url,
             )
+
+
+def _enable_automerge_for_adopted_prs(
+    cfg: Config,
+    adoptions: list[tuple[WorkerOutcome, dict[str, Any]]],
+    *,
+    refused_issues: set[int],
+    emit: Any,
+) -> None:
+    """Put critic-approved, mergeable adopted PRs back on the merge conveyor.
+
+    Issue #213, acceptance criterion 2/3. Mirrors
+    ``_enable_automerge_for_reviewed_outcomes`` but adds the adoption-specific
+    gates: skip if the critic just blocked (``outcome.error`` set), if the
+    source issue closed mid-tick (``refused_issues``), if the PR is not
+    ``mergeStateStatus == CLEAN``, or if it has unresolved review threads.
+    Every skip emits ``orphan_pr_skipped`` with a ``reason`` — no silent drop.
+    """
+    from forge_loop import gh as _gh
+
+    for outcome, pr in adoptions:
+        if outcome.status != "open" or not outcome.pr_url:
+            continue
+        if outcome.issue in refused_issues:
+            # The issue-closed gate already emitted merge_refused_issue_closed.
+            continue
+        if outcome.error:
+            # The critic blocked this PR during adoption — leave it for the
+            # repair loop (it now carries critic:blocking / critic:suspicious).
+            append_event(
+                cfg.events_file,
+                "orphan_pr_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason="critic_blocked",
+            )
+            continue
+        merge_state = str(pr.get("mergeStateStatus") or "").upper()
+        # AC2: require mergeStateStatus == CLEAN. An absent/unknown state must
+        # be treated as NOT mergeable (skip) — never bypass the gate. These
+        # skips are transient: the PR is left UNstamped so the next adoption
+        # scan re-evaluates it once it goes CLEAN (see the stamping rule below).
+        if merge_state != "CLEAN":
+            append_event(
+                cfg.events_file,
+                "orphan_pr_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason=f"not_mergeable:{merge_state.lower() or 'unknown'}",
+            )
+            continue
+        threads = _gh.unresolved_review_threads(outcome.pr_url, repo=cfg.github_repo)
+        if threads:
+            append_event(
+                cfg.events_file,
+                "orphan_pr_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason="unresolved_review_threads",
+                unresolved=len(threads),
+            )
+            continue
+        if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
+            outcome.status = "merged"
+            append_event(
+                cfg.events_file,
+                "orphan_pr_automerge_enabled",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+            )
+        else:
+            append_event(
+                cfg.events_file,
+                "orphan_pr_automerge_failed",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+            )
+
+
+def _run_adoption_tick(
+    cfg: Config,
+    tick: int,
+    adoptions: list[tuple[WorkerOutcome, dict[str, Any]]],
+    *,
+    bus_emit: Any,
+    short_sleep: Any,
+) -> None:
+    """Adopt orphaned clean PRs: re-critic (if no verdict) + merge-gate (#213).
+
+    Never spawns a worker — adoption is critic + merge-gate only (out of
+    scope: repair-worker dispatch). Idempotent: a ``loop:adopted`` label is
+    stamped on each successfully-adopted PR so a re-run of this scan excludes
+    it (no duplicate critic runs, no double auto-merge).
+    """
+    from forge_loop import gh as _gh
+    from forge_loop.runner.merge_gate import apply_issue_closed_gate
+
+    master_log_path = cfg.logs_dir / "master.log"
+    outcomes = [o for o, _pr in adoptions]
+    issue_nums = [o.issue for o in outcomes]
+    write_state(
+        cfg.state_file,
+        {
+            "state": "adopting",
+            "tick": tick,
+            "dispatched": [{"issue": o.issue, "pr": o.pr_url} for o in outcomes],
+        },
+    )
+    append_event(
+        cfg.events_file,
+        "orphan_pr_adoption_tick_start",
+        tick=tick,
+        issues=issue_nums,
+        prs=[o.pr_url for o in outcomes],
+    )
+    _mlog.info(master_log_path, f"tick {tick} adopting orphaned PR(s): {issue_nums}")
+    for o in outcomes:
+        append_event(cfg.events_file, "orphan_pr_adopted", issue=o.issue, pr=o.pr_url)
+
+    # Re-critic. The selector already excluded PRs that carry a verdict
+    # (critic:blocking/suspicious) or were previously adopted, so this never
+    # re-runs the critic on a PR that already has one.
+    if cfg.critic.enabled:
+        _run_critic_for_outcomes(cfg, outcomes, bus_emit)
+
+    # Pre-merge issue-closed gate (defence-in-depth for an issue closed
+    # between the adoption scan and this merge step).
+    refused = apply_issue_closed_gate(
+        outcomes,
+        gh=_gh,
+        repo=cfg.github_repo,
+        events_file=cfg.events_file,
+        emit=bus_emit,
+    )
+
+    _enable_automerge_for_adopted_prs(
+        cfg,
+        adoptions,
+        refused_issues=set(refused),
+        emit=bus_emit,
+    )
+
+    # Idempotency marker: stamp ONLY PRs that reached a terminal adoption
+    # outcome — auto-merged (status=="merged") or critic-blocked (error set;
+    # the critic:blocking label already excludes them and the repair loop owns
+    # them). PRs skipped for TRANSIENT reasons (not_mergeable:<state>,
+    # unresolved_review_threads, automerge enable failed) are left UNstamped so
+    # the next scan re-evaluates them once they go CLEAN / threads resolve —
+    # otherwise the marker would permanently re-orphan the PRs this feature
+    # exists to rescue (issue #213 regression caught in review).
+    refused_set = set(refused)
+    for o in outcomes:
+        terminal = o.status == "merged" or bool(o.error)
+        if o.pr_url and terminal and o.issue not in refused_set:
+            _gh.add_pr_label(o.pr_url, [_LOOP_ADOPTED_LABEL], repo=cfg.github_repo)
+
+    append_event(
+        cfg.events_file,
+        "orphan_pr_adoption_tick_done",
+        tick=tick,
+        outcomes=[asdict(o) for o in outcomes],
+    )
+    summary = consolidate_sprint(
+        cfg.events_file,
+        cfg.summaries_file,
+        tick,
+        [asdict(o) for o in outcomes],
+    )
+    write_state(
+        cfg.state_file,
+        {"state": "between-ticks", "tick": tick, "last_summary": summary},
+    )
+    short_sleep(cfg.tick_interval_s, cfg)
 
 
 def _should_run_worker_iterations(cfg: Any, outcomes: Sequence[object]) -> bool:
@@ -274,6 +464,23 @@ def _tick(cfg: Config, tick: int) -> None:
             done_event="repair_tick_done",
             log_action="repairing blocked PR(s)",
             remove_ready=False,
+        )
+        return
+
+    # Issue #213 — adopt orphaned clean PRs. A worker can open its PR and then
+    # trip ``worker_timeout_s`` before the post-critic merge step runs, leaving
+    # a CLEAN / never-critic'd PR open forever (it matches neither the blocking
+    # nor the ready-issue repair selectors). Re-critic + merge-gate it here.
+    # This runs BEFORE top_issues so it fires even on otherwise-idle ticks
+    # where the source issue no longer carries ``loop:ready``.
+    adoptions = _orphaned_clean_pr_adoptions(cfg)
+    if adoptions:
+        _run_adoption_tick(
+            cfg,
+            tick,
+            adoptions,
+            bus_emit=_bus_emit,
+            short_sleep=_short_sleep,
         )
         return
 

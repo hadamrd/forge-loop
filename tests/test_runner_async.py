@@ -339,3 +339,68 @@ def test_pools_from_env_reads_loop_vars(monkeypatch) -> None:
     monkeypatch.setenv("LOOP_CRITIC_POOL", "2")
     p = AsyncPools.from_env(default_worker=3)
     assert (p.po, p.worker, p.critic) == (4, 7, 2)
+
+
+def test_worker_timeout_recovers_orphaned_pr_url() -> None:
+    """Issue #213: a worker cancelled at the deadline after opening its PR
+    must surface the recovered PR URL on the synthetic timeout result so the
+    orphaned PR is not silently dropped."""
+    async def body() -> None:
+        async def po(issue):
+            await asyncio.sleep(0)
+            return {"issue": issue["number"], "skipped": False}
+
+        async def worker(issue, _po):
+            # Simulate the deadline tripping after the PR was opened.
+            await asyncio.sleep(10)
+            return {"issue": issue["number"], "status": "open", "pr_url": "x"}
+
+        async def critic(wr):
+            await asyncio.sleep(0)
+            return {"issue": wr["issue"], "verdict": "approved"}
+
+        def recover(issue) -> str:
+            return f"https://github.com/o/r/pull/{issue['number']}"
+
+        results, stats = await run_async_tick(
+            [{"number": 205, "title": "t"}],
+            pools=AsyncPools(po=1, worker=1, critic=1),
+            caps=AsyncQueueCaps(),
+            po_fn=po, worker_fn=worker, critic_fn=critic,
+            worker_timeout_s=0.05,
+            pr_recover_fn=recover,
+        )
+        assert stats.worker.timeouts == 1
+        assert len(results) == 1
+        assert results[0]["worker"]["status"] == "timeout"
+        assert results[0]["worker"]["pr_url"] == "https://github.com/o/r/pull/205"
+
+    asyncio.run(body())
+
+
+def test_worker_timeout_without_recoverer_keeps_pr_url_none() -> None:
+    """Adversarial: no pr_recover_fn wired → legacy pr_url=None behaviour."""
+    async def body() -> None:
+        async def po(issue):
+            await asyncio.sleep(0)
+            return {"issue": issue["number"], "skipped": False}
+
+        async def worker(issue, _po):
+            await asyncio.sleep(10)
+            return {"issue": issue["number"], "status": "open", "pr_url": "x"}
+
+        async def critic(wr):
+            await asyncio.sleep(0)
+            return {"issue": wr["issue"], "verdict": "approved"}
+
+        results, stats = await run_async_tick(
+            [{"number": 205, "title": "t"}],
+            pools=AsyncPools(po=1, worker=1, critic=1),
+            caps=AsyncQueueCaps(),
+            po_fn=po, worker_fn=worker, critic_fn=critic,
+            worker_timeout_s=0.05,
+        )
+        assert stats.worker.timeouts == 1
+        assert results[0]["worker"]["pr_url"] is None
+
+    asyncio.run(body())
