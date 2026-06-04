@@ -13,7 +13,10 @@ from typing import Any
 
 import typer
 
+from forge_loop.log import get_logger
 from forge_loop.state import tail_events
+
+_log = get_logger("forge_loop.cli_product_commands")
 
 
 class ProductCommandsMixin:
@@ -52,6 +55,7 @@ class ProductCommandsMixin:
             render_suggestion_text,
         )
         from forge_loop.manifestos import discover_manifestos
+        from forge_loop.settings import ConfigError
 
         pr_number = getattr(args, "from_pr", None)
         if pr_number is None:
@@ -65,7 +69,6 @@ class ProductCommandsMixin:
         repo_path = Path.cwd()
         owner = ""
         repo_name = ""
-        provider = "claude"
         model: Any = None
         timeout_s = 300
         try:
@@ -75,11 +78,17 @@ class ProductCommandsMixin:
             if "/" in gh_repo:
                 owner, repo_name = gh_repo.split("/", 1)
             po_cfg = getattr(cfg, "po", None)
-            provider = getattr(po_cfg, "provider", provider)
             model = getattr(po_cfg, "model", model)
             timeout_s = getattr(po_cfg, "timeout_s", timeout_s)
-        except Exception:  # noqa: BLE001 — command must work even without a config
-            pass
+        except ConfigError as exc:
+            # Command must work even without a config (dry-run still runs the
+            # SDK against cwd). Log the specific failure rather than swallowing
+            # it silently, so a genuinely broken config is diagnosable.
+            _log.warning(
+                "manifesto_suggest: config load failed; using defaults",
+                repo_path=str(repo_path),
+                error=str(exc),
+            )
 
         github_repo = f"{owner}/{repo_name}" if owner and repo_name else ""
 
@@ -110,7 +119,6 @@ class ProductCommandsMixin:
             owner,
             repo_name,
             gh_client=gh_client,
-            provider=provider,
             model=model,
             timeout_s=timeout_s,
         )

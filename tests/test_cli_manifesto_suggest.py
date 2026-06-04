@@ -192,6 +192,70 @@ def test_malformed_sdk_output_exits_nonzero_no_pr(
     assert opener.calls == []
 
 
+def test_factory_not_passed_dead_provider_kwarg(
+    runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for sev3 review: ``provider`` was accepted by the factory but
+    silently dropped (``ManifestoSuggester`` has no such field). The command
+    must no longer pass it."""
+    seen_kwargs: dict[str, Any] = {}
+    suggester = _StubSuggester(result=_suggestion())
+
+    def _factory(*_a: Any, **k: Any) -> _StubSuggester:
+        seen_kwargs.update(k)
+        return suggester
+
+    monkeypatch.setattr(cli, "_manifesto_suggester_factory", _factory)
+    monkeypatch.setattr(cli, "_manifesto_pr_opener", _SpyPrOpener())
+
+    result = runner.invoke(cli.app, ["manifesto", "suggest", "--from-pr", "207"])
+
+    assert result.exit_code == 0, result.stdout + getattr(result, "stderr", "")
+    assert "provider" not in seen_kwargs
+    # The kwargs that survive are the meaningful ones.
+    assert set(seen_kwargs) <= {"gh_client", "model", "timeout_s"}
+
+
+def test_config_load_error_is_logged_not_swallowed(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for sev1 EH-001: a failing ``self.load()`` must be caught
+    specifically (ConfigError) and logged with the repo path — not swallowed
+    by a bare ``except Exception: pass``. The dry-run still runs on defaults."""
+    from forge_loop import cli_product_commands
+    from forge_loop.settings import ConfigError
+
+    monkeypatch.chdir(tmp_path)
+
+    def _boom() -> Any:
+        raise ConfigError("broken forge-loop.yaml")
+
+    monkeypatch.setattr(cli, "load", _boom)
+    monkeypatch.setattr(cli, "_gh_client_factory", lambda: SimpleNamespace())
+
+    warnings: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        cli_product_commands._log,
+        "warning",
+        lambda event, **kw: warnings.append((event, kw)),
+    )
+
+    suggester = _StubSuggester(result=_suggestion())
+    opener = _install(monkeypatch, suggester)
+
+    result = runner.invoke(cli.app, ["manifesto", "suggest", "--from-pr", "207"])
+
+    # Command still works on defaults (dry-run), exits 0, writes nothing.
+    assert result.exit_code == 0, result.stdout + getattr(result, "stderr", "")
+    assert opener.calls == []
+    # The failure was logged (not silently swallowed) with the repo path.
+    assert warnings, "ConfigError should be logged, not swallowed"
+    event, kw = warnings[-1]
+    assert "config load failed" in event
+    assert "repo_path" in kw
+    assert "broken forge-loop.yaml" in kw.get("error", "")
+
+
 def test_empty_suggestion_apply_opens_nothing(
     runner: CliRunner, cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

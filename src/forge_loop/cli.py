@@ -216,7 +216,6 @@ def _manifesto_suggester_factory(
     repo: str,
     *,
     gh_client: Any = None,
-    provider: str = "claude",
     model: str | None = None,
     timeout_s: int = 300,
 ) -> Any:

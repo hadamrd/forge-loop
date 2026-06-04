@@ -41,3 +41,6 @@ loop-runner.pid
 loop-runner.pause
 loop-runner.stop
 loop-runner-logs/
+# Per-operator sprint investigation-log artifact — written when the loop runs
+# from this checkout; never a tracked repo artifact.
+sprint-events.jsonl

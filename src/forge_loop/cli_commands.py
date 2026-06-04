@@ -25,7 +25,6 @@ def _default_manifesto_suggester_factory(
     repo: str,
     *,
     gh_client: Any = None,
-    provider: str = "claude",
     model: Any = None,
     timeout_s: int = 300,
 ) -> Any:
