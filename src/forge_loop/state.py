@@ -49,16 +49,29 @@ def rotate_events_file_if_needed(
     A fresh empty ``events.jsonl`` is then created and an
     ``events_file_rotated`` event is appended as its first line.
 
+    Load-bearing guard (issue #210): before the oldest archive is unlinked,
+    any load-bearing line in it (a settled ``decision.made``, a
+    ``memory.superseded``, a terminal saga state, a capability grant, …) is
+    forced into a preserved sidecar tier — ``events.jsonl.preserved`` — so the
+    cascade never silently erases cognition that boot reconstruction depends on.
+    This is option (b) of the guard contract: preserve, then prune the
+    non-load-bearing remainder. Classification is delegated to the single source
+    of truth :func:`forge_loop.eventlog.models.is_load_bearing`. A
+    ``events_load_bearing_preserved`` telemetry line records how many lines were
+    rescued.
+
     On OSError at any step (permission denied, disk full, read-only target,
     etc.) the helper does NOT raise — it emits an ``events_rotation_failed``
     event best-effort (which may itself swallow OSError) and returns the
-    failure payload. Callers should treat the return value as informational
+    failure payload. The preservation step is likewise best-effort and never
+    raises through boot. Callers should treat the return value as informational
     telemetry only; boot must continue regardless.
 
     Returns:
         ``None`` if no rotation was required, otherwise a dict describing
         the outcome (``rotated``: bool, ``rotated_size``: int,
-        ``archive_count``: int, ``error``: str | None).
+        ``archive_count``: int, ``error``: str | None,
+        ``preserved_load_bearing``: int).
     """
     if rotate_bytes is None:
         rotate_bytes = _rotate_bytes_threshold()
@@ -70,19 +83,32 @@ def rotate_events_file_if_needed(
     except OSError as e:
         # Couldn't even stat — try to record this and bail.
         _try_append_event(events_path, "events_rotation_failed", error=str(e))
-        return {"rotated": False, "rotated_size": 0, "archive_count": 0, "error": str(e)}
+        return {
+            "rotated": False,
+            "rotated_size": 0,
+            "archive_count": 0,
+            "error": str(e),
+            "preserved_load_bearing": 0,
+        }
 
     if size < rotate_bytes:
         return None
 
     error: str | None = None
     archive_count = 0
+    preserved_load_bearing = 0
     try:
         # Walk archives from highest down: unlink the oldest that would be
         # overflowed, then shift each existing archive up by one. Finally,
         # rename the live file to .1.
         oldest = events_path.with_suffix(events_path.suffix + f".{max_archives}")
         if oldest.exists() or oldest.is_symlink():
+            # Issue #210: rescue load-bearing lines into the preserved tier
+            # BEFORE the oldest archive is discarded, so the cascade can never
+            # silently erase a settled decision / superseded memory / terminal
+            # saga state / capability grant.
+            preserved_path = events_path.with_suffix(events_path.suffix + ".preserved")
+            preserved_load_bearing = _preserve_load_bearing_lines(oldest, preserved_path)
             with contextlib.suppress(FileNotFoundError):
                 oldest.unlink()
 
@@ -111,21 +137,75 @@ def rotate_events_file_if_needed(
             "rotated_size": size,
             "archive_count": archive_count,
             "error": error,
+            "preserved_load_bearing": preserved_load_bearing,
         }
 
-    # Success path: stamp the first event in the fresh file.
+    # Success path: stamp the rotation marker as the first line of the fresh
+    # file (callers rely on line[0] being ``events_file_rotated``).
     _try_append_event(
         events_path,
         "events_file_rotated",
         rotated_size=size,
         archive_count=archive_count,
     )
+
+    # Telemetry for the guard (issue #210): surface how many load-bearing
+    # lines were rescued from the dropped archive into the preserved tier.
+    if preserved_load_bearing:
+        _try_append_event(
+            events_path,
+            "events_load_bearing_preserved",
+            preserved=preserved_load_bearing,
+        )
     return {
         "rotated": True,
         "rotated_size": size,
         "archive_count": archive_count,
         "error": None,
+        "preserved_load_bearing": preserved_load_bearing,
     }
+
+
+def _preserve_load_bearing_lines(archive_path: Path, preserved_path: Path) -> int:
+    """Append every load-bearing line of ``archive_path`` to ``preserved_path``.
+
+    The preserved tier (issue #210) is a plain append-only sidecar. A line is
+    load-bearing per :func:`forge_loop.eventlog.models.is_load_bearing`,
+    classified by its ``kind`` field; a line that fails to parse as JSON is
+    preserved fail-safe (we never silently drop something we cannot read).
+
+    Best-effort: any OSError is swallowed so rotation — and therefore boot —
+    never raises. Returns the number of lines rescued (0 on any read failure).
+    """
+    from forge_loop.eventlog.models import is_load_bearing
+
+    try:
+        raw = archive_path.read_text()
+    except OSError:
+        return 0
+
+    keep: list[str] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+            kind = record.get("kind") if isinstance(record, dict) else None
+        except json.JSONDecodeError:
+            kind = None
+        # Unparseable / kindless lines are preserved fail-safe.
+        if kind is None or is_load_bearing(str(kind)):
+            keep.append(line)
+
+    if not keep:
+        return 0
+
+    try:
+        with open(preserved_path, "a") as f:
+            f.write("\n".join(keep) + "\n")
+    except OSError:
+        return 0
+    return len(keep)
 
 
 def _try_append_event(events_path: Path, kind: str, **fields: Any) -> None:

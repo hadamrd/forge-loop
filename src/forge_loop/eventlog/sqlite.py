@@ -6,12 +6,31 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from forge_loop.eventlog.models import EventEnvelope, EventId, EventKind, EventRef
+from forge_loop.eventlog.guard import guard_prune
+from forge_loop.eventlog.models import (
+    EventEnvelope,
+    EventId,
+    EventKind,
+    EventRef,
+    is_load_bearing,
+)
 from forge_loop.eventlog.projections import ProjectionCursor, ProjectionReplayError
+
+
+@dataclass(frozen=True)
+class CompactionResult:
+    """Outcome of a guarded compaction pass (issue #210)."""
+
+    scanned: int
+    pruned: int
+    preserved_load_bearing: int
+    high_water_sequence: int
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -210,6 +229,93 @@ class SqliteEventLog:
             """
         )
         return {row["projection_name"]: ProjectionCursor(sequence=row["sequence"]) for row in rows}
+
+    def prune(self, sequences: Iterable[int]) -> int:
+        """Delete the given event sequences — GUARDED (issue #210, option a).
+
+        Refuses the whole prune by raising
+        :class:`forge_loop.eventlog.guard.LoadBearingGuardError` if ANY target
+        sequence is a load-bearing event (per
+        :func:`forge_loop.eventlog.models.is_load_bearing`). On refusal NOTHING
+        is deleted — load-bearing events are never dropped. Returns the number
+        of rows deleted on success.
+        """
+        targets = sorted({int(s) for s in sequences})
+        if not targets:
+            return 0
+        placeholders = ",".join("?" for _ in targets)
+        rows = self._connection.execute(
+            f"SELECT sequence, kind FROM events WHERE sequence IN ({placeholders})",
+            targets,
+        ).fetchall()
+        # guard_prune raises (refusing every deletion) if any target is
+        # load-bearing — the row(s) are left untouched on disk.
+        guard_prune(EventKind(row["kind"]) for row in rows)
+        present = [int(row["sequence"]) for row in rows]
+        if not present:
+            return 0
+        present_placeholders = ",".join("?" for _ in present)
+        with self._connection:
+            self._connection.execute(
+                f"DELETE FROM events WHERE sequence IN ({present_placeholders})",
+                present,
+            )
+        return len(present)
+
+    def compact_noise(self, *, emit_marker: bool = True) -> CompactionResult:
+        """Guarded compaction: drop telemetry/noise, keep load-bearing forever.
+
+        Issue #210, option (b): the load-bearing remainder is forced to survive
+        in the live tier (it is simply never selected for deletion) while only
+        non-load-bearing rows are pruned. The current high-water-mark row is
+        ALWAYS preserved regardless of kind, so ``latest_sequence()`` and every
+        projection cursor's accounting stay invariant across a compaction — this
+        is what keeps the boot-reconstruction invariant intact.
+
+        When ``emit_marker`` is true a :class:`EventKind.COMPACTION_PERFORMED`
+        telemetry event is appended after the prune (this advances the log tail,
+        so callers proving the boot invariant pass ``emit_marker=False`` to
+        isolate the pure prune).
+        """
+        high_water = self.latest_sequence()
+        rows = self._connection.execute("SELECT sequence, kind FROM events").fetchall()
+        scanned = len(rows)
+        droppable: list[int] = []
+        preserved = 0
+        for row in rows:
+            sequence = int(row["sequence"])
+            if is_load_bearing(EventKind(row["kind"])):
+                preserved += 1
+                continue
+            if sequence == high_water:
+                # Never prune the tail: keeps latest_sequence() stable.
+                continue
+            droppable.append(sequence)
+
+        if droppable:
+            placeholders = ",".join("?" for _ in droppable)
+            with self._connection:
+                self._connection.execute(
+                    f"DELETE FROM events WHERE sequence IN ({placeholders})",
+                    droppable,
+                )
+
+        if emit_marker:
+            self.append(
+                EventKind.COMPACTION_PERFORMED,
+                {
+                    "scanned": scanned,
+                    "pruned": len(droppable),
+                    "preserved_load_bearing": preserved,
+                },
+            )
+
+        return CompactionResult(
+            scanned=scanned,
+            pruned=len(droppable),
+            preserved_load_bearing=preserved,
+            high_water_sequence=high_water,
+        )
 
     def _find_by_idempotency_key(self, idempotency_key: str) -> EventEnvelope | None:
         row = self._connection.execute(
