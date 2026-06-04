@@ -7,11 +7,14 @@ All functions require ``repo="<owner>/<name>"``. The runner passes
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any
 
 from forge_loop import gh_issues
+
+logger = logging.getLogger(__name__)
 
 auth_source = "gh cli"
 
@@ -460,20 +463,34 @@ def review_threads(pr: int | str, repo: str | None = None) -> list[dict[str, Any
     return _parse_thread_nodes(nodes)
 
 
+# Max PR aliases per batched GraphQL query. Each alias requests
+# ``reviewThreads(first: 100)`` with nested comments, so a single query over
+# all 50 open PRs can blow GitHub's GraphQL node/complexity budget and fail
+# wholesale. Chunking bounds per-query complexity and limits the blast radius
+# of any one chunk failing (issue #226 review — sev2/correctness).
+_REVIEW_THREADS_BATCH_CHUNK = 10
+
+
 def review_threads_batch(
     pr_numbers: list[int],
     repo: str | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
-    """Fetch review threads for many PRs in ONE GraphQL round-trip.
+    """Fetch review threads for many PRs, batching GraphQL round-trips.
 
     Replaces the per-PR ``review_threads`` fan-out (issue #226): an idle repo
     with N open PRs cost N ``gh api graphql`` subprocesses per tick just to
-    discover nothing needed repair. One aliased query covers all PRs.
+    discover nothing needed repair. PRs are batched into aliased queries of at
+    most ``_REVIEW_THREADS_BATCH_CHUNK`` so a real workload's nested
+    ``reviewThreads`` selections stay under GitHub's GraphQL complexity limits.
+
+    Failure handling preserves the per-PR fetcher's blast radius: if a chunk
+    query fails (non-zero return, JSON error, or malformed payload), it is
+    logged and each PR in that chunk falls back to its own ``review_threads``
+    call, so a single failed batch never silently degrades *every* PR to "no
+    threads" and drops the ``unresolved_review_threads`` repair reason.
 
     Returns a ``{pr_number: [normalised threads]}`` map; PRs missing from the
-    response map to ``[]``. An empty ``pr_numbers`` issues no subprocess at
-    all, and any API/parse failure degrades to an empty map (matching the
-    per-PR fetcher's swallow-and-return-empty contract).
+    response map to ``[]``. An empty ``pr_numbers`` issues no subprocess at all.
     """
     repo = _require_repo(repo)
     # De-dup while preserving order so each PR gets exactly one alias.
@@ -486,10 +503,43 @@ def review_threads_batch(
             numbers.append(num)
     if not numbers:
         return {}
+
+    out: dict[int, list[dict[str, Any]]] = {}
+    for start in range(0, len(numbers), _REVIEW_THREADS_BATCH_CHUNK):
+        chunk = numbers[start : start + _REVIEW_THREADS_BATCH_CHUNK]
+        batched = _review_threads_chunk(chunk, repo=repo)
+        if batched is None:
+            # Chunk-level failure: fall back to per-PR fetch so only the PRs
+            # whose individual queries *also* fail degrade to [] — instead of
+            # the whole chunk silently looking idle.
+            logger.warning(
+                "review_threads_batch: batched query failed for PRs %s; "
+                "falling back to per-PR fetch",
+                chunk,
+            )
+            for num in chunk:
+                out[num] = review_threads(num, repo=repo)
+        else:
+            out.update(batched)
+    return out
+
+
+def _review_threads_chunk(
+    numbers: list[int],
+    repo: str,
+) -> dict[int, list[dict[str, Any]]] | None:
+    """Fetch one chunk of PRs in a single aliased GraphQL query.
+
+    Returns the ``{pr_number: [threads]}`` map on success, or ``None`` to
+    signal a chunk-level failure (non-zero return, JSON error, or malformed
+    payload) so the caller can fall back to per-PR fetches.
+    """
+    if not numbers:
+        return {}
     try:
         owner, name = repo.split("/", 1)
     except ValueError:
-        return {}
+        return None
 
     aliases = "\n".join(
         f"    pr{idx}: pullRequest(number: {num}) {{\n{_REVIEW_THREADS_SELECTION}    }}"
@@ -519,14 +569,18 @@ def review_threads_batch(
         check=False,
     )
     if r.returncode != 0:
-        return {}
+        return None
     try:
         data = json.loads(r.stdout)
     except json.JSONDecodeError:
-        return {}
+        return None
+    # A partial GraphQL failure still returns 0 but carries top-level errors and
+    # a null repository; treat that as a chunk failure so callers fall back.
+    if data.get("errors"):
+        return None
     repo_data = (data.get("data") or {}).get("repository") or {}
     if not isinstance(repo_data, dict):
-        return {}
+        return None
     out: dict[int, list[dict[str, Any]]] = {}
     for idx, num in enumerate(numbers):
         pr_obj = repo_data.get(f"pr{idx}") or {}

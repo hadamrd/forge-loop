@@ -261,14 +261,78 @@ def test_review_threads_batch_empty_input_issues_no_subprocess(monkeypatch) -> N
     assert gh.review_threads_batch([], repo="o/r") == {}
 
 
-def test_review_threads_batch_api_failure_returns_empty_map(monkeypatch) -> None:
-    """Adversarial: non-zero returncode degrades to an empty map."""
+def test_review_threads_batch_total_failure_falls_back_per_pr(monkeypatch) -> None:
+    """Sev2 (#226 review): a batch failure must NOT silently map every PR to [].
+
+    The batched query fails (non-zero return), so the helper falls back to a
+    per-PR fetch for each PR in the chunk. Here the per-PR fetches *also* fail,
+    so every PR ends up [] — but the count of subprocesses proves the fallback
+    actually ran (1 batched attempt + 1 per-PR attempt per PR), not a single
+    swallow-and-blank-everything.
+    """
+    graphql_calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        graphql_calls.append(cmd)
         return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="boom")
 
     monkeypatch.setattr(gh.subprocess, "run", fake_run)
-    assert gh.review_threads_batch([1, 2], repo="o/r") == {}
+    out = gh.review_threads_batch([1, 2], repo="o/r")
+    assert out == {1: [], 2: []}
+    # 1 batched query + 1 per-PR fallback query each for PRs 1 and 2.
+    assert len(graphql_calls) == 3
+
+
+def test_review_threads_batch_fallback_recovers_threads(monkeypatch) -> None:
+    """Sev2 (#226 review): when the batch fails but per-PR succeeds, the
+    ``unresolved_review_threads`` signal is recovered — not dropped for all PRs.
+    """
+    batched_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        # A batched query aliases multiple PRs (pr0/pr1...); a single-PR query
+        # passes `number=` as an -F flag. Distinguish them to simulate "batch
+        # blows the complexity budget but the smaller per-PR queries succeed".
+        is_single = any(arg.startswith("number=") for arg in cmd)
+        if not is_single:
+            batched_calls.append(cmd)
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr="node limit exceeded"
+            )
+        # Per-PR fallback: PR 1 has an unresolved thread, PR 2 has none.
+        number = next(arg.split("=", 1)[1] for arg in cmd if arg.startswith("number="))
+        nodes = [_thread("recovered")] if number == "1" else []
+        return _completed(
+            {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": nodes}}}}}
+        )
+
+    monkeypatch.setattr(gh.subprocess, "run", fake_run)
+    out = gh.review_threads_batch([1, 2], repo="o/r")
+    assert len(batched_calls) == 1  # the batch was attempted...
+    assert out[1][0]["id"] == "recovered"  # ...and the per-PR fallback recovered PR 1
+    assert out[2] == []
+
+
+def test_review_threads_batch_chunks_large_pr_sets(monkeypatch) -> None:
+    """Sev2 (#226 review): >chunk PRs are split into multiple bounded queries
+    so one giant aliased query can't exceed GraphQL complexity limits.
+    """
+    chunk = gh._REVIEW_THREADS_BATCH_CHUNK
+    pr_numbers = list(range(1, chunk * 2 + 2))  # two full chunks + a remainder
+    batched_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        query = next((arg for arg in cmd if arg.startswith("query=")), "")
+        n_aliases = query.count("pullRequest(number:")
+        assert n_aliases <= chunk  # no chunk exceeds the bound
+        batched_calls.append(cmd)
+        repo_obj = {f"pr{i}": {"reviewThreads": {"nodes": []}} for i in range(n_aliases)}
+        return _completed({"data": {"repository": repo_obj}})
+
+    monkeypatch.setattr(gh.subprocess, "run", fake_run)
+    out = gh.review_threads_batch(pr_numbers, repo="o/r")
+    assert set(out) == set(pr_numbers)
+    assert len(batched_calls) == 3  # ceil((2*chunk+1)/chunk) == 3
 
 
 def test_review_threads_batch_maps_aliases_back_to_pr_numbers(monkeypatch) -> None:

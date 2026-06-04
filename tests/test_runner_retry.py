@@ -118,12 +118,6 @@ def fake_world(monkeypatch, tmp_path: Path):
     def fake_top_issues(label: str, limit: int, repo: str | None = None):
         return [dict(issue)]
 
-    def fake_fetch_history_strict(num: int, repo: str | None = None):
-        return list(state.history.get(num, [])), state.corrupt.get(num, 0)
-
-    def fake_fetch_blocking_comments(num: int, repo: str | None = None):
-        return list(state.blocking_comments.get(num, []))
-
     def fake_fetch_issue_attempts(num: int, repo: str | None = None, **_kw):
         # Issue #226: the tick now fetches the comment payload once and derives
         # both views. The fake mirrors that single-fetch contract.
@@ -167,12 +161,13 @@ def fake_world(monkeypatch, tmp_path: Path):
     def fake_unlabel(num: int, label: str, repo: str | None = None) -> None:
         state.unlabeled.append((num, label, repo))
 
-    # Patch points: top_issues + attempts.fetch_history_strict +
+    # Patch points: top_issues + attempts.fetch_issue_attempts +
     # attempts.record + ThreadPoolExecutor's task (run_worker is captured by
     # name in runner via `from forge_loop.worker import run_worker`).
+    # The tick loop only calls fetch_issue_attempts now (issue #226 single
+    # fetch), so the legacy fetch_history_strict / fetch_blocking_comments
+    # seams are intentionally not patched here.
     monkeypatch.setattr(_runner, "top_issues", fake_top_issues)
-    monkeypatch.setattr(_attempts, "fetch_history_strict", fake_fetch_history_strict)
-    monkeypatch.setattr(_attempts, "fetch_blocking_comments", fake_fetch_blocking_comments)
     monkeypatch.setattr(_attempts, "fetch_issue_attempts", fake_fetch_issue_attempts)
     monkeypatch.setattr(_attempts, "record", fake_record)
     monkeypatch.setattr(_runner, "run_worker", fake_run_worker)
