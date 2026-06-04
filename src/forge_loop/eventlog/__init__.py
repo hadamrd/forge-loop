@@ -6,17 +6,38 @@ legacy JSONL events through :mod:`forge_loop.state` and
 control-plane work should use.
 """
 
+from forge_loop.eventlog.guard import (
+    LoadBearingGuardError,
+    PrunePartition,
+    guard_prune,
+    partition_for_prune,
+)
 from forge_loop.eventlog.legacy_mirror import LegacyEventMirror, LegacyRunnerEventKind
-from forge_loop.eventlog.models import EventEnvelope, EventId, EventKind, EventRef
+from forge_loop.eventlog.models import (
+    CAPABILITY_GRANT_EVENT_KIND,
+    LEGACY_TELEMETRY_KINDS,
+    LOAD_BEARING_EVENT_KINDS,
+    TELEMETRY_EVENT_KINDS,
+    EventEnvelope,
+    EventId,
+    EventKind,
+    EventRef,
+    is_load_bearing,
+)
 from forge_loop.eventlog.projections import (
     ProjectionCursor,
     ProjectionReplayError,
     replay_projection,
 )
-from forge_loop.eventlog.sqlite import SqliteEventLog
+from forge_loop.eventlog.sqlite import CompactionResult, SqliteEventLog
 from forge_loop.eventlog.store import EventLog, InMemoryEventLog
 
 __all__ = [
+    "CAPABILITY_GRANT_EVENT_KIND",
+    "LEGACY_TELEMETRY_KINDS",
+    "LOAD_BEARING_EVENT_KINDS",
+    "TELEMETRY_EVENT_KINDS",
+    "CompactionResult",
     "EventEnvelope",
     "EventId",
     "EventKind",
@@ -25,8 +46,13 @@ __all__ = [
     "InMemoryEventLog",
     "LegacyEventMirror",
     "LegacyRunnerEventKind",
+    "LoadBearingGuardError",
     "ProjectionCursor",
     "ProjectionReplayError",
+    "PrunePartition",
     "SqliteEventLog",
+    "guard_prune",
+    "is_load_bearing",
+    "partition_for_prune",
     "replay_projection",
 ]
