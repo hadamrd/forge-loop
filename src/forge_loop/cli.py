@@ -56,8 +56,11 @@ import typer
 
 from forge_loop.cli_commands import CliCommands
 from forge_loop.config import load
+from forge_loop.log import get_logger
 from forge_loop.runner import run as run_loop
 from forge_loop.settings import Settings
+
+_log = get_logger("forge_loop.cli")
 
 _STATUS_MARKERS = {
     "green": "[green]✓[/green]",
@@ -160,15 +163,18 @@ def _brainstormer_factory(
     ``None`` and the brainstormer degrades to its pre-memory behaviour.
     """
     from forge_loop.brainstormer import Brainstormer
+    from forge_loop.memory import memory_db_path
 
     memory_store: Any = None
-    db = Path(repo_path) / ".forge" / "memory.db"
-    if db.exists():
+    if memory_db_path(repo_path).exists():
         try:
-            from forge_loop.memory import SqliteMemoryStore
-
-            memory_store = SqliteMemoryStore(db)
-        except Exception:  # noqa: BLE001 — memory is optional; degrade gracefully
+            memory_store = _memory_store_factory(repo_path)
+        except Exception as exc:  # noqa: BLE001 — memory is optional; degrade gracefully
+            # Surface before degrading, mirroring the logged degrade in
+            # ``Brainstormer._load_rejected_paths`` and the stderr echoes in
+            # ``cli_product_commands``. Swallowing this silently would let the
+            # whole anti-relitigation feature no-op with zero signal.
+            _log.warning("memory_store_unavailable", error=str(exc))
             memory_store = None
 
     return Brainstormer(
@@ -194,9 +200,9 @@ def _memory_store_factory(repo_path: Path) -> Any:
 
     Tests monkeypatch this to inject a ``FakeMemoryStore``.
     """
-    from forge_loop.memory import SqliteMemoryStore
+    from forge_loop.memory import open_memory_store
 
-    return SqliteMemoryStore(Path(repo_path) / ".forge" / "memory.db")
+    return open_memory_store(repo_path)
 
 
 def _commands() -> CliCommands:

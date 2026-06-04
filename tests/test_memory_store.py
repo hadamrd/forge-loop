@@ -223,6 +223,20 @@ def test_sqlite_store_creates_parent_directories(tmp_path: Path) -> None:
     assert SqliteMemoryStore(db).get("mem-parent") is not None
 
 
+def test_open_memory_store_resolves_canonical_forge_path(tmp_path: Path) -> None:
+    """The consolidated helper resolves the single ``.forge/memory.db`` path and
+    constructs a working store, so the three CLI factories cannot drift."""
+    from forge_loop.memory import memory_db_path, open_memory_store
+
+    assert memory_db_path(tmp_path) == tmp_path / ".forge" / "memory.db"
+
+    store = open_memory_store(tmp_path)
+    assert isinstance(store, SqliteMemoryStore)
+    assert store.path == tmp_path / ".forge" / "memory.db"
+    store.put(_item("mem-helper", MemoryKind.SEMANTIC))
+    assert open_memory_store(tmp_path).get("mem-helper") is not None
+
+
 def test_superseding_missing_memory_raises_keyerror_for_real_and_fake_stores(
     tmp_path: Path,
 ) -> None:

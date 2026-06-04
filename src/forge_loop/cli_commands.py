@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 from forge_loop.cli_operator_commands import OperatorCommandsMixin
@@ -15,9 +14,9 @@ from forge_loop.cli_workflow_commands import WorkflowCommandsMixin
 
 def _default_memory_store_factory(repo_path: Any) -> Any:
     """Construct the durable memory store at ``.forge/memory.db``."""
-    from forge_loop.memory import SqliteMemoryStore
+    from forge_loop.memory import open_memory_store
 
-    return SqliteMemoryStore(Path(repo_path) / ".forge" / "memory.db")
+    return open_memory_store(repo_path)
 
 
 class CliCommands(

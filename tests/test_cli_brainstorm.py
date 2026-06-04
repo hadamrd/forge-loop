@@ -743,3 +743,49 @@ def test_two_run_loop_rejected_path_feeds_back_and_filters(
     # The prompt fed to run B's session cited the rejected path.
     assert "Wire Stripe SDK" in captured["prompt"]
     assert "Previously rejected paths" in captured["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# Factory degrade surfacing (review sev1: silent broad except — issue #203)
+# ---------------------------------------------------------------------------
+
+
+def test_brainstormer_factory_logs_and_degrades_when_store_construction_fails(
+    cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the memory db exists but the store cannot be constructed, the
+    factory must surface a warning (not swallow it silently) and degrade to a
+    ``None`` store — mirroring the logged degrade in sibling boundaries.
+    Regression guard for the sev1 silent-broad-except review finding."""
+    db = cwd_repo / ".forge" / "memory.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    db.write_text("corrupt", encoding="utf-8")
+
+    def _boom(_repo_path: Any) -> Any:
+        raise RuntimeError("corrupt sqlite header")
+
+    monkeypatch.setattr(cli, "_memory_store_factory", _boom)
+
+    warnings: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(cli._log, "warning", lambda event, **kw: warnings.append((event, kw)))
+
+    bs = cli._brainstormer_factory(cwd_repo, "acme", "widgets")
+
+    assert bs.memory_store is None
+    assert warnings, "construction failure must surface a warning, not be swallowed"
+    event, kw = warnings[0]
+    assert event == "memory_store_unavailable"
+    assert "corrupt sqlite header" in kw.get("error", "")
+
+
+def test_brainstormer_factory_no_db_degrades_silently(
+    cwd_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No db on disk → no store, no warning (identical to pre-memory behaviour)."""
+    warnings: list[Any] = []
+    monkeypatch.setattr(cli._log, "warning", lambda *a, **k: warnings.append((a, k)))
+
+    bs = cli._brainstormer_factory(cwd_repo, "acme", "widgets")
+
+    assert bs.memory_store is None
+    assert warnings == []
