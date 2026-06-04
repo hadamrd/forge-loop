@@ -117,6 +117,81 @@ discriminator into an enum + updating both call sites in the same PR.
 
 **How to apply.** When you add a rule like "no module > N LOC" or "no Any-typed param" or "no `subprocess.run(['gh', ...])` in production code": the same PR that adds the rule MUST add an audit probe under ``src/forge_loop/audit_probes/``. Rule and gate ship together; otherwise the rule is decoration.
 
+## Rule: reuse, function size, and performance (anti-slop)
+
+These three rules exist because the rubric above is entirely about
+*correctness/type-safety*. None of it catches the failure mode the operator
+named: code that is statistically shaped like good engineering and works on the
+surface, but whose internals are duplicated, bloated, or naively non-performant
+— the "AI slop" tells. A 2026 audit of this repo found all three accreting
+silently. Each rule names its concrete anchor (no rationale ⇒ no rule) and
+ships with a state-gate per the meta-rule above.
+
+### Q7. Reuse before you write. No second implementation of a capability that already exists.
+
+Before adding a function or module, search for an existing one that does the
+job. A new **public** function/method whose (verb, noun) duplicates an existing
+public capability is **sev2**; a **third or later** parallel implementation of
+the same capability is **sev1**. "I needed `X`, the model didn't surface the
+existing `X`, so it wrote a new `X`" is the single most common slop pattern, and
+it is invisible to the type checker — both copies type-check fine.
+
+**Rationale.** This repo has **three** GitHub-issue-creation surfaces:
+`gh.py::create_issue`, `gh_issues.py::create_issue`, and `gh_client.py` with
+**three** `create_issue` methods across its classes. A worker that needed "open
+an issue" reinvented it instead of importing the existing `GhClient`. None of
+the duplications was individually flagged because each looked like a reasonable
+new helper in its own diff — the same boiling-frog shape as cli.py's LOC.
+
+**How to apply.** When the diff adds a function/method, the critic checks
+whether a public function with the same normalized name (or same external
+target — same `gh` subcommand, same SQL table, same endpoint) already exists
+elsewhere in `src/`. If so: the new code must instead import and call the
+existing one, or the PR body must justify why a distinct implementation is
+warranted. **State-gate:** an audit probe under `audit_probes/` buckets public
+`def`s by normalized name and fails when ≥3 cross-module implementations of the
+same capability exist (seed it with the `create_issue` cluster as the first
+known offender to burn down).
+
+### Q8. No god-functions. A function over 80 LOC must be decomposed.
+
+A single function/method longer than **80 logical lines** (or whose cyclomatic
+complexity exceeds ~15) is **sev2**. A PR that grows an already-over-cap
+function is **sev2** even if the net diff is small — that is how they get to 582
+lines. Decompose into named helpers that can each be unit-tested.
+
+**Rationale.** `runner/tick.py::_tick()` is **582 lines** (432–1014). The #156
+auditor caps *module* size (cli.py at 1705 LOC) but never *function* size, so the
+single most important function in the system — the orchestration tick — grew
+unreviewable and has no unit tests of its branches, only end-to-end coverage.
+Module caps without function caps just relocate the boiling frog one scope down.
+
+**How to apply.** The per-PR critic flags any function in the diff that ends
+over 80 LOC. **State-gate:** an audit probe records the max-function-LOC per
+file and fails on regressions, seeded with `_tick()` as the first burn-down
+target (extract its phases — sync, groom, expand, select, dispatch, critic,
+merge, redeploy — into named, individually-tested steps).
+
+### Q9. Performance is a review dimension, not an afterthought.
+
+The critic must spend findings budget on *how the code runs*, not only whether
+it is correct: (a) **no network / DB / `gh` / subprocess call inside a loop over
+unbounded input** — batch it or hoist it out (N+1); (b) **no re-reading the same
+file/config or re-deriving the same value inside a loop** — compute once; (c) a
+change to a hot path (the tick loop, dispatch, the event projections) that could
+regress complexity needs a one-line **baseline → target** note in the PR body,
+matching the product axes' "no perf work without a number." Quadratic-by-default
+loops over the work-list or the event log are **sev2**.
+
+**Rationale.** Honesty per the meta-rule: this audit did **not** find a confirmed
+perf *incident* — but it did find that loop-bodies issuing external calls cluster
+in `gh.py`, `critic.py`, and `_worker_sdk.py`, exactly where an N+1 would hide,
+and the rubric has *zero* perf coverage, so nothing measures it. Per the
+boiling-frog meta-rule, perf needs an auditor probe before it accretes the way
+LOC did — the rule and that probe ship together; until the probe exists this
+rule is enforced per-PR on the diff only, and that limit is stated here on
+purpose rather than pretended away.
+
 ## How to apply this manifesto
 
 * When reviewing a forge-loop PR, scan the diff for each rule. A
