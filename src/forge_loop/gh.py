@@ -266,6 +266,17 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
     """
     repo = _require_repo(repo)
     prs = _open_prs(limit=max(limit, 50), repo=repo)
+    # Idle short-circuit: with no open PRs there is nothing to enrich, so skip
+    # the GraphQL pass entirely (issue #226).
+    if not prs:
+        return []
+
+    # One GraphQL round-trip for ALL open PRs instead of one per PR. An idle
+    # repo with N open PRs used to cost N ``gh api graphql`` subprocesses per
+    # tick just to discover nothing needed repair (issue #226 — N+1 fan-out).
+    numbers = [int(pr["number"]) for pr in prs if pr.get("number") is not None]
+    threads_by_pr = review_threads_batch(numbers, repo=repo)
+
     repairs: list[dict[str, Any]] = []
     for pr in prs:
         reasons: list[str] = []
@@ -277,7 +288,8 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
         if merge_state in {"DIRTY", "CONFLICTING"}:
             reasons.append(f"merge_state:{merge_state.lower()}")
 
-        threads = unresolved_review_threads(pr["number"], repo=repo)
+        all_threads = threads_by_pr.get(int(pr["number"]), [])
+        threads = [t for t in all_threads if not bool(t.get("isResolved"))]
         if threads:
             reasons.append("unresolved_review_threads")
 
@@ -360,23 +372,10 @@ def unresolved_review_threads(pr: int | str, repo: str | None = None) -> list[di
     return [t for t in review_threads(pr, repo=repo) if not bool(t.get("isResolved"))]
 
 
-def review_threads(pr: int | str, repo: str | None = None) -> list[dict[str, Any]]:
-    """Fetch PR review threads via GraphQL.
-
-    GitHub's REST and ``gh pr view --comments`` output omit inline review
-    threads. Those are the comments operators expect a repair worker to fix,
-    so silently losing them makes the loop appear idle even though PRs are
-    still blocked.
-    """
-    repo = _require_repo(repo)
-    try:
-        owner, name = repo.split("/", 1)
-    except ValueError:
-        return []
-    query = """
-    query($owner: String!, $name: String!, $number: Int!) {
-      repository(owner: $owner, name: $name) {
-        pullRequest(number: $number) {
+# Shared GraphQL selection for a PR's review threads. Used by both the
+# single-PR (``review_threads``) and the batched (``review_threads_batch``)
+# fetchers so the two cannot drift in the fields they request.
+_REVIEW_THREADS_SELECTION = """
           reviewThreads(first: 100) {
             nodes {
               id
@@ -396,10 +395,37 @@ def review_threads(pr: int | str, repo: str | None = None) -> list[dict[str, Any
               }
             }
           }
-        }
-      }
-    }
+"""
+
+
+def _parse_thread_nodes(nodes: Any) -> list[dict[str, Any]]:
+    if not isinstance(nodes, list):
+        return []
+    return [_normalise_review_thread(t) for t in nodes if isinstance(t, dict)]
+
+
+def review_threads(pr: int | str, repo: str | None = None) -> list[dict[str, Any]]:
+    """Fetch PR review threads via GraphQL.
+
+    GitHub's REST and ``gh pr view --comments`` output omit inline review
+    threads. Those are the comments operators expect a repair worker to fix,
+    so silently losing them makes the loop appear idle even though PRs are
+    still blocked.
     """
+    repo = _require_repo(repo)
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError:
+        return []
+    query = (
+        "query($owner: String!, $name: String!, $number: Int!) {\n"
+        "  repository(owner: $owner, name: $name) {\n"
+        "    pullRequest(number: $number) {\n"
+        f"{_REVIEW_THREADS_SELECTION}"
+        "    }\n"
+        "  }\n"
+        "}\n"
+    )
     r = subprocess.run(
         [
             "gh",
@@ -431,9 +457,82 @@ def review_threads(pr: int | str, repo: str | None = None) -> list[dict[str, Any
         .get("reviewThreads", {})
         .get("nodes", [])
     )
-    if not isinstance(nodes, list):
-        return []
-    return [_normalise_review_thread(t) for t in nodes if isinstance(t, dict)]
+    return _parse_thread_nodes(nodes)
+
+
+def review_threads_batch(
+    pr_numbers: list[int],
+    repo: str | None = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Fetch review threads for many PRs in ONE GraphQL round-trip.
+
+    Replaces the per-PR ``review_threads`` fan-out (issue #226): an idle repo
+    with N open PRs cost N ``gh api graphql`` subprocesses per tick just to
+    discover nothing needed repair. One aliased query covers all PRs.
+
+    Returns a ``{pr_number: [normalised threads]}`` map; PRs missing from the
+    response map to ``[]``. An empty ``pr_numbers`` issues no subprocess at
+    all, and any API/parse failure degrades to an empty map (matching the
+    per-PR fetcher's swallow-and-return-empty contract).
+    """
+    repo = _require_repo(repo)
+    # De-dup while preserving order so each PR gets exactly one alias.
+    seen: set[int] = set()
+    numbers: list[int] = []
+    for raw in pr_numbers:
+        num = int(raw)
+        if num not in seen:
+            seen.add(num)
+            numbers.append(num)
+    if not numbers:
+        return {}
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError:
+        return {}
+
+    aliases = "\n".join(
+        f"    pr{idx}: pullRequest(number: {num}) {{\n{_REVIEW_THREADS_SELECTION}    }}"
+        for idx, num in enumerate(numbers)
+    )
+    query = (
+        "query($owner: String!, $name: String!) {\n"
+        "  repository(owner: $owner, name: $name) {\n"
+        f"{aliases}\n"
+        "  }\n"
+        "}\n"
+    )
+    r = subprocess.run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"name={name}",
+            "-f",
+            f"query={query}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        return {}
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+    repo_data = (data.get("data") or {}).get("repository") or {}
+    if not isinstance(repo_data, dict):
+        return {}
+    out: dict[int, list[dict[str, Any]]] = {}
+    for idx, num in enumerate(numbers):
+        pr_obj = repo_data.get(f"pr{idx}") or {}
+        nodes = (pr_obj.get("reviewThreads") or {}).get("nodes", [])
+        out[num] = _parse_thread_nodes(nodes)
+    return out
 
 
 def _normalise_review_thread(thread: dict[str, Any]) -> dict[str, Any]:

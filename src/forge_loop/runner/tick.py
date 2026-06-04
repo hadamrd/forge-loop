@@ -655,14 +655,16 @@ def _tick(cfg: Config, tick: int) -> None:
         blocking_comments: list[str] = []
         corrupt = 0
         if cfg.attempts.enabled:
-            past, corrupt = _attempts.fetch_history_strict(
+            # One ``gh issue view --comments`` round-trip per issue per tick:
+            # the comment payload is fetched once and parsed for both attempt
+            # history and blocking comments (issue #226 — this used to be two
+            # identical subprocess fetches of the same payload).
+            attempts_view = _attempts.fetch_issue_attempts(
                 i["number"],
                 repo=cfg.github_repo,
             )
-            blocking_comments = _attempts.fetch_blocking_comments(
-                i["number"],
-                repo=cfg.github_repo,
-            )
+            past, corrupt = attempts_view.history, attempts_view.corrupt
+            blocking_comments = attempts_view.blocking_comments
             if corrupt:
                 append_event(
                     cfg.events_file,
