@@ -90,6 +90,12 @@ class _State:
         self.blocking_comments: dict[int, list[str]] = {}
         self.worker_kwargs: list[dict[str, Any]] = []
         self.automerge_calls: list[tuple[str, str | None]] = []
+        # Issue #213 — orphaned-PR adoption scan fakes.
+        self.open_prs: list[dict[str, Any]] = []
+        self.pr_labels: dict[str, list[str]] = {}
+        self.unresolved_threads: dict[str, list[dict[str, Any]]] = {}
+        self.issue_states: dict[int, str] = {}
+        self.critic_runs: list[str] = []
 
 
 @pytest.fixture
@@ -157,6 +163,51 @@ def fake_world(monkeypatch, tmp_path: Path):
         "enable_pr_auto_merge",
         lambda pr, repo=None: state.automerge_calls.append((pr, repo)) is None,
     )
+    # Issue #213 — orphaned-PR adoption scan fakes. By default no open PRs, so
+    # the scan is a no-op for legacy tests. Adoption tests populate
+    # ``state.open_prs`` / ``state.issue_states`` to exercise the path.
+    def fake_open_prs(limit: int, repo: str | None = None):
+        out: list[dict[str, Any]] = []
+        for pr in state.open_prs:
+            enriched = dict(pr)
+            url = enriched.get("url")
+            # Reflect any labels added during this run (idempotency marker).
+            base = list(enriched.get("labels") or [])
+            for lab in state.pr_labels.get(str(url), []):
+                if {"name": lab} not in base:
+                    base.append({"name": lab})
+            enriched["labels"] = base
+            out.append(enriched)
+        return out
+
+    def fake_fetch_issue(num: int, repo: str | None = None):
+        st = state.issue_states.get(num, "open")
+        return {
+            "number": num,
+            "title": "demo",
+            "body": "do the thing",
+            "state": st,
+            "labels": [],
+        }
+
+    def fake_add_pr_label(pr, labels, repo=None):
+        state.pr_labels.setdefault(str(pr), []).extend(labels)
+        return True
+
+    def fake_unresolved_threads(pr, repo=None):
+        return list(state.unresolved_threads.get(str(pr), []))
+
+    def fake_critic(_cfg, outcomes, _emit):
+        for o in outcomes:
+            if o.pr_url:
+                state.critic_runs.append(o.pr_url)
+
+    monkeypatch.setattr(_tick_mod, "open_prs", fake_open_prs)
+    monkeypatch.setattr(_tick_mod, "fetch_issue", fake_fetch_issue)
+    monkeypatch.setattr(_gh, "add_pr_label", fake_add_pr_label)
+    monkeypatch.setattr(_gh, "unresolved_review_threads", fake_unresolved_threads)
+    state.fake_critic = fake_critic  # type: ignore[attr-defined]
+
     # Defang side effects:
     monkeypatch.setattr(_runner, "_reap_worktree", lambda *a, **k: None)
     monkeypatch.setattr(_runner, "redeploy", lambda *a, **k: (True, "ok"))
@@ -410,6 +461,123 @@ def test_force_marker_bypasses_both_guards(fake_world) -> None:
     assert state.dispatched == [99]  # forced through
     # Marker is one-shot: consumed and cleared.
     assert not marker.exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #213 — orphaned clean PR adoption (integration)
+# ---------------------------------------------------------------------------
+
+def _adoptable_pr(num: int, *, labels=None, merge_state="CLEAN") -> dict[str, Any]:
+    return {
+        "number": num,
+        "url": f"https://github.com/o/r/pull/{num}",
+        "headRefName": f"loop/{num}-add-thing",
+        "labels": labels or [],
+        "mergeStateStatus": merge_state,
+    }
+
+
+def test_orphaned_clean_pr_adopted_runs_critic_and_automerge(fake_world, monkeypatch) -> None:
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    pr_url = "https://github.com/o/r/pull/205"
+    state.open_prs = [_adoptable_pr(205)]
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", state.fake_critic)
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.critic_runs == [pr_url]
+    assert state.automerge_calls == [(pr_url, "o/r")]
+    assert state.dispatched == []  # adoption path, no fresh worker dispatch
+    events = _read_events(cfg)
+    assert "orphan_pr_adopted" in _kinds(events)
+    assert "orphan_pr_automerge_enabled" in _kinds(events)
+    # Idempotency marker stamped.
+    assert state.pr_labels.get(pr_url) == ["loop:adopted"]
+
+
+def test_orphaned_blocking_pr_is_not_adopted(fake_world, monkeypatch) -> None:
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    state.open_prs = [_adoptable_pr(207, labels=[{"name": "critic:blocking"}])]
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", state.fake_critic)
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.automerge_calls == []
+    assert "https://github.com/o/r/pull/207" not in state.critic_runs
+    events = _read_events(cfg)
+    skip = next(e for e in events if e["kind"] == "orphan_pr_skipped")
+    assert skip["reason"] == "critic_blocked"
+
+
+def test_orphan_adoption_is_idempotent_across_ticks(fake_world, monkeypatch) -> None:
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    pr_url = "https://github.com/o/r/pull/211"
+    state.open_prs = [_adoptable_pr(211)]
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", state.fake_critic)
+
+    _runner._tick(cfg, tick=1)
+    _runner._tick(cfg, tick=2)
+
+    assert state.critic_runs == [pr_url]  # critic ran exactly once
+    assert state.automerge_calls == [(pr_url, "o/r")]  # auto-merge enabled once
+    reasons = [e.get("reason") for e in _read_events(cfg) if e["kind"] == "orphan_pr_skipped"]
+    assert "already_adopted" in reasons
+
+
+def test_orphan_adoption_skips_closed_issue(fake_world, monkeypatch) -> None:
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    state.open_prs = [_adoptable_pr(205)]
+    state.issue_states[205] = "closed"
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", state.fake_critic)
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.automerge_calls == []
+    assert "https://github.com/o/r/pull/205" not in state.critic_runs
+    skip = next(e for e in _read_events(cfg) if e["kind"] == "orphan_pr_skipped")
+    assert skip["reason"] == "issue_closed"
+
+
+def test_orphan_adoption_ignores_human_pr(fake_world, monkeypatch) -> None:
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    state.open_prs = [{
+        "number": 300,
+        "url": "https://github.com/o/r/pull/300",
+        "headRefName": "feature/manual-fix",
+        "labels": [],
+        "mergeStateStatus": "CLEAN",
+    }]
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", state.fake_critic)
+
+    _runner._tick(cfg, tick=1)
+
+    assert "https://github.com/o/r/pull/300" not in state.critic_runs
+    assert state.automerge_calls == []
+    assert "orphan_pr_adopted" not in _kinds(_read_events(cfg))
+
+
+def test_orphan_adoption_unresolved_threads_blocks_automerge(fake_world, monkeypatch) -> None:
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    pr_url = "https://github.com/o/r/pull/205"
+    state.open_prs = [_adoptable_pr(205)]
+    state.unresolved_threads[pr_url] = [{"id": "t1"}]
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", state.fake_critic)
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.critic_runs == [pr_url]  # critic still runs
+    assert state.automerge_calls == []  # but auto-merge is NOT enabled
+    skip = [
+        e for e in _read_events(cfg)
+        if e["kind"] == "orphan_pr_skipped" and e.get("reason") == "unresolved_review_threads"
+    ]
+    assert skip
 
 
 def test_corrupt_history_emits_event_and_continues(fake_world) -> None:

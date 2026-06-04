@@ -210,35 +210,48 @@ def _enable_automerge_for_adopted_prs(
             # The critic blocked this PR during adoption — leave it for the
             # repair loop (it now carries critic:blocking / critic:suspicious).
             append_event(
-                cfg.events_file, "orphan_pr_skipped", issue=outcome.issue,
-                pr=outcome.pr_url, reason="critic_blocked",
+                cfg.events_file,
+                "orphan_pr_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason="critic_blocked",
             )
             continue
         merge_state = str(pr.get("mergeStateStatus") or "").upper()
         if merge_state and merge_state != "CLEAN":
             append_event(
-                cfg.events_file, "orphan_pr_skipped", issue=outcome.issue,
-                pr=outcome.pr_url, reason=f"not_mergeable:{merge_state.lower()}",
+                cfg.events_file,
+                "orphan_pr_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason=f"not_mergeable:{merge_state.lower()}",
             )
             continue
         threads = _gh.unresolved_review_threads(outcome.pr_url, repo=cfg.github_repo)
         if threads:
             append_event(
-                cfg.events_file, "orphan_pr_skipped", issue=outcome.issue,
-                pr=outcome.pr_url, reason="unresolved_review_threads",
+                cfg.events_file,
+                "orphan_pr_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason="unresolved_review_threads",
                 unresolved=len(threads),
             )
             continue
         if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
             outcome.status = "merged"
             append_event(
-                cfg.events_file, "orphan_pr_automerge_enabled",
-                issue=outcome.issue, pr=outcome.pr_url,
+                cfg.events_file,
+                "orphan_pr_automerge_enabled",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
             )
         else:
             append_event(
-                cfg.events_file, "orphan_pr_automerge_failed",
-                issue=outcome.issue, pr=outcome.pr_url,
+                cfg.events_file,
+                "orphan_pr_automerge_failed",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
             )
 
 
@@ -272,8 +285,11 @@ def _run_adoption_tick(
         },
     )
     append_event(
-        cfg.events_file, "orphan_pr_adoption_tick_start", tick=tick,
-        issues=issue_nums, prs=[o.pr_url for o in outcomes],
+        cfg.events_file,
+        "orphan_pr_adoption_tick_start",
+        tick=tick,
+        issues=issue_nums,
+        prs=[o.pr_url for o in outcomes],
     )
     _mlog.info(master_log_path, f"tick {tick} adopting orphaned PR(s): {issue_nums}")
     for o in outcomes:
@@ -296,7 +312,10 @@ def _run_adoption_tick(
     )
 
     _enable_automerge_for_adopted_prs(
-        cfg, adoptions, refused_issues=set(refused), emit=bus_emit,
+        cfg,
+        adoptions,
+        refused_issues=set(refused),
+        emit=bus_emit,
     )
 
     # Idempotency marker: stamp adopted PRs so the next scan is a no-op.
@@ -305,7 +324,9 @@ def _run_adoption_tick(
             _gh.add_pr_label(o.pr_url, [_LOOP_ADOPTED_LABEL], repo=cfg.github_repo)
 
     append_event(
-        cfg.events_file, "orphan_pr_adoption_tick_done", tick=tick,
+        cfg.events_file,
+        "orphan_pr_adoption_tick_done",
+        tick=tick,
         outcomes=[asdict(o) for o in outcomes],
     )
     summary = consolidate_sprint(

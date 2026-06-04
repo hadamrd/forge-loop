@@ -209,19 +209,28 @@ def orphaned_clean_pr_adoptions(
         labels = _pr_labels(pr)
         if labels & _CRITIC_BLOCK_LABELS:
             append_event(
-                cfg.events_file, "orphan_pr_skipped", pr=url, issue=issue_num,
+                cfg.events_file,
+                "orphan_pr_skipped",
+                pr=url,
+                issue=issue_num,
                 reason="critic_blocked",
             )
             continue
         if LOOP_ADOPTED_LABEL in labels:
             append_event(
-                cfg.events_file, "orphan_pr_skipped", pr=url, issue=issue_num,
+                cfg.events_file,
+                "orphan_pr_skipped",
+                pr=url,
+                issue=issue_num,
                 reason="already_adopted",
             )
             continue
         if issue_num in seen_issues:
             append_event(
-                cfg.events_file, "orphan_pr_skipped", pr=url, issue=issue_num,
+                cfg.events_file,
+                "orphan_pr_skipped",
+                pr=url,
+                issue=issue_num,
                 reason="issue_already_selected",
             )
             continue
@@ -229,7 +238,10 @@ def orphaned_clean_pr_adoptions(
         issue = fetch_issue_fn(issue_num, repo=cfg.github_repo)
         if not issue:
             append_event(
-                cfg.events_file, "orphan_pr_skipped", pr=url, issue=issue_num,
+                cfg.events_file,
+                "orphan_pr_skipped",
+                pr=url,
+                issue=issue_num,
                 reason="issue_fetch_failed",
             )
             continue
@@ -239,14 +251,20 @@ def orphaned_clean_pr_adoptions(
         state = str(issue.get("state") or "").upper()
         if state != "OPEN":
             append_event(
-                cfg.events_file, "orphan_pr_skipped", pr=url, issue=issue_num,
+                cfg.events_file,
+                "orphan_pr_skipped",
+                pr=url,
+                issue=issue_num,
                 reason="issue_closed",
             )
             continue
         issue_labels = {str(lab.get("name") or "") for lab in issue.get("labels") or []}
         if risk_gate_label and risk_gate_label in issue_labels:
             append_event(
-                cfg.events_file, "orphan_pr_skipped", pr=url, issue=issue_num,
+                cfg.events_file,
+                "orphan_pr_skipped",
+                pr=url,
+                issue=issue_num,
                 reason="risk_gated",
             )
             continue
@@ -262,7 +280,10 @@ def orphaned_clean_pr_adoptions(
             events=[],
         )
         append_event(
-            cfg.events_file, "orphan_pr_selected", pr=url, issue=issue_num,
+            cfg.events_file,
+            "orphan_pr_selected",
+            pr=url,
+            issue=issue_num,
             merge_state=str(pr.get("mergeStateStatus") or "").upper() or None,
         )
         adoptions.append((outcome, pr))
