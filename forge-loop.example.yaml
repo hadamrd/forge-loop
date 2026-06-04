@@ -45,6 +45,12 @@ worker:
   provider: claude
   model: claude-opus-4-7
   thinking: medium
+  # Worker permission profile (how much power each worker gets):
+  #   full     - full host access, no sandbox, no prompts (default; runs like
+  #              your own interactive agent). Best for a trusted single-operator box.
+  #   standard - works freely in its worktree but sandboxed from the rest of the host.
+  #   readonly - planning/triage only; no edits or command execution.
+  permissions: full
 
 po:
   provider: claude

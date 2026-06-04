@@ -545,6 +545,7 @@ def _run_worker_with_saga(
             base_branch=cfg.base_branch,
             capability_policy=capability_policy,
             maestro_context=maestro_context,
+            permissions=getattr(cfg.worker, "permissions", "full"),
         )
     except BaseException as ex_:
         # The subprocess crashed before producing a WorkerOutcome. We

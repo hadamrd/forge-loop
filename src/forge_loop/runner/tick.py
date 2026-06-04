@@ -602,6 +602,7 @@ def _tick(cfg: Config, tick: int) -> None:
                     mcp_servers=cfg.worker.mcp_servers,
                     base_branch=cfg.base_branch,
                     brief_override=brief,
+                    permissions=getattr(cfg.worker, "permissions", "full"),
                 )
 
             try:

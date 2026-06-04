@@ -108,6 +108,7 @@ class WorkerConfig:
     load_timeout_ms: int = 180000
     strict_mcp_config: bool = True
     mcp_servers: dict[str, Any] = field(default_factory=dict)
+    permissions: str = "full"
 
 
 @dataclass(frozen=True)
@@ -291,6 +292,7 @@ def _from_settings(s: Settings) -> Config:
             load_timeout_ms=s.worker.load_timeout_ms,
             strict_mcp_config=s.worker.strict_mcp_config,
             mcp_servers=dict(s.worker.mcp_servers),
+            permissions=s.worker.permissions,
         ),
         attempts=AttemptsConfig(
             enabled=s.attempts.enabled,
