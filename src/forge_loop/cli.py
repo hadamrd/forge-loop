@@ -324,8 +324,10 @@ def cmd_recover(
 
 
 @app.command("doctor", help="One-shot health check (config-independent checks still run).")
-def cmd_doctor() -> None:
-    _exit(_cmd_doctor(SimpleNamespace()))
+def cmd_doctor(
+    json_: bool = typer.Option(False, "--json", help="Emit raw JSON for scripts."),
+) -> None:
+    _exit(_cmd_doctor(SimpleNamespace(json=json_)))
 
 
 @app.command("events", help="Tail the events log.")

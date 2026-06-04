@@ -70,16 +70,40 @@ class OperatorCommandsMixin:
         )
         return 2
 
-    def _cmd_doctor(self, _args: SimpleNamespace) -> int:
-        """One-shot health check with a Rich table."""
+    def _cmd_doctor(self, args: SimpleNamespace) -> int:
+        """One-shot health check with a Rich table.
+
+        ``--json`` (``args.json``) emits a machine-readable object whose
+        ``control_plane`` key carries the four durable control-plane checks
+        (issue #202); the human path appends a control-plane section to the
+        Rich table. Either way a ``fail`` control-plane check drives the exit
+        code to 1, consistent with the existing red-check behaviour.
+        """
         import glob
         import shutil
         import subprocess as _sp
+        from datetime import datetime
 
         from rich.console import Console
         from rich.table import Table
 
+        from forge_loop.control.doctor import (
+            FAIL as _CP_FAIL,
+        )
+        from forge_loop.control.doctor import (
+            PASS as _CP_PASS,
+        )
+        from forge_loop.control.doctor import (
+            collect_control_plane_doctor,
+            unavailable_checks,
+        )
+
+        want_json = bool(getattr(args, "json", False))
         console = Console()
+
+        # ``--json`` accumulates structured rows alongside the Rich table so
+        # the two surfaces never drift apart.
+        json_checks: list[dict[str, Any]] = []
 
         try:
             cfg = self.load()
@@ -102,9 +126,14 @@ class OperatorCommandsMixin:
         table.add_column("Check", style="bold")
         table.add_column("Detail", style="dim", overflow="fold")
 
+        # Map the human marker colour to a machine-readable status word so the
+        # JSON and Rich surfaces stay in lock-step.
+        _marker_status = {"green": _CP_PASS, "yellow": "warn", "red": _CP_FAIL}
+
         def line(status: str, label: str, detail: str = "") -> None:
             nonlocal red
             table.add_row(_STATUS_MARKERS[status], label, detail)
+            json_checks.append({"name": label, "status": _marker_status[status], "detail": detail})
             if status == "red":
                 red = True
 
@@ -203,6 +232,47 @@ class OperatorCommandsMixin:
             "deploy-drift halt",
             "ENABLED (opt-in)" if drift_halt_opt_in else "disabled (default)",
         )
+
+        # ---- Durable control-plane checks (issue #202) -------------------
+        # These probe the event log / frontier / memory / task state that
+        # lives *inside* ``.forge`` — the part ``doctor`` was previously blind
+        # to. Read-only: the replay probe re-projects into a throwaway target
+        # and never advances the live cursor.
+        if cfg_ok and cfg is not None:
+            try:
+                control_plane = collect_control_plane_doctor(
+                    Path(getattr(cfg, "repo", cfg.state_dir)),
+                    datetime.now(UTC),
+                    state_dir=Path(cfg.state_dir),
+                )
+            except Exception as exc:  # noqa: BLE001 — doctor must never crash
+                control_plane = unavailable_checks(
+                    f"control-plane probe errored (treated as not-applicable): {exc}"
+                )
+        else:
+            control_plane = unavailable_checks("config load failed; cannot locate .forge stores")
+
+        _cp_marker = {_CP_PASS: "green", "warn": "yellow", _CP_FAIL: "red"}
+        for name, result in control_plane.items():
+            detail = result["detail"]
+            remediation = result["remediation"]
+            if remediation:
+                detail = f"{detail}  →  {remediation}"
+            label = f"control-plane: {name}"
+            table.add_row(_STATUS_MARKERS[_cp_marker[result["status"]]], label, detail)
+            if result["status"] == _CP_FAIL:
+                red = True
+
+        if want_json:
+            import json as _json
+
+            payload = {
+                "ok": not red,
+                "checks": json_checks,
+                "control_plane": control_plane,
+            }
+            sys.stdout.write(_json.dumps(payload, indent=2, default=str) + "\n")
+            return 1 if red else 0
 
         console.print(table)
         return 1 if red else 0
