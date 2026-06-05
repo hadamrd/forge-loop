@@ -20,6 +20,7 @@ from forge_loop import master_log as _mlog
 from forge_loop import worker as _worker
 from forge_loop.config import Config
 from forge_loop.deploy import redeploy
+from forge_loop.gh_client import GhError
 from forge_loop.gh_issues import (
     fetch_issue,
     open_prs,
@@ -486,6 +487,18 @@ def _maybe_run_maintenance(cfg: Config, tick: int, *, short_sleep: Any) -> bool:
     return False
 
 
+def _record_ready_probe_failure(cfg: Config, exc: Exception) -> None:
+    """Log a ``_any_ready_issue`` probe failure (review EH-001, #248).
+
+    Emits a structured event and a master-log warning so a transient gh error
+    that flips the repair/dispatch reservation leaves a trace instead of
+    silently returning the ``False`` fallback.
+    """
+    err = f"{type(exc).__name__}: {exc}"[:200]
+    append_event(cfg.events_file, "repair_ready_probe_failed", err=err)
+    _mlog.warn(cfg.logs_dir / "master.log", f"_any_ready_issue probe failed: {err}")
+
+
 def _any_ready_issue(cfg: Config) -> bool:
     """Cheap probe: are there any ``loop:ready`` issues waiting? (issue #248).
 
@@ -493,10 +506,19 @@ def _any_ready_issue(cfg: Config) -> bool:
     repair tick should yield to new dispatch. A ``gh`` failure is treated as
     "no ready work" so the reservation never starves repairs on a transient
     list error (the normal candidate fetch later in the tick surfaces it).
+
+    The probe runs on the hot tick path and gates whether repairs yield to
+    dispatch, so a swallowed error must never be silent: every failure is
+    recorded (structured ``repair_ready_probe_failed`` event + master-log
+    warning) before falling back to ``False`` (review EH-001, #248).
     """
     try:
         return bool(top_issues(cfg.labels.ready, 1, repo=cfg.github_repo))
-    except Exception:  # noqa: BLE001
+    except (GhError, RuntimeError, OSError) as exc:
+        # GhError: non-2xx gh/API response. RuntimeError: bad repo / wrapped
+        # transport failure. OSError: socket/DNS. All are transient-or-config
+        # probe failures — log and treat as "no ready work" (never crash tick).
+        _record_ready_probe_failure(cfg, exc)
         return False
 
 

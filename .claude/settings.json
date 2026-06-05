@@ -1,9 +1,9 @@
 {
-  "hasCompletedProjectOnboarding": true,
-  "hasTrustDialogAccepted": true,
   "permissions": {
-    "allow": [],
-    "defaultMode": "default",
+    "defaultMode": "bypassPermissions",
+    "allow": ["Bash(*)", "Edit(*)", "Write(*)", "Read(*)", "Grep(*)", "Glob(*)", "WebFetch(*)", "WebSearch(*)", "Task(*)", "TodoWrite(*)", "NotebookEdit(*)", "mcp__*"],
     "deny": []
-  }
+  },
+  "hasTrustDialogAccepted": true,
+  "hasCompletedProjectOnboarding": true
 }

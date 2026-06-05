@@ -379,3 +379,35 @@ def test_feature_disabled_repairs_short_circuit_every_tick(
     flags = _drive_pre_dispatch(cfg, ticks=3)
     assert flags == [True, True, True]
     assert not cfg.repair_scheduler_file.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Unit — ready-issue probe failure is logged, never silent (review EH-001)
+# --------------------------------------------------------------------------- #
+
+
+def test_any_ready_issue_probe_failure_is_logged_not_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gh failure in ``_any_ready_issue`` must fall back to False *and* leave
+    a trace (structured event + master-log warning), not silently flip the
+    scheduler's repair/dispatch reservation (review EH-001, #248)."""
+    from forge_loop.gh_client import GhError
+
+    cfg = _make_cfg(tmp_path, RepairConfig(enabled=True))
+
+    def _boom(label: str, limit: int, *, repo: str | None = None) -> list[dict[str, Any]]:
+        raise GhError("list_for_repo(loop:ready)", 503, "upstream unavailable")
+
+    monkeypatch.setattr(_tick_mod, "top_issues", _boom)
+
+    assert _tick_mod._any_ready_issue(cfg) is False
+
+    events = _read_events(cfg)
+    probe_failures = [e for e in events if e.get("kind") == "repair_ready_probe_failed"]
+    assert len(probe_failures) == 1
+    assert "GhError" in probe_failures[0]["err"]
+
+    master_log = cfg.logs_dir / "master.log"
+    assert master_log.exists()
+    assert "_any_ready_issue probe failed" in master_log.read_text()
