@@ -1,8 +1,8 @@
-[← Agent Enablement](./08-agent-enablement.md) · [Index](./README.md) · [Next: Conclusion →](./10-conclusion.md)
+[← The Convergence Problem](./09-the-convergence-problem.md) · [Index](./README.md) · [Next: Conclusion →](./11-conclusion.md)
 
 ---
 
-# 9. Limitations & Threats to Validity
+# 10. Limitations & Threats to Validity
 
 A position paper that only argues its own strengths is advertising. This
 section is the honest ledger: where the *thesis* may be wrong, and where the
@@ -101,4 +101,4 @@ read as one.
 
 ---
 
-[← Agent Enablement](./08-agent-enablement.md) · [Index](./README.md) · [Next: Conclusion →](./10-conclusion.md)
+[← The Convergence Problem](./09-the-convergence-problem.md) · [Index](./README.md) · [Next: Conclusion →](./11-conclusion.md)

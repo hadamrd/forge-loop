@@ -1,8 +1,8 @@
-[← Limitations](./09-limitations.md) · [Index](./README.md)
+[← Limitations](./10-limitations.md) · [Index](./README.md)
 
 ---
 
-# 10. Conclusion
+# 11. Conclusion
 
 ## 9.1 The argument, restated
 
@@ -55,7 +55,7 @@ regime it targets.
 The forge-loop *product* competes in a crowded and fast-converging space;
 platform-native "assign an issue, get a PR" features may well absorb the
 dispatch loop. We are explicit about that, and about the artifact's own
-unevenness (Section 9).
+unevenness (Section 10).
 
 But the **idea** is more durable than the product. The proposition that
 autonomous agents should be governed by *machine-checkable value and
@@ -84,4 +84,4 @@ gates are the contribution. Everything else is plumbing.
 
 ---
 
-[← Limitations](./09-limitations.md) · [Index](./README.md)
+[← Limitations](./10-limitations.md) · [Index](./README.md)

@@ -1,4 +1,4 @@
-[← System Architecture](./07-system-architecture.md) · [Index](./README.md) · [Next: Limitations →](./09-limitations.md)
+[← System Architecture](./07-system-architecture.md) · [Index](./README.md) · [Next: The Convergence Problem →](./09-the-convergence-problem.md)
 
 ---
 
@@ -123,4 +123,4 @@ explicitly.**
 
 ---
 
-[← System Architecture](./07-system-architecture.md) · [Index](./README.md) · [Next: Limitations →](./09-limitations.md)
+[← System Architecture](./07-system-architecture.md) · [Index](./README.md) · [Next: The Convergence Problem →](./09-the-convergence-problem.md)

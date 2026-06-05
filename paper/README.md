@@ -50,7 +50,7 @@ imposes (operator effort to write specifications and rules upfront) buys
 the one property an autonomous system cannot otherwise have: **bounded,
 non-decreasing value over an unbounded number of unsupervised actions.** We
 also state, honestly, where the current implementation falls short of the
-thesis it embodies (see [Limitations & Threats to Validity](./09-limitations.md)).
+thesis it embodies (see [Limitations & Threats to Validity](./10-limitations.md)).
 
 ---
 
@@ -66,8 +66,9 @@ thesis it embodies (see [Limitations & Threats to Validity](./09-limitations.md)
 | 6 | [The Slop Daemon](./06-hunting-sloppy-patterns.md) | Naming AI code pathologies and hunting them on every loop. |
 | 7 | [System Architecture: The Tick](./07-system-architecture.md) | How the three surfaces compose into one control loop. |
 | 8 | [Agent Enablement](./08-agent-enablement.md) | The dual of governance: declaring, provisioning, and verifying the agent's capability envelope. |
-| 9 | [Limitations & Threats to Validity](./09-limitations.md) | Where implementation diverges from thesis. |
-| 10 | [Conclusion](./10-conclusion.md) | The governance triad as the durable contribution. |
+| 9 | [The Convergence Problem](./09-the-convergence-problem.md) | A reliable gate is not enough: why critic-guided agents fail to *converge* on hard tasks, and how to make the critic teach. |
+| 10 | [Limitations & Threats to Validity](./10-limitations.md) | Where implementation diverges from thesis. |
+| 11 | [Conclusion](./11-conclusion.md) | The governance triad as the durable contribution. |
 
 ---
 
@@ -78,9 +79,10 @@ establishes the problem; Section 2 states the thesis as an explicit
 tradeoff; Sections 3–5 defend each of the three control surfaces in turn;
 Section 6 names the AI code pathologies and how they are hunted; Section 7
 shows how the surfaces compose at runtime; Section 8 is the enablement dual —
-what the agent must be given to act; Section 9 is the honest ledger of where
-the artifact does not yet live up to the argument; Section 10 states what we
-believe is durable.
+what the agent must be given to act; Section 9 is the convergence problem —
+why a reliable gate still does not guarantee the agent reaches *done*; Section 10
+is the honest ledger of where the artifact does not yet live up to the argument;
+Section 11 states what we believe is durable.
 
 Throughout, claims are grounded in the actual mechanisms of the
 `forge-loop` codebase (`.forge/axes.yaml`, `.forge/quality-manifesto.md`,
