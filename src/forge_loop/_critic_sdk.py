@@ -16,10 +16,79 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from forge_loop._sdk_events import SdkEventKind, parse_sdk_event
+
+# Cap for the rich error excerpt persisted to the per-critic error log.
+# The acceptance criteria for #270 require >= 2000 chars (vs the legacy
+# 200/300/500 truncations that threw the real cause away).
+ERROR_DETAIL_MAX = 4000
+
+
+class CriticErrorClass(StrEnum):
+    """Machine-readable cause category for a ``verdict="error"`` critic run.
+
+    Shared discriminator imported by both ``_critic_sdk`` (producer) and
+    ``critic`` (consumer / event emitter) so error verdicts can be tallied
+    by cause instead of grepped by hand (#270). Per the manifesto's
+    "no stringly-typed cross-module event boundaries" rule this is a
+    ``str`` Enum compared with ``is``, never a bare string literal.
+    """
+
+    EVENT_LOOP_CLOSED = "event_loop_closed"
+    PARSE_FAILURE = "parse_failure"
+    TIMEOUT = "timeout"
+    SDK_TRANSPORT = "sdk_transport"
+    UNKNOWN = "unknown"
+
+
+# Substrings (lower-cased) that mark a transport/connection-layer failure.
+_TRANSPORT_MARKERS = (
+    "connection",
+    "transport",
+    "broken pipe",
+    "clienterror",
+    "remoteprotocol",
+    "econnreset",
+    "httpx",
+    "read timed out",
+)
+
+# Causes that a transient blip — a second call may succeed, so the critic
+# retries these within its attempt budget before giving up (#270).
+TRANSIENT_ERROR_CLASSES = frozenset(
+    {CriticErrorClass.EVENT_LOOP_CLOSED, CriticErrorClass.SDK_TRANSPORT}
+)
+
+
+def classify_critic_error_text(text: str | None) -> CriticErrorClass:
+    """Classify a critic failure from its message text.
+
+    Used for the SDK's own ``error`` string (no exception object in hand).
+    """
+    t = (text or "").lower()
+    if "event loop is closed" in t:
+        return CriticErrorClass.EVENT_LOOP_CLOSED
+    if "timeout" in t or "timed out" in t:
+        return CriticErrorClass.TIMEOUT
+    if any(marker in t for marker in _TRANSPORT_MARKERS):
+        return CriticErrorClass.SDK_TRANSPORT
+    return CriticErrorClass.UNKNOWN
+
+
+def classify_critic_error(exc: BaseException) -> CriticErrorClass:
+    """Classify a critic failure from the captured exception type/message."""
+    if isinstance(exc, TimeoutError):
+        return CriticErrorClass.TIMEOUT
+    return classify_critic_error_text(f"{type(exc).__name__}: {exc}")
+
+
+def is_transient_critic_error(error_class: CriticErrorClass | None) -> bool:
+    """True if this cause is worth a retry-with-backoff before giving up."""
+    return error_class in TRANSIENT_ERROR_CLASSES
 
 # Canonical manifesto location. Can be overridden by LOOP_MANIFESTOS_DIR
 # (operator escape hatch — primarily for tests). The default tracks the
@@ -83,6 +152,12 @@ class CriticSdkResult:
     duration_s: float = 0.0
     timed_out: bool = False
     error: str | None = None
+    # Machine-readable cause category, set on every error path (#270).
+    error_class: CriticErrorClass | None = None
+    # Full class name + a >= 2000-char excerpt (incl. traceback when the
+    # failure was an exception) for the per-critic error log. The 200-char
+    # event field stays for back-compat; this is the rich detail.
+    error_detail: str | None = None
 
 
 def run_critic_sdk(
@@ -110,6 +185,7 @@ def run_critic_sdk(
     SDK module doesn't have to be importable at unit-test time.
     """
     import time
+    import traceback
 
     from forge_loop._worker_sdk import run_sdk_session
 
@@ -177,18 +253,42 @@ def run_critic_sdk(
         except RuntimeError:
             last_text, err = asyncio.run(_drive())
     except Exception as exc:  # noqa: BLE001 — boundary
+        # Preserve the REAL cause instead of collapsing it into a 300-char
+        # string (#270): the exception class drives classification and the
+        # full traceback is persisted to the per-critic error log on disk.
+        detail = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
         return CriticSdkResult(
             last_message="",
             duration_s=time.time() - start,
             timed_out=False,
             error=f"sdk_session_failed: {type(exc).__name__}: {exc}"[:300],
+            error_class=classify_critic_error(exc),
+            error_detail=detail[:ERROR_DETAIL_MAX],
         )
 
+    if err == "timeout":
+        return CriticSdkResult(
+            last_message=last_text,
+            duration_s=time.time() - start,
+            timed_out=True,
+            error="timeout",
+            error_class=CriticErrorClass.TIMEOUT,
+            error_detail=f"critic SDK session timed out after {timeout_s}s",
+        )
+    if err:
+        return CriticSdkResult(
+            last_message=last_text,
+            duration_s=time.time() - start,
+            timed_out=False,
+            error=err,
+            error_class=classify_critic_error_text(err),
+            error_detail=err[:ERROR_DETAIL_MAX],
+        )
     return CriticSdkResult(
         last_message=last_text,
         duration_s=time.time() - start,
-        timed_out=(err == "timeout"),
-        error=err if err and err != "timeout" else None,
+        timed_out=False,
+        error=None,
     )
 
 
@@ -205,7 +305,13 @@ def run_po_sdk(*args: Any, **kwargs: Any) -> CriticSdkResult:
 
 
 __all__ = [
+    "ERROR_DETAIL_MAX",
+    "TRANSIENT_ERROR_CLASSES",
+    "CriticErrorClass",
     "CriticSdkResult",
+    "classify_critic_error",
+    "classify_critic_error_text",
+    "is_transient_critic_error",
     "load_manifestos_text",
     "run_critic_sdk",
     "run_po_sdk",

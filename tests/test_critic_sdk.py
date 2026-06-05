@@ -419,3 +419,188 @@ def test_review_pr_round1_keeps_sev3_blocking_and_terse_brief(
     assert outcome.report.round_number == 0
     assert [f.severity for f in outcome.report.findings] == ["sev3"]
     assert outcome.report.follow_ups == []
+
+
+# ---------------------------------------------------------------------------
+# #270 — root-cause critic verdict=error: capture, classify, retry-recover.
+# ---------------------------------------------------------------------------
+
+from forge_loop._critic_sdk import (  # noqa: E402
+    CriticErrorClass,
+    classify_critic_error,
+    classify_critic_error_text,
+    is_transient_critic_error,
+)
+
+
+def test_classify_event_loop_closed_from_exception() -> None:
+    assert (
+        classify_critic_error(RuntimeError("Event loop is closed"))
+        is CriticErrorClass.EVENT_LOOP_CLOSED
+    )
+
+
+def test_classify_timeout_from_exception() -> None:
+    assert classify_critic_error(TimeoutError()) is CriticErrorClass.TIMEOUT
+
+
+def test_classify_transport_and_unknown_from_text() -> None:
+    assert (
+        classify_critic_error_text("httpx.ConnectError: connection refused")
+        is CriticErrorClass.SDK_TRANSPORT
+    )
+    assert classify_critic_error_text("totally novel boom") is CriticErrorClass.UNKNOWN
+
+
+def test_only_eventloop_and_transport_are_transient() -> None:
+    assert is_transient_critic_error(CriticErrorClass.EVENT_LOOP_CLOSED)
+    assert is_transient_critic_error(CriticErrorClass.SDK_TRANSPORT)
+    assert not is_transient_critic_error(CriticErrorClass.TIMEOUT)
+    assert not is_transient_critic_error(CriticErrorClass.PARSE_FAILURE)
+    assert not is_transient_critic_error(CriticErrorClass.UNKNOWN)
+
+
+def test_transient_sdk_error_retries_then_recovers_to_real_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient event-loop error on attempt 0 that succeeds on attempt 1
+    returns the REAL verdict (not verdict=error), and parse_retries reflects
+    the retry. Proves a transient blip recovers instead of burning a round."""
+    monkeypatch.setattr(critic_mod, "_TRANSIENT_BACKOFF_S", 0.0)
+    monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
+    calls = {"n": 0}
+
+    def flaky_sdk(**kw: object) -> CriticSdkResult:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return CriticSdkResult(
+                last_message="",
+                duration_s=0.1,
+                error="RuntimeError: Event loop is closed",
+                error_class=CriticErrorClass.EVENT_LOOP_CLOSED,
+                error_detail="RuntimeError: Event loop is closed\n<traceback>",
+            )
+        return CriticSdkResult(last_message=_approve_payload(), duration_s=0.2)
+
+    monkeypatch.setattr("forge_loop._critic_sdk.run_critic_sdk", flaky_sdk)
+
+    outcome = critic_mod.review_pr(
+        pr_url="https://github.com/owner/repo/pull/1",
+        issue_number=7,
+        repo=tmp_path,
+        logs_dir=_mk_logs(tmp_path),
+        timeout_s=60,
+    )
+
+    assert calls["n"] == 2
+    assert outcome.verdict == "approved"
+    assert outcome.parse_retries == 1
+    assert outcome.error_class is None
+
+
+def test_persistent_event_loop_closed_exhausts_budget_and_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adversarial: a PERSISTENT event-loop failure exhausts the retry+backoff
+    budget and still returns verdict=error with error_class=event_loop_closed —
+    retry can't mask a real outage and the #264/#269 safety contract holds."""
+    monkeypatch.setattr(critic_mod, "_TRANSIENT_BACKOFF_S", 0.0)
+    monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
+    calls = {"n": 0}
+
+    def always_loop_closed(**kw: object) -> CriticSdkResult:
+        calls["n"] += 1
+        return CriticSdkResult(
+            last_message="",
+            duration_s=0.1,
+            error="RuntimeError: Event loop is closed",
+            error_class=CriticErrorClass.EVENT_LOOP_CLOSED,
+            error_detail="RuntimeError: Event loop is closed\n" + ("x" * 3000),
+        )
+
+    monkeypatch.setattr("forge_loop._critic_sdk.run_critic_sdk", always_loop_closed)
+    emitted: list[tuple[str, dict[str, object]]] = []
+
+    outcome = critic_mod.review_pr(
+        pr_url="https://github.com/owner/repo/pull/2",
+        issue_number=8,
+        repo=tmp_path,
+        logs_dir=_mk_logs(tmp_path),
+        timeout_s=60,
+        emit=lambda kind, payload: emitted.append((kind, payload)),
+    )
+
+    # Bounded: exactly the 2-attempt budget, never an unbounded storm.
+    assert calls["n"] == 2
+    assert outcome.verdict == "error"
+    assert outcome.error_class is CriticErrorClass.EVENT_LOOP_CLOSED
+    assert outcome.parse_retries == 1
+    payload = next(p for k, p in emitted if k == "critic_parse_failed")
+    assert payload["error_class"] == "event_loop_closed"
+    assert payload["error_log"]
+
+
+def test_error_log_written_with_full_class_and_long_excerpt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-critic error log holds the class name + an excerpt LONGER than
+    the 200-char event field (full capture goes to disk, #270)."""
+    monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
+    long_detail = "RuntimeError: Event loop is closed\n" + ("y" * 2500)
+    monkeypatch.setattr(
+        "forge_loop._critic_sdk.run_critic_sdk",
+        lambda **kw: CriticSdkResult(
+            last_message="",
+            duration_s=0.1,
+            error="sdk_session_failed: RuntimeError: Event loop is closed",
+            error_class=CriticErrorClass.UNKNOWN,  # non-transient → single attempt
+            error_detail=long_detail,
+        ),
+    )
+    logs = _mk_logs(tmp_path)
+    outcome = critic_mod.review_pr(
+        pr_url="https://github.com/owner/repo/pull/3",
+        issue_number=9,
+        repo=tmp_path,
+        logs_dir=logs,
+        timeout_s=60,
+    )
+    assert outcome.verdict == "error"
+    assert outcome.error_log is not None
+    log_text = Path(outcome.error_log).read_text(encoding="utf-8")
+    assert "error_class=unknown" in log_text
+    assert len(log_text) > 200
+    assert "y" * 2000 in log_text
+
+
+def test_timeout_is_classified_and_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout on a large diff is NOT retried into a multiplied hang: single
+    attempt, classified error_class=timeout, verdict=error."""
+    monkeypatch.setattr(critic_mod, "_TRANSIENT_BACKOFF_S", 0.0)
+    monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
+    calls = {"n": 0}
+
+    def slow_sdk(**kw: object) -> CriticSdkResult:
+        calls["n"] += 1
+        return CriticSdkResult(
+            last_message="",
+            duration_s=60.0,
+            timed_out=True,
+            error="timeout",
+            error_class=CriticErrorClass.TIMEOUT,
+            error_detail="critic SDK session timed out after 60s",
+        )
+
+    monkeypatch.setattr("forge_loop._critic_sdk.run_critic_sdk", slow_sdk)
+    outcome = critic_mod.review_pr(
+        pr_url="https://github.com/owner/repo/pull/4",
+        issue_number=10,
+        repo=tmp_path,
+        logs_dir=_mk_logs(tmp_path),
+        timeout_s=60,
+    )
+    assert calls["n"] == 1  # NOT retried
+    assert outcome.verdict == "error"
+    assert outcome.error_class is CriticErrorClass.TIMEOUT
