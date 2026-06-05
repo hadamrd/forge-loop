@@ -699,27 +699,79 @@ def test_verify_result_ok_property() -> None:
 # ---------------------------------------------------------------------------
 # Contract test (manifesto T4 / T3): the REAL SubprocessVerifyRunner returns
 # the same VerifyResult shape the fake does, on representative inputs — clean
-# command (exit 0) AND failing command (exit !=0). Uses portable shell builtins
-# so it needs no project toolchain on PATH.
+# command (exit 0) AND failing command (exit !=0). Drives the current Python
+# interpreter as a portable, no-shell argv so it needs no project toolchain on
+# PATH (and proves the runner execs argv directly, not via /bin/sh).
 # ---------------------------------------------------------------------------
 
 def test_subprocess_verify_runner_real_clean_and_dirty(tmp_path: Path) -> None:
     import os
+    import shlex as _shlex
+    import sys
 
     runner = SubprocessVerifyRunner(timeout_s=30.0)
     env = dict(os.environ)
+    py = _shlex.quote(sys.executable)
 
-    clean = runner.run_verify("true", cwd=str(tmp_path), env=env)
+    clean = runner.run_verify(f"{py} -c pass", cwd=str(tmp_path), env=env)
     assert isinstance(clean, VerifyResult)
     assert clean.ok is True
     assert clean.returncode == 0
 
+    script = 'import sys; sys.stderr.write("boom-on-stderr"); sys.exit(3)'
     dirty = runner.run_verify(
-        "echo boom-on-stderr 1>&2; exit 3", cwd=str(tmp_path), env=env
+        f"{py} -c {_shlex.quote(script)}",
+        cwd=str(tmp_path),
+        env=env,
     )
     assert dirty.ok is False
     assert dirty.returncode == 3
     assert "boom-on-stderr" in dirty.output_tail
+
+
+# Regression (sev3/security thread): the runner must NOT interpret shell
+# metacharacters — a command string is tokenised with shlex and exec'd as argv,
+# never piped through /bin/sh. A trailing ``; rm -rf …`` is therefore passed as
+# literal args to the program, not executed as a second shell command.
+def test_subprocess_verify_runner_does_not_invoke_shell(tmp_path: Path) -> None:
+    import os
+    import shlex as _shlex
+    import sys
+
+    canary = tmp_path / "canary"
+    canary.write_text("intact")
+    runner = SubprocessVerifyRunner(timeout_s=30.0)
+    env = dict(os.environ)
+    py = _shlex.quote(sys.executable)
+
+    # If this ran through a shell, the ``;`` would start a second command and
+    # delete the canary. With shell=False the whole string after -c is one arg.
+    res = runner.run_verify(
+        f'{py} -c pass ; rm {_shlex.quote(str(canary))}',
+        cwd=str(tmp_path),
+        env=env,
+    )
+    # ``rm`` is just an argv token to python -c (ignored), so python exits 0
+    # and the canary survives — proving no shell ran.
+    assert res.returncode == 0
+    assert canary.exists()
+    assert canary.read_text() == "intact"
+
+
+# An unparseable command (unbalanced quote) is a config error → fail-closed,
+# never a crash and never a silent pass.
+def test_subprocess_verify_runner_unparseable_command_fails_closed(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    runner = SubprocessVerifyRunner(timeout_s=30.0)
+    res = runner.run_verify(
+        'ruff check "unterminated', cwd=str(tmp_path), env=dict(os.environ)
+    )
+    assert res.ok is False
+    assert res.returncode == -1
+    assert "not parseable" in res.output_tail
 
 
 # ===========================================================================

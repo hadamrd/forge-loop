@@ -260,7 +260,11 @@ result it disables auto-merge, posts a PR comment, emits a typed
 output tail), and flips the worker outcome ``merged`` → ``open`` so the attempts
 ledger reflects the truth. Tools are resolved via the **declared** ``worker.env``
 contract (Q11), never ambient ``PATH``; a missing tool fails LOUD (refuse), never
-silently passes. Shipping a verify list with no gate behind it, or a gate that
+silently passes. Each verify command is tokenised with ``shlex.split`` and exec'd
+as ``argv`` (``shell=False``) — never piped through ``/bin/sh`` — so an
+operator-declared config string carries no shell-injection sharp edge; an
+unparseable command is a config error → fail-closed, not a silent pass. Shipping
+a verify list with no gate behind it, or a gate that
 checks only the diff rather than the whole repo, is **sev2**. The gate may ship
 behind an enable flag defaulting to off ONLY while the baseline is red (a
 non-clean repo would block every PR); the flip-to-enforce is then a tracked

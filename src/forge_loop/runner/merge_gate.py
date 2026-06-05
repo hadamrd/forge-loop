@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import shlex
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -417,7 +418,14 @@ class SubprocessVerifyRunner:
     does not apply. The command runs with ``cwd`` and the EXACT ``env`` the gate
     built from the declared ``worker.env`` contract — never ambient PATH.
 
-    A non-zero return code OR a timeout maps to a non-clean :class:`VerifyResult`
+    The command string is tokenised with :func:`shlex.split` and exec'd as
+    ``argv`` with ``shell=False`` — it is NEVER piped through ``/bin/sh``. This
+    removes the shell-injection sharp edge of running an operator-config string
+    through a shell (a verify command is a plain argv like ``ruff check src/
+    tests/``); shell metacharacters are passed through as literal arguments.
+
+    A non-zero return code, a timeout, an unparseable command, or a launch
+    failure (missing binary) all map to a non-clean :class:`VerifyResult`
     (fail-closed); the runner never raises for a normal command failure.
     """
 
@@ -427,10 +435,32 @@ class SubprocessVerifyRunner:
     def run_verify(
         self, command: str, *, cwd: str, env: Mapping[str, str]
     ) -> VerifyResult:
+        # No ``shell=True``: a verify command is a plain ``argv`` (``ruff check
+        # src/ tests/``), so we tokenise with ``shlex.split`` and exec directly.
+        # This removes the shell-injection sharp edge of running a config string
+        # through ``/bin/sh`` while keeping the operator contract intact. A
+        # command that fails to tokenise (e.g. an unbalanced quote) is a config
+        # error → fail-closed, never silent-pass.
         try:
-            proc = subprocess.run(  # noqa: S602 — verify commands are operator-declared
-                command,
-                shell=True,
+            argv = shlex.split(command)
+        except ValueError as ex:
+            return VerifyResult(
+                command=command,
+                returncode=-1,
+                output_tail=f"verify command not parseable: {ex}"[
+                    -_VERIFY_TAIL_CHARS:
+                ],
+            )
+        if not argv:
+            return VerifyResult(
+                command=command,
+                returncode=-1,
+                output_tail="verify command is empty after tokenisation",
+            )
+        try:
+            proc = subprocess.run(  # noqa: S603 — argv from declared config, no shell
+                argv,
+                shell=False,
                 cwd=str(Path(cwd)),
                 env=dict(env),
                 capture_output=True,
@@ -445,6 +475,19 @@ class SubprocessVerifyRunner:
                 command=command,
                 returncode=124,  # conventional timeout code
                 output_tail=(f"verify TIMEOUT after {self._timeout_s}s\n{tail}")[
+                    -_VERIFY_TAIL_CHARS:
+                ],
+            )
+        except OSError as ex:
+            # With shell=False a missing/non-executable binary raises
+            # (e.g. FileNotFoundError) instead of returning 127. The declared
+            # ``require`` preflight catches known tools, but map any residual
+            # OSError to a non-clean result so the runner never crashes the
+            # tick — fail-closed, same as a timeout.
+            return VerifyResult(
+                command=command,
+                returncode=-1,
+                output_tail=f"verify command failed to launch: {ex}"[
                     -_VERIFY_TAIL_CHARS:
                 ],
             )
