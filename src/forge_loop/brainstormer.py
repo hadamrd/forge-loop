@@ -450,12 +450,29 @@ class Brainstormer:
             if reason is None:
                 outcome.kept.append(number)
                 continue
+            # The gh_issues mutation helpers SUPPRESS GitHub errors and report
+            # success via their bool return (they never raise) — so detect a
+            # failed mutation by branching on that bool, not via try/except
+            # (which would be dead in production). The try/except remains only
+            # as a backstop for an unexpected raise (e.g. a programming bug).
+            #
+            # Order matters for idempotency: post the demotion comment LAST,
+            # only after ``loop:ready`` is actually removed. A failed unlabel
+            # leaves the issue ``loop:ready`` → re-fetched next pass; commenting
+            # before that removal lands would duplicate the comment. Short-
+            # circuit on the first failure so a half-applied demotion (cold
+            # added, ready not removed) never also posts a comment.
+            err = ""
             try:
-                gh.label(number, [LOOP_COLD_LABEL], repo=repo)
-                gh.unlabel(number, LOOP_READY_LABEL, repo=repo)
-                gh.comment(number, _audit_demotion_comment(reason), repo=repo)
+                if not gh.label(number, [LOOP_COLD_LABEL], repo=repo):
+                    err = "add loop:cold label failed"
+                elif not gh.unlabel(number, LOOP_READY_LABEL, repo=repo):
+                    err = "remove loop:ready label failed"
+                elif not gh.comment(number, _audit_demotion_comment(reason), repo=repo):
+                    err = "post demotion comment failed"
             except Exception as exc:  # noqa: BLE001 — isolate per-issue failures
                 err = f"{type(exc).__name__}: {exc}"[:200]
+            if err:
                 outcome.failures[number] = err
                 _log.warning("brainstormer_audit_demote_failed", issue=number, error=err)
                 self._emit_audit_partial_failure(events_file, number, err)

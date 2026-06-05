@@ -10,7 +10,9 @@ from forge_loop.state import append_event
 
 
 class UnlabelFn(Protocol):
-    def __call__(self, issue: int, label: str, *, repo: str | None = None) -> None: ...
+    # Returns gh_issues.unlabel's success bool; this caller ignores it
+    # (label hygiene is best-effort) but the type must match the real helper.
+    def __call__(self, issue: int, label: str, *, repo: str | None = None) -> bool: ...
 
 
 def remove_ready_label(

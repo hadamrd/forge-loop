@@ -16,7 +16,6 @@ as gh``), so the ``gh.<fn>(...)`` call shape is preserved byte-for-byte.
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -120,27 +119,42 @@ def issue_comments(issue: int, repo: str | None = None) -> list[dict[str, Any]]:
     return client().issue_comments(owner, name, issue)
 
 
-def comment(issue: int, body: str, repo: str | None = None) -> None:
-    """Post a comment to an issue. Errors are swallowed (caller logs)."""
+def comment(issue: int, body: str, repo: str | None = None) -> bool:
+    """Post a comment to an issue.
+
+    Errors are swallowed (the loop never crashes on a best-effort comment) but
+    surfaced as the return value: ``True`` on success, ``False`` if the GitHub
+    call raised. Callers that need to know whether the mutation landed (e.g. the
+    backlog audit, issue #125) branch on it; fire-and-forget callers ignore it.
+    """
     owner, name = _owner_name(repo)
-    with suppress(Exception):
+    try:
         client().add_comment(owner, name, issue, body)
+    except Exception:  # noqa: BLE001 — boundary; report failure via return value
+        return False
+    return True
 
 
-def label(issue: int, labels: list[str], repo: str | None = None) -> None:
-    """Add labels to an issue."""
+def label(issue: int, labels: list[str], repo: str | None = None) -> bool:
+    """Add labels to an issue. ``True`` on success, ``False`` if the call raised."""
     if not labels:
-        return
+        return True
     owner, name = _owner_name(repo)
-    with suppress(Exception):
+    try:
         client().add_labels(owner, name, issue, labels)
+    except Exception:  # noqa: BLE001 — boundary; report failure via return value
+        return False
+    return True
 
 
-def unlabel(issue: int, label: str, repo: str | None = None) -> None:
-    """Remove a single label from an issue."""
+def unlabel(issue: int, label: str, repo: str | None = None) -> bool:
+    """Remove a single label from an issue. ``True`` on success, ``False`` on error."""
     owner, name = _owner_name(repo)
-    with suppress(Exception):
+    try:
         client().remove_label(owner, name, issue, label)
+    except Exception:  # noqa: BLE001 — boundary; report failure via return value
+        return False
+    return True
 
 
 def create_issue(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import time
 
 from forge_loop.config import Config
 from forge_loop.maintenance import run_maintenance
@@ -102,8 +103,6 @@ def run_brainstormer_audit(cfg: Config, tick: int) -> bool:
     when the audit was skipped (no repo, or a missing/invalid ``.forge/axes.yaml``)
     so the tick continues into normal dispatch.
     """
-    import time
-
     from forge_loop.brainstormer import Brainstormer
     from forge_loop.events import BrainstormerAuditDoneEvent, emit
     from forge_loop.product_vision import MissingVisionError

@@ -64,7 +64,7 @@ class _FakeBacklog:
             i["number"]: {**i, "labels": list(i["labels"])} for i in issues
         }
         self.comments: dict[int, list[str]] = {}
-        self.label_raise_on: set[int] = set()
+        self.label_fail_on: set[int] = set()
 
     def top_issues(self, label: str, limit: int, repo: str | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -80,20 +80,27 @@ class _FakeBacklog:
                 )
         return out[:limit]
 
-    def label(self, issue: int, labels: list[str], repo: str | None = None) -> None:
-        if issue in self.label_raise_on:
-            raise RuntimeError("simulated gh label failure")
+    def label(self, issue: int, labels: list[str], repo: str | None = None) -> bool:
+        # Mirror the REAL gh_issues.label contract: a GitHub failure is
+        # SUPPRESSED (never raised) and surfaced as a False return. The audit
+        # detects the failed mutation by branching on this bool — exactly the
+        # production path the adversarial test must exercise (issue #125).
+        if issue in self.label_fail_on:
+            return False
         for lbl in labels:
             if lbl not in self._issues[issue]["labels"]:
                 self._issues[issue]["labels"].append(lbl)
+        return True
 
-    def unlabel(self, issue: int, label: str, repo: str | None = None) -> None:
+    def unlabel(self, issue: int, label: str, repo: str | None = None) -> bool:
         labels = self._issues[issue]["labels"]
         if label in labels:
             labels.remove(label)
+        return True
 
-    def comment(self, issue: int, body: str, repo: str | None = None) -> None:
+    def comment(self, issue: int, body: str, repo: str | None = None) -> bool:
         self.comments.setdefault(issue, []).append(body)
+        return True
 
     # -- assertions helpers --
     def labels_of(self, issue: int) -> list[str]:
@@ -274,19 +281,21 @@ def test_audit_continues_after_single_issue_failure(
             {"number": 3, "title": "t3", "body": "no axis", "labels": [LOOP_READY_LABEL]},
         ]
     )
-    fake.label_raise_on = {2}
+    fake.label_fail_on = {2}  # gh.label returns False (suppressed), as in prod
     _install(monkeypatch, fake)
     events_file = tmp_path / "events.jsonl"
 
     outcome = Brainstormer(repo_path=tmp_path).audit_backlog("o/r", events_file=events_file)
 
     # #1 and #3 demoted cleanly; #2 recorded as a failure, not aborting the pass.
+    # #2 is NOT in demoted — the falsey gh.label return is treated as a failure.
     assert sorted(outcome.demoted) == [1, 3]
     assert 2 in outcome.failures
+    assert 2 not in outcome.demoted
     assert LOOP_COLD_LABEL in fake.labels_of(1)
     assert LOOP_COLD_LABEL in fake.labels_of(3)
     assert LOOP_COLD_LABEL not in fake.labels_of(2)  # label never landed
-    assert LOOP_READY_LABEL in fake.labels_of(2)  # still ready — unlabel never ran
+    assert LOOP_READY_LABEL in fake.labels_of(2)  # still ready — short-circuited before unlabel
     assert 2 not in fake.comments
 
     events = _read_events(events_file)
