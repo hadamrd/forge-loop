@@ -20,7 +20,7 @@ from forge_loop import master_log as _mlog
 from forge_loop import worker as _worker
 from forge_loop.config import Config
 from forge_loop.deploy import redeploy
-from forge_loop.gh import (
+from forge_loop.gh_issues import (
     fetch_issue,
     open_prs,
     pr_review_context,
@@ -157,7 +157,7 @@ def _enable_automerge_for_reviewed_outcomes(
     refused_issues: set[int],
 ) -> None:
     """Enable auto-merge only after critic and merge gates have passed."""
-    from forge_loop import gh as _gh
+    from forge_loop import gh_issues as _gh
 
     for outcome in outcomes:
         if outcome.status != "open" or not outcome.pr_url:
@@ -199,7 +199,7 @@ def _enable_automerge_for_adopted_prs(
     ``mergeStateStatus == CLEAN``, or if it has unresolved review threads.
     Every skip emits ``orphan_pr_skipped`` with a ``reason`` — no silent drop.
     """
-    from forge_loop import gh as _gh
+    from forge_loop import gh_issues as _gh
 
     for outcome, pr in adoptions:
         if outcome.status != "open" or not outcome.pr_url:
@@ -275,7 +275,7 @@ def _run_adoption_tick(
     stamped on each successfully-adopted PR so a re-run of this scan excludes
     it (no duplicate critic runs, no double auto-merge).
     """
-    from forge_loop import gh as _gh
+    from forge_loop import gh_issues as _gh
     from forge_loop.runner.merge_gate import apply_issue_closed_gate
 
     master_log_path = cfg.logs_dir / "master.log"
@@ -941,7 +941,7 @@ def _run_merge_gate(
         if o.status in {"open", "merged"} and o.pr_url:
             _remove_ready_label(cfg, o.issue, status=o.status, pr_url=o.pr_url)
 
-    from forge_loop import gh as _gh
+    from forge_loop import gh_issues as _gh
     from forge_loop.runner.merge_gate import apply_issue_closed_gate
 
     refused = apply_issue_closed_gate(

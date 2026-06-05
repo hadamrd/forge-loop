@@ -297,7 +297,7 @@ def test_selector_skips_when_issue_fetch_fails(tmp_path: Path) -> None:
 # _enable_automerge_for_adopted_prs — adoption merge gates (sev2b sad paths)
 # ---------------------------------------------------------------------------
 
-from forge_loop import gh as _ghmod  # noqa: E402
+from forge_loop import gh_issues as _ghmod  # noqa: E402
 from forge_loop.runner.tick import (  # noqa: E402
     _enable_automerge_for_adopted_prs,
     _run_adoption_tick,

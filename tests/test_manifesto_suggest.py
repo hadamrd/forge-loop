@@ -431,6 +431,12 @@ class TestBuildPrPlan:
 
 
 class _RecordingRunner:
+    """Records the git commands ``open_manifesto_pr`` runs.
+
+    Only ``git`` is driven through this runner now — the PR open goes through
+    the GhClient (``create_pull``), not a ``gh pr create`` subprocess (#223).
+    """
+
     def __init__(self, *, fail_cmd: str | None = None) -> None:
         self.calls: list[list[str]] = []
         self.fail_cmd = fail_cmd
@@ -439,10 +445,7 @@ class _RecordingRunner:
         self.calls.append(cmd)
         if self.fail_cmd is not None and self.fail_cmd in cmd:
             return SimpleNamespace(returncode=1, stdout="", stderr=f"{self.fail_cmd} failed")
-        stdout = (
-            "https://github.com/acme/widgets/pull/777" if cmd[:3] == ["gh", "pr", "create"] else ""
-        )
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
 def _plan() -> ManifestoPrPlan:
@@ -458,20 +461,33 @@ def _plan() -> ManifestoPrPlan:
 
 class TestOpenManifestoPr:
     def test_happy_path_writes_files_and_returns_url(self, tmp_path: Path) -> None:
-        runner = _RecordingRunner()
-        url = open_manifesto_pr(
-            _plan(),
-            repo_path=tmp_path,
-            github_repo="acme/widgets",
-            runner=runner,
-        )
+        from forge_loop import gh_issues
+        from forge_loop.gh_client import MockGhClient
+
+        client = MockGhClient(create_pull_url="https://github.com/acme/widgets/pull/777")
+        gh_issues.set_client(client)
+        try:
+            runner = _RecordingRunner()
+            url = open_manifesto_pr(
+                _plan(),
+                repo_path=tmp_path,
+                github_repo="acme/widgets",
+                runner=runner,
+            )
+        finally:
+            gh_issues.set_client(None)
         assert url == "https://github.com/acme/widgets/pull/777"
         # File actually written with the delta.
         assert (tmp_path / QUALITY_REL).read_text(encoding="utf-8") == "# Quality\n\nnew rule\n"
-        # Exactly one gh pr create call.
-        creates = [c for c in runner.calls if c[:3] == ["gh", "pr", "create"]]
+        # The PR was opened via the client (not a gh subprocess), exactly once,
+        # for the right repo/branch.
+        creates = [c for c in client.calls if c[0] == "create_pull"]
         assert len(creates) == 1
-        assert "acme/widgets" in creates[0]
+        assert creates[0][1]["repo"] == "widgets"
+        assert creates[0][1]["head"] == "manifesto/suggest-from-pr-207"
+        # git ran; no gh subprocess.
+        assert any(c[:1] == ["git"] for c in runner.calls)
+        assert not any(c and c[0] == "gh" for c in runner.calls)
 
     def test_guard_without_repo_raises(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="github_repo"):

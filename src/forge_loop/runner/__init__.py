@@ -32,9 +32,9 @@ from forge_loop.config import Config as _Config
 # legacy ``monkeypatch.setattr(forge_loop.runner, ...)`` calls in tests
 # continue to bite the actual call sites after the #50 split.
 from forge_loop.deploy import redeploy as redeploy
-from forge_loop.gh import fetch_issue as fetch_issue
-from forge_loop.gh import top_issues as top_issues
-from forge_loop.gh import unlabel as unlabel
+from forge_loop.gh_issues import fetch_issue as fetch_issue
+from forge_loop.gh_issues import top_issues as top_issues
+from forge_loop.gh_issues import unlabel as unlabel
 from forge_loop.runner import boot as _boot
 from forge_loop.runner import dispatch as _dispatch_mod
 from forge_loop.runner import iteration as iteration
@@ -122,10 +122,16 @@ def __getattr__(name: str) -> Any:  # pragma: no cover — thin compat shim
 # The mapping below is closed-world (only the names tests have historically
 # patched). New names fall through to plain attribute assignment.
 # ---------------------------------------------------------------------------
-_PROXY_TICK_NAMES = frozenset({
-    "top_issues", "fetch_issue", "unlabel", "_reap_worktree",
-    "_short_sleep", "redeploy",
-})
+_PROXY_TICK_NAMES = frozenset(
+    {
+        "top_issues",
+        "fetch_issue",
+        "unlabel",
+        "_reap_worktree",
+        "_short_sleep",
+        "redeploy",
+    }
+)
 _PROXY_DISPATCH_NAMES = frozenset({"run_worker"})
 
 

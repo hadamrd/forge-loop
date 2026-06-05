@@ -422,11 +422,11 @@ def run_async(cfg: Config) -> int:
     import asyncio
 
     from forge_loop import attempts as _attempts
-    from forge_loop import gh as _gh
+    from forge_loop import gh_issues as _gh
     from forge_loop.critic import review_pr as _critic_review
     from forge_loop.critic_actions import apply_critic_report
     from forge_loop.deploy import redeploy
-    from forge_loop.gh import fetch_issue, top_issues
+    from forge_loop.gh_issues import fetch_issue, top_issues
     from forge_loop.po import expand_thin_specs as _po_expand
     from forge_loop.runner._helpers import reap_worktree as _reap_worktree
     from forge_loop.runner.dispatch import _sev_counts

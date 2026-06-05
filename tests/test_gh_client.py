@@ -8,8 +8,6 @@ in a recorded-fixture pass, deferred to follow-up.
 
 from __future__ import annotations
 
-import subprocess
-
 import pytest
 
 from forge_loop.gh_client import (
@@ -22,61 +20,64 @@ from forge_loop.gh_client import (
 )
 
 # ---------------------------------------------------------------------------
-# Auth resolution
+# Auth resolution — env-only (GITHUB_TOKEN > GH_TOKEN). No gh-CLI fallback
+# after #223; the gh CLI is not used by forge-loop.
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_token_prefers_gh_token(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_token_prefers_github_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GH_TOKEN", "from-gh")
     monkeypatch.setenv("GITHUB_TOKEN", "from-actions")
-    assert resolve_token() == "from-gh"
-
-
-def test_resolve_token_falls_back_to_github_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.setenv("GITHUB_TOKEN", "from-actions")
+    # GITHUB_TOKEN wins (GitHub Actions convention checked first).
     assert resolve_token() == "from-actions"
 
 
+def test_resolve_token_falls_back_to_gh_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "from-gh")
+    assert resolve_token() == "from-gh"
+
+
 class _FakeTokenSource:
-    def __init__(self, *, env: dict[str, str | None], gh_token: str | None = None) -> None:
+    """Env-only token source double (the TokenSource Protocol post-#223)."""
+
+    def __init__(self, *, env: dict[str, str | None]) -> None:
         self.env = env
-        self.gh_token = gh_token
 
     def env_token(self, name: str) -> str | None:
         return self.env.get(name)
 
-    def gh_auth_token(self) -> str | None:
-        return self.gh_token
 
-
-def test_resolve_token_uses_gh_auth_token_after_env_vars() -> None:
-    source = _FakeTokenSource(env={"GH_TOKEN": None, "GITHUB_TOKEN": None}, gh_token="from-gh-cli")
-    assert resolve_token(source) == "from-gh-cli"
-
-
-def test_resolve_token_prefers_env_over_gh_auth_token() -> None:
-    source = _FakeTokenSource(env={"GH_TOKEN": "from-env"}, gh_token="from-gh-cli")
+def test_resolve_token_uses_injected_source() -> None:
+    source = _FakeTokenSource(env={"GITHUB_TOKEN": None, "GH_TOKEN": "from-env"})
     assert resolve_token(source) == "from-env"
 
 
-def test_real_token_source_returns_none_when_gh_auth_token_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _Run:
-        returncode = 1
-        stdout = ""
-        stderr = "not logged in"
-
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Run())
-    assert GhTokenSource().gh_auth_token() is None
+def test_real_token_source_returns_none_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    assert GhTokenSource().env_token("GH_TOKEN") is None
+    assert GhTokenSource().env_token("GITHUB_TOKEN") is None
 
 
 def test_resolve_token_returns_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.setattr(GhTokenSource, "gh_auth_token", lambda self: None)
     assert resolve_token() is None
+
+
+def test_constructing_client_without_token_raises_naming_both_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Env-only auth must fail fast with a clear, actionable error (#223)."""
+    from forge_loop.gh_client import GithubkitClient
+
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    with pytest.raises(RuntimeError) as exc:
+        GithubkitClient()
+    msg = str(exc.value)
+    assert "GITHUB_TOKEN" in msg and "GH_TOKEN" in msg
 
 
 # ---------------------------------------------------------------------------

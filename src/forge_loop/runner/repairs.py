@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from forge_loop.config import Config
-from forge_loop.gh import (
+from forge_loop.gh_issues import (
     fetch_issue,
     open_prs,
     pr_review_context,
@@ -296,7 +296,7 @@ def enable_automerge_for_repaired_prs(
     emit: Any,
 ) -> None:
     """After repair + critic, put fixed PRs back on the merge conveyor."""
-    from forge_loop import gh as _gh
+    from forge_loop import gh_issues as _gh
     from forge_loop.runner.merge_gate import apply_issue_closed_gate
 
     apply_issue_closed_gate(
