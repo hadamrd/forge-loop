@@ -25,6 +25,7 @@ so the last gh check wins.
 from __future__ import annotations
 
 import contextlib
+import logging
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -34,6 +35,23 @@ from typing import Any, Protocol
 from forge_loop.state import append_event
 from forge_loop.worker import WorkerOutcome
 from forge_loop.worker_env import missing_tools
+
+_log = logging.getLogger(__name__)
+
+
+def _best_effort(action: str, fn: Callable[[], Any]) -> None:
+    """Run a best-effort gh side effect that must never abort the refusal.
+
+    The gate's durable record is the typed event + the ``merged`` → ``open``
+    status flip; a gh API hiccup while disabling auto-merge or posting the
+    explanatory comment must not crash the tick. We still log at DEBUG with the
+    traceback so an operator can diagnose a silently-failing comment/disable
+    (issue #241 review nit) instead of staring at a swallowed exception.
+    """
+    try:
+        fn()
+    except Exception:  # noqa: BLE001 — best-effort; event+status flip still fire
+        _log.debug("verify-gate: %s failed (suppressed)", action, exc_info=True)
 
 
 class GhMergeGateClient(Protocol):
@@ -286,14 +304,22 @@ def check_verify_clean_gate(
 
     Outcomes without a ``pr_url`` are skipped (nothing to gate).
     """
-    if not outcome.pr_url:
+    pr_url = outcome.pr_url
+    if not pr_url:
         return False
 
     body = _verify_refusal_comment(result)
-    with contextlib.suppress(Exception):
-        gh.disable_pr_auto_merge(outcome.pr_url, repo=repo)
-    with contextlib.suppress(Exception):
-        gh.pr_comment(outcome.pr_url, body, repo=repo)
+    # Best-effort side effects; the event + status flip below MUST still fire.
+    # Suppress-but-log (DEBUG, with traceback) so a silently-failing gh
+    # comment/disable is diagnosable rather than swallowed (issue #241 nit).
+    _best_effort(
+        "disable_pr_auto_merge",
+        lambda: gh.disable_pr_auto_merge(pr_url, repo=repo),
+    )
+    _best_effort(
+        "pr_comment",
+        lambda: gh.pr_comment(pr_url, body, repo=repo),
+    )
 
     payload = {
         "issue": outcome.issue,
