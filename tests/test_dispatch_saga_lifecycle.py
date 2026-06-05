@@ -112,6 +112,34 @@ def test_dispatch_seeds_delete_branch_and_appends_close_pr(
     assert seeded_branch["b"]  # the branch was actually seeded mid-flight
 
 
+def test_append_close_pr_failure_is_logged_not_silent(tmp_path: Any) -> None:
+    """#272 EH-001: a swallowed ``append_compensation`` failure is the feature's
+    linchpin — if it vanishes silently, recovery can never close the abandoned
+    PR. The write stays best-effort (no raise) but is surfaced as an event."""
+    from forge_loop.events import read_events
+
+    class _BoomStore:
+        def append_compensation(self, *_a: Any, **_k: Any) -> None:
+            raise RuntimeError("saga already finalised")
+
+    events_file = tmp_path / "events.jsonl"
+
+    # Must not raise — best-effort contract preserved.
+    dispatch_mod._append_close_pr_compensation(
+        _BoomStore(),  # type: ignore[arg-type]
+        task_id="task-7-worker",
+        pr_url="https://github.com/o/r/pull/4242",
+        events_file=events_file,
+    )
+
+    kinds = [e for e in read_events(events_file)]
+    failed = [e for e in kinds if e.get("kind") == "close_pr_compensation_append_failed"]
+    assert len(failed) == 1
+    assert failed[0]["task_id"] == "task-7-worker"
+    assert failed[0]["pr_url"].endswith("/pull/4242")
+    assert "RuntimeError" in failed[0]["err"]
+
+
 def test_record_worker_task_policy_seeds_delete_branch(tmp_path: Any) -> None:
     """#272 (both seed paths): the fallback policy-recording path also seeds a
     delete-branch compensation alongside remove-worktree."""

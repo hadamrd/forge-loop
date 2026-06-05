@@ -346,6 +346,7 @@ def _append_close_pr_compensation(
     *,
     task_id: str,
     pr_url: str | None,
+    events_file: Path | None = None,
 ) -> None:
     """Durably append a ``close-pr`` compensation once the worker opens its PR.
 
@@ -353,13 +354,17 @@ def _append_close_pr_compensation(
     (e.g. the saga already finalised) is swallowed — recording the compensation
     must never mask or break the real worker outcome. Recovery only *uses* it
     if the saga is later abandoned (process killed before merge).
+
+    EH-001: the store-write failure is non-fatal but **not** invisible — a
+    swallowed append means recovery can never close the abandoned PR, so we log
+    it (with ``task_id``/``pr_url`` context) before continuing.
     """
     if saga_store is None or not pr_url:
         return
     number = _pr_number_from_url(pr_url)
     if number is None:
         return
-    with contextlib.suppress(Exception):
+    try:
         saga_store.append_compensation(
             task_id,
             Compensation(
@@ -368,6 +373,16 @@ def _append_close_pr_compensation(
                 reason="close abandoned never-merged PR on stale-saga recovery",
             ),
         )
+    except Exception as ex_:  # best-effort, but surface it (EH-001)
+        if events_file is not None:
+            with contextlib.suppress(Exception):
+                append_event(
+                    events_file,
+                    "close_pr_compensation_append_failed",
+                    task_id=task_id,
+                    pr_url=pr_url,
+                    err=f"{type(ex_).__name__}: {ex_!s:.200}",
+                )
 
 
 def _worker_task_id(issue_number: int) -> str:
@@ -664,7 +679,10 @@ def _run_worker_with_saga(
             _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
             raise
         _append_close_pr_compensation(
-            saga_store, task_id=task_id, pr_url=legacy_outcome.pr_url
+            saga_store,
+            task_id=task_id,
+            pr_url=legacy_outcome.pr_url,
+            events_file=cfg.events_file,
         )
         _finalize_worker_saga(saga_store, task_id=task_id, status=legacy_outcome.status)
         return legacy_outcome
@@ -739,7 +757,12 @@ def _run_worker_with_saga(
             )
         # Issue #272: if the crashed worker had already opened its PR, record the
         # close-pr compensation so a later stale-saga recovery can reverse it.
-        _append_close_pr_compensation(saga_store, task_id=task_id, pr_url=recovered_pr)
+        _append_close_pr_compensation(
+            saga_store,
+            task_id=task_id,
+            pr_url=recovered_pr,
+            events_file=cfg.events_file,
+        )
         _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
         raise
 
@@ -749,7 +772,12 @@ def _run_worker_with_saga(
         outcome=outcome,
         events_file=cfg.events_file,
     )
-    _append_close_pr_compensation(saga_store, task_id=task_id, pr_url=outcome.pr_url)
+    _append_close_pr_compensation(
+        saga_store,
+        task_id=task_id,
+        pr_url=outcome.pr_url,
+        events_file=cfg.events_file,
+    )
     _finalize_worker_saga(saga_store, task_id=task_id, status=outcome.status)
     return outcome
 

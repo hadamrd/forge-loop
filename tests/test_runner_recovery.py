@@ -384,6 +384,43 @@ def test_abandoned_saga_with_branch_and_pr_is_fully_compensated_on_boot(
     assert rec.prs_closed == ("888",)
 
 
+def test_recovery_gh_callbacks_logs_unexpected_construction_failure(
+    tmp_path: Path,
+) -> None:
+    """#272 (sev2): an offline/no-token boot returns ``(None, None)`` so recovery
+    skips branch/PR cleanup — but a genuine GithubkitClient construction failure
+    must be observable, not silently indistinguishable from 'no token'."""
+    from forge_loop.events import read_events
+    from forge_loop.runner import boot as boot_mod
+
+    class _Cfg:
+        github_repo = "o/r"
+        events_file = tmp_path / "events.jsonl"
+
+    cfg = _Cfg()
+    cfg.events_file.touch()
+
+    import forge_loop.gh_client as gh_mod
+
+    def _boom() -> object:
+        raise RuntimeError("kaboom building client")
+
+    # Force the construction to blow up (not the benign no-token path).
+    orig = gh_mod.GithubkitClient
+    gh_mod.GithubkitClient = _boom  # type: ignore[misc,assignment]
+    try:
+        cb = boot_mod._recovery_gh_callbacks(cfg)  # type: ignore[arg-type]
+    finally:
+        gh_mod.GithubkitClient = orig  # type: ignore[misc]
+
+    assert cb == (None, None)  # offline-safe: recovery still runs, just skips gh
+    events = list(read_events(cfg.events_file))
+    offline = [e for e in events if e.get("kind") == "boot_recovery_gh_offline"]
+    assert len(offline) == 1
+    assert offline[0]["repo"] == "o/r"
+    assert "RuntimeError" in offline[0]["err"]
+
+
 # ---------------------------------------------------------------------------
 # Event schema — typed model validates required fields.
 # ---------------------------------------------------------------------------

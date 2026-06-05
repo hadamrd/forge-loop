@@ -7,6 +7,7 @@ no behaviour change, no signature change.
 
 from __future__ import annotations
 
+import contextlib
 import signal
 import subprocess
 import time
@@ -143,7 +144,17 @@ def _recovery_gh_callbacks(
 
         owner, name = repo_slug.split("/", 1)
         gh = GithubkitClient()
-    except Exception:  # noqa: BLE001 - no token / offline: recovery stays offline-safe
+    except Exception as exc:  # noqa: BLE001 - no token / offline: recovery stays offline-safe
+        # Offline/no-token fallback is expected and benign, but a genuine
+        # construction failure would silently disable branch/PR cleanup —
+        # surface it (debug) so the unexpected case is observable (#272).
+        with contextlib.suppress(Exception):
+            append_event(
+                cfg.events_file,
+                "boot_recovery_gh_offline",
+                repo=repo_slug,
+                err=f"{type(exc).__name__}: {exc!s:.200}",
+            )
         return None, None
 
     def _delete_branch(branch: str) -> bool:
