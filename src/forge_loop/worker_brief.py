@@ -10,6 +10,26 @@ from typing import Any
 from forge_loop.sandbox import CapabilityPolicy, render_capability_policy
 
 
+def _render_verify_section(verify_commands: tuple[str, ...]) -> str:
+    """Render the canonical "Definition of done" verify block.
+
+    Injects the project's CANONICAL check commands so the worker never has to
+    guess ``mypy`` vs ``python -m mypy`` (the 2026-06-05 silent-toolchain
+    incident: the worker tried command variants for ~20 min). Empty when no
+    commands are declared — the brief reads identically to the historical one.
+    """
+    if not verify_commands:
+        return ""
+    rendered = "\n".join(f"   - `{cmd}`" for cmd in verify_commands)
+    return (
+        "\nDEFINITION OF DONE — run THESE EXACT commands to verify (do not "
+        "guess variants):\n"
+        f"{rendered}\n"
+        "   These are the project's canonical gates. Run them verbatim from the "
+        "worktree root; every one MUST pass (exit 0) before you open the PR.\n"
+    )
+
+
 def make_brief(
     issue: dict[str, Any],
     worktree: Path,
@@ -23,6 +43,7 @@ def make_brief(
     dry_run: bool = False,
     manifesto_bundle: Any | None = None,
     capability_policy: CapabilityPolicy | None = None,
+    verify_commands: tuple[str, ...] = (),
 ) -> str:
     """Render the worker brief for an issue."""
     body = (issue.get("body") or "")[:6000]
@@ -78,6 +99,7 @@ def make_brief(
     capability_policy_section = (
         "\n" + render_capability_policy(capability_policy) if capability_policy is not None else ""
     )
+    verify_section = _render_verify_section(verify_commands)
 
     from forge_loop.briefs import render_brief
 
@@ -95,6 +117,7 @@ def make_brief(
         coauthor_line=coauthor_line,
         final_status=final_status,
         capability_policy_section=capability_policy_section,
+        verify_section=verify_section,
     )
     if dry_run:
         from forge_loop.replay import apply_dry_run_to_brief
@@ -116,6 +139,7 @@ def make_repair_brief(
     lumen_top_k: int = 3,
     lumen_test_pattern: str = "**/*Test.*",
     coauthor: str = "",
+    verify_commands: tuple[str, ...] = (),
 ) -> str:
     """Render a worker brief for repairing an existing blocked PR."""
     body = (issue.get("body") or "")[:6000]
@@ -125,6 +149,7 @@ def make_repair_brief(
     head = pr.get("headRefName") or ""
     final_status = f'{{"issue": {n}, "pr": "{pr_url}", "status": "open", "note": "repair pushed"}}'
     coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
+    verify_section = _render_verify_section(verify_commands)
     return f"""You are an autonomous repair worker in a sprint loop.
 
 WORKTREE (already created): {worktree}
@@ -155,7 +180,7 @@ CONTRACT:
 8. Push the current branch with `git push`.
 9. Resolve review threads after fixing them when the GitHub API/CLI allows it; otherwise reply/comment with the fixed evidence.
 10. Leave a short PR comment summarizing the repair and remaining state.
-
+{verify_section}
 LOOP INFRASTRUCTURE - DO NOT TOUCH:
 - `{worktree}/.claude/settings.json` is loop-planted. Do NOT `git clean`, `rm`, or chmod it.
 - Don't run `git clean -fdx`.

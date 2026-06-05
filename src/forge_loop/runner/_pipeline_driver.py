@@ -122,6 +122,10 @@ def _build_default_handlers(
             provider=getattr(cfg.worker, "provider", "claude"),
             allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
             base_branch=getattr(cfg, "base_branch", "trunk"),
+            env_path_prepend=getattr(cfg.worker, "env_path_prepend", ()),
+            env_vars=getattr(cfg.worker, "env_vars", {}),
+            env_require=getattr(cfg.worker, "env_require", ()),
+            verify_commands=getattr(cfg.worker, "verify_commands", ()),
         )
         ok = out.status in {"merged", "open"}
         return StepOutcome(

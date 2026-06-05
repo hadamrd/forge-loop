@@ -109,6 +109,12 @@ class WorkerConfig:
     strict_mcp_config: bool = True
     mcp_servers: dict[str, Any] = field(default_factory=dict)
     permissions: str = "full"
+    # Worker environment contract (2026-06-05 silent-toolchain incident).
+    # Provisioned + preflighted by the dispatch path via forge_loop.worker_env.
+    env_path_prepend: tuple[str, ...] = ()
+    env_vars: dict[str, str] = field(default_factory=dict)
+    env_require: tuple[str, ...] = ()
+    verify_commands: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -293,6 +299,10 @@ def _from_settings(s: Settings) -> Config:
             strict_mcp_config=s.worker.strict_mcp_config,
             mcp_servers=dict(s.worker.mcp_servers),
             permissions=s.worker.permissions,
+            env_path_prepend=s.worker.env_path_prepend,
+            env_vars=dict(s.worker.env_vars),
+            env_require=s.worker.env_require,
+            verify_commands=s.worker.verify_commands,
         ),
         attempts=AttemptsConfig(
             enabled=s.attempts.enabled,

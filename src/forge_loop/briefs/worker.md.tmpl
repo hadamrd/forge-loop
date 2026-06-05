@@ -75,7 +75,7 @@ CONTRACT (content-grade — NOT the smallest possible diff):
    The commit message MUST have a body (the "why"), not just a one-line title.
 9. git push -u origin <branch>.
 {merge_step_renumbered}
-
+{verify_section}
 COMMIT DISCIPLINE — HARD RULE:
 - Every 20 turns of editing OR every 5 file edits, run `git add -A && git commit -m "wip: <one-line>"` (no need to push). This is non-negotiable: even partial work that exits cleanly will produce a draft PR that the operator can pick up.
 - Before any tool call after turn 40, your IMMEDIATELY-NEXT tool call must be one of: git commit, git push, gh pr create. The implementation phase is over; ship what you have to PR-open.

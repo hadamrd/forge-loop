@@ -18,7 +18,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -323,6 +323,9 @@ async def run_sdk_session(
     cwd: Path,
     max_turns: int = 120,
     env: dict[str, str] | None = None,
+    repo: Path | None = None,
+    env_path_prepend: Iterable[str] = (),
+    env_vars: Mapping[str, str] | Iterable[tuple[str, str]] = (),
     add_dirs: Iterable[Path] = (),
     permission_mode: str = "bypassPermissions",
     sandbox: dict[str, Any] | None = None,
@@ -413,12 +416,28 @@ async def run_sdk_session(
     # versions; ``thinking_budget`` is newer — if the installed SDK does
     # not accept it we transparently retry without it (the role still
     # gets the requested model, just without an explicit thinking knob).
+    # Provision the worker env from the declared contract (the 2026-06-05
+    # silent-toolchain incident). The base is the explicit ``env`` if the
+    # caller passed one, else the cleaned os.environ. When a ``repo`` is given
+    # we prepend the declared dirs (e.g. ``.venv/bin``) and set the declared
+    # vars (e.g. ``VIRTUAL_ENV``) so the worker's required toolchain is on PATH
+    # instead of silently inheriting the orchestrator's ambient env.
+    effective_env = env if env is not None else _clean_sdk_env()
+    if repo is not None and (env_path_prepend or env_vars):
+        from forge_loop.worker_env import build_worker_env
+
+        effective_env = build_worker_env(
+            effective_env,
+            repo=repo,
+            path_prepend=env_path_prepend,
+            vars=env_vars,
+        )
     base_kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "max_turns": max_turns,
         "permission_mode": permission_mode,
         "add_dirs": [str(p) for p in add_dirs],
-        "env": env if env is not None else _clean_sdk_env(),
+        "env": effective_env,
     }
     # Host-level confinement for the worker (permission profiles 'standard' /
     # 'readonly' — see forge_loop.worker_permissions). A SandboxSettings dict.

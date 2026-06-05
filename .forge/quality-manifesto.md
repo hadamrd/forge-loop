@@ -219,6 +219,33 @@ documented fallback, and no seam test. The loop's own per-PR critic could not
 catch it because the break was *between* components. This rule + the
 findings-always-land fix ship together.
 
+### Q11. A worker's required toolchain/environment must be DECLARED and PREFLIGHTED — no verification step may depend on ambient PATH/inherited env.
+
+A capability the agent needs — the project venv, a linter, a type-checker, a
+test runner — must be **provisioned and verified at dispatch**, failing LOUD if
+absent, never silently degrading. Concretely: the per-project worker-environment
+contract (``worker.env.path_prepend`` / ``vars`` / ``require`` + ``worker.verify``)
+is the single source of truth; the loop builds the worker's PATH from it and
+preflights ``require`` with ``shutil.which`` BEFORE driving the session,
+aborting with a typed ``worker_toolchain_unavailable`` event if a tool is
+missing. A verification step (lint/type/test gate) that resolves its tool via
+the worker's *inherited* ``PATH``/``VIRTUAL_ENV`` rather than the *declared*
+contract is **sev2**; shipping a worker path that runs a gate command without a
+declared+preflighted contract behind it is **sev2**. The brief must inject the
+canonical ``verify`` commands so the worker runs them verbatim and never guesses
+``mypy`` vs ``python -m mypy``.
+
+**Rationale.** The 2026-06-05 silent-toolchain incident: workers run in a
+``/tmp`` git worktree and inherited the orchestrator's ambient env
+(``_worker_sdk._clean_sdk_env`` = ``dict(os.environ)``). The project ``.venv``
+was NOT on that PATH (workers saw ``VIRTUAL_ENV=/usr`` and the system python),
+so ``pyright`` / ``mypy`` / ``pytest`` silently failed with "command not found";
+the worker retried command variants for ~20 minutes with NO error surfaced. The
+toolchain was an IMPLICIT, unverified, silently-degrading dependency — the
+"Agent Enablement" gap: an agent must be GIVEN (and verified to have) the
+environment it needs. This rule + the ``worker_env`` provisioning/preflight and
+the declared per-project contract ship together.
+
 ## How to apply this manifesto
 
 * When reviewing a forge-loop PR, scan the diff for each rule. A

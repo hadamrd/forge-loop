@@ -256,12 +256,16 @@ def test_run_worker_emits_start_and_done_events(
     )
 
     assert out.status == "open"
-    assert [kind for kind, _payload in events] == ["worker_start", "worker_done"]
+    # No env contract declared in this call → a worker_env_undeclared warning
+    # is emitted between start and done (the toolchain-contract gap is visible
+    # but non-fatal). See test_worker_env.py for the contract behaviours.
+    kinds = [kind for kind, _payload in events]
+    assert kinds == ["worker_start", "worker_env_undeclared", "worker_done"]
     assert events[0][1]["issue"] == 12
     assert events[0][1]["tick"] == 5
     assert events[0][1]["worktree"] == str(worktree)
-    assert events[1][1]["status"] == "open"
-    assert events[1][1]["pr_url"] == "https://github.com/o/r/pull/12"
+    assert events[-1][1]["status"] == "open"
+    assert events[-1][1]["pr_url"] == "https://github.com/o/r/pull/12"
 
 
 # Gradle/WSL-OOM guard tests removed: forge-loop is stack-agnostic; the

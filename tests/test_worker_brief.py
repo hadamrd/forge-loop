@@ -145,3 +145,40 @@ def test_make_repair_brief_keeps_same_pr_contract(tmp_path: Path) -> None:
     assert "https://github.com/o/r/pull/7" in brief
     assert "[sev1] fix the real consumer" in brief
     assert '"pr": "https://github.com/o/r/pull/7"' in brief
+
+
+# ---------------------------------------------------------------------------
+# Worker environment contract — canonical verify section (2026-06-05 incident).
+# ---------------------------------------------------------------------------
+
+
+def test_make_brief_injects_verify_commands(tmp_path: Path) -> None:
+    issue = {"number": 5, "title": "x", "body": "y"}
+    brief = make_brief(
+        issue,
+        tmp_path / "w",
+        verify_commands=("ruff check src tests", "pyright src/forge_loop"),
+    )
+    assert "DEFINITION OF DONE" in brief
+    # The EXACT commands appear so the worker never guesses variants.
+    assert "`ruff check src tests`" in brief
+    assert "`pyright src/forge_loop`" in brief
+
+
+def test_make_brief_no_verify_section_when_unset(tmp_path: Path) -> None:
+    brief = make_brief({"number": 5, "title": "x", "body": "y"}, tmp_path / "w")
+    assert "DEFINITION OF DONE" not in brief
+
+
+def test_make_repair_brief_injects_verify_commands(tmp_path: Path) -> None:
+    issue = {"number": 42, "title": "fix", "body": "z"}
+    pr = {"number": 7, "url": "https://x/pull/7", "headRefName": "loop/42-fix"}
+    brief = make_repair_brief(
+        issue,
+        tmp_path / "wt",
+        pr=pr,
+        review_context="ctx",
+        verify_commands=("python -m pytest -q",),
+    )
+    assert "DEFINITION OF DONE" in brief
+    assert "`python -m pytest -q`" in brief
