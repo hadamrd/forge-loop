@@ -566,19 +566,20 @@ def run_async(cfg: Config) -> int:
                 )
                 from forge_loop.critic_findings import open_critic_findings_store
 
-                await asyncio.to_thread(
-                    apply_critic_report,
-                    c.report,
-                    wr["pr_url"],
-                    lines,
-                    cfg.critic.block_on_sev2,
-                    cfg.critic.min_findings_for_approve,
-                    _gh,
-                    cfg.github_repo,
-                    _bus_emit,
-                    findings_store=open_critic_findings_store(cfg.repo),
-                    issue=wr.get("issue"),
-                )
+                with open_critic_findings_store(cfg.repo) as findings_store:
+                    await asyncio.to_thread(
+                        apply_critic_report,
+                        c.report,
+                        wr["pr_url"],
+                        lines,
+                        cfg.critic.block_on_sev2,
+                        cfg.critic.min_findings_for_approve,
+                        _gh,
+                        cfg.github_repo,
+                        _bus_emit,
+                        findings_store=findings_store,
+                        issue=wr.get("issue"),
+                    )
             except Exception as act_ex:
                 append_event(
                     cfg.events_file,

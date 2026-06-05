@@ -838,81 +838,83 @@ def _run_critic_for_outcomes(
     """Critic agent: review PRs the workers opened, before auto-merge fires."""
     from forge_loop.critic_findings import open_critic_findings_store
 
-    findings_store = open_critic_findings_store(cfg.repo)
-    for o in outcomes:
-        if o.status in {"open", "merged"} and o.pr_url:
-            try:
-                critic_outcome = _critic_review(
-                    o.pr_url,
-                    o.issue,
-                    cfg.repo,
-                    cfg.logs_dir,
-                    timeout_s=cfg.critic.timeout_s,
-                    emit=bus_emit,
-                    model=cfg.critic.model,
-                    provider=getattr(cfg.critic, "provider", "claude"),
-                )
-                append_event(
-                    cfg.events_file,
-                    "critic_done",
-                    issue=o.issue,
-                    pr=o.pr_url,
-                    verdict=critic_outcome.verdict,
-                    reasons=critic_outcome.reasons,
-                    duration_s=round(critic_outcome.duration_s, 1),
-                    sev_counts=_sev_counts(critic_outcome),
-                    parse_retries=critic_outcome.parse_retries,
-                )
-                if critic_outcome.report is not None:
-                    try:
-                        lines = _gh.pr_changed_lines(o.pr_url, repo=cfg.github_repo)
-                        plan = apply_critic_report(
-                            critic_outcome.report,
-                            o.pr_url,
-                            lines,
-                            cfg.critic.block_on_sev2,
-                            cfg.critic.min_findings_for_approve,
-                            gh=_gh,
-                            repo=cfg.github_repo,
-                            emit=bus_emit,
-                            findings_store=findings_store,
-                            issue=o.issue,
-                        )
-                        if plan.block_merge:
-                            o.status = "open"
-                            reason = "; ".join(critic_outcome.reasons) or critic_outcome.verdict
-                            note = f"critic blocked merge: {reason}"[:200]
-                            o.error = f"{o.error}; {note}" if o.error else note
-                        else:
-                            for label in ("critic:blocking", "critic:suspicious"):
-                                ok = _gh.remove_pr_label(
-                                    o.pr_url,
-                                    label,
-                                    repo=cfg.github_repo,
-                                )
-                                if not ok:
-                                    bus_emit(
-                                        "critic_actions_failed",
-                                        {
-                                            "pr": o.pr_url,
-                                            "method": "remove_pr_label",
-                                            "label": label,
-                                            "auth_source": getattr(
-                                                _gh,
-                                                "auth_source",
-                                                "github-client",
-                                            ),
-                                        },
+    with open_critic_findings_store(cfg.repo) as findings_store:
+        for o in outcomes:
+            if o.status in {"open", "merged"} and o.pr_url:
+                try:
+                    critic_outcome = _critic_review(
+                        o.pr_url,
+                        o.issue,
+                        cfg.repo,
+                        cfg.logs_dir,
+                        timeout_s=cfg.critic.timeout_s,
+                        emit=bus_emit,
+                        model=cfg.critic.model,
+                        provider=getattr(cfg.critic, "provider", "claude"),
+                    )
+                    append_event(
+                        cfg.events_file,
+                        "critic_done",
+                        issue=o.issue,
+                        pr=o.pr_url,
+                        verdict=critic_outcome.verdict,
+                        reasons=critic_outcome.reasons,
+                        duration_s=round(critic_outcome.duration_s, 1),
+                        sev_counts=_sev_counts(critic_outcome),
+                        parse_retries=critic_outcome.parse_retries,
+                    )
+                    if critic_outcome.report is not None:
+                        try:
+                            lines = _gh.pr_changed_lines(o.pr_url, repo=cfg.github_repo)
+                            plan = apply_critic_report(
+                                critic_outcome.report,
+                                o.pr_url,
+                                lines,
+                                cfg.critic.block_on_sev2,
+                                cfg.critic.min_findings_for_approve,
+                                gh=_gh,
+                                repo=cfg.github_repo,
+                                emit=bus_emit,
+                                findings_store=findings_store,
+                                issue=o.issue,
+                            )
+                            if plan.block_merge:
+                                o.status = "open"
+                                reason = "; ".join(critic_outcome.reasons) or critic_outcome.verdict
+                                note = f"critic blocked merge: {reason}"[:200]
+                                o.error = f"{o.error}; {note}" if o.error else note
+                            else:
+                                for label in ("critic:blocking", "critic:suspicious"):
+                                    ok = _gh.remove_pr_label(
+                                        o.pr_url,
+                                        label,
+                                        repo=cfg.github_repo,
                                     )
-                    except Exception as act_ex:
-                        append_event(
-                            cfg.events_file,
-                            "critic_actions_failed",
-                            issue=o.issue,
-                            err=str(act_ex)[:200],
-                        )
-            except Exception as ex_:
-                append_event(cfg.events_file, "critic_failed", issue=o.issue, err=str(ex_)[:200])
+                                    if not ok:
+                                        bus_emit(
+                                            "critic_actions_failed",
+                                            {
+                                                "pr": o.pr_url,
+                                                "method": "remove_pr_label",
+                                                "label": label,
+                                                "auth_source": getattr(
+                                                    _gh,
+                                                    "auth_source",
+                                                    "github-client",
+                                                ),
+                                            },
+                                        )
+                        except Exception as act_ex:
+                            append_event(
+                                cfg.events_file,
+                                "critic_actions_failed",
+                                issue=o.issue,
+                                err=str(act_ex)[:200],
+                            )
+                except Exception as ex_:
+                    append_event(
+                        cfg.events_file, "critic_failed", issue=o.issue, err=str(ex_)[:200]
+                    )
 
 
 def run_multirepo(
