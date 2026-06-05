@@ -172,6 +172,13 @@ that the loop refuses to do the wrong thing:
   so future workers see prior tries' notes
 - **Watchdog** — kills workers idle > 30 min; wall ceiling at 2 hours
 - **Orphan worktree reaper** — stale `/tmp/wt-loop-*` paths cleaned at boot
+- **Stale-saga recovery** — a worker hard-killed (^C / OOM / SIGKILL) after it
+  pushed `loop/N-…` and opened a draft PR is fully reversed on the next boot:
+  recovery reaps the worktree **and** deletes the abandoned branch and closes
+  the never-merged PR (#272), so the firm-path `gh pr close <N> --delete-branch`
+  is no longer needed for crashed never-merged work. Offline boots stay green —
+  the branch/PR cleanup is best-effort and skipped (without error) when no
+  GitHub token is configured.
 - **Auto-restart on self-upgrade** — if a merged PR bumps forge-loop's
   own version, the running process exits cleanly and the all-nighter
   shim re-execs against the fresh install
