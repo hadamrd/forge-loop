@@ -61,6 +61,7 @@ from forge_loop.runner.repairs import (
 )
 from forge_loop.runner.rescue import rescue_uncommitted_work as _rescue_uncommitted_work
 from forge_loop.runner.tick_checks import run_codebase_audit as _run_codebase_audit
+from forge_loop.runner.tick_checks import run_brainstormer_audit as _run_brainstormer_audit
 from forge_loop.runner.tick_checks import run_maintenance_tick as _run_maintenance_tick
 from forge_loop.runner.tick_checks import run_stuck_sweep as _run_stuck_sweep
 from forge_loop.state import append_event, consolidate_sprint, write_state
@@ -483,6 +484,21 @@ def _maybe_run_maintenance(cfg: Config, tick: int, *, short_sleep: Any) -> bool:
         _run_codebase_audit(cfg, tick)
     if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
         _run_maintenance_tick(cfg, tick)
+        short_sleep(cfg.tick_interval_s, cfg)
+        return True
+    return False
+
+
+def _maybe_run_brainstormer_audit(cfg: Config, tick: int, *, short_sleep: Any) -> bool:
+    """Periodic backlog audit (#125) before the worker dispatch path.
+
+    Fires on the ``brainstormer.audit_every_n_ticks`` cadence (``0`` disables).
+    Returns True when the audit ran and the caller must return immediately
+    (mirroring ``_maybe_run_maintenance``). A skipped audit (no repo / bad
+    ``.forge/axes.yaml``) returns False so the tick continues into dispatch.
+    """
+    n = cfg.brainstormer.audit_every_n_ticks
+    if n > 0 and tick % n == 0 and _run_brainstormer_audit(cfg, tick):
         short_sleep(cfg.tick_interval_s, cfg)
         return True
     return False
@@ -1203,6 +1219,9 @@ def _tick(cfg: Config, tick: int) -> None:
         append_event(cfg.events_file, kind, **payload)
 
     if _maybe_run_maintenance(cfg, tick, short_sleep=_short_sleep):
+        return
+
+    if _maybe_run_brainstormer_audit(cfg, tick, short_sleep=_short_sleep):
         return
 
     pre_repairs = _run_pre_dispatch_repairs(cfg, tick, bus_emit=_bus_emit, short_sleep=_short_sleep)

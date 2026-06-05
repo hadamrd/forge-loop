@@ -93,6 +93,73 @@ def run_codebase_audit(cfg: Config, tick: int) -> None:
         )
 
 
+def run_brainstormer_audit(cfg: Config, tick: int) -> bool:
+    """Periodic backlog audit (#125): demote cosmetic tickets to ``loop:cold``.
+
+    Mirrors :func:`run_maintenance_tick`'s structure (write_state → emit start
+    → call → emit done → write_state). Returns ``True`` when the audit ran and
+    the tick should short-circuit (the caller then sleeps + returns), ``False``
+    when the audit was skipped (no repo, or a missing/invalid ``.forge/axes.yaml``)
+    so the tick continues into normal dispatch.
+    """
+    import time
+
+    from forge_loop.brainstormer import Brainstormer
+    from forge_loop.events import BrainstormerAuditDoneEvent, emit
+    from forge_loop.product_vision import MissingVisionError
+
+    if cfg.github_repo is None or "/" not in cfg.github_repo:
+        append_event(cfg.events_file, "brainstormer_audit_skipped", tick=tick, reason="no_repo")
+        return False
+
+    write_state(cfg.state_file, {"state": "brainstormer_audit", "tick": tick})
+    append_event(cfg.events_file, "brainstormer_audit_start", tick=tick)
+    owner, name = cfg.github_repo.split("/", 1)
+    started = time.monotonic()
+    try:
+        bs = Brainstormer(repo_path=cfg.repo, owner=owner, repo=name)
+        outcome = bs.audit_backlog(cfg.github_repo, events_file=cfg.events_file)
+    except MissingVisionError as ex:
+        append_event(
+            cfg.events_file,
+            "brainstormer_audit_skipped",
+            tick=tick,
+            reason=f"axes_yaml: {ex}"[:200],
+        )
+        write_state(cfg.state_file, {"state": "between-ticks", "tick": tick})
+        return False
+    except Exception as ex:  # noqa: BLE001 — never crash the tick on the audit
+        append_event(
+            cfg.events_file,
+            "brainstormer_audit_crashed",
+            tick=tick,
+            err=f"{type(ex).__name__}: {ex}"[:200],
+        )
+        write_state(cfg.state_file, {"state": "between-ticks", "tick": tick})
+        return False
+    emit(
+        cfg.events_file,
+        BrainstormerAuditDoneEvent(
+            tick=tick,
+            demoted=outcome.demoted,
+            kept=outcome.kept,
+            duration_s=round(time.monotonic() - started, 3),
+        ),
+    )
+    write_state(
+        cfg.state_file,
+        {
+            "state": "between-ticks",
+            "tick": tick,
+            "last_brainstormer_audit": {
+                "demoted": outcome.demoted,
+                "kept": outcome.kept,
+            },
+        },
+    )
+    return True
+
+
 def run_maintenance_tick(cfg: Config, tick: int) -> None:
     """Run the AI-as-PM maintenance branch and write its tick state."""
     write_state(cfg.state_file, {"state": "maintenance", "tick": tick})

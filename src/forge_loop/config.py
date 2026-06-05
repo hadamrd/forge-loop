@@ -138,6 +138,12 @@ class LumenConfig:
 
 
 @dataclass(frozen=True)
+class BrainstormerConfig:
+    # Periodic backlog-audit cadence (issue #125). ``0`` disables the audit.
+    audit_every_n_ticks: int = 10
+
+
+@dataclass(frozen=True)
 class Config:
     repo: Path
     github_repo: str | None = None
@@ -167,6 +173,7 @@ class Config:
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     attempts: AttemptsConfig = field(default_factory=AttemptsConfig)
     lumen: LumenConfig = field(default_factory=LumenConfig)
+    brainstormer: BrainstormerConfig = field(default_factory=BrainstormerConfig)
 
     worker_max_iterations: int = 3
 
@@ -320,6 +327,9 @@ def _from_settings(s: Settings) -> Config:
             max_history_in_brief=s.attempts.max_history_in_brief,
         ),
         lumen=LumenConfig(top_k=s.lumen.top_k),
+        brainstormer=BrainstormerConfig(
+            audit_every_n_ticks=s.brainstormer.audit_every_n_ticks,
+        ),
         worker_max_iterations=s.iteration.max_iterations,
         stuck_threshold_attempts=s.maintenance.stuck_threshold_attempts,
         stuck_tail_events=s.maintenance.stuck_tail_events,

@@ -375,6 +375,42 @@ class CriticReviewErroredEvent(EventBase):
 
 
 @register_event
+class BrainstormerAuditDoneEvent(EventBase):
+    """One periodic backlog-audit pass completed (issue #125).
+
+    The brainstormer re-applies the axes rubric to the *existing*
+    ``loop:ready`` backlog and demotes cosmetic / unaligned tickets to
+    ``loop:cold``. This event records the net result of one pass so the
+    operator can see what the janitor touched without grepping structlog.
+
+    ``demoted`` / ``kept`` are issue numbers; ``duration_s`` is the wall
+    time of the pass (gh round-trips dominate it).
+    """
+
+    KIND: ClassVar[str] = "brainstormer_audit_done"
+    tick: int = Field(ge=0, default=0)
+    demoted: list[int] = Field(default_factory=list)
+    kept: list[int] = Field(default_factory=list)
+    duration_s: float = 0.0
+
+
+@register_event
+class BrainstormerAuditPartialFailureEvent(EventBase):
+    """A single issue's demotion failed mid-audit (issue #125).
+
+    The audit wraps every gh mutation in try/except so one issue's failure
+    cannot abort the pass for the next issue. This event makes that
+    swallowed failure observable LOUD (``error`` carries the failure tail)
+    instead of vanishing — the operator can see *which* issue the janitor
+    could not demote and why.
+    """
+
+    KIND: ClassVar[str] = "brainstormer_audit_partial_failure"
+    issue: int = Field(ge=1)
+    error: str = ""
+
+
+@register_event
 class WorkerPolicyEnforcedEvent(EventBase):
     """Deny-by-default worker settings were planted from the saga grant (#200).
 
@@ -528,6 +564,8 @@ __all__ = [
     "EVENT_REGISTRY",
     "AuditCleanEvent",
     "AuditViolationFiledEvent",
+    "BrainstormerAuditDoneEvent",
+    "BrainstormerAuditPartialFailureEvent",
     "CriticReviewErroredEvent",
     "EventBase",
     "LoopStartEvent",

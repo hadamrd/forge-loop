@@ -406,6 +406,20 @@ class SchedulingSettings(BaseSettings):
     maintenance_every_n_ticks: int = 0
 
 
+class BrainstormerSettings(BaseSettings):
+    """Knobs for the brainstormer's periodic backlog audit (issue #125).
+
+    ``audit_every_n_ticks`` gates the janitor pass that re-applies the
+    axes rubric to the *existing* ``loop:ready`` backlog and demotes
+    cosmetic / axis-unaligned tickets to ``loop:cold``. The cadence
+    convention matches ``SchedulingSettings.maintenance_every_n_ticks``:
+    a value of ``0`` disables the audit entirely.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+    audit_every_n_ticks: int = 10
+
+
 class RepoSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
     github: str | None = None
@@ -479,6 +493,7 @@ class Settings(BaseSettings):
 
     repo: RepoSettings = Field(default_factory=RepoSettings)
     scheduling: SchedulingSettings = Field(default_factory=SchedulingSettings)
+    brainstormer: BrainstormerSettings = Field(default_factory=BrainstormerSettings)
     deploy: DeploySettings = Field(default_factory=DeploySettings)
     labels: LabelsSettings = Field(default_factory=LabelsSettings)
     briefs: BriefsSettings = Field(default_factory=BriefsSettings)
@@ -516,6 +531,7 @@ class Settings(BaseSettings):
             "repo_path": repo,
             "repo": {**(y.get("repo") or {})},
             "scheduling": {**(y.get("scheduling") or {})},
+            "brainstormer": {**(y.get("brainstormer") or {})},
             "deploy": {**(y.get("deploy") or {})},
             "labels": {**(y.get("labels") or {})},
             "briefs": {**(y.get("briefs") or {})},
@@ -619,6 +635,7 @@ ENV_MAP: tuple[tuple[str, str, Any], ...] = (
     ("LOOP_MAX_TICKS", "scheduling.max_ticks", int),
     ("LOOP_WORKER_TIMEOUT_S", "scheduling.worker_timeout_s", int),
     ("LOOP_MAINTENANCE_EVERY_N", "scheduling.maintenance_every_n_ticks", int),
+    ("LOOP_BRAINSTORMER_AUDIT_EVERY_N", "brainstormer.audit_every_n_ticks", int),
     # Deploy
     ("LOOP_DEPLOY_TASK", "deploy.task", str),
     ("LOOP_DEPLOY_DRIFT_HALT", "deploy.drift_halt", _coerce_bool),

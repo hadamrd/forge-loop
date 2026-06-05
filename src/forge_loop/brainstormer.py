@@ -19,9 +19,10 @@ its own refusal contract — defense in depth.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from forge_loop.log import get_logger
 from forge_loop.product_vision import ProductVision
 
 __all__ = [
+    "AuditOutcome",
     "BrainstormReport",
     "Brainstormer",
     "ProposedEpic",
@@ -40,6 +42,71 @@ __all__ = [
 ]
 
 _log = get_logger("forge_loop.brainstormer")
+
+#: Backlog labels the audit moves issues between (issue #125). Demotion is
+#: one-way: drop ``loop:ready`` + add ``loop:cold``. Humans re-promote.
+LOOP_READY_LABEL = "loop:ready"
+LOOP_COLD_LABEL = "loop:cold"
+
+
+@dataclass
+class AuditOutcome:
+    """Result of one :meth:`Brainstormer.audit_backlog` pass (issue #125).
+
+    ``demoted`` / ``kept`` are issue numbers. ``reasons`` maps each demoted
+    issue to the human-readable rubric failure that triggered the demotion.
+    ``failures`` maps an issue number to the error string when a gh mutation
+    raised — those issues are neither in ``demoted`` nor ``kept`` because the
+    demotion did not land, and one such failure never aborts the rest of the
+    pass.
+    """
+
+    demoted: list[int] = field(default_factory=list)
+    kept: list[int] = field(default_factory=list)
+    reasons: dict[int, str] = field(default_factory=dict)
+    failures: dict[int, str] = field(default_factory=dict)
+
+
+def _audit_demotion_reason(
+    title: str, body: str, labels: Any, vision: ProductVision
+) -> str | None:
+    """Return the rubric-failure reason for an issue, or ``None`` to keep it.
+
+    Two demotion branches (issue #125), checked in order:
+
+    1. No ``axis:*`` label → ``"missing axis citation"``.
+    2. Title OR body matches any ``rejected_as_cosmetic`` regex of ANY axis
+       (case-insensitive ``re.search``) → a reason naming the offending axis
+       + rule. Rules that are not valid regexes are skipped, not crashed.
+    """
+    from forge_loop.axis import extract_axes
+
+    if not extract_axes(labels):
+        return "missing axis citation"
+    haystack = f"{title}\n{body}"
+    for axis in vision.axes:
+        for rule in axis.rejected_as_cosmetic:
+            if not rule:
+                continue
+            try:
+                matched = re.search(rule, haystack, re.IGNORECASE) is not None
+            except re.error:
+                continue
+            if matched:
+                return f'matches cosmetic pattern: "{rule}" (axis: {axis.name})'
+    return None
+
+
+def _audit_demotion_comment(reason: str) -> str:
+    """Render the demotion comment quoting the failed rubric + axes link."""
+    return (
+        "forge-loop backlog audit demoted this issue from `loop:ready` to "
+        "`loop:cold`.\n\n"
+        f"- failed rubric: {reason}\n\n"
+        "This issue did not satisfy the value-axes rubric in "
+        "`.forge/axes.yaml`. It stays open under `loop:cold` for human "
+        "triage — re-apply `loop:ready` manually if it should ship.\n"
+    )
 
 
 class _ProposedBase(BaseModel):
@@ -335,6 +402,81 @@ class Brainstormer:
         #    matches a previously-rejected path (anti-relitigation).
         filtered = filter_report_for_vision(raw, vision)[0]
         return self._filter_rejected_paths(filtered, rejected_paths)
+
+    def audit_backlog(
+        self,
+        repo: str,
+        *,
+        events_file: Path | None = None,
+        limit: int = 100,
+    ) -> AuditOutcome:
+        """Re-apply the axes rubric to the existing ``loop:ready`` backlog.
+
+        Issue #125. Unlike :meth:`run` (which gates *new* proposals), this
+        prunes the *existing* backlog: any open ``loop:ready`` issue that
+        fails the rubric (no ``axis:*`` label, or a title/body matching an
+        axis's ``rejected_as_cosmetic`` regex) is demoted to ``loop:cold``.
+
+        Demotion side-effects (all via :mod:`forge_loop.gh_issues` helpers):
+        add ``loop:cold``, remove ``loop:ready``, post one comment quoting
+        the failed rubric. The pass is idempotent: it only ever fetches
+        ``loop:ready`` issues, so an already-demoted issue is never returned
+        and never re-commented.
+
+        Every per-issue mutation is wrapped in try/except — one issue's
+        failure is recorded (and emitted as ``brainstormer_audit_partial_
+        failure`` when ``events_file`` is given) but never aborts the pass
+        for the next issue.
+
+        Raises :class:`forge_loop.product_vision.MissingVisionError` when
+        ``.forge/axes.yaml`` is missing or invalid; the tick caller catches
+        that and skips the audit so the tick continues into dispatch.
+        """
+        from forge_loop import gh_issues as gh
+        from forge_loop.product_vision import discover
+
+        vision = discover(self.repo_path)
+        outcome = AuditOutcome()
+        for issue in gh.top_issues(LOOP_READY_LABEL, limit, repo=repo):
+            number = issue.get("number")
+            if not isinstance(number, int):
+                continue
+            reason = _audit_demotion_reason(
+                issue.get("title") or "",
+                issue.get("body") or "",
+                issue.get("labels") or [],
+                vision,
+            )
+            if reason is None:
+                outcome.kept.append(number)
+                continue
+            try:
+                gh.label(number, [LOOP_COLD_LABEL], repo=repo)
+                gh.unlabel(number, LOOP_READY_LABEL, repo=repo)
+                gh.comment(number, _audit_demotion_comment(reason), repo=repo)
+            except Exception as exc:  # noqa: BLE001 — isolate per-issue failures
+                err = f"{type(exc).__name__}: {exc}"[:200]
+                outcome.failures[number] = err
+                _log.warning("brainstormer_audit_demote_failed", issue=number, error=err)
+                self._emit_audit_partial_failure(events_file, number, err)
+                continue
+            outcome.demoted.append(number)
+            outcome.reasons[number] = reason
+        return outcome
+
+    @staticmethod
+    def _emit_audit_partial_failure(
+        events_file: Path | None, issue: int, error: str
+    ) -> None:
+        """Emit the typed partial-failure event; never crash the audit on emit."""
+        if events_file is None:
+            return
+        try:
+            from forge_loop.events import BrainstormerAuditPartialFailureEvent, emit
+
+            emit(events_file, BrainstormerAuditPartialFailureEvent(issue=issue, error=error))
+        except Exception:  # noqa: BLE001 — emission is best-effort
+            _log.warning("brainstormer_audit_emit_failed", issue=issue)
 
     # -- helpers --------------------------------------------------------
 
