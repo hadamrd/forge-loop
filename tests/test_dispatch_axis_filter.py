@@ -270,3 +270,49 @@ def test_repaired_pr_gets_automerge_after_threads_are_clear(
     assert merge_calls == ["https://github.com/acme/widgets/pull/10"]
     assert outcome.status == "merged"
     assert "repair_automerge_enabled" in cfg.events_file.read_text()
+
+
+def test_repaired_pr_critic_error_verdict_is_not_automerged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Issue #267: a re-critic verdict=error on a repaired PR is NOT merged.
+
+    Same allow-list dual as the dispatch + adoption gates: a crashed re-review
+    sets status=open WITHOUT ``outcome.error`` (an error is not an adjudicated
+    block), so the deny-list ``if outcome.error`` does NOT catch it. Without the
+    allow-list the unreviewed repaired PR would auto-merge.
+    """
+    from forge_loop import gh_issues as gh
+    from forge_loop.config import Config
+    from forge_loop.runner import merge_gate
+    from forge_loop.runner import tick as tick_mod
+    from forge_loop.worker import WorkerOutcome
+
+    cfg = Config(repo=tmp_path, github_repo="acme/widgets")
+    merge_calls: list[str] = []
+    monkeypatch.setattr(merge_gate, "apply_issue_closed_gate", lambda outcomes, **_kwargs: [])
+    monkeypatch.setattr(gh, "unresolved_review_threads", lambda *_a, **_k: [])
+    from forge_loop.gh_issues import MergeOutcome as _MergeOutcome
+
+    monkeypatch.setattr(
+        gh,
+        "ensure_pr_merged",
+        lambda pr, **_kwargs: (merge_calls.append(str(pr)), _MergeOutcome(True, "auto"))[1],
+    )
+    outcome = WorkerOutcome(
+        issue=99,
+        title="fix review",
+        pr_url="https://github.com/acme/widgets/pull/11",
+        status="open",
+        duration_s=1.0,
+        stdout_tail="",
+        critic_verdict="error",  # crashed re-review — no affirmative approval
+    )
+
+    tick_mod._enable_automerge_for_repaired_prs(cfg, [outcome], lambda *_a, **_k: None)
+
+    assert merge_calls == []  # unreviewed repaired PR never merged
+    assert outcome.status == "open"
+    text = cfg.events_file.read_text()
+    assert "repair_automerge_enabled" not in text
+    assert "critic_verdict_not_approved:error" in text

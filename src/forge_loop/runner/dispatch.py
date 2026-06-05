@@ -934,6 +934,12 @@ def _run_critic_for_outcomes(
                         cfg.critic, "sev3_demotion_round_threshold", 3
                     ),
                 )
+                # Issue #267 (safety): record the verdict ON the outcome so the
+                # merge gate can require an AFFIRMATIVE "approved" to auto-merge.
+                # This is set for EVERY reviewed PR — including the verdict=error
+                # branch below — so a crashed review can never fall through the
+                # gate's allow-list and auto-merge an unreviewed PR.
+                o.critic_verdict = critic_outcome.verdict
                 append_event(
                     cfg.events_file,
                     "critic_done",
