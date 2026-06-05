@@ -38,6 +38,7 @@ from forge_loop.runner.dispatch import (
     _run_critic_for_outcomes,
     _run_repair_workers,
     _run_workers,
+    reserved_new_work_slots,
 )
 from forge_loop.runner.drift import (
     _RECENT_OUTCOMES,
@@ -493,13 +494,15 @@ def _run_pre_dispatch_repairs(
     *,
     bus_emit: Any,
     short_sleep: Any,
-) -> bool:
+) -> int:
     """Stuck-issue sweep (#129) + blocking-PR repair + orphaned-clean-PR adoption.
 
-    Each repair/adoption path is a terminal tick body: when one runs, the caller
-    must return immediately. Returns True if any of them ran. The stuck sweep
-    fires first so an issue the iteration loop gave up on gets caught here, not
-    re-picked by ``top_issues`` later in the tick.
+    Returns the number of repairs/adoptions dispatched this tick (``0`` when
+    none ran). A non-zero count signals the caller that a repair tick body ran;
+    the #262 fairness mechanism uses the count to decide whether to reserve a
+    dispatch slot for new work rather than letting the repair starve the
+    backlog. The stuck sweep fires first so an issue the iteration loop gave up
+    on gets caught here, not re-picked by ``top_issues`` later in the tick.
     """
     _run_stuck_sweep(cfg, tick)
 
@@ -516,7 +519,7 @@ def _run_pre_dispatch_repairs(
             log_action="repairing blocked PR(s)",
             remove_ready=False,
         )
-        return True
+        return len(repairs)
 
     # Issue #213 — adopt orphaned clean PRs. A worker can open its PR and then
     # trip ``worker_timeout_s`` before the post-critic merge step runs, leaving
@@ -531,8 +534,8 @@ def _run_pre_dispatch_repairs(
             bus_emit=bus_emit,
             short_sleep=short_sleep,
         )
-        return True
-    return False
+        return len(adoptions)
+    return 0
 
 
 def _resolve_axis_filter(cfg: Config, tick: int) -> list[str]:
@@ -569,6 +572,7 @@ def _select_candidates(
     tick: int,
     *,
     short_sleep: Any,
+    quiet: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Resolve the axis filter, fetch ready issues, apply the filter.
 
@@ -577,6 +581,13 @@ def _select_candidates(
     filtering (emits ``tick_idle``). When a filter is active the fetch window is
     widened to ``max(parallel, 50)`` so the filter has something to chew on,
     then trimmed back to ``cfg.parallel``.
+
+    ``quiet`` (issue #262): when a repair tick already ran this tick, the
+    fairness mechanism re-fetches the ready backlog ONLY to decide whether to
+    reserve a dispatch slot for new work. In that mode the repair tick already
+    owns the terminal side-effects (idle/error event + state write + sleep), so
+    ``quiet=True`` suppresses them — an empty/failed fetch returns ``None``
+    silently, keeping the no-ready-candidates path byte-identical to today.
     """
     from forge_loop.axis import filter_issues_by_axes
 
@@ -585,30 +596,33 @@ def _select_candidates(
     try:
         issues = top_issues(cfg.labels.ready, fetch_limit, repo=cfg.github_repo)
     except subprocess.CalledProcessError as e:
-        append_event(cfg.events_file, "gh_list_failed", err=(e.stderr or "")[:200])
-        write_state(cfg.state_file, {"state": "gh_error", "tick": tick})
-        short_sleep(60, cfg)
+        if not quiet:
+            append_event(cfg.events_file, "gh_list_failed", err=(e.stderr or "")[:200])
+            write_state(cfg.state_file, {"state": "gh_error", "tick": tick})
+            short_sleep(60, cfg)
         return None
 
     if axis_filter:
-        append_event(
-            cfg.events_file,
-            "axis_filter_active",
-            tick=tick,
-            axes=axis_filter,
-            candidates=len(issues),
-        )
+        if not quiet:
+            append_event(
+                cfg.events_file,
+                "axis_filter_active",
+                tick=tick,
+                axes=axis_filter,
+                candidates=len(issues),
+            )
         issues = filter_issues_by_axes(issues, axis_filter)[: cfg.parallel]
-        if not issues:
+        if not issues and not quiet:
             append_event(cfg.events_file, "axis_filter_empty", tick=tick, axes=axis_filter)
 
     if not issues:
-        append_event(cfg.events_file, "tick_idle", tick=tick)
-        write_state(
-            cfg.state_file,
-            {"state": "idle", "tick": tick, "next_check_s": cfg.tick_interval_s},
-        )
-        short_sleep(cfg.tick_interval_s, cfg)
+        if not quiet:
+            append_event(cfg.events_file, "tick_idle", tick=tick)
+            write_state(
+                cfg.state_file,
+                {"state": "idle", "tick": tick, "next_check_s": cfg.tick_interval_s},
+            )
+            short_sleep(cfg.tick_interval_s, cfg)
         return None
     return issues
 
@@ -672,8 +686,14 @@ def _run_ready_issue_repairs(
     *,
     bus_emit: Any,
     short_sleep: Any,
-) -> bool:
-    """Repair open PRs attached to ready issues; terminal tick body if any run."""
+) -> int:
+    """Repair open PRs attached to ready issues; returns the repair count.
+
+    Returns the number of ready-issue open-PR repairs dispatched (``0`` when
+    none). Like :func:`_run_pre_dispatch_repairs`, a non-zero count tells the
+    caller a repair tick body ran so the #262 fairness mechanism can reserve a
+    dispatch slot for new work instead of starving the backlog.
+    """
     open_pr_repairs = _ready_issue_open_pr_repairs(cfg, issues)
     if open_pr_repairs:
         _run_repair_tick(
@@ -687,8 +707,8 @@ def _run_ready_issue_repairs(
             log_action="repairing open PR(s)",
             remove_ready=True,
         )
-        return True
-    return False
+        return len(open_pr_repairs)
+    return 0
 
 
 def _apply_maestro_plan(
@@ -1080,12 +1100,19 @@ def _finalize_tick(
     *,
     fingerprint_by_issue: dict[int, str],
     short_sleep: Any,
+    skip_sleep: bool = False,
 ) -> None:
     """Record attempts → promote memory → reap → redeploy → drift → consolidate.
 
     The terminal phase of a dispatching tick. If the drift detector halts the
     loop (3 identical failures in a row) the consolidation/sleep tail is skipped
     via an early return, exactly as the inline body did.
+
+    ``skip_sleep`` (issue #262): when this dispatch ran AFTER a repair tick in
+    the same tick (the anti-starvation reserved-slot path), the repair tick
+    already slept ``tick_interval_s``. Skipping the trailing sleep here keeps
+    the loop cadence at one interval per tick instead of doubling it whenever a
+    stuck repair forces the fairness path.
     """
     _record_attempts(cfg, outcomes, fingerprint_by_issue=fingerprint_by_issue)
 
@@ -1142,7 +1169,19 @@ def _finalize_tick(
     )
     append_event(cfg.events_file, "sprint_consolidated", **summary)
     write_state(cfg.state_file, {"state": "between-ticks", "tick": tick, "last_summary": summary})
-    short_sleep(cfg.tick_interval_s, cfg)
+    if not skip_sleep:
+        short_sleep(cfg.tick_interval_s, cfg)
+
+
+def _can_reserve_new_work_slot(cfg: Config) -> bool:
+    """True when the tick has a slot to reserve for new work past repairs (#262).
+
+    A pure function of ``parallel``: reserving needs ``parallel >= 2`` so repairs
+    keep at least one slot. On ``parallel <= 1`` repairs win the whole tick (the
+    documented tie-break) and the loop early-returns from the repair path exactly
+    as it did pre-#262.
+    """
+    return reserved_new_work_slots(cfg.parallel, repairs_pending=1, ready_count=1) > 0
 
 
 def _tick(cfg: Config, tick: int) -> None:
@@ -1151,6 +1190,11 @@ def _tick(cfg: Config, tick: int) -> None:
     Reads as a sequence of named phases (issue #225 decomposition). Each phase
     helper owns one slice of the tick and is unit-testable in isolation; this
     body only wires them together and handles the early-return control flow.
+
+    Issue #262 — repair work is no longer an unconditional terminal tick body.
+    When a repair tick runs AND ``loop:ready`` work is waiting, the loop reserves
+    ``>=1`` dispatch slot for new work (``dispatch_slot_reserved``) instead of
+    returning early, so a perpetually-stuck repair can't starve the backlog.
     """
     # Imported lazily to avoid an import cycle (boot.py imports tick.py).
     from forge_loop.runner.boot import _short_sleep
@@ -1161,17 +1205,28 @@ def _tick(cfg: Config, tick: int) -> None:
     if _maybe_run_maintenance(cfg, tick, short_sleep=_short_sleep):
         return
 
-    if _run_pre_dispatch_repairs(cfg, tick, bus_emit=_bus_emit, short_sleep=_short_sleep):
+    pre_repairs = _run_pre_dispatch_repairs(cfg, tick, bus_emit=_bus_emit, short_sleep=_short_sleep)
+    if pre_repairs and not _can_reserve_new_work_slot(cfg):
+        # parallel < 2: no slot to spare — repairs win the whole tick. Exactly
+        # the pre-#262 early return.
         return
 
-    issues = _select_candidates(cfg, tick, short_sleep=_short_sleep)
+    # #262: when a repair tick already ran above, re-fetch the ready backlog
+    # QUIETLY (no idle event/sleep — the repair tick already owned them) so we
+    # can reserve a slot for new work when ready issues exist. With no repair in
+    # flight ``quiet`` is False and this is the ordinary candidate fetch.
+    issues = _select_candidates(cfg, tick, short_sleep=_short_sleep, quiet=bool(pre_repairs))
     if issues is None:
         return
 
     issues = _expand_specs(cfg, tick, issues)
 
-    if _run_ready_issue_repairs(cfg, tick, issues, bus_emit=_bus_emit, short_sleep=_short_sleep):
+    ready_repairs = _run_ready_issue_repairs(
+        cfg, tick, issues, bus_emit=_bus_emit, short_sleep=_short_sleep
+    )
+    if ready_repairs and not _can_reserve_new_work_slot(cfg):
         return
+    repairs_ran = pre_repairs + ready_repairs
 
     write_state(
         cfg.state_file,
@@ -1186,6 +1241,30 @@ def _tick(cfg: Config, tick: int) -> None:
     issues, maestro_context = _apply_maestro_plan(cfg, tick, issues)
 
     issues, workers_meta = _select_dispatch_set(cfg, issues)
+
+    if repairs_ran:
+        # #262 anti-starvation: a repair tick ran this tick. Reserve >=1 slot for
+        # NEW dispatch so a stuck repair can't block the backlog forever. (The
+        # parallel<2 tie-break already returned above, so the reserve is >=1
+        # whenever dispatchable new work exists.)
+        if not issues:
+            # No dispatchable new work (all in-flight/cooldown). The repair tick
+            # owns this tick — no forced empty dispatch, no reservation event.
+            return
+        reserved = reserved_new_work_slots(
+            cfg.parallel, repairs_pending=repairs_ran, ready_count=len(issues)
+        )
+        append_event(
+            cfg.events_file,
+            "dispatch_slot_reserved",
+            tick=tick,
+            reserved=reserved,
+            repairs_pending=repairs_ran,
+            ready_count=len(issues),
+        )
+        issues = issues[:reserved]
+        workers_meta = workers_meta[:reserved]
+
     if not issues:
         # All candidates were skipped (in-flight or cooldown). Idle the tick.
         append_event(cfg.events_file, "tick_all_skipped", tick=tick)
@@ -1237,4 +1316,6 @@ def _tick(cfg: Config, tick: int) -> None:
         outcomes,
         fingerprint_by_issue=fingerprint_by_issue,
         short_sleep=_short_sleep,
+        # #262: the repair tick already slept this interval; don't double-sleep.
+        skip_sleep=bool(repairs_ran),
     )
