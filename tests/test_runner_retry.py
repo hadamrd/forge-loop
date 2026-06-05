@@ -173,10 +173,15 @@ def fake_world(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(_runner, "run_worker", fake_run_worker)
     monkeypatch.setattr(_runner, "unlabel", fake_unlabel)
     monkeypatch.setattr(_gh, "get_issue_state", lambda *_a, **_kw: "OPEN")
+    from forge_loop.gh_issues import MergeOutcome as _MergeOutcome
+
     monkeypatch.setattr(
         _gh,
-        "enable_pr_auto_merge",
-        lambda pr, repo=None: state.automerge_calls.append((pr, repo)) is None,
+        "ensure_pr_merged",
+        lambda pr, repo=None: (
+            state.automerge_calls.append((pr, repo)),
+            _MergeOutcome(True, "auto"),
+        )[1],
     )
 
     # Issue #213 — orphaned-PR adoption scan fakes. By default no open PRs, so

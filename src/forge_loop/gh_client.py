@@ -34,9 +34,14 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 logger = logging.getLogger(__name__)
+
+#: The merge strategies GitHub's REST merge endpoint accepts. The loop only
+#: ever uses ``squash`` (the convention for loop-authored PRs), but the type
+#: is kept open to the full set so the client mirrors githubkit's contract.
+MergeMethod = Literal["merge", "squash", "rebase"]
 
 # ---------------------------------------------------------------------------
 # Typed return shapes — small, hand-curated dataclasses covering what
@@ -71,6 +76,33 @@ class PullRequest:
     additions: int = 0
     deletions: int = 0
     changed_files: int = 0
+
+
+@dataclass(frozen=True)
+class AutoMergeResult:
+    """Outcome of an ``enablePullRequestAutoMerge`` attempt.
+
+    ``enabled`` is the success flag; ``reason`` carries the GraphQL error
+    message / HTTP detail when ``enabled`` is False, so callers never log an
+    empty-reason ``*_automerge_failed`` event (issue #255 — fail loud, never
+    swallow). ``reason`` is the empty string on success.
+    """
+
+    enabled: bool
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """Outcome of a direct REST merge (``pulls.merge``).
+
+    ``merged`` is the success flag; ``reason`` carries the HTTP status + body
+    tail when the merge fails (e.g. 405 not mergeable, 409 head changed), so
+    the fallback path also fails loud (issue #255).
+    """
+
+    merged: bool
+    reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +252,17 @@ class GhClient(Protocol):
     ) -> bool: ...
 
     # -- auto-merge ----------------------------------------------------------
-    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool: ...
+    def enable_pr_auto_merge(
+        self, owner: str, repo: str, number: int
+    ) -> AutoMergeResult: ...
 
     def disable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool: ...
+
+    def merge_pull_request(
+        self, owner: str, repo: str, number: int, *, method: MergeMethod = ...
+    ) -> MergeResult: ...
+
+    def delete_branch(self, owner: str, repo: str, branch: str) -> bool: ...
 
     # -- auth ----------------------------------------------------------------
     def check_auth(self) -> None: ...
@@ -314,6 +354,34 @@ def _label_names(labels: Any) -> list[str]:
 # ---------------------------------------------------------------------------
 # Real implementation — wraps githubkit.GitHub.
 # ---------------------------------------------------------------------------
+
+
+def _graphql_error_text(exc: Exception) -> str:
+    """Best-effort human-readable cause from a githubkit GraphQL/HTTP failure.
+
+    githubkit raises ``GraphQLFailed`` (carrying ``response.errors``, a list of
+    GraphQL error objects with a ``message``) when a mutation returns errors,
+    and ``RequestFailed`` (carrying an httpx ``Response``) on transport-level
+    4xx/5xx. Either way we extract the most specific message available so the
+    ``*_automerge_failed`` event names the real cause (issue #255) — never an
+    empty reason. Falls back to ``str(exc)`` for anything else.
+    """
+    response = getattr(exc, "response", None)
+    errors = getattr(response, "errors", None)
+    if errors:
+        messages = [
+            str(getattr(e, "message", None) or e).strip()
+            for e in errors
+            if (getattr(e, "message", None) or e)
+        ]
+        if messages:
+            return "; ".join(messages)[:300]
+    # RequestFailed wraps an httpx.Response; surface status + body tail.
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        body = (getattr(response, "text", "") or "").strip()
+        return f"HTTP {status}: {body}"[:300]
+    return (str(exc) or exc.__class__.__name__)[:300]
 
 
 class GithubkitClient:
@@ -1027,11 +1095,18 @@ class GithubkitClient:
         node_id = getattr(resp.parsed_data, "node_id", None)
         return node_id if isinstance(node_id, str) and node_id else None
 
-    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
-        """Enable SQUASH auto-merge for a PR (GraphQL). Best-effort: False on fail."""
+    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> AutoMergeResult:
+        """Enable SQUASH auto-merge for a PR (GraphQL).
+
+        Returns :class:`AutoMergeResult`. On failure (e.g. the repo's
+        "Allow auto-merge" setting is off, or the PR can't take auto-merge yet)
+        the actual GraphQL error message is captured in ``reason`` so callers
+        log a NON-EMPTY ``*_automerge_failed`` reason (issue #255 — fail loud,
+        never swallow the cause).
+        """
         node_id = self._pull_request_node_id(owner, repo, number)
         if node_id is None:
-            return False
+            return AutoMergeResult(False, f"could not resolve PR #{number} node id")
         mutation = (
             "mutation($id: ID!) {\n"
             "  enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH}) {\n"
@@ -1041,7 +1116,40 @@ class GithubkitClient:
         )
         try:
             self._gh.graphql(mutation, {"id": node_id})
-        except Exception:  # noqa: BLE001 — e.g. auto-merge not allowed on the repo
+        except Exception as exc:  # noqa: BLE001 — e.g. auto-merge not allowed on the repo
+            return AutoMergeResult(False, _graphql_error_text(exc))
+        return AutoMergeResult(True)
+
+    def merge_pull_request(
+        self, owner: str, repo: str, number: int, *, method: MergeMethod = "squash"
+    ) -> MergeResult:
+        """Directly merge a PR via the REST merge endpoint.
+
+        The fallback for when GitHub auto-merge can't be enabled (issue #255):
+        the loop only reaches here for a critic-approved + CLEAN PR, so a direct
+        merge is correct. ``reason`` carries the HTTP status + body tail on
+        failure so the failure is never silent.
+        """
+        try:
+            resp = self._gh.rest.pulls.merge(
+                owner=owner, repo=repo, pull_number=number, merge_method=method
+            )
+            self._raise_if_error(f"merge_pull_request({number})", resp)
+        except Exception as exc:  # noqa: BLE001
+            return MergeResult(False, str(exc)[:300])
+        return MergeResult(True)
+
+    def delete_branch(self, owner: str, repo: str, branch: str) -> bool:
+        """Delete a branch (``heads/<branch>`` ref). Best-effort: False on fail.
+
+        Used to tidy up after a direct fallback merge. A failure here is
+        non-fatal — the PR is already merged — but it is still returned so the
+        caller can note it.
+        """
+        try:
+            resp = self._gh.rest.git.delete_ref(owner=owner, repo=repo, ref=f"heads/{branch}")
+            self._raise_if_error(f"delete_branch({branch})", resp)
+        except Exception:  # noqa: BLE001
             return False
         return True
 
@@ -1177,6 +1285,14 @@ class MockGhClient:
     #: Recorded post_review_comment outcomes; controls inline 422 simulation.
     inline_review_fails: bool = False
     create_pull_url: str = "https://github.com/o/r/pull/999"
+    #: When set, ``enable_pr_auto_merge`` returns ``AutoMergeResult(False, ...)``
+    #: with this reason — simulates the repo's auto-merge feature being off (#255).
+    auto_merge_fail_reason: str | None = None
+    #: When set, ``merge_pull_request`` returns ``MergeResult(False, ...)`` with
+    #: this reason — simulates a direct-merge failure (e.g. PR not mergeable).
+    merge_fail_reason: str | None = None
+    #: When True, ``delete_branch`` reports failure (still non-fatal).
+    delete_branch_fails: bool = False
 
     def _record(self, method: str, **kwargs: Any) -> None:
         self.calls.append((method, kwargs))
@@ -1398,13 +1514,33 @@ class MockGhClient:
         self._record("post_review_comment_plain", owner=owner, repo=repo, number=number, body=body)
         return True
 
-    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
+    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> AutoMergeResult:
         self._record("enable_pr_auto_merge", owner=owner, repo=repo, number=number)
-        return True
+        if self.auto_merge_fail_reason is not None:
+            return AutoMergeResult(False, self.auto_merge_fail_reason)
+        return AutoMergeResult(True)
 
     def disable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
         self._record("disable_pr_auto_merge", owner=owner, repo=repo, number=number)
         return True
+
+    def merge_pull_request(
+        self, owner: str, repo: str, number: int, *, method: MergeMethod = "squash"
+    ) -> MergeResult:
+        self._record(
+            "merge_pull_request",
+            owner=owner,
+            repo=repo,
+            number=number,
+            merge_method=method,
+        )
+        if self.merge_fail_reason is not None:
+            return MergeResult(False, self.merge_fail_reason)
+        return MergeResult(True)
+
+    def delete_branch(self, owner: str, repo: str, branch: str) -> bool:
+        self._record("delete_branch", owner=owner, repo=repo, branch=branch)
+        return not self.delete_branch_fails
 
     def _next_number(self) -> int:
         existing = [n for (_, _, n) in self.issues]

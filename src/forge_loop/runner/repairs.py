@@ -358,13 +358,16 @@ def enable_automerge_for_repaired_prs(
                 unresolved_human_threads=len(human_threads),
             )
             continue
-        if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
+        result = _gh.ensure_pr_merged(outcome.pr_url, repo=cfg.github_repo)
+        if result.merged:
             outcome.status = "merged"
             append_event(
                 cfg.events_file,
                 "repair_automerge_enabled",
                 issue=outcome.issue,
                 pr=outcome.pr_url,
+                method=result.method,
+                detail=result.reason or None,
             )
         else:
             append_event(
@@ -372,4 +375,5 @@ def enable_automerge_for_repaired_prs(
                 "repair_automerge_failed",
                 issue=outcome.issue,
                 pr=outcome.pr_url,
+                reason=result.reason,
             )

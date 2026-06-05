@@ -17,12 +17,29 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 from forge_loop.critic_format import is_finding_body
-from forge_loop.gh_client import GhClient, GithubkitClient, Issue
+from forge_loop.gh_client import AutoMergeResult, GhClient, GithubkitClient, Issue
 
 _GH_CLIENT: GhClient | None = None
+
+
+@dataclass(frozen=True)
+class MergeOutcome:
+    """Result of :func:`ensure_pr_merged` — how (and whether) a PR landed.
+
+    ``method`` is ``"auto"`` (GitHub auto-merge enabled), ``"squash"`` (direct
+    fallback merge), or ``"none"`` (both failed). ``reason`` is non-empty
+    whenever something other than a clean auto-merge enable happened, so the
+    caller's telemetry never logs an empty reason (issue #255).
+    """
+
+    merged: bool
+    method: str
+    reason: str = ""
+    branch_deleted: bool = False
 
 #: Best-effort label for telemetry. Reflects the configured client's auth
 #: source once one is constructed; ``"github-client"`` until then. Callers read
@@ -551,8 +568,13 @@ def post_review_comment(
     return client().post_review_comment(owner, name, _pr_number(pr), body, file=file, line=line)
 
 
-def enable_pr_auto_merge(pr: int | str, repo: str | None = None) -> bool:
-    """Enable squash auto-merge for a PR. Best-effort: False on failure."""
+def enable_pr_auto_merge(pr: int | str, repo: str | None = None) -> AutoMergeResult:
+    """Enable squash auto-merge for a PR.
+
+    Returns the typed :class:`AutoMergeResult` (``.enabled`` + ``.reason``) so
+    callers can log the real failure cause (issue #255). Most call sites should
+    prefer :func:`ensure_pr_merged`, which also falls back to a direct merge.
+    """
     owner, name = _owner_name(repo)
     return client().enable_pr_auto_merge(owner, name, _pr_number(pr))
 
@@ -561,6 +583,58 @@ def disable_pr_auto_merge(pr: int | str, repo: str | None = None) -> bool:
     """Disable auto-merge on a PR. Best-effort: False on failure."""
     owner, name = _owner_name(repo)
     return client().disable_pr_auto_merge(owner, name, _pr_number(pr))
+
+
+def ensure_pr_merged(pr: int | str, repo: str | None = None) -> MergeOutcome:
+    """Land an already-gated (critic-approved + CLEAN) PR.
+
+    Issue #255. The loop's previous behaviour relied solely on GitHub's
+    ``enablePullRequestAutoMerge`` mutation and treated any failure as a silent
+    best-effort no-op — so a repo with auto-merge unavailable (or a PR that
+    can't take auto-merge yet) produced an EMPTY-reason ``*_automerge_failed``
+    event and the loop never self-landed anything.
+
+    This does two things:
+
+    1. Try to enable GitHub auto-merge (the convenience path). On success,
+       return ``MergeOutcome(merged=True, method="auto")``.
+    2. If that fails, capture the real reason and FALL BACK to a direct squash
+       merge via the REST merge endpoint, then delete the head branch. The loop
+       only calls this once a PR is critic-approved + CLEAN, so a direct merge
+       is correct — auto-merge was only ever a convenience.
+
+    Either failure carries a NON-EMPTY ``reason`` so the caller's event names
+    the actual cause. ``reason`` is "" only on a clean auto-merge enable.
+    """
+    owner, name = _owner_name(repo)
+    number = _pr_number(pr)
+    gh = client()
+    auto = gh.enable_pr_auto_merge(owner, name, number)
+    if auto.enabled:
+        return MergeOutcome(merged=True, method="auto")
+
+    # Auto-merge could not be enabled — fall back to a direct squash merge.
+    merge = gh.merge_pull_request(owner, name, number, method="squash")
+    if not merge.merged:
+        return MergeOutcome(
+            merged=False,
+            method="none",
+            reason=f"auto-merge enable failed ({auto.reason}); "
+            f"direct squash merge failed ({merge.reason})",
+        )
+
+    # Merged directly — best-effort branch cleanup (non-fatal if it fails).
+    branch_deleted = False
+    pull = gh.get_pull(owner, name, number)
+    head_ref = pull.head_ref if pull else ""
+    if head_ref:
+        branch_deleted = gh.delete_branch(owner, name, head_ref)
+    return MergeOutcome(
+        merged=True,
+        method="squash",
+        reason=f"auto-merge unavailable ({auto.reason}); merged directly via squash",
+        branch_deleted=branch_deleted,
+    )
 
 
 # --------------------------------------------------------------------------- #
