@@ -17,6 +17,7 @@ import pytest
 
 from forge_loop import gh_issues
 from forge_loop.gh_client import GithubkitClient, MockGhClient, PullRequest
+from tests.conftest import make_critic_thread, make_human_thread
 
 
 @pytest.fixture(autouse=True)
@@ -255,3 +256,170 @@ def _gql_thread(id_: str, *, resolved: bool = False) -> dict[str, Any]:
         "line": 12,
         "comments": {"nodes": []},
     }
+
+
+# ---------------------------------------------------------------------------
+# issue #230 — critic-approved + CLEAN PRs must NOT re-enter the repair loop;
+# critic-vs-human thread classification + AC3 human-thread gating.
+# ---------------------------------------------------------------------------
+
+
+# Centralised in conftest (#230 sev3/tests): ONE thread factory, critic body
+# derived from the real ``critic_format.finding_tag`` formatter so a producer
+# format drift breaks these tests instead of being silently masked.
+def _critic_thread(id_: str, *, sev: str = "sev3", resolved: bool = False) -> dict[str, Any]:
+    return make_critic_thread(id_, sev=sev, resolved=resolved)
+
+
+def _human_thread(id_: str, *, resolved: bool = False) -> dict[str, Any]:
+    return make_human_thread(id_, resolved=resolved)
+
+
+# --- is_approved_mergeable (pure predicate) --------------------------------
+
+
+def test_is_approved_mergeable_true_when_clean_and_no_block_labels() -> None:
+    """verdict=approved (no block label) + CLEAN → True."""
+    pr = {"labels": [{"name": "loop:adopted"}], "mergeStateStatus": "CLEAN"}
+    assert gh_issues.is_approved_mergeable(pr) is True
+    assert gh_issues.is_approved_mergeable({"labels": [], "mergeStateStatus": "CLEAN"}) is True
+
+
+def test_is_approved_mergeable_false_when_blocking_label_present() -> None:
+    """A block label means NOT approved, regardless of merge state."""
+    for label in ("critic:blocking", "critic:suspicious"):
+        pr = {"labels": [{"name": label}], "mergeStateStatus": "CLEAN"}
+        assert gh_issues.is_approved_mergeable(pr) is False, label
+
+
+def test_is_approved_mergeable_false_when_not_clean() -> None:
+    """Any non-CLEAN merge state means NOT mergeable, so NOT terminal."""
+    for state in ("DIRTY", "CONFLICTING", "BEHIND", "BLOCKED", "UNKNOWN", "", None):
+        pr = {"labels": [], "mergeStateStatus": state}
+        assert gh_issues.is_approved_mergeable(pr) is False, state
+
+
+def test_is_approved_mergeable_missing_fields_is_false() -> None:
+    """Adversarial: empty dict (no labels, no merge state) → not mergeable."""
+    assert gh_issues.is_approved_mergeable({}) is False
+
+
+# --- critic-vs-human thread classification (AC3) ---------------------------
+
+
+def test_human_unresolved_threads_keeps_human_drops_critic() -> None:
+    """The critic's ``**[sevN/...]**`` threads are filtered out; an unresolved
+    human request-changes thread is kept (#230 AC3)."""
+    critic = _critic_thread("c1", sev="sev3")
+    human = _human_thread("h1")
+    resolved_human = _human_thread("h2", resolved=True)
+    out = gh_issues.human_unresolved_threads([critic, human, resolved_human])
+    assert [t["id"] for t in out] == ["h1"]
+
+
+def test_human_unresolved_threads_treats_empty_thread_as_human() -> None:
+    """Conservative direction: a thread we cannot prove is the critic's (no
+    comments / unknown signature) is treated as human so we never auto-merge
+    over it."""
+    empty = {"id": "e", "isResolved": False, "comments": []}
+    assert [t["id"] for t in gh_issues.human_unresolved_threads([empty])] == ["e"]
+
+
+def test_is_approved_mergeable_false_with_unresolved_human_thread() -> None:
+    """AC3: a CLEAN PR with no block label is NOT terminal while a human
+    request-changes thread is open — even though merge state is CLEAN."""
+    pr = {"labels": [], "mergeStateStatus": "CLEAN"}
+    assert gh_issues.is_approved_mergeable(pr, unresolved_threads=[_human_thread("h")]) is False
+
+
+def test_is_approved_mergeable_true_with_only_critic_threads() -> None:
+    """A CLEAN PR whose only open threads are the critic's leftover sev3 notes
+    IS terminal (the leftover threads do not hold it back)."""
+    pr = {"labels": [], "mergeStateStatus": "CLEAN"}
+    assert gh_issues.is_approved_mergeable(pr, unresolved_threads=[_critic_thread("c")]) is True
+
+
+# --- prs_requiring_repair (the real selector) ------------------------------
+
+
+def test_prs_requiring_repair_excludes_approved_mergeable_with_only_sev3_threads() -> None:
+    """#230: a critic-approved (no block label) + CLEAN PR whose only open
+    threads are leftover sev3 critic inline comments is NOT returned as a
+    repair — it is terminal. The exclusion is surfaced via ``on_skip`` (no
+    silent drop)."""
+    client = MockGhClient(
+        open_prs_response=[_open_pr(7, body="closes #42", headRefName="loop/42-fix-thing")],
+        review_threads_by_pr={7: [_critic_thread("c1")]},
+    )
+    gh_issues.set_client(client)
+
+    skipped: list[dict[str, Any]] = []
+    prs = gh_issues.prs_requiring_repair(5, repo="o/r", on_skip=skipped.append)
+
+    assert prs == []
+    assert [p["number"] for p in skipped] == [7]
+    assert skipped[0]["approvedMergeableSkip"] is True
+
+
+def test_prs_requiring_repair_no_on_skip_is_silent_but_still_excludes() -> None:
+    """Without an ``on_skip`` callback the approved-mergeable PR is still
+    excluded (the exclusion does not depend on the callback)."""
+    client = MockGhClient(
+        open_prs_response=[_open_pr(7, body="closes #42", headRefName="loop/42-fix-thing")],
+        review_threads_by_pr={7: [_critic_thread("c1")]},
+    )
+    gh_issues.set_client(client)
+
+    assert gh_issues.prs_requiring_repair(5, repo="o/r") == []
+
+
+def test_prs_requiring_repair_blocking_label_still_selected_despite_clean() -> None:
+    """Regression guard: a ``critic:blocking`` PR is STILL selected even when
+    CLEAN and carrying only critic threads — the fix must not disable repair."""
+    client = MockGhClient(
+        open_prs_response=[
+            _open_pr(8, labels=[{"name": "critic:blocking"}], headRefName="loop/8-x"),
+        ],
+        review_threads_by_pr={8: [_critic_thread("c1")]},
+    )
+    gh_issues.set_client(client)
+
+    skipped: list[dict[str, Any]] = []
+    prs = gh_issues.prs_requiring_repair(5, repo="o/r", on_skip=skipped.append)
+
+    assert [p["number"] for p in prs] == [8]
+    assert "critic:blocking" in prs[0]["repairReasons"]
+    assert skipped == []
+
+
+def test_prs_requiring_repair_selects_approved_clean_with_human_thread() -> None:
+    """#230 AC3 through the REAL selector: an approved + CLEAN PR carrying an
+    unresolved *human* request-changes thread is STILL selected for repair (it
+    is not approved-mergeable), and is NOT surfaced as an approved skip."""
+    client = MockGhClient(
+        open_prs_response=[_open_pr(9, headRefName="loop/9-x")],
+        review_threads_by_pr={9: [_human_thread("h")]},
+    )
+    gh_issues.set_client(client)
+
+    skipped: list[dict[str, Any]] = []
+    prs = gh_issues.prs_requiring_repair(5, repo="o/r", on_skip=skipped.append)
+
+    assert [p["number"] for p in prs] == [9]
+    assert prs[0]["repairReasons"] == ["unresolved_review_threads"]
+    assert skipped == []
+
+
+def test_prs_requiring_repair_conflicting_with_critic_thread_still_selected() -> None:
+    """A CONFLICTING PR is NOT approved-mergeable, so its (critic) threads
+    still contribute — the merge-state path is unaffected by the #230 fix."""
+    client = MockGhClient(
+        open_prs_response=[_open_pr(5, mergeStateStatus="CONFLICTING", headRefName="loop/5-x")],
+        review_threads_by_pr={5: [_critic_thread("c1")]},
+    )
+    gh_issues.set_client(client)
+
+    prs = gh_issues.prs_requiring_repair(5, repo="o/r")
+    assert [p["number"] for p in prs] == [5]
+    assert "merge_state:conflicting" in prs[0]["repairReasons"]
+    assert "unresolved_review_threads" in prs[0]["repairReasons"]

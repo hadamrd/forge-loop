@@ -599,12 +599,19 @@ def test_orphan_adoption_ignores_human_pr(fake_world, monkeypatch) -> None:
     assert "orphan_pr_adopted" not in _kinds(_read_events(cfg))
 
 
-def test_orphan_adoption_unresolved_threads_blocks_automerge(fake_world, monkeypatch) -> None:
+def test_orphan_adoption_unresolved_human_thread_blocks_automerge(fake_world, monkeypatch) -> None:
+    """#230 AC3: an unresolved *human* request-changes thread still holds an
+    approved + CLEAN adopted PR back. A thread the runner cannot prove is the
+    critic's own leftover sev3 note (here: no comments / unknown signature) is
+    conservatively classified as human, so auto-merge is skipped with
+    ``reason="human_review_unresolved"`` — NOT the old blanket
+    ``unresolved_review_threads`` gate that caused the #229 stall on leftover
+    *critic* threads."""
     state, cfg, _ = fake_world
     cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
     pr_url = "https://github.com/o/r/pull/205"
     state.open_prs = [_adoptable_pr(205)]
-    state.unresolved_threads[pr_url] = [{"id": "t1"}]
+    state.unresolved_threads[pr_url] = [{"id": "t1"}]  # no critic signature → human
     monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", state.fake_critic)
 
     _runner._tick(cfg, tick=1)
@@ -614,7 +621,7 @@ def test_orphan_adoption_unresolved_threads_blocks_automerge(fake_world, monkeyp
     skip = [
         e
         for e in _read_events(cfg)
-        if e["kind"] == "orphan_pr_skipped" and e.get("reason") == "unresolved_review_threads"
+        if e["kind"] == "orphan_pr_skipped" and e.get("reason") == "human_review_unresolved"
     ]
     assert skip
 

@@ -35,23 +35,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from forge_loop import critic_format
 from forge_loop.worker import ensure_subagent_trusted
 
 VALID_OVERALL = {"approve", "request_changes", "block"}
-VALID_SEVERITY = {"sev1", "sev2", "sev3"}
-VALID_CATEGORY = {
-    "correctness",
-    "security",
-    "style",
-    "tests",
-    "docs",
-    "product",
-    # Anti-slop lenses: internal quality the other categories don't cover —
-    # reinvention / non-reuse / over-abstraction (architecture) and
-    # N+1 / redundant I/O / bad complexity (performance).
-    "performance",
-    "architecture",
-}
+# The severity / category vocabulary lives in ``critic_format`` (the single
+# source of truth shared with the gh_issues thread classifier — #230). We alias
+# it here so existing call sites keep using ``VALID_SEVERITY`` / ``VALID_CATEGORY``
+# unchanged. The "anti-slop" lenses (architecture / performance) and ``product``
+# are part of that one vocabulary.
+VALID_SEVERITY = set(critic_format.SEVERITIES)
+VALID_CATEGORY = set(critic_format.CATEGORIES)
 PRECOMMIT_BYPASS_TAG = "precommit_bypass"
 _NO_VERIFY_RE = re.compile(r"\bgit(?:\s+-[cC]\s+\S+)*\s+commit\b[^\n]*\s(?:--no-verify|-n)\b")
 _BODY_NO_VERIFY_ACTION_RE = re.compile(

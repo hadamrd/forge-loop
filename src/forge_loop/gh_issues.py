@@ -15,9 +15,11 @@ as gh``), so the ``gh.<fn>(...)`` call shape is preserved byte-for-byte.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import suppress
 from typing import Any
 
+from forge_loop.critic_format import is_finding_body
 from forge_loop.gh_client import GhClient, GithubkitClient, Issue
 
 _GH_CLIENT: GhClient | None = None
@@ -221,13 +223,129 @@ def open_prs(limit: int, repo: str | None = None) -> list[dict[str, Any]]:
     return sorted(prs, key=lambda p: str(p.get("updatedAt") or ""))
 
 
-def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, Any]]:
+#: Critic verdict labels that mean a PR is NOT approved — it is still the
+#: repair loop's job and is NOT eligible for terminal auto-merge. Declared here
+#: (the ``gh_issues`` facade) so the repair selector AND the adoption /
+#: automerge steps share ONE source of truth instead of re-spelling the string
+#: literals on each side (manifesto: no stringly-typed cross-module
+#: discriminator — a typo on one side silently breaks the gate).
+CRITIC_BLOCK_LABELS = frozenset({"critic:blocking", "critic:suspicious"})
+
+
+def _pr_label_names(pr: dict[str, Any]) -> set[str]:
+    return {str(label.get("name") or "") for label in pr.get("labels") or []}
+
+
+#: The critic posts inline findings as ``**[sevN/category]** <message>`` (see
+#: ``critic_actions.apply_critic_report``). That machine signature on the
+#: *opening* comment of a thread — NOT the author login — is how we tell a
+#: leftover *critic* thread from a genuine *human* review thread. We cannot key
+#: off ``author{login}``: when the loop dogfoods itself the critic and human
+#: reviewers can share one GitHub identity, so the login does not discriminate.
+#: The critic's body format is stable code, so it does. The producer
+#: (``critic_actions``) and this classifier share ONE spelling of that format
+#: via ``critic_format`` — see :func:`critic_format.is_finding_body` — so a
+#: change to the tag on one side cannot silently desync the other (#230
+#: sev2/architecture).
+
+
+def _thread_is_critic(thread: dict[str, Any]) -> bool:
+    """Return ``True`` iff a review thread was opened by the critic.
+
+    Classification keys off the *opening* comment (the one that created the
+    thread): a human reply on a critic thread does not make it human, and a
+    critic reply on a human thread does not make it critic. A thread with no
+    comments — or whose opening comment does not match the critic's stable
+    ``**[<sev>/<category>]**`` finding format — is treated as NOT-critic (i.e.
+    human), the conservative direction: we never auto-merge over a thread we
+    cannot prove is the critic's own leftover sev3 note (AC3).
+
+    The match requires the *full* tag (known severity AND known category, with
+    the closing ``]**``), not just a ``**[sev`` prefix, so a human comment that
+    merely opens with two asterisks — or quotes/pastes an unknown
+    ``[sevN/...]`` token — is not mistaken for the critic's own finding (#230
+    sev3/correctness: silently merging past a human request-changes is the
+    exact AC3 violation the fix must prevent).
+    """
+    comments = thread.get("comments") or []
+    if not comments:
+        return False
+    body = str((comments[0] or {}).get("body") or "")
+    return is_finding_body(body)
+
+
+def human_unresolved_threads(
+    threads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the unresolved review threads NOT authored by the critic.
+
+    Issue #230 / AC3: leftover *critic* sev3 inline-comment threads on an
+    approved PR are informational and must NOT, on their own, keep the PR off
+    the merge conveyor (gating on them is exactly what caused the #229
+    multi-hour stall). But unresolved *human* review threads requesting changes
+    MUST still hold the PR back. A human inline-comment thread does not flip
+    ``mergeStateStatus`` off CLEAN, so merge state alone cannot encode this — we
+    filter the threads explicitly by their (non-critic) authorship signature.
+    """
+    return [t for t in threads if not bool(t.get("isResolved")) and not _thread_is_critic(t)]
+
+
+def is_approved_mergeable(
+    pr: dict[str, Any],
+    *,
+    unresolved_threads: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Return ``True`` iff a loop PR is critic-approved AND cleanly mergeable.
+
+    Issue #230. "Approved" is represented operationally by the *absence* of a
+    critic block label: the runner removes ``critic:blocking`` /
+    ``critic:suspicious`` the moment the critic's latest verdict is *approve*
+    (see ``dispatch.py``), so a PR carrying neither label has a latest verdict
+    of approved. "Mergeable" is ``mergeStateStatus == CLEAN``.
+
+    Such a PR is *terminal* for the repair loop. The critic posts sev3 findings
+    as inline comments, which remain unresolved review threads even after an
+    APPROVE verdict — those leftover threads must NOT, on their own, re-enter
+    the PR into the repair set (the #229 multi-hour stall).
+
+    AC3: a genuinely blocked PR keeps a block label, and a human "request
+    changes" review usually drops ``mergeStateStatus`` off CLEAN under branch
+    protection — both fail this predicate. But a human inline-comment thread
+    leaves merge state CLEAN, so when the caller has the PR's unresolved review
+    threads it passes them as ``unresolved_threads`` and we additionally exclude
+    any PR carrying an unresolved *human* thread (see
+    :func:`human_unresolved_threads`). When ``unresolved_threads`` is omitted,
+    the predicate falls back to label + CLEAN only.
+    """
+    if _pr_label_names(pr) & CRITIC_BLOCK_LABELS:
+        return False
+    if str(pr.get("mergeStateStatus") or "").upper() != "CLEAN":
+        return False
+    # AC3: an unresolved *human* review thread keeps the PR off the merge
+    # conveyor even though merge state is CLEAN; leftover critic sev3 threads do
+    # not. ``human_unresolved_threads`` filters the latter out.
+    return not (unresolved_threads and human_unresolved_threads(unresolved_threads))
+
+
+def prs_requiring_repair(
+    limit: int,
+    repo: str | None = None,
+    *,
+    on_skip: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
     """Return open PRs the repair loop should revisit.
 
     A PR needs repair when it is critic-blocked, has unresolved review threads,
     or is merge-conflicted/dirty. Enriches the open-PR list with ONE batched
     GraphQL review-threads pass (issue #226 — no per-PR N+1 fan-out). Idle
     short-circuit: with no open PRs there is nothing to enrich.
+
+    Issue #230: a critic-approved, CLEAN PR (see :func:`is_approved_mergeable`)
+    is NOT returned even if it still carries unresolved sev3 *critic* review
+    threads — it is terminal and belongs on the merge conveyor, not the repair
+    loop. Re-dispatching a repair worker against such a PR caused a multi-hour
+    stall (#229). Each excluded PR is passed to ``on_skip`` (when provided) so
+    the caller can emit a structured skip event — no silent drop.
     """
     owner, name = _owner_name(repo)
     cl = client()
@@ -243,7 +361,7 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
     repairs: list[dict[str, Any]] = []
     for pr in prs:
         reasons: list[str] = []
-        labels = {str(lab.get("name") or "") for lab in pr.get("labels") or []}
+        labels = _pr_label_names(pr)
         if "critic:blocking" in labels:
             reasons.append("critic:blocking")
 
@@ -253,7 +371,16 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
 
         all_threads = threads_by_pr.get(int(pr["number"]), [])
         threads = [t for t in all_threads if not bool(t.get("isResolved"))]
-        if threads:
+
+        # #230: leftover sev3 *critic* threads on an APPROVED + CLEAN PR are
+        # not, on their own, a repair trigger. They only count when the PR is
+        # otherwise blocked (block label / DIRTY / CONFLICTING — i.e. NOT
+        # approved-mergeable), where a human review or merge conflict is the
+        # real driver. An unresolved *human* thread, however, keeps the PR out
+        # of the approved-mergeable set (AC3) — ``is_approved_mergeable`` is
+        # passed the threads so it can make that distinction.
+        approved_mergeable = is_approved_mergeable(pr, unresolved_threads=threads)
+        if threads and not approved_mergeable:
             reasons.append("unresolved_review_threads")
 
         if reasons:
@@ -261,6 +388,13 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
             enriched["repairReasons"] = reasons
             enriched["unresolvedReviewThreads"] = threads
             repairs.append(enriched)
+        elif threads and approved_mergeable and on_skip is not None:
+            # Approved + CLEAN with only leftover sev3 critic threads → terminal.
+            # Surface the exclusion so the caller emits a skip event (#230 AC1/AC5).
+            enriched = dict(pr)
+            enriched["unresolvedReviewThreads"] = threads
+            enriched["approvedMergeableSkip"] = True
+            on_skip(enriched)
 
     return sorted(repairs, key=lambda p: str(p.get("updatedAt") or ""))[:limit]
 
