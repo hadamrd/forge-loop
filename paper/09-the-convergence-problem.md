@@ -187,6 +187,25 @@ settled results.
    precisely the regime where §9.2 says the loop *does* converge — or escalate to
    a stronger model or a human. Non-termination is itself a defect to be gated.
 
+6. **The learning critic (persistent teaching memory).** Levers 1–5 improve
+   teaching *within* a task; none lets the critic improve *across* tasks. Give
+   the critic a two-tier persistent memory — a write-ahead log of every finding
+   it has raised (which recurred, which the worker addressed, which PRs merged
+   versus were abandoned) and a compacted, curated *front page* of distilled
+   lessons (the recurring failure modes on this codebase, the teaching framings
+   that actually produced convergence). The critic reads the front page at
+   review time to mentor with institutional knowledge ("workers here repeatedly
+   add dead code when touching the scheduler — wire it in or cut it"), and a
+   periodic consolidation pass re-curates the front page from the log. This is
+   the same two-tier architecture the rest of the system already uses (the
+   `.forge/` event log plus projections; this paper's own authoring memory),
+   applied to the *evaluator*. The caveat is dual to the benefit: a curated
+   memory is a *poisoning* surface — a wrong lesson, taught persistently, is a
+   systematic defect — so lessons must be evidence-gated (corroborated across
+   instances), decay if unconfirmed, and never override a present-tense reading
+   of the actual diff. Sequenced last, because a learning layer over an
+   unvalidated teacher learns the wrong things.
+
 The unifying principle: **shrink the gap between what the worker can cheaply
 iterate against (observable, stationary, deterministic) and what the critic
 ultimately judges (expensive, holistic, adversarial)** — by teaching the path,
