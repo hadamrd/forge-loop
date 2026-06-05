@@ -206,6 +206,21 @@ class Config:
         return self.state_dir / "loop-runner-summaries.jsonl"
 
     @property
+    def repair_backoff_file(self) -> Path:
+        """Append-only per-PR repair re-block ledger (issue #248).
+
+        Durable (never truncated like the events log) so the per-PR
+        consecutive-block streak survives across ticks and runner restarts.
+        """
+        return self.state_dir / "loop-runner-repair-backoff.jsonl"
+
+    @property
+    def repair_scheduler_file(self) -> Path:
+        """Tiny JSON holding the consecutive repair-terminal-tick counter
+        used by the dispatch-slot reservation / round-robin (issue #248)."""
+        return self.state_dir / "loop-runner-repair-scheduler.json"
+
+    @property
     def pause_file(self) -> Path:
         return self.state_dir / "loop-runner.pause"
 

@@ -134,6 +134,35 @@ def free_dispatch_slots(store: WorkerSessionStore, parallel: int) -> int:
     return max(0, parallel - store.active_count())
 
 
+def repair_slot_budget(
+    parallel: int,
+    repairs_pending: int,
+    *,
+    ready_present: bool,
+    reserve: int = 1,
+) -> tuple[int, int]:
+    """Split ``parallel`` worker slots between repairs and new dispatch (issue #248).
+
+    Returns ``(repairs_to_run, dispatch_slots_reserved)``. When ready issues
+    are waiting we hold back ``reserve`` slots for new dispatch so in-flight
+    repairs can never claim 100% of the worker budget — the headline
+    starvation fix. With no ready work (or ``reserve<=0``) repairs may use
+    every slot, exactly as before.
+
+    Invariant exercised by the tests: with ``parallel=2``, ``ready_present``
+    and ``reserve>=1``, ``dispatch_slots_reserved >= 1`` whenever there is at
+    least one pending repair.
+    """
+    repairs_pending = max(0, repairs_pending)
+    if not ready_present or reserve <= 0 or repairs_pending == 0:
+        repairs_to_run = min(repairs_pending, parallel)
+        return repairs_to_run, max(0, parallel - repairs_to_run)
+    max_repairs = max(0, parallel - reserve)
+    repairs_to_run = min(repairs_pending, max_repairs)
+    dispatch_reserved = parallel - repairs_to_run
+    return repairs_to_run, dispatch_reserved
+
+
 def _branch_for_issue(issue: dict[str, Any]) -> str:
     """Recompute the branch the worker subprocess will use.
 

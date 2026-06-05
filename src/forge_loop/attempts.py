@@ -339,6 +339,84 @@ def classify_skip(
     return SkipDecision()
 
 
+# ---------------------------------------------------------------------------
+# Repair backoff classification (issue #248)
+#
+# The new-dispatch path already backs an issue off after a failed attempt
+# (``classify_skip`` above). The repair path had no equivalent, so a PR stuck
+# on ``critic:blocking`` was re-selected every tick forever, pinning a worker
+# slot and starving the ready backlog. This mirrors the ``classify_skip``
+# cooldown semantics for *repair* selection — same shape, same vocabulary,
+# keyed on consecutive re-blocks of a single PR rather than issue fingerprint.
+# ---------------------------------------------------------------------------
+
+# Default backoff window after a PR hits the consecutive-block cap before it
+# is offered for repair again. Override via LOOP_REPAIR_COOLDOWN_S / the
+# ``repair.cooldown_s`` setting.
+DEFAULT_REPAIR_COOLDOWN_S = 3600
+
+
+@dataclass
+class RepairBackoffDecision:
+    """Result of evaluating a PR's consecutive-block streak.
+
+    ``skip`` is True iff the PR has re-blocked at least ``max_consecutive``
+    ticks in a row AND its most recent block is still inside the cooldown
+    window — i.e. it should be excluded from repair selection this tick to
+    free its slot. Once the window elapses the PR becomes selectable again
+    (one retry per window), mirroring ``classify_skip``'s cooldown arm.
+    """
+
+    skip: bool = False
+    consecutive_blocks: int = 0
+    cooldown_remaining_s: int = 0
+
+
+def classify_repair_backoff(
+    block_timestamps: list[str],
+    *,
+    max_consecutive: int,
+    cooldown_s: int = DEFAULT_REPAIR_COOLDOWN_S,
+    now: datetime | None = None,
+) -> RepairBackoffDecision:
+    """Decide whether a PR should back off from repair selection.
+
+    ``block_timestamps`` is the run of CONSECUTIVE recent re-block timestamps
+    for one PR (oldest→newest); the caller is responsible for resetting the
+    run on a clearing event. ``max_consecutive <= 0`` disables the backoff
+    (feature-off / legacy behaviour) — the PR is never skipped.
+    """
+    consecutive = len(block_timestamps)
+    if max_consecutive <= 0 or consecutive < max_consecutive:
+        return RepairBackoffDecision(skip=False, consecutive_blocks=consecutive)
+    when = _parse_iso(block_timestamps[-1])
+    if when is None:
+        return RepairBackoffDecision(skip=False, consecutive_blocks=consecutive)
+    now = now or datetime.now(UTC)
+    elapsed = (now - when).total_seconds()
+    if elapsed < cooldown_s:
+        return RepairBackoffDecision(
+            skip=True,
+            consecutive_blocks=consecutive,
+            cooldown_remaining_s=int(cooldown_s - elapsed),
+        )
+    return RepairBackoffDecision(skip=False, consecutive_blocks=consecutive)
+
+
+def repair_cooldown_from_env(default_s: int = DEFAULT_REPAIR_COOLDOWN_S) -> int:
+    """Resolve the repair backoff window via the unified Settings layer.
+
+    Mirrors :func:`cooldown_from_env` but reads ``repair.cooldown_s``
+    (env ``LOOP_REPAIR_COOLDOWN_S`` > yaml > default).
+    """
+    try:
+        from forge_loop.settings import Settings
+
+        return max(0, Settings.load().repair.cooldown_s)
+    except Exception:  # noqa: BLE001
+        return default_s
+
+
 def cooldown_from_env(default_s: int = DEFAULT_RETRY_COOLDOWN_S) -> int:
     """Resolve the cooldown window via the unified Settings layer (issue #84).
 
@@ -357,11 +435,15 @@ __all__ = [
     "AttemptRecord",
     "MARKER",
     "DEFAULT_RETRY_COOLDOWN_S",
+    "DEFAULT_REPAIR_COOLDOWN_S",
     "IssueAttempts",
+    "RepairBackoffDecision",
     "SkipDecision",
+    "classify_repair_backoff",
     "classify_skip",
     "compute_fingerprint",
     "cooldown_from_env",
+    "repair_cooldown_from_env",
     "fetch_history",
     "fetch_history_strict",
     "fetch_blocking_comments",

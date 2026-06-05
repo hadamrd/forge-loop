@@ -38,6 +38,7 @@ from forge_loop.runner.dispatch import (
     _run_critic_for_outcomes,
     _run_repair_workers,
     _run_workers,
+    repair_slot_budget,
 )
 from forge_loop.runner.drift import (
     _RECENT_OUTCOMES,
@@ -57,6 +58,12 @@ from forge_loop.runner.repairs import (
 )
 from forge_loop.runner.repairs import (
     ready_issue_open_pr_repairs as _ready_issue_open_pr_repairs_impl,
+)
+from forge_loop.runner.repairs import (
+    load_repair_tick_counter as _load_repair_tick_counter,
+)
+from forge_loop.runner.repairs import (
+    save_repair_tick_counter as _save_repair_tick_counter,
 )
 from forge_loop.runner.rescue import rescue_uncommitted_work as _rescue_uncommitted_work
 from forge_loop.runner.tick_checks import run_codebase_audit as _run_codebase_audit
@@ -479,6 +486,64 @@ def _maybe_run_maintenance(cfg: Config, tick: int, *, short_sleep: Any) -> bool:
     return False
 
 
+def _any_ready_issue(cfg: Config) -> bool:
+    """Cheap probe: are there any ``loop:ready`` issues waiting? (issue #248).
+
+    Used by the dispatch-slot reservation to decide whether a blocking-PR
+    repair tick should yield to new dispatch. A ``gh`` failure is treated as
+    "no ready work" so the reservation never starves repairs on a transient
+    list error (the normal candidate fetch later in the tick surfaces it).
+    """
+    try:
+        return bool(top_issues(cfg.labels.ready, 1, repo=cfg.github_repo))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _repair_reserve_should_yield(
+    cfg: Config,
+    tick: int,
+    repairs: list[tuple[dict[str, Any], dict[str, Any], str]],
+) -> bool:
+    """Decide whether to yield this tick to new dispatch instead of repairs.
+
+    Issue #248 forward-progress guarantee. When repair fair-scheduling is
+    enabled and ready issues are waiting, we track consecutive repair-terminal
+    ticks; after ``reserve_dispatch_after_ticks`` of them in a row we yield the
+    tick to new dispatch (reserving its worker slots), guaranteeing a ready
+    issue is dispatched within ``reserve_dispatch_after_ticks + 1`` ticks. The
+    counter resets whenever there is no ready work (no starvation risk) so the
+    legacy "repairs run every tick" behaviour holds when the backlog is empty.
+
+    Disabled (``repair.enabled`` False / ``reserve_dispatch_after_ticks<=0``)
+    ⇒ always returns False (byte-identical legacy behaviour).
+    """
+    if not cfg.repair.enabled or cfg.repair.reserve_dispatch_after_ticks <= 0:
+        return False
+    counter_file = cfg.repair_scheduler_file
+    if not _any_ready_issue(cfg):
+        # No ready work waiting — repairs cannot starve anything. Reset.
+        _save_repair_tick_counter(counter_file, 0)
+        return False
+    consecutive = _load_repair_tick_counter(counter_file)
+    if consecutive >= cfg.repair.reserve_dispatch_after_ticks:
+        _save_repair_tick_counter(counter_file, 0)
+        _, reserved = repair_slot_budget(
+            cfg.parallel, len(repairs), ready_present=True, reserve=1
+        )
+        append_event(
+            cfg.events_file,
+            "repair_dispatch_slot_reserved",
+            tick=tick,
+            consecutive_repair_ticks=consecutive,
+            repairs_deferred=len(repairs),
+            dispatch_slots_reserved=reserved,
+        )
+        return True
+    _save_repair_tick_counter(counter_file, consecutive + 1)
+    return False
+
+
 def _run_pre_dispatch_repairs(
     cfg: Config,
     tick: int,
@@ -496,6 +561,16 @@ def _run_pre_dispatch_repairs(
     _run_stuck_sweep(cfg, tick)
 
     repairs = _blocking_pr_repairs(cfg)
+    if not repairs and cfg.repair.enabled:
+        # No blocking repairs ⇒ no starvation pressure; clear the consecutive
+        # repair-tick counter so a future repair streak starts from zero.
+        _save_repair_tick_counter(cfg.repair_scheduler_file, 0)
+    if repairs and _repair_reserve_should_yield(cfg, tick, repairs):
+        # Issue #248: reserve this tick for new dispatch so in-flight repairs
+        # cannot starve the ready backlog. The blocking PRs are simply not
+        # repaired this tick; they are re-selected next tick (subject to the
+        # per-PR backoff). Fall through to candidate selection / dispatch.
+        return False
     if repairs:
         _run_repair_tick(
             cfg,

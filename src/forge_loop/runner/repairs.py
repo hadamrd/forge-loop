@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+from forge_loop import attempts as _attempts
 from forge_loop.config import Config
 from forge_loop.gh_issues import (
     CRITIC_BLOCK_LABELS,
@@ -61,17 +65,122 @@ def issue_number_from_pr(pr: dict[str, Any]) -> int | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Per-PR repair backoff ledger (issue #248).
+#
+# A durable append-only JSONL of ``{ts, pr, issue, blocked}`` rows — one per
+# repaired PR per repair tick. ``consecutive_block_timestamps`` reads the
+# trailing run of ``blocked=True`` rows for a PR (reset by any ``blocked=False``
+# row), which feeds ``attempts.classify_repair_backoff``. Kept out of the
+# events log because that log is truncated to its last ~50 lines each tick.
+# --------------------------------------------------------------------------- #
+
+
+def record_repair_block(
+    backoff_file: Path,
+    pr_url: str | None,
+    issue: int | None,
+    *,
+    blocked: bool,
+    ts: str | None = None,
+) -> None:
+    """Append one repair-outcome row to the backoff ledger.
+
+    ``blocked=True`` means the PR re-blocked after the repair attempt;
+    ``blocked=False`` clears the streak (a clean / merged outcome).
+    """
+    if not pr_url:
+        return
+    row = {
+        "ts": ts or datetime.now(UTC).isoformat(timespec="seconds"),
+        "pr": pr_url,
+        "issue": issue,
+        "blocked": bool(blocked),
+    }
+    backoff_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(backoff_file, "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def consecutive_block_timestamps(backoff_file: Path, pr_url: str) -> list[str]:
+    """Return the trailing run of consecutive ``blocked=True`` timestamps.
+
+    Scans the ledger in order, keeping only rows for ``pr_url``. The streak
+    resets to empty on any ``blocked=False`` row, so the result is the count
+    of *consecutive* re-blocks since the PR last came back clean.
+    """
+    if not backoff_file.exists():
+        return []
+    streak: list[str] = []
+    try:
+        lines = backoff_file.read_text().splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict) or row.get("pr") != pr_url:
+            continue
+        if row.get("blocked"):
+            ts = row.get("ts")
+            if isinstance(ts, str):
+                streak.append(ts)
+        else:
+            streak = []
+    return streak
+
+
+def load_repair_tick_counter(path: Path) -> int:
+    """Read the consecutive repair-terminal-tick counter (0 if absent/corrupt)."""
+    if not path.exists():
+        return 0
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    value = data.get("consecutive_repair_ticks") if isinstance(data, dict) else None
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def save_repair_tick_counter(path: Path, value: int) -> None:
+    """Persist the consecutive repair-terminal-tick counter."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"consecutive_repair_ticks": max(0, int(value))}))
+
+
+def _default_block_timestamps_fn(cfg: Config) -> Any:
+    backoff_file = cfg.repair_backoff_file
+
+    def _read(pr_url: str) -> list[str]:
+        return consecutive_block_timestamps(backoff_file, pr_url)
+
+    return _read
+
+
 def blocking_pr_repairs(
     cfg: Config,
     *,
     prs_requiring_repair_fn: Any = prs_requiring_repair,
     fetch_issue_fn: Any = fetch_issue,
     pr_review_context_fn: Any = pr_review_context,
+    block_timestamps_fn: Any = None,
+    now: datetime | None = None,
 ) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
     from forge_loop.axis import matches_axes, parse_filter_env
 
     axis_filter = parse_filter_env()
     repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    # Issue #248: per-PR repair backoff. Disabled (max_consecutive_blocks<=0 or
+    # repair.enabled False) ⇒ the filter is a no-op and selection is identical
+    # to the legacy path.
+    backoff_on = cfg.repair.enabled and cfg.repair.max_consecutive_blocks > 0
+    if block_timestamps_fn is None:
+        block_timestamps_fn = _default_block_timestamps_fn(cfg)
 
     def _on_skip(pr: dict[str, Any]) -> None:
         # #230 AC1/AC5: a critic-approved + CLEAN PR carrying only leftover
@@ -93,6 +202,26 @@ def blocking_pr_repairs(
                 reason="source_issue_not_found",
             )
             continue
+        if backoff_on:
+            block_ts = block_timestamps_fn(pr.get("url"))
+            decision = _attempts.classify_repair_backoff(
+                block_ts,
+                max_consecutive=cfg.repair.max_consecutive_blocks,
+                cooldown_s=cfg.repair.cooldown_s,
+                now=now,
+            )
+            if decision.skip:
+                # AC3: a repair skipped for backoff is observable — PR url,
+                # issue, consecutive-block count, remaining cooldown.
+                append_event(
+                    cfg.events_file,
+                    "repair_pr_backoff",
+                    pr=pr.get("url"),
+                    issue=issue_num,
+                    consecutive_blocks=decision.consecutive_blocks,
+                    cooldown_remaining_s=decision.cooldown_remaining_s,
+                )
+                continue
         issue = fetch_issue_fn(issue_num, repo=cfg.github_repo)
         if not issue:
             append_event(
@@ -322,6 +451,16 @@ def enable_automerge_for_repaired_prs(
     for outcome in outcomes:
         if outcome.status not in {"open", "merged"} or not outcome.pr_url:
             continue
+        # #248: record this repair outcome in the backoff ledger so a PR that
+        # keeps re-blocking eventually backs off (freeing its slot), while a
+        # PR that comes back clean resets its streak. No-op when disabled.
+        if cfg.repair.enabled:
+            record_repair_block(
+                cfg.repair_backoff_file,
+                outcome.pr_url,
+                outcome.issue,
+                blocked=bool(outcome.error),
+            )
         # #230: the re-critic in this repair tick sets ``outcome.error`` when it
         # re-blocks the PR (re-applying critic:blocking/suspicious). THAT is the
         # signal to hold a PR back — NOT the presence of leftover *critic* sev3
