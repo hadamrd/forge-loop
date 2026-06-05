@@ -324,3 +324,98 @@ def test_no_subprocess_claude_in_critic_or_po() -> None:
             f"{fname} still calls subprocess.run — migrate via _critic_sdk"
         )
         assert "import subprocess" not in text, f"{fname} still imports subprocess directly"
+
+
+# ---------------------------------------------------------------------------
+# Teaching critic — round derivation + brief threading + sev3 demotion E2E
+# ---------------------------------------------------------------------------
+
+
+def test_review_pr_threads_round_number_into_brief_and_demotes_sev3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: prior critic logs => round count => brief carries the round
+    and stalled-round guidance => the parsed report's sev3 nits are demoted."""
+    logs = _mk_logs(tmp_path)
+    # Seed THREE prior reviews so this call is round 4 (>= demotion threshold 3).
+    for stamp in (1000, 2000, 3000):
+        (logs / f"critic-1-{stamp}-0.log").write_text("{}")
+
+    seen_brief: dict[str, str] = {}
+
+    def fake_sdk(**kwargs: object) -> CriticSdkResult:
+        seen_brief["prompt"] = str(kwargs.get("prompt", ""))
+        return CriticSdkResult(
+            last_message=json.dumps(
+                {
+                    "overall": "request_changes",
+                    "minimal_path_to_green": ["fix the real defect in a.py"],
+                    "findings": [
+                        {"severity": "sev2", "category": "tests", "message": "weak assert"},
+                        {"severity": "sev3", "category": "style", "message": "rename var"},
+                    ],
+                }
+            ),
+            duration_s=0.1,
+        )
+
+    monkeypatch.setattr("forge_loop._critic_sdk.run_critic_sdk", fake_sdk)
+    monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
+
+    outcome = critic_mod.review_pr(
+        pr_url="https://github.com/owner/repo/pull/1",
+        issue_number=1,
+        repo=tmp_path,
+        logs_dir=logs,
+        timeout_s=60,
+        sev3_demotion_round_threshold=3,
+    )
+
+    assert "3 prior review(s)" in seen_brief["prompt"]
+    assert "ROUND 4" in seen_brief["prompt"]
+    assert outcome.report is not None
+    assert outcome.report.round_number == 3
+    assert sorted(f.severity for f in outcome.report.findings) == ["sev2"]
+    assert sorted(f.severity for f in outcome.report.follow_ups) == ["sev3"]
+    assert outcome.report.minimal_path_to_green == ["fix the real defect in a.py"]
+
+
+def test_review_pr_round1_keeps_sev3_blocking_and_terse_brief(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First review (no prior logs): sev3 is NOT demoted and the brief is terse."""
+    logs = _mk_logs(tmp_path)
+    seen_brief: dict[str, str] = {}
+
+    def fake_sdk(**kwargs: object) -> CriticSdkResult:
+        seen_brief["prompt"] = str(kwargs.get("prompt", ""))
+        return CriticSdkResult(
+            last_message=json.dumps(
+                {
+                    "overall": "request_changes",
+                    "minimal_path_to_green": ["address the nit"],
+                    "findings": [
+                        {"severity": "sev3", "category": "style", "message": "rename var"},
+                    ],
+                }
+            ),
+            duration_s=0.1,
+        )
+
+    monkeypatch.setattr("forge_loop._critic_sdk.run_critic_sdk", fake_sdk)
+    monkeypatch.setattr("forge_loop.critic.ensure_subagent_trusted", lambda _p: None)
+
+    outcome = critic_mod.review_pr(
+        pr_url="https://github.com/owner/repo/pull/1",
+        issue_number=1,
+        repo=tmp_path,
+        logs_dir=logs,
+        timeout_s=60,
+        sev3_demotion_round_threshold=3,
+    )
+
+    assert "ROUND 1" in seen_brief["prompt"]
+    assert outcome.report is not None
+    assert outcome.report.round_number == 0
+    assert [f.severity for f in outcome.report.findings] == ["sev3"]
+    assert outcome.report.follow_ups == []

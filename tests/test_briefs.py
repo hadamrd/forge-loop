@@ -69,6 +69,8 @@ def test_render_critic_brief_substitutes_pr_and_issue() -> None:
         pr_url="https://github.com/acme/repo/pull/7",
         issue_number=7,
         manifestos="(test manifestos block)",
+        round_number=0,
+        round_guidance="ROUND 1 (first review of this PR).",
     )
     assert "https://github.com/acme/repo/pull/7" in out
     assert "#7" in out
@@ -76,6 +78,10 @@ def test_render_critic_brief_substitutes_pr_and_issue() -> None:
     # No leftover Python-format markers.
     assert "{pr_url}" not in out
     assert "{issue_number}" not in out
+    assert "{round_number}" not in out
+    assert "{round_guidance}" not in out
+    # Teaching-critic output shape: must-fix path is mandatory.
+    assert "minimal_path_to_green" in out
 
 
 # ---------------------------------------------------------------------------

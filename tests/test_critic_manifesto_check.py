@@ -61,6 +61,8 @@ def test_manifesto_text_rendered_into_prompt(tmp_path: Path) -> None:
         pr_url="https://example.com/pr/1",
         issue_number=1,
         manifestos=load_manifestos_text(tmp_path),
+        round_number=0,
+        round_guidance="ROUND 1 (first review of this PR).",
     )
     assert "AR-001: never alpha." in rendered
     assert "BR-001: never beta." in rendered

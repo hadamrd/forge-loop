@@ -123,6 +123,16 @@ class CriticReport:
     findings: list[Finding] = field(default_factory=list)
     manifesto_violations: list[ManifestoViolation] = field(default_factory=list)
     raw: str = ""
+    # Teaching-critic (Ch9 convergence). ``minimal_path_to_green`` is the
+    # explicit, ordered, MINIMAL must-fix set the worker has to clear to merge —
+    # the acceptance predicate, stated rather than discovered by violation.
+    # ``follow_ups`` are advisory items that do NOT block (optional polish, plus
+    # sev3 nits demoted out of the blocking set once a PR has stalled for
+    # ``sev3_demotion_round_threshold`` rounds). ``round_number`` is how many
+    # critic reviews this PR has had BEFORE this one (0 == first review).
+    minimal_path_to_green: list[str] = field(default_factory=list)
+    follow_ups: list[Finding] = field(default_factory=list)
+    round_number: int = 0
 
     def severities(self) -> set[str]:
         return {f.severity for f in self.findings}
@@ -258,6 +268,70 @@ def _worker_command_context(issue_number: int, logs_dir: Path) -> str:
                 if isinstance(command, str):
                     chunks.append(command)
     return "\n".join(chunks)
+
+
+def count_prior_critic_rounds(issue_number: int, logs_dir: Path) -> int:
+    """How many critic reviews this PR/issue has already had.
+
+    The round source for the teaching critic (Ch9). Each ``review_pr`` call
+    writes one or more ``critic-{issue}-{ts}-{attempt}.log`` files (SDK path)
+    or a single ``critic-{issue}-{ts}-codex.log`` (codex path). Counting the
+    DISTINCT ``{ts}`` stamps already on disk yields the number of completed
+    prior reviews — the retry-attempt suffix (``-0``/``-1``) of a single review
+    must NOT inflate the count, so we key on the timestamp, not the file.
+
+    Returns 0 when the logs dir is missing or holds no prior critic logs (the
+    first review of this PR is round 0).
+    """
+    if not logs_dir.is_dir():
+        return 0
+    stamps: set[str] = set()
+    for path in logs_dir.glob(f"critic-{issue_number}-*.log"):
+        m = re.match(rf"^critic-{issue_number}-(\d+)(?:-\w+)?$", path.stem)
+        if m:
+            stamps.add(m.group(1))
+    return len(stamps)
+
+
+def demote_sev3_if_stalled(
+    report: CriticReport,
+    *,
+    round_number: int,
+    threshold: int,
+) -> CriticReport:
+    """Triage, NOT standard erosion (Ch9 §9.5.2).
+
+    Once a PR has stalled for ``threshold`` rounds, cosmetic (sev3) findings are
+    moved out of the blocking ``findings`` set into ``follow_ups`` so rounds are
+    not burned on nits. sev1/sev2 are NEVER touched — real defects always block,
+    no matter the round count. A ``threshold`` of 0 disables demotion. If the
+    demotion removes every blocking finding and the manifesto set is clean, an
+    ``request_changes`` overall is relaxed to ``approve`` (nothing left blocks);
+    a critic-emitted ``block`` is left intact (an explicit hard stop is not a nit).
+    """
+    if threshold <= 0 or round_number < threshold:
+        return report
+    blocking = [f for f in report.findings if f.severity != "sev3"]
+    demoted = [f for f in report.findings if f.severity == "sev3"]
+    if not demoted:
+        return report
+    overall = report.overall
+    still_blocks = (
+        bool(blocking)
+        or any(v.severity in {"sev1", "sev2"} for v in report.manifesto_violations)
+        or overall == "block"
+    )
+    if overall == "request_changes" and not still_blocks:
+        overall = "approve"
+    return CriticReport(
+        overall=overall,
+        findings=blocking,
+        manifesto_violations=report.manifesto_violations,
+        raw=report.raw,
+        minimal_path_to_green=report.minimal_path_to_green,
+        follow_ups=[*report.follow_ups, *demoted],
+        round_number=report.round_number,
+    )
 
 
 def _command_segments(text: str) -> list[str]:
@@ -414,6 +488,46 @@ def _with_deterministic_findings(
     return report
 
 
+def _round_guidance(round_number: int, sev3_demotion_round_threshold: int) -> str:
+    """Round-aware instructions woven into the critic brief (Ch9 §9.5.1/.3).
+
+    Early rounds stay terse — let the worker try. Later rounds escalate from
+    *what is wrong* → *why* → *how* → *a concrete minimal patch sketch*, and
+    once nits would otherwise burn rounds, instruct the critic to demote them.
+    The text is deterministic given (round, threshold) so the behaviour is
+    testable without invoking the model.
+    """
+    demote = sev3_demotion_round_threshold
+    if round_number == 0:
+        return (
+            "ROUND 1 (first review of this PR). Keep BLOCKING findings TERSE: "
+            "name what is wrong and where. Let the worker attempt the fix. Do "
+            "NOT pre-write patches yet — that is for stalled rounds."
+        )
+    lines = [
+        f"ROUND {round_number + 1} (this PR has already had {round_number} "
+        "critic review(s) and has NOT converged — escalate specificity).",
+        "For EVERY blocking (sev1/sev2) finding you carry or add, escalate: "
+        "state (a) what is wrong, (b) WHY it matters, (c) HOW to fix it, and "
+        "(d) a CONCRETE MINIMAL PATCH SKETCH — name the file + function and the "
+        "specific change. The goal is to SHRINK what the worker must invent.",
+        "DIAGNOSE THE META-CAUSE, do not just re-flag symptoms: if the diff is "
+        "large and pure-addition (e.g. +N/-0), or the SAME class of finding "
+        "recurs across rounds, the root cause is usually scope inflation / wrong "
+        "approach / over-building. Say so explicitly and instruct the worker to "
+        "CUT scope / simplify / split — not to add more code.",
+    ]
+    if demote > 0 and round_number >= demote:
+        lines.append(
+            f"This PR has stalled for {round_number} rounds (>= demotion "
+            f"threshold {demote}). Move every COSMETIC (sev3) item OUT of "
+            "`findings` and into `follow_ups` so it does NOT block — record it, "
+            "do not grind on it. sev1/sev2 STILL BLOCK; never demote a real "
+            "defect."
+        )
+    return "\n".join(lines)
+
+
 def review_pr(
     pr_url: str,
     issue_number: int,
@@ -424,6 +538,7 @@ def review_pr(
     emit: Callable[[str, dict[str, Any]], None] | None = None,
     model: str | None = None,
     provider: str = "claude",
+    sev3_demotion_round_threshold: int = 3,
 ) -> CriticOutcome:
     """Spawn the critic subagent against an open PR. Synchronous.
 
@@ -431,15 +546,26 @@ def review_pr(
     also fails, emit ``critic_parse_failed`` via ``emit`` and surface an
     ``error`` verdict (the runner then leaves the PR alone — no auto-block,
     no auto-approve — so a human can intervene).
+
+    ``sev3_demotion_round_threshold`` drives the teaching critic's triage
+    (Ch9 §9.5.2): the round number is derived from the prior ``critic-*.log``
+    files already on disk for this issue and woven into the brief, and once it
+    reaches the threshold the parsed report's sev3 nits are demoted to
+    non-blocking follow-ups.
     """
     template = brief_template or _default_brief()
     from forge_loop._critic_sdk import load_manifestos_text
 
     manifestos = load_manifestos_text(repo)
+    # Round source: count prior critic reviews of this PR (0 == first review).
+    # Computed BEFORE this review writes its own log so it is not self-counted.
+    round_number = count_prior_critic_rounds(issue_number, logs_dir)
     brief = template.format(
         pr_url=pr_url,
         issue_number=issue_number,
         manifestos=manifestos,
+        round_number=round_number,
+        round_guidance=_round_guidance(round_number, sev3_demotion_round_threshold),
     )
 
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -491,12 +617,14 @@ def review_pr(
                 stdout_tail=tail,
                 error=parse_error or result.error or "critic_parse_failed",
             )
-        report = _with_deterministic_findings(
+        report = _finalize_report(
             report,
             pr_url=pr_url,
             repo=repo,
             issue_number=issue_number,
             logs_dir=logs_dir,
+            round_number=round_number,
+            sev3_demotion_round_threshold=sev3_demotion_round_threshold,
         )
         verdict = _verdict_from_overall(report.overall)
         reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
@@ -580,12 +708,14 @@ def review_pr(
             parse_retries=retries,
         )
 
-    report = _with_deterministic_findings(
+    report = _finalize_report(
         report,
         pr_url=pr_url,
         repo=repo,
         issue_number=issue_number,
         logs_dir=logs_dir,
+        round_number=round_number,
+        sev3_demotion_round_threshold=sev3_demotion_round_threshold,
     )
     verdict = _verdict_from_overall(report.overall)
     reasons = [f"[{f.severity}/{f.category}] {f.message}" for f in report.findings]
@@ -596,6 +726,38 @@ def review_pr(
         stdout_tail=tail,
         report=report,
         parse_retries=retries,
+    )
+
+
+def _finalize_report(
+    report: CriticReport,
+    *,
+    pr_url: str,
+    repo: Path,
+    issue_number: int,
+    logs_dir: Path,
+    round_number: int,
+    sev3_demotion_round_threshold: int,
+) -> CriticReport:
+    """Apply deterministic rules, stamp the round, then triage sev3 nits.
+
+    Order matters: deterministic precommit/pip-editable findings are added
+    FIRST (so a sev1 they raise is never demoted), the round is stamped, and
+    only then are cosmetic findings demoted once the PR has stalled. sev1/sev2
+    pass through ``demote_sev3_if_stalled`` untouched.
+    """
+    report = _with_deterministic_findings(
+        report,
+        pr_url=pr_url,
+        repo=repo,
+        issue_number=issue_number,
+        logs_dir=logs_dir,
+    )
+    report.round_number = round_number
+    return demote_sev3_if_stalled(
+        report,
+        round_number=round_number,
+        threshold=sev3_demotion_round_threshold,
     )
 
 
@@ -735,11 +897,46 @@ def _coerce_report(obj: dict[str, Any], raw: str) -> CriticReport | None:
     if overall == "approve" and any(v.severity == "sev1" for v in violations):
         overall = "request_changes"
 
+    # Teaching-critic: the explicit ordered must-fix set. Tolerant of a missing
+    # field (back-compat with reports emitted before this field existed) and of
+    # the model handing back a single string instead of a list.
+    raw_mptg = obj.get("minimal_path_to_green")
+    if isinstance(raw_mptg, str):
+        raw_mptg = [raw_mptg]
+    minimal_path_to_green = (
+        [s.strip() for s in raw_mptg if isinstance(s, str) and s.strip()]
+        if isinstance(raw_mptg, list)
+        else []
+    )
+
+    raw_followups = obj.get("follow_ups") or []
+    follow_ups: list[Finding] = []
+    if isinstance(raw_followups, list):
+        for item in raw_followups:
+            if not isinstance(item, dict):
+                continue
+            line = item.get("line")
+            if isinstance(line, str) and line.isdigit():
+                line = int(line)
+            elif not isinstance(line, int):
+                line = None
+            f = Finding(
+                severity=str(item.get("severity", "")),
+                category=str(item.get("category", "")),
+                file=item.get("file") if isinstance(item.get("file"), str) else None,
+                line=line,
+                message=str(item.get("message", "")),
+            )
+            if f.is_valid():
+                follow_ups.append(f)
+
     return CriticReport(
         overall=overall,
         findings=findings,
         manifesto_violations=violations,
         raw=raw,
+        minimal_path_to_green=minimal_path_to_green,
+        follow_ups=follow_ups,
     )
 
 

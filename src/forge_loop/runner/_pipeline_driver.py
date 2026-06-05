@@ -161,6 +161,9 @@ def _build_default_handlers(
                 emit=bus_emit,
                 model=cfg.critic.model,
                 provider=getattr(cfg.critic, "provider", "claude"),
+                sev3_demotion_round_threshold=getattr(
+                    cfg.critic, "sev3_demotion_round_threshold", 3
+                ),
             )
         except Exception as e:  # noqa: BLE001 — boundary
             return StepOutcome(
