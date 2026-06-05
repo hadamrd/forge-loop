@@ -300,10 +300,13 @@ def check_verify_clean_gate(
     Mirrors :func:`check_issue_closed_gate`: disables auto-merge, posts a
     comment, emits ``merge_refused_verify_unclean`` (typed, manifesto Q4),
     flips ``merged`` → ``open``. Side effects are best-effort; the event +
-    status flip MUST still fire. Returns ``True`` (always refused — the caller
-    only invokes this when ``result`` is already known non-clean).
+    status flip MUST still fire.
 
-    Outcomes without a ``pr_url`` are skipped (nothing to gate).
+    Returns ``True`` when the outcome was refused. Returns ``False`` only for
+    an outcome with no ``pr_url`` — there is nothing to gate, so it is skipped.
+    The production caller (:func:`apply_verify_clean_gate`) pre-filters by
+    ``pr_url`` so it never hits that branch, but the guard is kept (and unit
+    tested) so the function is safe to call directly.
     """
     pr_url = outcome.pr_url
     if not pr_url:
