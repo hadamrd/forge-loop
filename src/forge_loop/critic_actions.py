@@ -8,7 +8,6 @@ spinning up subprocesses or threads. The runner imports
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -153,11 +152,29 @@ def _recover_issue_from_branch(
 
     # Lazy import: avoids a module-load cycle (repairs imports worker_brief /
     # gh_issues; this module is imported by the runner that also imports repairs).
+    from forge_loop.gh_client import GhError
     from forge_loop.runner.repairs import issue_from_loop_branch
 
     branch: str | None = None
-    with suppress(Exception):
+    # EH-001: only the EXPECTED degradation modes are swallowed — a GitHub API
+    # failure (``GhError``) or a malformed pr/repo reference (``ValueError`` from
+    # the pr-number / owner-name parse). A programming bug (AttributeError,
+    # TypeError, …) must NOT be hidden: it propagates so the observability
+    # discipline this PR adds isn't defeated by a silent broad catch. On the
+    # expected failures we emit ``critic_findings_issue_recovery_failed`` with
+    # context BEFORE degrading to ``None`` so the fallback's failure is visible.
+    try:
         branch = gh.pr_head_branch(pr_url, repo=repo)
+    except (GhError, ValueError) as exc:
+        if emit is not None:
+            emit(
+                "critic_findings_issue_recovery_failed",
+                {
+                    "pr": pr_url,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
     issue = issue_from_loop_branch(branch)
     if issue is not None and emit is not None:
         emit(

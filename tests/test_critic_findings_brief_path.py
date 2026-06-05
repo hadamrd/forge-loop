@@ -33,6 +33,11 @@ class _FailingGh:
     def disable_pr_auto_merge(self, pr, repo=None) -> bool:  # noqa: ANN001
         return False
 
+    def pr_head_branch(self, pr, repo=None) -> str | None:  # noqa: ANN001
+        # Default: no recoverable head branch (e.g. API returned None). Subclasses
+        # override to model a loop branch, a non-loop branch, or a raised error.
+        return None
+
     def post_review_comment(self, pr, body, file=None, line=None, repo=None) -> bool:  # noqa: ANN001
         # The original bug: inline comment on an out-of-diff line 422s. We model
         # the worst case — posting reports failure for every comment.
@@ -248,3 +253,67 @@ def test_posting_raise_does_not_lose_findings() -> None:
         )
     # Findings were persisted BEFORE the posting that raised.
     assert store.open_count(PR) == 2
+
+
+def test_recovery_api_failure_is_loud_not_silently_swallowed() -> None:
+    """sev1/correctness (EH-001): an EXPECTED failure of the head-branch lookup
+    (a GitHub ``GhError`` / malformed-ref ``ValueError``) is no longer swallowed
+    by a broad ``suppress(Exception)``. It emits
+    ``critic_findings_issue_recovery_failed`` with context BEFORE degrading to a
+    loud ``issue_missing`` drop — the fallback's failure is observable."""
+    from forge_loop.gh_client import GhError
+
+    class _ApiFailGh(_FailingGh):
+        def pr_head_branch(self, pr, repo=None):  # noqa: ANN001
+            raise GhError("get_pull(10)", 500, "boom")
+
+    store = SqliteCriticFindingsStore(":memory:")
+    events: list[tuple[str, dict]] = []
+
+    apply_critic_report(
+        _report(),
+        PR,
+        500,
+        block_on_sev2=False,
+        min_findings_for_approve=0,
+        gh=_ApiFailGh(),
+        repo="acme/widgets",
+        emit=lambda name, payload: events.append((name, payload)),
+        findings_store=store,
+        issue=None,
+    )
+
+    # The recovery failure was made loud with context...
+    failed = [p for n, p in events if n == "critic_findings_issue_recovery_failed"]
+    assert len(failed) == 1
+    assert failed[0]["error_type"] == "GhError"
+    assert failed[0]["pr"] == PR
+    # ...and the genuinely-missing issue still produces a loud drop, never silence.
+    skipped = [p for n, p in events if n == "critic_findings_persist_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "issue_missing"
+    assert store.open_count(PR) == 0
+
+
+def test_recovery_programming_bug_is_not_hidden() -> None:
+    """sev1/correctness (EH-001): a genuine programming bug in the head-branch
+    lookup (e.g. ``TypeError``) must PROPAGATE, not be masked by the recovery's
+    expected-error catch — preserving the observability discipline this PR adds."""
+
+    class _BuggyGh(_FailingGh):
+        def pr_head_branch(self, pr, repo=None):  # noqa: ANN001
+            raise TypeError("unexpected programming bug")
+
+    store = SqliteCriticFindingsStore(":memory:")
+    with pytest.raises(TypeError):
+        apply_critic_report(
+            _report(),
+            PR,
+            500,
+            block_on_sev2=False,
+            min_findings_for_approve=0,
+            gh=_BuggyGh(),
+            repo="acme/widgets",
+            findings_store=store,
+            issue=None,
+        )
