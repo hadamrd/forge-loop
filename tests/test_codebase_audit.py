@@ -16,12 +16,13 @@ idempotency. Hits both the manifesto T1 (state-machine edges) and T2
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable
 
 import pytest
+from pydantic import ValidationError
 
 from forge_loop.audit_probes.file_size import (
     DEFAULT_THRESHOLDS,
@@ -32,7 +33,6 @@ from forge_loop.codebase_audit import (
     AUDIT_AXIS_LABEL,
     PROBE_LABEL_PREFIX,
     AuditReport,
-    FilingOutcome,
     Violation,
     audit,
     file_violations,
@@ -41,7 +41,6 @@ from forge_loop.codebase_audit import (
 )
 from forge_loop.events import AuditCleanEvent, AuditViolationFiledEvent
 from forge_loop.gh_client import Issue, MockGhClient
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -346,7 +345,7 @@ def test_audit_events_are_typed_and_validated() -> None:
     assert rec["issue_number"] == 99
 
     # Out-of-range severity is rejected by pydantic.
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         AuditViolationFiledEvent(severity=99)  # ge=1, le=5
 
     clean = AuditCleanEvent(probes_run=["a", "b"])

@@ -717,7 +717,7 @@ def _classify_issue_for_dispatch(
     i: dict[str, Any],
     *,
     force_set: set[int],
-    cooldown_s: float,
+    cooldown_s: int,
     brief_hash: str,
     risk_gate_label: str,
 ) -> dict[str, Any] | None:

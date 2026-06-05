@@ -36,13 +36,13 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from forge_loop.events import EventBase, StuckSweepDemotedEvent, emit
 from forge_loop.log import get_logger
-
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -319,9 +319,10 @@ def sweep(
     if threshold < 1:
         threshold = 1  # nonsense thresholds get clamped, not crashed
 
-    if emit_fn is None:
-        def emit_fn(ev: EventBase) -> None:  # noqa: E306 — local closure
-            emit(events_file, ev)
+    def _default_emit(ev: EventBase) -> None:
+        emit(events_file, ev)
+
+    do_emit: EmitFn = emit_fn if emit_fn is not None else _default_emit
 
     events = _read_tail(events_file, tail)
     report = SweepReport(scanned=len(events))
@@ -372,7 +373,7 @@ def sweep(
         if not ok:
             report.errors[issue] = err or "unknown"
         try:
-            emit_fn(StuckSweepDemotedEvent(
+            do_emit(StuckSweepDemotedEvent(
                 issue=issue,
                 attempts=tally.attempts,
                 last_state=tally.last_state,

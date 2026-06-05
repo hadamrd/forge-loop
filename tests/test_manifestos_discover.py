@@ -37,7 +37,6 @@ from forge_loop.manifestos import (
     discover_manifestos,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixture builder — one tmp_path per case, written inline so the test file
 # is self-contained and a future contributor doesn't have to grep for a

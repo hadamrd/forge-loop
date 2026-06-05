@@ -32,10 +32,10 @@ State diagram::
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class WorkerState(str, Enum):
+class WorkerState(StrEnum):
     """Discrete states a worker session can occupy.
 
     :class:`str` inheritance keeps the value JSON-serialisable + lets

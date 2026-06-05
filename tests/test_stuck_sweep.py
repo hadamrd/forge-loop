@@ -5,12 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from forge_loop.events import StuckSweepDemotedEvent
 from forge_loop.gh_client import GhError, Issue, MockGhClient
-from forge_loop.stuck_sweep import Demotion, SweepReport, sweep
-
+from forge_loop.stuck_sweep import sweep
 
 READY = "loop:ready"
 NEEDS_HUMAN = "loop:needs-human"

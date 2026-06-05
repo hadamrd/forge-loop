@@ -21,9 +21,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-try:  # textual is an optional dep — fail with a clean message if missing.
+if TYPE_CHECKING:
+    # For the type-checker textual is always present: annotate against the
+    # real classes so ``App[None]`` / ``ComposeResult`` resolve correctly.
+    # The runtime fallback below (textual absent) is a separate concern.
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical
@@ -31,10 +34,19 @@ try:  # textual is an optional dep — fail with a clean message if missing.
     from textual.widgets import Footer, Header, Static
 
     _TEXTUAL_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised in --tui error path
-    _TEXTUAL_AVAILABLE = False
-    App = object  # type: ignore[assignment,misc]
-    ComposeResult = Any  # type: ignore[assignment,misc]
+else:
+    try:  # textual is an optional dep — fail with a clean message if missing.
+        from textual.app import App, ComposeResult
+        from textual.binding import Binding
+        from textual.containers import Horizontal, Vertical
+        from textual.message import Message
+        from textual.widgets import Footer, Header, Static
+
+        _TEXTUAL_AVAILABLE = True
+    except ImportError:  # pragma: no cover - exercised in --tui error path
+        _TEXTUAL_AVAILABLE = False
+        App = object
+        ComposeResult = Any
 
 
 def _tail_jsonl(path: Path, n: int = 20) -> list[dict[str, Any]]:

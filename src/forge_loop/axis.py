@@ -23,8 +23,8 @@ fetch issues; we just bucket them.
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable
-
+from collections.abc import Iterable
+from typing import Any
 
 AXIS_PREFIX = "axis:"
 UNALIGNED_BUCKET = "unaligned"
@@ -45,10 +45,7 @@ def extract_axes(labels: Iterable[Any]) -> set[str]:
     """
     out: set[str] = set()
     for raw in labels or []:
-        if isinstance(raw, dict):
-            name = str(raw.get("name") or "")
-        else:
-            name = str(raw or "")
+        name = str(raw.get("name") or "") if isinstance(raw, dict) else str(raw or "")
         low = name.strip().lower()
         if not low.startswith(AXIS_PREFIX):
             continue

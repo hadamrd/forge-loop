@@ -17,7 +17,6 @@ from hypothesis import strategies as st
 
 from forge_loop.attempts import compute_fingerprint
 
-
 _issue_id_st = st.one_of(
     st.integers(min_value=1, max_value=999_999),
     st.text(min_size=1, max_size=40),

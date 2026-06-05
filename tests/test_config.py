@@ -157,15 +157,15 @@ def test_explicit_config_path_env_var(fake_repo: Path, monkeypatch: pytest.Monke
 
 
 def test_model_defaults_match_issue_34(fake_repo: Path) -> None:
-    """Defaults: worker/po → opus-4-7; critic → sonnet-4-6.
+    """Defaults: worker/po → opus-4-8; critic → sonnet-4-6.
 
     Thinking: worker=medium, po=high, critic=off.
     """
     cfg = config_mod.load()
-    assert cfg.worker.model == "claude-opus-4-7"
+    assert cfg.worker.model == "claude-opus-4-8"
     assert cfg.worker.provider == "claude"
     assert cfg.worker.thinking == "medium"
-    assert cfg.po.model == "claude-opus-4-7"
+    assert cfg.po.model == "claude-opus-4-8"
     assert cfg.po.provider == "claude"
     assert cfg.po.thinking == "high"
     assert cfg.critic.model == "claude-sonnet-4-6"
@@ -228,8 +228,8 @@ def test_missing_env_and_yaml_falls_back_to_documented_defaults(
     ):
         monkeypatch.delenv(k, raising=False)
     cfg = config_mod.load()
-    assert (cfg.worker.model, cfg.worker.thinking) == ("claude-opus-4-7", "medium")
-    assert (cfg.po.model, cfg.po.thinking) == ("claude-opus-4-7", "high")
+    assert (cfg.worker.model, cfg.worker.thinking) == ("claude-opus-4-8", "medium")
+    assert (cfg.po.model, cfg.po.thinking) == ("claude-opus-4-8", "high")
     assert (cfg.critic.model, cfg.critic.thinking) == ("claude-sonnet-4-6", "off")
 
 
