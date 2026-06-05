@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
-from collections.abc import Iterable
+import threading
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Concatenate, ParamSpec, Protocol, TypeVar, cast
 
 from forge_loop.sandbox import CapabilityPolicy, canonical_policy_json
 from forge_loop.tasks.saga import (
@@ -49,6 +51,19 @@ _TERMINAL_STATE_VALUES = (
     TaskState.COMPENSATED.value,
     TaskState.QUARANTINED.value,
 )
+
+# Process-level guard so schema creation + compat migration run **at most once
+# per database path per process** (#227 AC2: "guard or memoize"), not merely
+# once per tick. A run's saga DB path is stable, so once this process has
+# created the table + back-filled the compat columns for a path, every later
+# store on that same path skips the (idempotent but PRAGMA/ALTER-probing) work.
+# Keyed by resolved absolute path. ``:memory:`` is never memoized: each
+# in-memory connection is a *distinct* database that must build its own schema.
+# The lock guards this shared module cache only (a different concern from the
+# per-instance saga-op ``RLock``); construction is rare, so holding it across
+# the one-time migration is cheap.
+_MIGRATED_PATHS: set[str] = set()
+_MIGRATION_LOCK = threading.Lock()
 
 
 class TaskSagaStore(Protocol):
@@ -129,6 +144,36 @@ class TaskSagaStore(Protocol):
         ...
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _synchronized(
+    method: Callable[Concatenate[SqliteTaskSagaStore, _P], _R],
+) -> Callable[Concatenate[SqliteTaskSagaStore, _P], _R]:
+    """Serialise a store method through the per-instance lock.
+
+    Issue #227: the saga store is now opened **once per tick** and the single
+    connection is shared across the tick's worker threads (the dispatch
+    ``ThreadPoolExecutor``) and the per-worker heartbeat thread, instead of
+    being re-``__init__``'d 2-3x per worker. sqlite forbids using one
+    connection from multiple threads unless ``check_same_thread=False``; this
+    decorator guarantees that, with that guard off, only one thread ever
+    touches the connection at a time. The lock is re-entrant (``RLock``) so
+    methods that call other decorated methods (``put`` calls ``get``;
+    ``mark_*`` call ``_require_mutable`` + ``put``) do not deadlock.
+    """
+
+    @functools.wraps(method)
+    def _wrapper(self: SqliteTaskSagaStore, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    # functools.wraps returns a ``_Wrapped`` shim; cast back to the precise
+    # signature so callers keep the decorated method's typed arguments.
+    return cast("Callable[Concatenate[SqliteTaskSagaStore, _P], _R]", _wrapper)
+
+
 class SqliteTaskSagaStore:
     """SQLite-backed durable task saga store."""
 
@@ -137,13 +182,59 @@ class SqliteTaskSagaStore:
         connect_path: str | Path = ":memory:" if str(path) == ":memory:" else self.path
         if str(path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(connect_path)
+        # One connection is shared across the tick's worker threads and the
+        # heartbeat thread (#227): one store per tick, not one per worker.
+        # sqlite refuses cross-thread use of a connection unless
+        # check_same_thread is off, so we disable it and serialise every
+        # operation through ``self._lock`` (see ``_synchronized``). WAL still
+        # lets out-of-process readers (boot/recovery) observe writes.
+        self._lock = threading.RLock()
+        self._connection = sqlite3.connect(connect_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         if str(path) != ":memory:":
             self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.executescript(_SCHEMA)
-        self._ensure_compat_columns()
+        # Schema creation + compat migration are the expensive part of
+        # construction; running them on *every* store __init__ was
+        # schema-migration work per worker per tick (#227). Two layers fix it:
+        #   1. the store is opened ONCE per tick and reused across dispatch +
+        #      heartbeat + policy recording (see runner/dispatch.py), and
+        #   2. a process-level memoize (``_MIGRATED_PATHS``) makes the schema +
+        #      compat work run at most ONCE per database path per process, so a
+        #      long-running loop with frequent ticks does not repeat it each
+        #      tick either (#227 AC2: "at most once per process").
+        self._migrate_schema_once()
 
+    def close(self) -> None:
+        """Close the shared connection.
+
+        Opened once per tick and owned by ``_run_workers`` (#227), which closes
+        it in a ``finally`` after the dispatch ThreadPool drains and every
+        heartbeat thread has stopped — so no other thread touches the
+        connection at close time. Idempotent: a second close is a sqlite no-op.
+        """
+        with self._lock:
+            self._connection.close()
+
+    def _migrate_schema_once(self) -> None:
+        """Create the schema + back-fill compat columns at most once per process.
+
+        Keyed by resolved absolute path in the module-level ``_MIGRATED_PATHS``
+        cache (#227 AC2). ``:memory:`` is always migrated: each in-memory
+        connection is its own database, so there is nothing to memoize. The
+        ``executescript(_SCHEMA)`` uses ``CREATE TABLE IF NOT EXISTS`` and the
+        compat probe is idempotent, so skipping them for an already-migrated
+        path is safe — the table and columns already exist on disk.
+        """
+        migrate_key = None if str(self.path) == ":memory:" else str(self.path.resolve())
+        with _MIGRATION_LOCK:
+            if migrate_key is not None and migrate_key in _MIGRATED_PATHS:
+                return
+            self._connection.executescript(_SCHEMA)
+            self._ensure_compat_columns()
+            if migrate_key is not None:
+                _MIGRATED_PATHS.add(migrate_key)
+
+    @_synchronized
     def put(self, saga: TaskSaga) -> TaskSaga:
         if saga.state is TaskState.FAILED and not saga.compensations:
             raise LeaseConflictError(f"task {saga.task_id} failure requires compensation")
@@ -255,6 +346,7 @@ class SqliteTaskSagaStore:
             raise LeaseConflictError(f"task {saga.task_id} update conflicted")
         return saga
 
+    @_synchronized
     def create(
         self,
         *,
@@ -315,6 +407,7 @@ class SqliteTaskSagaStore:
             raise LeaseConflictError(f"task {task_id} or saga {saga_id} already exists") from exc
         return saga
 
+    @_synchronized
     def acquire_lease(
         self,
         task_id: str,
@@ -361,6 +454,7 @@ class SqliteTaskSagaStore:
             raise KeyError(task_id)
         return leased
 
+    @_synchronized
     def heartbeat(
         self,
         task_id: str,
@@ -412,6 +506,7 @@ class SqliteTaskSagaStore:
             raise KeyError(task_id)
         return heartbeaten
 
+    @_synchronized
     def get(self, task_id: str) -> TaskSaga | None:
         row = self._connection.execute(
             """
@@ -425,9 +520,11 @@ class SqliteTaskSagaStore:
             return None
         return _saga_from_row(row)
 
+    @_synchronized
     def list_in_flight(self) -> tuple[TaskSaga, ...]:
         return tuple(saga for saga in self._select_all() if not saga.is_terminal)
 
+    @_synchronized
     def list_stale(self, *, now: datetime) -> tuple[TaskSaga, ...]:
         return tuple(
             saga
@@ -437,9 +534,11 @@ class SqliteTaskSagaStore:
             and saga.lease_expires_at <= now
         )
 
+    @_synchronized
     def mark_completed(self, task_id: str, *, reason: str | None = None) -> TaskSaga:
         return self._mark_terminal(task_id, TaskState.COMPLETED, reason=reason)
 
+    @_synchronized
     def mark_failed(
         self,
         task_id: str,
@@ -461,9 +560,11 @@ class SqliteTaskSagaStore:
         )
         return self.put(failed)
 
+    @_synchronized
     def mark_compensated(self, task_id: str, *, reason: str | None = None) -> TaskSaga:
         return self._mark_terminal(task_id, TaskState.COMPENSATED, reason=reason)
 
+    @_synchronized
     def mark_quarantined(self, task_id: str, *, reason: str) -> TaskSaga:
         return self._mark_terminal(task_id, TaskState.QUARANTINED, reason=reason)
 
