@@ -404,6 +404,52 @@ def test_verify_ruff_unclean_refuses_and_flips(tmp_path: Path) -> None:
     assert [c for c, _ in runner.calls] == [_RUFF]
 
 
+def test_verify_gh_side_effects_suppressed_but_logged(
+    tmp_path: Path, caplog
+) -> None:
+    """Review nit (#241): a raising gh.disable/comment must be SUPPRESSED so the
+    durable record (typed event + merged→open flip) still fires — but the
+    suppression must be logged at DEBUG (with traceback) so a silently-failing
+    comment/disable is diagnosable, not swallowed in silence."""
+    import logging
+
+    runner = _FakeVerifyRunner(results={
+        _RUFF: VerifyResult(_RUFF, 1, "src/foo.py:1:1: F401 imported but unused"),
+    })
+    gh = _FakeGh(disable_raises=True, comment_raises=True)
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+    events_path = tmp_path / "events.jsonl"
+    captured: list = []
+
+    with caplog.at_level(logging.DEBUG, logger="forge_loop.runner.merge_gate"):
+        refused = apply_verify_clean_gate(
+            [o],
+            runner=runner,
+            gh=gh,
+            repo="o/r",
+            commands=[_RUFF],
+            cwd=str(tmp_path),
+            env=_env_with_tools(tmp_path, "ruff", "pyright"),
+            require=["ruff", "pyright"],
+            enabled=True,
+            events_file=events_path,
+            emit=lambda k, p: captured.append((k, p)),
+        )
+
+    # Refusal still happened despite BOTH gh side effects raising.
+    assert refused == [241]
+    assert captured and captured[0][0] == "merge_refused_verify_unclean"
+    evt = json.loads(events_path.read_text().strip().splitlines()[-1])
+    assert evt["kind"] == "merge_refused_verify_unclean"
+    assert o.status == "open"
+    # The swallowed gh failures are logged at DEBUG, named per action.
+    debug_msgs = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+    ]
+    assert any("disable_pr_auto_merge" in m for m in debug_msgs)
+    assert any("pr_comment" in m for m in debug_msgs)
+
+
 def test_verify_pyright_unclean_refuses(tmp_path: Path) -> None:
     """Ruff clean but pyright dirty → still refused (second command checked)."""
     runner = _FakeVerifyRunner(results={
