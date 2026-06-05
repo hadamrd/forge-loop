@@ -564,6 +564,8 @@ def run_async(cfg: Config) -> int:
                     wr["pr_url"],
                     cfg.github_repo,
                 )
+                from forge_loop.critic_findings import open_critic_findings_store
+
                 await asyncio.to_thread(
                     apply_critic_report,
                     c.report,
@@ -574,6 +576,8 @@ def run_async(cfg: Config) -> int:
                     _gh,
                     cfg.github_repo,
                     _bus_emit,
+                    findings_store=open_critic_findings_store(cfg.repo),
+                    issue=wr.get("issue"),
                 )
             except Exception as act_ex:
                 append_event(

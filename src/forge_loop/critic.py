@@ -26,6 +26,7 @@ follow-up issue) — the CLI has no thinking-budget flag today.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -115,6 +116,29 @@ class Finding:
             and (self.file is None or isinstance(self.file, str))
             and (self.line is None or isinstance(self.line, int))
         )
+
+
+def derive_finding_id(pr: str | int, issue: int, finding: Finding) -> str:
+    """Derive a STABLE, globally-addressable id for a critic finding (#242).
+
+    The id is a content hash over ``(pr, issue, category, file, line, message)``
+    — deliberately NOT severity (a re-classification of the same defect must map
+    to the SAME row) and NOT attempt (the same finding seen across re-review
+    attempts is idempotent, never duplicated — acceptance criterion 2). Encoding
+    ``pr`` + ``issue`` into the hash makes the id unique across PRs so the MCP
+    ``mark_finding_addressed(finding_id)`` tool can address a row by id alone.
+    """
+
+    parts = [
+        str(pr),
+        str(issue),
+        finding.category,
+        finding.file or "",
+        "" if finding.line is None else str(finding.line),
+        finding.message.strip(),
+    ]
+    digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+    return digest[:32]
 
 
 @dataclass

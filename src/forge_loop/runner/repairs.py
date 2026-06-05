@@ -6,6 +6,8 @@ import re
 from typing import Any
 
 from forge_loop.config import Config
+from forge_loop.critic_findings import open_critic_findings_store, render_findings_block
+from forge_loop.critic_findings.store import CriticFindingsStore
 from forge_loop.gh_issues import (
     CRITIC_BLOCK_LABELS,
     fetch_issue,
@@ -32,6 +34,32 @@ _CRITIC_BLOCK_LABELS = CRITIC_BLOCK_LABELS
 #: adoption scan keys off this so a human PR (any other branch) is never
 #: adopted/critic'd/merged.
 _LOOP_BRANCH_RE = re.compile(r"^loop/(\d+)-")
+
+
+def _compose_review_context(
+    store: CriticFindingsStore,
+    pr: dict[str, Any],
+    supplementary: str,
+) -> str:
+    """Build the repair brief's review context, durable findings FIRST (#242).
+
+    The durable ``open`` findings from the ``.forge`` control plane are the
+    AUTHORITATIVE baseline — the worker has them even if GitHub posting 422'd
+    and even if it never calls an MCP tool (AC3/AC5). The re-fetched GitHub
+    review comments (``supplementary``) are DEMOTED to a humans-only read-model
+    appended below; they are no longer the worker's sole/critical data path
+    (Q10 — kill the GitHub round-trip).
+    """
+
+    pr_url = str(pr.get("url") or "")
+    block = render_findings_block(store.open_findings(pr_url)) if pr_url else ""
+    if block and supplementary.strip():
+        return (
+            f"{block}\n\n"
+            "--- supplementary (GitHub review read-model; may be incomplete) ---\n"
+            f"{supplementary}"
+        )
+    return block or supplementary
 
 
 def loop_issue_from_branch(pr: dict[str, Any]) -> int | None:
@@ -67,9 +95,11 @@ def blocking_pr_repairs(
     prs_requiring_repair_fn: Any = prs_requiring_repair,
     fetch_issue_fn: Any = fetch_issue,
     pr_review_context_fn: Any = pr_review_context,
+    findings_store: CriticFindingsStore | None = None,
 ) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
     from forge_loop.axis import matches_axes, parse_filter_env
 
+    store = findings_store or open_critic_findings_store(cfg.repo)
     axis_filter = parse_filter_env()
     repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
 
@@ -120,7 +150,8 @@ def blocking_pr_repairs(
             issue=issue_num,
             reasons=pr.get("repairReasons") or [],
         )
-        repairs.append((issue, pr, pr_review_context_fn(pr["number"], repo=cfg.github_repo)))
+        supplementary = pr_review_context_fn(pr["number"], repo=cfg.github_repo)
+        repairs.append((issue, pr, _compose_review_context(store, pr, supplementary)))
     return repairs
 
 
@@ -130,6 +161,7 @@ def ready_issue_open_pr_repairs(
     *,
     open_prs_fn: Any = prs_by_label,
     pr_review_context_fn: Any = pr_review_context,
+    findings_store: CriticFindingsStore | None = None,
 ) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
     """Select existing open PRs for ready issues before new dispatch.
 
@@ -143,6 +175,7 @@ def ready_issue_open_pr_repairs(
     if not ready_by_number:
         return []
 
+    store = findings_store or open_critic_findings_store(cfg.repo)
     repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
     seen_issues: set[int] = set()
     limit = max(cfg.parallel, 50)
@@ -173,11 +206,12 @@ def ready_issue_open_pr_repairs(
             pr=enriched.get("url"),
             reasons=reasons,
         )
+        supplementary = pr_review_context_fn(enriched["number"], repo=cfg.github_repo)
         repairs.append(
             (
                 ready_by_number[issue_num],
                 enriched,
-                pr_review_context_fn(enriched["number"], repo=cfg.github_repo),
+                _compose_review_context(store, enriched, supplementary),
             )
         )
     return repairs

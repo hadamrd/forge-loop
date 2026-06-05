@@ -310,6 +310,47 @@ def critic_review_pr(pr_url: str, issue_number: int, timeout_s: int = 600) -> di
     }
 
 
+# ── Critic findings (durable control plane, #242) ───────────────────────────
+
+
+@mcp.tool()
+def critic_findings(pr: str) -> list[dict[str, Any]]:
+    """Return the OPEN critic findings for a PR from the durable ``.forge`` store.
+
+    This is the worker's first-class data path for what to repair — it reads
+    the SQLite control-plane projection, NOT re-fetched GitHub review comments
+    (which 422 and silently drop findings, #242). ``pr`` is the PR URL the
+    critic reviewed. Returns one dict per open finding with ``finding_id``,
+    ``severity``, ``category``, ``file``, ``line``, ``message``, ``status``,
+    ``note``. Returns ``[]`` when the PR has no open findings (drained).
+    """
+    cfg = load_config()
+    from forge_loop.critic_findings import open_critic_findings_store
+
+    store = open_critic_findings_store(cfg.repo)
+    return [f.to_dict() for f in store.open_findings(pr)]
+
+
+@mcp.tool()
+def mark_finding_addressed(finding_id: str, note: str = "") -> dict[str, Any]:
+    """Mark one critic finding as ``addressed`` and persist a ``note`` (#242).
+
+    Used by a repair worker to claim it fixed a finding. On the next re-review
+    the critic reconciles: if the finding is gone it stays closed (the PR
+    converges when the open-count hits 0); if it is STILL present the critic
+    reopens it (no false convergence). Returns the updated finding dict, or
+    ``{"error": ...}`` if no finding carries ``finding_id``.
+    """
+    cfg = load_config()
+    from forge_loop.critic_findings import FindingStatus, open_critic_findings_store
+
+    store = open_critic_findings_store(cfg.repo)
+    updated = store.set_status(finding_id, FindingStatus.ADDRESSED, note=note or None)
+    if updated is None:
+        return {"error": f"no finding with id '{finding_id}'"}
+    return updated.to_dict()
+
+
 # ── Manual (operator runbook) tools ─────────────────────────────────────────
 
 

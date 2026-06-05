@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from forge_loop.critic import CriticReport, Finding
+from forge_loop.critic_findings.store import CriticFindingsStore
 from forge_loop.critic_format import finding_tag
 
 MIN_SUSPICIOUS_APPROVE_LINES = 100
@@ -140,15 +141,48 @@ def apply_critic_report(
     gh: GhClient,
     repo: str | None,
     emit: Callable[[str, dict[str, Any]], None] | None = None,
+    *,
+    findings_store: CriticFindingsStore | None = None,
+    issue: int | None = None,
+    attempt: int = 1,
 ) -> CriticActionPlan:
     """Compute the plan and execute it via ``gh``. Returns the plan so the
-    runner can log a summary event."""
+    runner can log a summary event.
+
+    When ``findings_store`` + ``issue`` are supplied, every :class:`Finding`
+    is persisted to the durable control plane (status ``open``) and reconciled
+    against prior findings (#242) BEFORE any GitHub posting. The store — not the
+    re-fetched GitHub comments — is the repair worker's data path, so a posting
+    failure (e.g. an inline-comment 422 on an out-of-diff line) no longer
+    silently starves the worker. GitHub posting is demoted to a derived,
+    humans-only read-model.
+    """
     plan = plan_actions(
         report,
         pr_changed_lines,
         block_on_sev2,
         min_findings_for_approve,
     )
+
+    # AC2/AC6: durable findings FIRST — load-bearing data is handed to the
+    # repair worker via the store, never round-tripped through GitHub (Q10).
+    if findings_store is not None and issue is not None:
+        result = findings_store.reconcile(pr_url, issue, attempt, list(report.findings))
+        if emit is not None:
+            emit(
+                "critic_findings_persisted",
+                {
+                    "pr": pr_url,
+                    "issue": issue,
+                    "attempt": attempt,
+                    "inserted": result.inserted,
+                    "kept_open": result.kept_open,
+                    "reopened": result.reopened,
+                    "closed": result.closed,
+                    "open_count": result.open_count,
+                },
+            )
+
     mutation_failed = False
 
     if plan.block_merge:

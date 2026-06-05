@@ -836,6 +836,9 @@ def _run_critic_for_outcomes(
     bus_emit: Any,
 ) -> None:
     """Critic agent: review PRs the workers opened, before auto-merge fires."""
+    from forge_loop.critic_findings import open_critic_findings_store
+
+    findings_store = open_critic_findings_store(cfg.repo)
     for o in outcomes:
         if o.status in {"open", "merged"} and o.pr_url:
             try:
@@ -872,6 +875,8 @@ def _run_critic_for_outcomes(
                             gh=_gh,
                             repo=cfg.github_repo,
                             emit=bus_emit,
+                            findings_store=findings_store,
+                            issue=o.issue,
                         )
                         if plan.block_merge:
                             o.status = "open"
