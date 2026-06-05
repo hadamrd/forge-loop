@@ -153,9 +153,22 @@ def _seeded_repo(
     forge_dir = tmp_path / ".forge"
     _seed_event_log(forge_dir, cursor_sequence=cursor_sequence)
     _seed_memory(forge_dir)
+    # TIME-BOMB TRAP (#251): the default seeded lease MUST be relative to the
+    # real wall-clock (``datetime.now(UTC)``), NOT to the fixed test clock
+    # ``_FIXED_NOW``. Unit tests inject ``_FIXED_NOW`` into
+    # ``collect_control_plane_doctor`` so any future lease is "live" for them.
+    # But the CLI path (``cli._cmd_doctor``) hard-codes ``datetime.now(UTC)``
+    # (cli_operator_commands.py ~L245). A fixed-clock lease (``_FIXED_NOW + 5m``
+    # = 2026-06-04 12:05 UTC) pairs a *real-clock* CLI probe with a *frozen*
+    # fixture: once real time passes that instant the seeded lease reads as
+    # expired, ``stale_leases`` correctly FAILs, and the "healthy" integration
+    # tests flake by calendar date. Fixed-clock fixture lease + real-clock CLI
+    # path = date-dependent failure. Future seeded leases for any CLI-path test
+    # MUST be relative to ``datetime.now(UTC)``.
+    default_lease = datetime.now(UTC) + timedelta(hours=1)
     _seed_sessions(
         tmp_path / "docs" / "ops",
-        lease_expires_at=lease_expires_at or (_FIXED_NOW + timedelta(minutes=5)),
+        lease_expires_at=lease_expires_at or default_lease,
     )
     return tmp_path
 
@@ -302,7 +315,20 @@ class TestDoctorJsonIntegration:
     ) -> None:
         # Healthy: cursor at head, live lease. (tmux/git/orphan checks warn at
         # most; only control-plane fails drive a non-zero control-plane exit.)
-        repo = _seeded_repo(tmp_path, cursor_sequence=2)
+        #
+        # ``stale_leases`` guards in-flight sagas whose worker lease has lapsed
+        # — i.e. dead-worker candidates, remediated by ``forge-loop recover``.
+        # It runs over the *real* wall-clock via the CLI path, so the seeded
+        # lease must be real-clock-relative to stay live (see #251 trap note in
+        # ``_seeded_repo``).
+        #
+        # Seed the lease EXPLICITLY relative to the real clock the CLI uses and
+        # assert it is strictly in the future at setup time. This guards against
+        # silent date-rot: the test stays green regardless of the calendar date
+        # the suite runs on (today is well past ``_FIXED_NOW``).
+        live_lease = datetime.now(UTC) + timedelta(hours=1)
+        assert live_lease > datetime.now(UTC), "seeded lease must be live at probe time"
+        repo = _seeded_repo(tmp_path, cursor_sequence=2, lease_expires_at=live_lease)
         cfg = _cfg(repo)
 
         rc, blob = _run_doctor_json(monkeypatch, cfg, capsys)
@@ -361,6 +387,9 @@ class TestDoctorJsonIntegration:
     def test_doctor_does_not_mutate_event_log_or_cursors(
         self, monkeypatch: Any, tmp_path: Path, capsys: Any
     ) -> None:
+        # Reaches the real-clock CLI path with the DEFAULT seeded lease. This is
+        # safe (no latent time-bomb) only because ``_seeded_repo``'s default is
+        # now real-clock-relative (``datetime.now(UTC) + 1h``); see #251.
         repo = _seeded_repo(tmp_path, cursor_sequence=2)
         cfg = _cfg(repo)
         events_db = repo / ".forge" / "events.db"
