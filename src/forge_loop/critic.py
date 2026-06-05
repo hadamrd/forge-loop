@@ -304,12 +304,33 @@ def _has_precommit_bypass_justification(pr_body: str) -> bool:
     return bool(body)
 
 
-def _fetch_pr_precommit_context(pr_url: str, repo: Path) -> tuple[str, str]:
-    """Return PR body plus commit metadata for deterministic local checks."""
+def _repo_slug_from_pr_url(pr_url: str) -> str:
+    """Extract ``owner/name`` from a GitHub PR URL.
 
-    from forge_loop import gh
+    The critic's ``repo`` arg is the LOCAL checkout path, but the GitHub
+    client addresses repos by ``owner/name``. The PR URL carries it:
+    ``https://github.com/<owner>/<name>/pull/<n>``.
+    """
+    m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/(?:pull|issues)/\d+", pr_url)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    return ""
 
-    return gh.pr_precommit_context(pr_url, repo)
+
+def _fetch_pr_precommit_context(pr_url: str, _repo: Path) -> tuple[str, str]:
+    """Return PR body plus commit metadata for deterministic checks.
+
+    ``_repo`` (the local checkout path) is retained for call-site symmetry but
+    unused — the data now comes from the GitHub API, addressed by the
+    ``owner/name`` parsed out of ``pr_url``.
+    """
+
+    from forge_loop import gh_issues as gh
+
+    slug = _repo_slug_from_pr_url(pr_url)
+    if not slug:
+        return "", ""
+    return gh.pr_precommit_context(pr_url, slug)
 
 
 def _with_deterministic_precommit_findings(
@@ -338,10 +359,13 @@ def _with_deterministic_precommit_findings(
     )
 
 
-def _fetch_pr_changed_files(pr_url: str, repo: Path) -> list[str]:
-    from forge_loop import gh
+def _fetch_pr_changed_files(pr_url: str, _repo: Path) -> list[str]:
+    from forge_loop import gh_issues as gh
 
-    return gh.pr_changed_files(pr_url, repo)
+    slug = _repo_slug_from_pr_url(pr_url)
+    if not slug:
+        return []
+    return gh.pr_changed_files(pr_url, slug)
 
 
 def _with_deterministic_pip_editable_findings(

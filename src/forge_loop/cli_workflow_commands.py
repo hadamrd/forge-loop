@@ -26,16 +26,14 @@ class WorkflowCommandsMixin:
         if args.issue_file:
             issue = json.loads(Path(args.issue_file).read_text())
         else:
-            r = subprocess.run(
-                ["gh", "issue", "view", str(args.issue), "--json", "number,title,body"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if r.returncode != 0:
-                sys.stderr.write(f"gh issue view failed: {r.stderr}\n")
+            from forge_loop import gh_issues as _gh
+
+            cfg = self.load()
+            fetched = _gh.fetch_issue(args.issue, repo=cfg.github_repo)
+            if fetched is None:
+                sys.stderr.write(f"could not fetch issue #{args.issue}\n")
                 return 2
-            issue = json.loads(r.stdout)
+            issue = fetched
 
         worktree = Path(args.worktree).resolve() if args.worktree else Path.cwd().resolve()
         brief = make_brief(issue, worktree)
@@ -58,7 +56,7 @@ class WorkflowCommandsMixin:
     def _cmd_retry(self, args: SimpleNamespace) -> int:
         from forge_loop import attempts as _attempts
         from forge_loop import worker as _worker
-        from forge_loop.gh import fetch_issue
+        from forge_loop.gh_issues import fetch_issue
         from forge_loop.runner import _force_retry_file
 
         cfg = self.load()
@@ -124,22 +122,20 @@ class WorkflowCommandsMixin:
         if args.issue_file:
             issue = json.loads(Path(args.issue_file).read_text())
         elif args.issue is not None:
+            from forge_loop import gh_issues as _gh
+
             try:
-                r = subprocess.run(
-                    ["gh", "issue", "view", str(args.issue), "--json", "number,title,body"],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                if r.returncode == 0:
-                    issue = json.loads(r.stdout)
+                cfg = self.load()
+                fetched = _gh.fetch_issue(args.issue, repo=cfg.github_repo)
+                if fetched is not None:
+                    issue = fetched
                 else:
                     sys.stderr.write(
-                        f"[brief] gh issue view failed ({r.returncode}); "
-                        f"falling back to a placeholder issue. stderr={r.stderr.strip()}\n"
+                        f"[brief] could not fetch issue #{args.issue}; "
+                        "falling back to a placeholder issue.\n"
                     )
-            except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
-                sys.stderr.write(f"[brief] gh unavailable ({e}); using placeholder.\n")
+            except Exception as e:  # noqa: BLE001 — degrade to placeholder on any failure
+                sys.stderr.write(f"[brief] GitHub unavailable ({e}); using placeholder.\n")
 
         if not issue:
             issue = {

@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 from typing import Any
 
-from forge_loop import gh as _gh
+from forge_loop import gh_issues as _gh
 from forge_loop.worker_sessions import WorkerSessionStore
 from forge_loop.worker_state import InvalidTransition, WorkerState
 
@@ -104,9 +104,7 @@ def format_critic_followup_prompt(report: Any) -> str:
             if getattr(finding, "line", None):
                 loc = f"{loc}:{finding.line}"
             loc = f" ({loc})"
-        lines.append(
-            f"- [{finding.severity}/{finding.category}]{loc} {finding.message}"
-        )
+        lines.append(f"- [{finding.severity}/{finding.category}]{loc} {finding.message}")
     return "\n".join(lines)
 
 

@@ -44,11 +44,11 @@ def rescue_uncommitted_work(outcome: WorkerOutcome, cfg: Config) -> str | None:
         return None
 
     has_tests = _diff_has_tests(worktree, cfg.base_branch)
-    url = _open_rescue_pr(worktree, branch, outcome, cfg, has_tests=has_tests)
+    url = _open_rescue_pr(branch, outcome, cfg, has_tests=has_tests)
     if url is None:
         return None
     if has_tests:
-        _enable_best_effort_automerge(worktree, url)
+        _enable_best_effort_automerge(url, cfg)
     return url
 
 
@@ -149,7 +149,6 @@ def _diff_has_tests(worktree: Path, base_branch: str) -> bool:
 
 
 def _open_rescue_pr(
-    worktree: Path,
     branch: str,
     outcome: WorkerOutcome,
     cfg: Config,
@@ -158,38 +157,28 @@ def _open_rescue_pr(
 ) -> str | None:
     if not cfg.github_repo:
         return None
-    pr_args = [
-        "gh",
-        "pr",
-        "create",
-        "--repo",
-        cfg.github_repo,
-        "--base",
-        cfg.base_branch,
-        "--head",
-        branch,
-        "--title",
-        f"feat(loop): auto-shipped #{outcome.issue} - worker session captured",
-        "--body",
-        _pr_body(outcome, has_tests=has_tests),
-        "--label",
-        "loop:auto-rescued",
-    ]
+    from forge_loop import gh_issues as _gh
+
+    labels = ["loop:auto-rescued"]
     if not has_tests:
-        pr_args.insert(3, "--draft")
-        pr_args.extend(["--label", "loop:needs-review"])
-    pr = subprocess.run(
-        pr_args,
-        cwd=worktree,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    if pr.returncode != 0:
+        labels.append("loop:needs-review")
+    try:
+        url = _gh.create_pull(
+            f"feat(loop): auto-shipped #{outcome.issue} - worker session captured",
+            _pr_body(outcome, has_tests=has_tests),
+            branch,
+            cfg.base_branch,
+            cfg.github_repo,
+            draft=not has_tests,
+        )
+    except Exception:  # noqa: BLE001 — rescue is best-effort; never raise on PR open
         return None
-    url = pr.stdout.strip().splitlines()[-1] if pr.stdout.strip() else ""
-    return url if url.startswith("https://github.com/") else None
+    if not url.startswith("https://github.com/"):
+        return None
+    # Labels are a second call (REST creates PRs without labels). Best-effort:
+    # a labelling hiccup must not lose the rescued PR.
+    _gh.add_pr_label(url, labels, repo=cfg.github_repo)
+    return url
 
 
 def _pr_body(outcome: WorkerOutcome, *, has_tests: bool) -> str:
@@ -206,11 +195,10 @@ def _pr_body(outcome: WorkerOutcome, *, has_tests: bool) -> str:
     )
 
 
-def _enable_best_effort_automerge(worktree: Path, url: str) -> None:
-    subprocess.run(
-        ["gh", "pr", "merge", url, "--squash", "--auto", "--delete-branch"],
-        cwd=worktree,
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
+def _enable_best_effort_automerge(url: str, cfg: Config) -> None:
+    if not cfg.github_repo:
+        return
+    from forge_loop import gh_issues as _gh
+
+    with contextlib.suppress(Exception):
+        _gh.enable_pr_auto_merge(url, repo=cfg.github_repo)

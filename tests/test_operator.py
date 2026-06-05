@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import urllib.request
-from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -51,35 +50,60 @@ class _FakeClock:
         self.t += max(secs, 0.001)
 
 
-def _make_runner(
+@pytest.fixture(autouse=True)
+def _reset_gh_client() -> Any:
+    """Reset the gh_issues client singleton around every operator test."""
+    from forge_loop import gh_issues
+
+    gh_issues.set_client(None)
+    yield
+    gh_issues.set_client(None)
+
+
+class _FakeOperatorClient:
+    """Stateful GhClient double for the operator flow.
+
+    ``issue_comments`` returns successive ``comments_by_call`` payloads (one per
+    poll); ``add_comment`` records the post and raises iff ``comment_post_ok``
+    is False (so ``post_github_issue`` reports failure). Only the methods the
+    operator path uses are implemented.
+    """
+
+    auth_source = "fake"
+
+    def __init__(
+        self,
+        comments_by_call: list[list[dict[str, Any]]],
+        *,
+        comment_post_ok: bool = True,
+    ) -> None:
+        self.comments_by_call = comments_by_call
+        self.comment_post_ok = comment_post_ok
+        self.posted: list[dict[str, Any]] = []
+        self.view_count = 0
+
+    def add_comment(self, owner: str, repo: str, number: int, body: str) -> None:
+        self.posted.append({"owner": owner, "repo": repo, "number": number, "body": body})
+        if not self.comment_post_ok:
+            raise RuntimeError("comment post failed")
+
+    def issue_comments(self, owner: str, repo: str, number: int) -> list[dict[str, Any]]:
+        seq = self.comments_by_call
+        i = self.view_count
+        self.view_count = min(i + 1, len(seq) - 1) if seq else 0
+        return list(seq[i]) if i < len(seq) else []
+
+
+def _seed_operator_client(
     comments_by_call: list[list[dict[str, Any]]],
     *,
-    capture_cmds: list[list[str]] | None = None,
     comment_post_ok: bool = True,
-) -> Callable[[list[str]], tuple[int, str, str]]:
-    """Build a fake subprocess runner.
+) -> _FakeOperatorClient:
+    from forge_loop import gh_issues
 
-    Returns successive ``comments_by_call`` payloads for each ``gh issue view``
-    call. ``gh issue comment`` posts are recorded into ``capture_cmds`` and
-    return ``comment_post_ok``.
-    """
-    calls = {"view": 0}
-
-    def _runner(cmd: list[str]) -> tuple[int, str, str]:
-        if capture_cmds is not None:
-            capture_cmds.append(list(cmd))
-        # gh issue comment <N> --repo --body
-        if len(cmd) >= 3 and cmd[1] == "issue" and cmd[2] == "comment":
-            return (0, "", "") if comment_post_ok else (1, "", "boom")
-        # gh issue view <N> --repo --json comments
-        if len(cmd) >= 3 and cmd[1] == "issue" and cmd[2] == "view":
-            i = calls["view"]
-            calls["view"] = min(i + 1, len(comments_by_call) - 1) if comments_by_call else 0
-            payload = comments_by_call[i] if i < len(comments_by_call) else []
-            return 0, json.dumps({"comments": payload}), ""
-        return 0, "", ""
-
-    return _runner
+    client = _FakeOperatorClient(comments_by_call, comment_post_ok=comment_post_ok)
+    gh_issues.set_client(client)
+    return client
 
 
 # ── happy path ──────────────────────────────────────────────────────────────
@@ -99,14 +123,12 @@ def test_ask_returns_chosen_option_when_marker_matches() -> None:
         ],
     ]
     events: list[tuple[str, dict[str, Any]]] = []
-    cmds: list[list[str]] = []
     clock = _FakeClock()
-    runner = _make_runner(comments, capture_cmds=cmds)
+    client = _seed_operator_client(comments)
 
     result = op.ask(
         _ask_request(),
         emit=lambda k, p: events.append((k, p)),
-        runner=runner,
         sleep=clock.sleep,
         monotonic=clock.mono,
         now_iso=lambda: "1970-01-01T00:00:00+00:00",
@@ -133,9 +155,9 @@ def test_ask_returns_chosen_option_when_marker_matches() -> None:
     assert answers[0][1]["answer"] == "no"
 
     # The GH comment that was posted carries the question + options.
-    posted = [c for c in cmds if c[1:3] == ["issue", "comment"]]
-    assert len(posted) == 1
-    body = posted[0][posted[0].index("--body") + 1]
+    assert len(client.posted) == 1
+    body = client.posted[0]["body"]
+    assert client.posted[0]["number"] == 42
     assert "Delete the 0042_drop_users migration" in body
     assert "/forge-answer" in body
     assert "`yes`" in body and "`no`" in body
@@ -152,9 +174,9 @@ def test_ask_normalises_option_casing_and_strips_trailing_prose() -> None:
         ]
     ]
     clock = _FakeClock()
+    _seed_operator_client(comments)
     result = op.ask(
         _ask_request(),
-        runner=_make_runner(comments),
         sleep=clock.sleep,
         monotonic=clock.mono,
         now_iso=lambda: "1970-01-01T00:00:00+00:00",
@@ -179,12 +201,12 @@ def test_ask_raises_timeout_when_no_reply() -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     clock = _FakeClock()
     req = _ask_request(timeout_s=2, poll_interval_s=1)
+    _seed_operator_client(comments)
 
     with pytest.raises(op.OperatorTimeout):
         op.ask(
             req,
             emit=lambda k, p: events.append((k, p)),
-            runner=_make_runner(comments),
             sleep=clock.sleep,
             monotonic=clock.mono,
             now_iso=lambda: "2999-01-01T00:00:00+00:00",
@@ -207,10 +229,10 @@ def test_ask_rejects_unknown_option() -> None:
         ]
     ]
     clock = _FakeClock()
+    _seed_operator_client(comments)
     with pytest.raises(op.OperatorTimeout):
         op.ask(
             _ask_request(timeout_s=1, poll_interval_s=1),
-            runner=_make_runner(comments),
             sleep=clock.sleep,
             monotonic=clock.mono,
             now_iso=lambda: "1970-01-01T00:00:00+00:00",
@@ -291,10 +313,10 @@ def test_ask_continues_when_webhook_fails_but_github_succeeds() -> None:
         ]
     ]
     clock = _FakeClock()
+    _seed_operator_client(comments)
     result = op.ask(
         _ask_request(),
         webhook_url="https://broken.example/hook",
-        runner=_make_runner(comments),
         opener=_opener,
         sleep=clock.sleep,
         monotonic=clock.mono,
@@ -450,15 +472,13 @@ def test_end_to_end_via_fixture_gh_issue_simulated_reply() -> None:
             }
         ],
     ]
-    cmds: list[list[str]] = []
-    runner = _make_runner(comments_sequence, capture_cmds=cmds)
+    client = _seed_operator_client(comments_sequence)
     clock = _FakeClock()
     events: list[tuple[str, dict[str, Any]]] = []
 
     result = op.ask(
         _ask_request(timeout_s=60, poll_interval_s=1),
         emit=lambda k, p: events.append((k, p)),
-        runner=runner,
         sleep=clock.sleep,
         monotonic=clock.mono,
         now_iso=lambda: "1970-01-01T00:00:00+00:00",
@@ -467,12 +487,10 @@ def test_end_to_end_via_fixture_gh_issue_simulated_reply() -> None:
     assert result.status == "answered"
     assert result.answer == "yes"
 
-    # Sanity: a question was posted, then the issue was viewed multiple
+    # Sanity: a question was posted, then the issue was polled multiple
     # times before the reply landed.
-    post_calls = [c for c in cmds if c[1:3] == ["issue", "comment"]]
-    view_calls = [c for c in cmds if c[1:3] == ["issue", "view"]]
-    assert len(post_calls) == 1
-    assert len(view_calls) >= 2
+    assert len(client.posted) == 1
+    assert client.view_count >= 2
 
     kinds = [k for (k, _p) in events]
     assert kinds[0] == "operator_question"

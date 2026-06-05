@@ -1,12 +1,15 @@
-"""Typed GitHub client (issue #83).
+"""Typed GitHub client (issue #83, completed in #223).
 
-Replaces the 18 ``subprocess.run(["gh", ...])`` callsites in
-:mod:`forge_loop.gh` with a single :class:`GhClient` backed by
-:mod:`githubkit` — the typed, async-capable, OpenAPI-generated SDK.
+The SINGLE way the codebase talks to GitHub. Every GitHub operation —
+issues, PRs, labels, comments, review threads, auto-merge — goes through
+:class:`GithubkitClient`, backed by :mod:`githubkit` (the typed,
+OpenAPI-generated SDK). The legacy ``gh`` CLI subprocess layer
+(``forge_loop.gh``) is GONE: there is no subprocess shell-out to ``gh``
+anywhere in ``src/``.
 
 Win shape:
 * Per-call latency drops from ~50-100ms subprocess spawn to an HTTP
-  round-trip the SDK can keep-alive across calls.
+  round-trip the SDK keeps alive across calls.
 * Return values are typed (Pydantic models from githubkit), not
   stringly-typed JSON.
 * Pagination + rate-limit handling lives in githubkit, not per-callsite.
@@ -14,23 +17,26 @@ Win shape:
   ``monkeypatch.setattr(subprocess, "run", ...)`` per case.
 * :class:`GhError` raises a typed exception with HTTP status + body.
 
-Auth: ``GH_TOKEN`` env var first, then ``GITHUB_TOKEN``, then the
-authenticated ``gh auth token`` fallback used by operators who log in
-through the GitHub CLI instead of exporting an SDK token.
+REST is used for issues/PRs/labels/comments/state/create/update/close.
+GraphQL (``githubkit.GitHub.graphql``) is used for review threads, the
+PR-list enrichment (mergeStateStatus + labels), and the
+``enablePullRequestAutoMerge`` / ``disablePullRequestAutoMerge``
+mutations — those are GraphQL-only on GitHub.
 
-Migration pattern: this PR ships the framework (Protocol, githubkit-
-backed impl, mock, auth, error type) + tests. Per-method follow-ups
-swap each ``forge_loop.gh.<fn>`` body to call through the client.
-The legacy ``forge_loop.gh`` surface keeps working with zero changes
-until each method migrates.
+Auth: ``GITHUB_TOKEN`` or ``GH_TOKEN`` env var ONLY. There is no
+``gh auth token`` fallback — the ``gh`` CLI is not installed/used. If
+neither env var is set, the client raises a clear :class:`RuntimeError`
+naming both env vars.
 """
 
 from __future__ import annotations
 
+import logging
 import os
-import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Typed return shapes — small, hand-curated dataclasses covering what
@@ -102,8 +108,14 @@ class GhError(RuntimeError):
 
 
 class GhClient(Protocol):
-    """GitHub operations the loop uses. Subset of githubkit's full API."""
+    """GitHub operations the loop uses. Subset of githubkit's full API.
 
+    The full surface the ``gh_issues`` facade depends on; both
+    :class:`GithubkitClient` (real) and :class:`MockGhClient` (tests)
+    implement it.
+    """
+
+    # -- issues --------------------------------------------------------------
     def issues_by_label(self, owner: str, repo: str, label: str, limit: int) -> list[Issue]: ...
 
     def get_issue(self, owner: str, repo: str, number: int) -> Issue | None: ...
@@ -114,12 +126,105 @@ class GhClient(Protocol):
 
     def remove_label(self, owner: str, repo: str, number: int, label: str) -> None: ...
 
-    def get_pull(self, owner: str, repo: str, number: int) -> PullRequest | None: ...
-
     def create_issue(
         self, owner: str, repo: str, title: str, body: str, labels: list[str]
     ) -> Issue: ...
 
+    def issue_comments(self, owner: str, repo: str, number: int) -> list[dict[str, Any]]: ...
+
+    def issue_comment_bodies(self, owner: str, repo: str, number: int) -> list[str]: ...
+
+    def update_issue(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        title: str | None = ...,
+        body: str | None = ...,
+        add_labels: list[str] | None = ...,
+        remove_labels: list[str] | None = ...,
+    ) -> bool: ...
+
+    def get_issue_state(self, owner: str, repo: str, number: int) -> str | None: ...
+
+    def close_issue(
+        self, owner: str, repo: str, number: int, *, reason: str | None = ...
+    ) -> bool: ...
+
+    def create_label(
+        self, owner: str, repo: str, name: str, color: str, description: str
+    ) -> bool: ...
+
+    # -- pull requests -------------------------------------------------------
+    def get_pull(self, owner: str, repo: str, number: int) -> PullRequest | None: ...
+
+    def create_pull(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        title: str,
+        body: str,
+        head: str,
+        base: str,
+        draft: bool = ...,
+    ) -> str: ...
+
+    def add_pr_label(self, owner: str, repo: str, number: int, labels: list[str]) -> bool: ...
+
+    def remove_pr_label(self, owner: str, repo: str, number: int, label: str) -> bool: ...
+
+    def pr_comment(self, owner: str, repo: str, number: int, body: str) -> bool: ...
+
+    def pr_changed_lines(self, owner: str, repo: str, number: int) -> int: ...
+
+    def pr_changed_files(self, owner: str, repo: str, number: int) -> list[str]: ...
+
+    def pr_diff(self, owner: str, repo: str, number: int) -> str: ...
+
+    def pr_precommit_context(self, owner: str, repo: str, number: int) -> tuple[str, str]: ...
+
+    def pr_status_failed(self, owner: str, repo: str, number: int) -> bool: ...
+
+    def list_open_prs(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        label: str | None = ...,
+        head: str | None = ...,
+        limit: int = ...,
+    ) -> list[dict[str, Any]]: ...
+
+    def find_pr_by_head(self, owner: str, repo: str, head: str) -> dict[str, Any] | None: ...
+
+    def latest_critic_report(self, owner: str, repo: str, number: int) -> str: ...
+
+    # -- review threads ------------------------------------------------------
+    def review_threads(self, owner: str, repo: str, number: int) -> list[dict[str, Any]]: ...
+
+    def review_threads_batch(
+        self, owner: str, repo: str, numbers: list[int]
+    ) -> dict[int, list[dict[str, Any]]]: ...
+
+    def post_review_comment(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        body: str,
+        *,
+        file: str | None = ...,
+        line: int | None = ...,
+    ) -> bool: ...
+
+    # -- auto-merge ----------------------------------------------------------
+    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool: ...
+
+    def disable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool: ...
+
+    # -- auth ----------------------------------------------------------------
     def check_auth(self) -> None: ...
 
     @property
@@ -134,8 +239,6 @@ class GhClient(Protocol):
 class TokenSource(Protocol):
     def env_token(self, name: str) -> str | None: ...
 
-    def gh_auth_token(self) -> str | None: ...
-
 
 @dataclass(frozen=True)
 class ResolvedToken:
@@ -146,57 +249,56 @@ class ResolvedToken:
 class GhTokenSource:
     """Real GitHub token source for SDK clients.
 
-    Precedence is intentionally aligned with common GitHub tooling:
-    ``GH_TOKEN`` first, ``GITHUB_TOKEN`` second, then the authenticated
-    ``gh`` CLI token. Token values are never logged.
+    Reads ``GITHUB_TOKEN`` / ``GH_TOKEN`` from the environment ONLY. There
+    is no ``gh auth token`` fallback — the ``gh`` CLI is not part of this
+    codebase. Token values are never logged.
     """
 
     def env_token(self, name: str) -> str | None:
         value = os.environ.get(name)
         return value.strip() if value and value.strip() else None
 
-    def gh_auth_token(self) -> str | None:
-        try:
-            result = subprocess.run(
-                ["gh", "auth", "token"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if result.returncode != 0:
-            return None
-        token = result.stdout.strip()
-        return token or None
+
+#: The two env vars (in precedence order) the client reads a token from.
+#: ``GITHUB_TOKEN`` is the GitHub Actions convention; ``GH_TOKEN`` is the
+#: gh-CLI convention. We accept both so operators' existing ``.env`` works.
+_TOKEN_ENV_VARS = ("GITHUB_TOKEN", "GH_TOKEN")
 
 
 def resolve_token_info(source: TokenSource | None = None) -> ResolvedToken:
+    """Resolve a GitHub token from ``GITHUB_TOKEN`` / ``GH_TOKEN`` env.
+
+    Returns ``ResolvedToken(token=None, source="none")`` when neither var
+    is set, so callers (e.g. :meth:`GithubkitClient.check_auth`) can raise
+    a precise, actionable error instead of failing opaquely mid-request.
+    """
     source = source or GhTokenSource()
-    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+    for name in _TOKEN_ENV_VARS:
         token = source.env_token(name)
         if token:
             return ResolvedToken(token=token, source=name)
-    token = source.gh_auth_token()
-    if token:
-        return ResolvedToken(token=token, source="gh auth token")
     return ResolvedToken(token=None, source="none")
 
 
 def resolve_token(source: TokenSource | None = None) -> str | None:
-    """Resolve a GitHub token from env (canonical for dev tools).
+    """Resolve a GitHub token from env (``GITHUB_TOKEN`` then ``GH_TOKEN``).
 
-    Precedence:
-    1. ``GH_TOKEN`` env (gh CLI convention)
-    2. ``GITHUB_TOKEN`` env (GitHub Actions convention)
-    3. ``gh auth token`` (operator is authenticated through the gh CLI)
-    4. None — caller decides whether unauthenticated mode is acceptable.
-
-    Operators set the token in their ``.env`` next to ``LOOP_GH_REPO``.
-    A future Settings field could surface this if needed.
+    Returns ``None`` when neither is set — the caller decides whether
+    unauthenticated mode is acceptable. Operators set the token in their
+    ``.env`` next to ``LOOP_GH_REPO``.
     """
     return resolve_token_info(source).token
+
+
+def _require_token(source: TokenSource | None = None) -> ResolvedToken:
+    """Resolve a token or raise naming both accepted env vars."""
+    resolved = resolve_token_info(source)
+    if resolved.token is None:
+        raise RuntimeError(
+            "no GitHub token available; set GITHUB_TOKEN or GH_TOKEN "
+            "(the gh CLI is not used by forge-loop)"
+        )
+    return resolved
 
 
 def _label_names(labels: Any) -> list[str]:
@@ -226,8 +328,12 @@ class GithubkitClient:
     ) -> None:
         from githubkit import GitHub
 
+        # Env-only auth (#223): require a real token at construction so a
+        # misconfigured deployment fails fast with a clear message naming
+        # both accepted env vars, instead of issuing unauthenticated calls
+        # that 401 deep inside githubkit.
         resolved = (
-            resolve_token_info(token_source) if token is None else ResolvedToken(token, "explicit")
+            _require_token(token_source) if token is None else ResolvedToken(token, "explicit")
         )
         self._auth_source = resolved.source
         self._gh = GitHub(resolved.token)
@@ -243,13 +349,9 @@ class GithubkitClient:
             raise GhError(method, status, body, auth_source=self.auth_source)
 
     def check_auth(self) -> None:
-        if self.auth_source == "none":
-            raise GhError(
-                "check_auth",
-                401,
-                "no GitHub token available; set GH_TOKEN/GITHUB_TOKEN or run gh auth login",
-                auth_source=self.auth_source,
-            )
+        # A real client cannot be constructed without a token (the ctor
+        # raises via ``_require_token``), so reaching here means we have one;
+        # verify it actually authenticates against the API.
         resp = self._gh.rest.users.get_authenticated()
         self._raise_if_error("check_auth", resp)
 
@@ -367,6 +469,666 @@ class GithubkitClient:
             changed_files=getattr(item, "changed_files", 0) or 0,
         )
 
+    # -- issue mutations -----------------------------------------------------
+
+    def issue_comments(self, owner: str, repo: str, number: int) -> list[dict[str, Any]]:
+        """Return an issue's comments as ``[{body, createdAt}, ...]`` (oldest first).
+
+        [] on any failure. The operator reply-poller needs ``createdAt`` to
+        ignore stale replies, so this preserves the timestamp where
+        :meth:`issue_comment_bodies` returns only bodies.
+        """
+        try:
+            resp = self._gh.rest.issues.list_comments(
+                owner=owner, repo=repo, issue_number=number, per_page=100
+            )
+            self._raise_if_error(f"issue_comments({number})", resp)
+        except Exception:  # noqa: BLE001 — best-effort: caller treats [] as "no comments"
+            return []
+        out: list[dict[str, Any]] = []
+        for c in cast(list[Any], resp.parsed_data or []):
+            created = getattr(c, "created_at", None)
+            iso = getattr(created, "isoformat", None)
+            out.append(
+                {
+                    "body": str(getattr(c, "body", "") or ""),
+                    "createdAt": iso() if callable(iso) else "",
+                }
+            )
+        return out
+
+    def issue_comment_bodies(self, owner: str, repo: str, number: int) -> list[str]:
+        """Return an issue's comment bodies (oldest first). [] on failure."""
+        return [c["body"] for c in self.issue_comments(owner, repo, number)]
+
+    def update_issue(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        add_labels: list[str] | None = None,
+        remove_labels: list[str] | None = None,
+    ) -> bool:
+        """Patch an issue's title/body and add/remove labels. True on success.
+
+        Mirrors the legacy ``gh issue edit`` semantics: a no-op call (no
+        fields, no labels) returns True without a round-trip; label adds and
+        removes are independent calls so a partial failure is still reported.
+        """
+        ok = True
+        data: dict[str, Any] = {}
+        if title is not None:
+            data["title"] = title
+        if body is not None:
+            data["body"] = body
+        if data:
+            try:
+                resp = self._gh.rest.issues.update(
+                    owner=owner, repo=repo, issue_number=number, **data
+                )
+                self._raise_if_error(f"update_issue({number})", resp)
+            except Exception:  # noqa: BLE001 — return False, never raise (legacy contract)
+                ok = False
+        for lab in add_labels or []:
+            try:
+                self.add_labels(owner, repo, number, [lab])
+            except Exception:  # noqa: BLE001
+                ok = False
+        for lab in remove_labels or []:
+            try:
+                self.remove_label(owner, repo, number, lab)
+            except Exception:  # noqa: BLE001
+                ok = False
+        return ok
+
+    def get_issue_state(self, owner: str, repo: str, number: int) -> str | None:
+        """Return ``"OPEN"`` / ``"CLOSED"`` or ``None`` on any failure.
+
+        Callers (the pre-merge gate, issue #65) treat ``None`` conservatively
+        — same as CLOSED — so a transient API outage never silently lands work
+        on a ticket the operator may have closed.
+        """
+        try:
+            resp = self._gh.rest.issues.get(owner=owner, repo=repo, issue_number=number)
+            self._raise_if_error(f"get_issue_state({number})", resp)
+        except Exception:  # noqa: BLE001
+            return None
+        state = getattr(resp.parsed_data, "state", None)
+        return state.upper() if isinstance(state, str) else None
+
+    def close_issue(self, owner: str, repo: str, number: int, *, reason: str | None = None) -> bool:
+        """Close an issue. ``reason`` is ``completed`` / ``not planned``.
+
+        Returns True on success. The gh-CLI accepted ``"not planned"`` (with a
+        space); the REST API expects ``not_planned`` — we normalise so callers
+        keep passing the CLI spelling.
+        """
+        data: dict[str, Any] = {"state": "closed"}
+        if reason:
+            normalised = reason.strip().lower().replace(" ", "_")
+            if normalised in {"completed", "not_planned", "reopened"}:
+                data["state_reason"] = normalised
+        try:
+            resp = self._gh.rest.issues.update(owner=owner, repo=repo, issue_number=number, **data)
+            self._raise_if_error(f"close_issue({number})", resp)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def create_label(self, owner: str, repo: str, name: str, color: str, description: str) -> bool:
+        """Create a repo label (idempotent at the caller). True iff created.
+
+        A 422 (label already exists) returns False — the legacy
+        ``ensure_labels_via_gh`` only counted *newly created* labels.
+        """
+        try:
+            resp = self._gh.rest.issues.create_label(
+                owner=owner, repo=repo, name=name, color=color, description=description
+            )
+            self._raise_if_error(f"create_label({name})", resp)
+        except Exception:  # noqa: BLE001 — already-exists / transient: not created
+            return False
+        return True
+
+    def create_pull(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        title: str,
+        body: str,
+        head: str,
+        base: str,
+        draft: bool = False,
+    ) -> str:
+        """Create a PR and return its HTML URL. Raises :class:`GhError` on fail."""
+        resp = self._gh.rest.pulls.create(
+            owner=owner,
+            repo=repo,
+            title=title,
+            body=body,
+            head=head,
+            base=base,
+            draft=draft,
+        )
+        self._raise_if_error(f"create_pull({head}->{base})", resp)
+        url = getattr(resp.parsed_data, "html_url", "")
+        return url if isinstance(url, str) else ""
+
+    # -- PR labels + reads ---------------------------------------------------
+
+    def add_pr_label(self, owner: str, repo: str, number: int, labels: list[str]) -> bool:
+        """Add labels to a PR (PRs are issues for the labels API). True on ok."""
+        if not labels:
+            return True
+        try:
+            self.add_labels(owner, repo, number, labels)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def remove_pr_label(self, owner: str, repo: str, number: int, label: str) -> bool:
+        """Remove a label from a PR. Best-effort: False on failure."""
+        try:
+            self.remove_label(owner, repo, number, label)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def pr_comment(self, owner: str, repo: str, number: int, body: str) -> bool:
+        """Post a top-level PR comment (PRs are issues for the comments API)."""
+        try:
+            self.add_comment(owner, repo, number, body)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def pr_changed_lines(self, owner: str, repo: str, number: int) -> int:
+        """additions + deletions for a PR. 0 on failure (caller falls back)."""
+        pr = self.get_pull(owner, repo, number)
+        if pr is None:
+            return 0
+        return int(pr.additions) + int(pr.deletions)
+
+    def pr_changed_files(self, owner: str, repo: str, number: int) -> list[str]:
+        """List the file paths a PR touches. [] on failure."""
+        try:
+            resp = self._gh.rest.pulls.list_files(
+                owner=owner, repo=repo, pull_number=number, per_page=100
+            )
+            self._raise_if_error(f"pr_changed_files({number})", resp)
+        except Exception:  # noqa: BLE001
+            return []
+        out: list[str] = []
+        for entry in cast(list[Any], resp.parsed_data or []):
+            path = getattr(entry, "filename", None)
+            if isinstance(path, str) and path:
+                out.append(path)
+        return out
+
+    def pr_diff(self, owner: str, repo: str, number: int) -> str:
+        """Return a PR's unified diff. "" on failure (graceful degrade)."""
+        try:
+            resp = self._gh.rest.pulls.get(
+                owner=owner,
+                repo=repo,
+                pull_number=number,
+                headers={"Accept": "application/vnd.github.v3.diff"},
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+        status = getattr(resp, "status_code", 200)
+        if status and status >= 400:
+            return ""
+        text = getattr(resp, "text", "")
+        return text if isinstance(text, str) else ""
+
+    def pr_precommit_context(self, owner: str, repo: str, number: int) -> tuple[str, str]:
+        """Return (PR body, concatenated commit messages). ("","") on failure."""
+        body = ""
+        try:
+            pull = self._gh.rest.pulls.get(owner=owner, repo=repo, pull_number=number)
+            self._raise_if_error(f"pr_precommit_context({number})", pull)
+            raw_body = getattr(pull.parsed_data, "body", None)
+            body = raw_body if isinstance(raw_body, str) else ""
+            commits_resp = self._gh.rest.pulls.list_commits(
+                owner=owner, repo=repo, pull_number=number, per_page=100
+            )
+            self._raise_if_error(f"pr_precommit_context.commits({number})", commits_resp)
+        except Exception:  # noqa: BLE001
+            return "", ""
+        chunks: list[str] = []
+        for c in cast(list[Any], commits_resp.parsed_data or []):
+            message = getattr(getattr(c, "commit", None), "message", None)
+            if isinstance(message, str) and message.strip():
+                chunks.append(message)
+        return body, "\n".join(chunks)
+
+    def pr_status_failed(self, owner: str, repo: str, number: int) -> bool:
+        """True iff any required check on the PR's head is in a failing state.
+
+        Mirrors the legacy ``statusCheckRollup`` walk: combined status + check
+        runs on the PR head SHA. Read-only; False on any failure so a probe
+        error never falsely reports CI failure.
+        """
+        try:
+            pull = self._gh.rest.pulls.get(owner=owner, repo=repo, pull_number=number)
+            self._raise_if_error(f"pr_status_failed({number})", pull)
+            sha = getattr(getattr(pull.parsed_data, "head", None), "sha", None)
+            if not isinstance(sha, str) or not sha:
+                return False
+            combined = self._gh.rest.repos.get_combined_status_for_ref(
+                owner=owner, repo=repo, ref=sha
+            )
+            self._raise_if_error(f"pr_status_failed.status({number})", combined)
+            for st in getattr(combined.parsed_data, "statuses", None) or []:
+                if str(getattr(st, "state", "")).upper() in {"FAILURE", "ERROR"}:
+                    return True
+            runs = self._gh.rest.checks.list_for_ref(owner=owner, repo=repo, ref=sha, per_page=100)
+            self._raise_if_error(f"pr_status_failed.checks({number})", runs)
+            for run in getattr(runs.parsed_data, "check_runs", None) or []:
+                if str(getattr(run, "conclusion", "")).upper() in {
+                    "FAILURE",
+                    "TIMED_OUT",
+                    "CANCELLED",
+                    "ACTION_REQUIRED",
+                }:
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    # -- PR listing (rich, GraphQL) -----------------------------------------
+
+    def list_open_prs(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        label: str | None = None,
+        head: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return open PRs as legacy-shaped dicts via one GraphQL round-trip.
+
+        Each dict carries the exact keys the runner reads:
+        ``number, title, body, headRefName, baseRefName, url, labels (list of
+        {name}), updatedAt, mergeStateStatus, state, isDraft, mergeable``.
+        REST's ``pulls.list`` omits ``mergeStateStatus`` + labels, so the
+        legacy code used ``gh pr list --json ...`` (GraphQL under the hood);
+        we issue the GraphQL directly. ``label`` / ``head`` filter
+        client-side (GraphQL search by label is awkward and the result set is
+        small). [] on failure.
+        """
+        query = (
+            "query($owner: String!, $name: String!, $limit: Int!) {\n"
+            "  repository(owner: $owner, name: $name) {\n"
+            "    pullRequests(states: OPEN, first: $limit, "
+            "orderBy: {field: UPDATED_AT, direction: ASC}) {\n"
+            "      nodes {\n"
+            "        number title body url isDraft updatedAt\n"
+            "        headRefName baseRefName state mergeable mergeStateStatus\n"
+            "        labels(first: 50) { nodes { name } }\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        try:
+            data = self._gh.graphql(
+                query, {"owner": owner, "name": repo, "limit": max(min(limit, 100), 1)}
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_open_prs GraphQL failed for %s/%s: %s", owner, repo, exc)
+            return []
+        nodes = (((data or {}).get("repository") or {}).get("pullRequests") or {}).get(
+            "nodes"
+        ) or []
+        out: list[dict[str, Any]] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            labels = [
+                {"name": lab.get("name") or ""}
+                for lab in ((node.get("labels") or {}).get("nodes") or [])
+                if isinstance(lab, dict)
+            ]
+            if label and label not in {lab["name"] for lab in labels}:
+                continue
+            if head is not None and node.get("headRefName") != head:
+                continue
+            out.append(
+                {
+                    "number": node.get("number"),
+                    "title": node.get("title") or "",
+                    "body": node.get("body") or "",
+                    "headRefName": node.get("headRefName") or "",
+                    "baseRefName": node.get("baseRefName") or "",
+                    "url": node.get("url") or "",
+                    "labels": labels,
+                    "updatedAt": node.get("updatedAt") or "",
+                    "mergeStateStatus": node.get("mergeStateStatus") or "",
+                    "state": node.get("state") or "",
+                    "isDraft": bool(node.get("isDraft")),
+                    "mergeable": node.get("mergeable") or "",
+                }
+            )
+        return out
+
+    def find_pr_by_head(self, owner: str, repo: str, head: str) -> dict[str, Any] | None:
+        """Return the most recent PR (any state) for head branch ``head``.
+
+        Used by the iteration probe (#78): it must see MERGED / CLOSED PRs too,
+        not just open ones. Returns a dict with the keys the probe reads
+        (``url, number, state, mergeable, mergeStateStatus, isDraft``) or None.
+        GraphQL so we get ``mergeStateStatus`` + ``mergeable`` in one call.
+        """
+        query = (
+            "query($owner: String!, $name: String!, $head: String!) {\n"
+            "  repository(owner: $owner, name: $name) {\n"
+            "    pullRequests(headRefName: $head, first: 1, "
+            "orderBy: {field: UPDATED_AT, direction: DESC}) {\n"
+            "      nodes { number url state isDraft mergeable mergeStateStatus }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        try:
+            data = self._gh.graphql(query, {"owner": owner, "name": repo, "head": head})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("find_pr_by_head GraphQL failed for %s: %s", head, exc)
+            return None
+        nodes = (((data or {}).get("repository") or {}).get("pullRequests") or {}).get(
+            "nodes"
+        ) or []
+        if not nodes or not isinstance(nodes[0], dict):
+            return None
+        node = nodes[0]
+        return {
+            "url": node.get("url") or "",
+            "number": node.get("number"),
+            "state": str(node.get("state") or "").upper(),
+            "mergeable": str(node.get("mergeable") or "").upper(),
+            "mergeStateStatus": str(node.get("mergeStateStatus") or "").upper(),
+            "isDraft": bool(node.get("isDraft")),
+        }
+
+    def latest_critic_report(self, owner: str, repo: str, number: int) -> str:
+        """Return the most recent critic-report comment body on a PR, or "".
+
+        The critic posts findings as a PR comment carrying ``critic-report`` /
+        ``sev1`` / ``sev2``; we scan the last 10 comments newest-first.
+        """
+        comments = self.issue_comments(owner, repo, number)
+        for c in reversed(comments[-10:]):
+            body = str(c.get("body") or "")
+            low = body.lower()
+            if "critic-report" in low or "sev1" in low or "sev2" in low:
+                return body[:4000]
+        return ""
+
+    # -- review threads (GraphQL) -------------------------------------------
+
+    def review_threads(self, owner: str, repo: str, number: int) -> list[dict[str, Any]]:
+        """Fetch a PR's review threads (GraphQL). [] on failure.
+
+        REST + ``gh pr view --comments`` omit inline review threads; those are
+        exactly what a repair worker must address, so they are fetched here.
+        """
+        query = (
+            "query($owner: String!, $name: String!, $number: Int!) {\n"
+            "  repository(owner: $owner, name: $name) {\n"
+            "    pullRequest(number: $number) {\n"
+            f"{_REVIEW_THREADS_SELECTION}"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        try:
+            data = self._gh.graphql(query, {"owner": owner, "name": repo, "number": int(number)})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("review_threads GraphQL failed for PR #%s: %s", number, exc)
+            return []
+        nodes = (
+            (((data or {}).get("repository") or {}).get("pullRequest") or {}).get("reviewThreads")
+            or {}
+        ).get("nodes") or []
+        return _parse_thread_nodes(nodes)
+
+    def review_threads_batch(
+        self, owner: str, repo: str, numbers: list[int]
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Fetch review threads for many PRs, batching GraphQL round-trips.
+
+        Replaces the per-PR fan-out (#226): an idle repo with N open PRs cost
+        N GraphQL calls per tick. PRs are batched into aliased queries of at
+        most ``_REVIEW_THREADS_BATCH_CHUNK`` so nested selections stay under
+        GitHub's complexity limit. A chunk failure falls back to per-PR fetches
+        so one failed batch never silently degrades *every* PR to "no threads".
+        Returns ``{pr_number: [threads]}``; empty input issues no call.
+        """
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for raw in numbers:
+            n = int(raw)
+            if n not in seen:
+                seen.add(n)
+                ordered.append(n)
+        if not ordered:
+            return {}
+        out: dict[int, list[dict[str, Any]]] = {}
+        for start in range(0, len(ordered), _REVIEW_THREADS_BATCH_CHUNK):
+            chunk = ordered[start : start + _REVIEW_THREADS_BATCH_CHUNK]
+            batched = self._review_threads_chunk(owner, repo, chunk)
+            if batched is None:
+                logger.warning(
+                    "review_threads_batch: batched query failed for PRs %s; "
+                    "falling back to per-PR fetch",
+                    chunk,
+                )
+                for n in chunk:
+                    out[n] = self.review_threads(owner, repo, n)
+            else:
+                out.update(batched)
+        return out
+
+    def _review_threads_chunk(
+        self, owner: str, repo: str, numbers: list[int]
+    ) -> dict[int, list[dict[str, Any]]] | None:
+        """One chunk of PRs in a single aliased query. None on chunk failure."""
+        if not numbers:
+            return {}
+        aliases = "\n".join(
+            f"    pr{idx}: pullRequest(number: {num}) {{\n{_REVIEW_THREADS_SELECTION}    }}"
+            for idx, num in enumerate(numbers)
+        )
+        query = (
+            "query($owner: String!, $name: String!) {\n"
+            "  repository(owner: $owner, name: $name) {\n"
+            f"{aliases}\n"
+            "  }\n"
+            "}\n"
+        )
+        try:
+            data = self._gh.graphql(query, {"owner": owner, "name": repo})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("review_threads_batch chunk failed: %s", exc)
+            return None
+        repo_data = (data or {}).get("repository")
+        if not isinstance(repo_data, dict):
+            return None
+        out: dict[int, list[dict[str, Any]]] = {}
+        for idx, num in enumerate(numbers):
+            pr_obj = repo_data.get(f"pr{idx}") or {}
+            nodes = (pr_obj.get("reviewThreads") or {}).get("nodes", [])
+            out[num] = _parse_thread_nodes(nodes)
+        return out
+
+    # -- review comments / findings -----------------------------------------
+
+    def post_review_comment(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        body: str,
+        *,
+        file: str | None = None,
+        line: int | None = None,
+    ) -> bool:
+        r"""Post a critic finding so it ALWAYS lands (the #234 contract).
+
+        With ``file``+``line``, an INLINE review comment is attempted first.
+        GitHub 422-rejects an inline comment whose line is not part of the PR's
+        diff — routine, since findings often cite lines outside changed hunks.
+        On ANY such failure we FALL BACK to a plain (non-inline) review comment
+        with the location prepended (``\`{file}:{line}\` — {body}``).
+
+        This fallback is load-bearing: the repair worker rebuilds its brief
+        from the posted review context, so a silently-dropped finding blinds
+        the repair loop and it never converges. Inline is a nicety; landing the
+        finding is the contract. Returns True if posted by either path.
+        """
+        text = body
+        if file is not None and line is not None:
+            try:
+                resp = self._gh.rest.pulls.create_review(
+                    owner=owner,
+                    repo=repo,
+                    pull_number=number,
+                    body=body,
+                    event="COMMENT",
+                    comments=[{"path": file, "line": int(line), "body": body}],
+                )
+                self._raise_if_error(f"post_review_comment.inline({number})", resp)
+                return True
+            except Exception:  # noqa: BLE001 — inline rejected (422 line-not-in-diff): fall back
+                text = f"`{file}:{line}` — {body}"
+        try:
+            resp = self._gh.rest.pulls.create_review(
+                owner=owner, repo=repo, pull_number=number, body=text, event="COMMENT"
+            )
+            self._raise_if_error(f"post_review_comment.plain({number})", resp)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    # -- auto-merge (GraphQL mutations) -------------------------------------
+
+    def _pull_request_node_id(self, owner: str, repo: str, number: int) -> str | None:
+        try:
+            resp = self._gh.rest.pulls.get(owner=owner, repo=repo, pull_number=number)
+            self._raise_if_error(f"pull_node_id({number})", resp)
+        except Exception:  # noqa: BLE001
+            return None
+        node_id = getattr(resp.parsed_data, "node_id", None)
+        return node_id if isinstance(node_id, str) and node_id else None
+
+    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
+        """Enable SQUASH auto-merge for a PR (GraphQL). Best-effort: False on fail."""
+        node_id = self._pull_request_node_id(owner, repo, number)
+        if node_id is None:
+            return False
+        mutation = (
+            "mutation($id: ID!) {\n"
+            "  enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH}) {\n"
+            "    pullRequest { id }\n"
+            "  }\n"
+            "}\n"
+        )
+        try:
+            self._gh.graphql(mutation, {"id": node_id})
+        except Exception:  # noqa: BLE001 — e.g. auto-merge not allowed on the repo
+            return False
+        return True
+
+    def disable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
+        """Disable auto-merge on a PR (GraphQL). Best-effort: False on failure.
+
+        Failure is fine (e.g. auto-merge was never enabled).
+        """
+        node_id = self._pull_request_node_id(owner, repo, number)
+        if node_id is None:
+            return False
+        mutation = (
+            "mutation($id: ID!) {\n"
+            "  disablePullRequestAutoMerge(input: {pullRequestId: $id}) {\n"
+            "    pullRequest { id }\n"
+            "  }\n"
+            "}\n"
+        )
+        try:
+            self._gh.graphql(mutation, {"id": node_id})
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Shared GraphQL selection for a PR's review threads. Used by both the
+# single-PR and the batched fetchers so the two cannot drift in fields.
+# ---------------------------------------------------------------------------
+
+_REVIEW_THREADS_SELECTION = """
+          reviewThreads(first: 100) {
+            nodes {
+              id
+              isResolved
+              isOutdated
+              path
+              line
+              comments(first: 20) {
+                nodes {
+                  author { login }
+                  body
+                  url
+                  path
+                  line
+                  createdAt
+                }
+              }
+            }
+          }
+"""
+
+#: Max PR aliases per batched GraphQL query — bounds per-query complexity so a
+#: single query over many PRs can't blow GitHub's GraphQL node budget (#226).
+_REVIEW_THREADS_BATCH_CHUNK = 10
+
+
+def _parse_thread_nodes(nodes: Any) -> list[dict[str, Any]]:
+    if not isinstance(nodes, list):
+        return []
+    return [_normalise_review_thread(t) for t in nodes if isinstance(t, dict)]
+
+
+def _normalise_review_thread(thread: dict[str, Any]) -> dict[str, Any]:
+    comments = []
+    for comment in (thread.get("comments") or {}).get("nodes") or []:
+        if not isinstance(comment, dict):
+            continue
+        comments.append(
+            {
+                "author": comment.get("author") or {},
+                "body": comment.get("body") or "",
+                "url": comment.get("url") or "",
+                "path": comment.get("path") or thread.get("path") or "",
+                "line": comment.get("line") or thread.get("line") or "",
+                "createdAt": comment.get("createdAt") or "",
+            }
+        )
+    return {
+        "id": thread.get("id") or "",
+        "isResolved": bool(thread.get("isResolved")),
+        "isOutdated": bool(thread.get("isOutdated")),
+        "path": thread.get("path") or "",
+        "line": thread.get("line") or "",
+        "comments": comments,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Mock — call recording, canned responses, per-method overrides.
@@ -392,6 +1154,29 @@ class MockGhClient:
     next_issue_number: int | None = None
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     auth_source: str = "mock"
+
+    # -- canned data for the extended (PR / review / comment) surface --------
+    #: ``{number: [{body, createdAt}, ...]}`` returned by ``issue_comments``.
+    issue_comments_by_number: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    #: Result of ``list_open_prs`` (legacy-shaped PR dicts).
+    open_prs_response: list[dict[str, Any]] = field(default_factory=list)
+    #: ``{number: [thread, ...]}`` for ``review_threads`` / ``review_threads_batch``.
+    review_threads_by_pr: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    #: ``{head_ref: pr_dict}`` for ``find_pr_by_head``.
+    pr_by_head: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: ``{number: report}`` for ``latest_critic_report``.
+    critic_report_by_pr: dict[int, str] = field(default_factory=dict)
+    #: ``{number: bool}`` for ``pr_status_failed``.
+    pr_status_failed_by_pr: dict[int, bool] = field(default_factory=dict)
+    #: ``{number: [path, ...]}`` for ``pr_changed_files``.
+    pr_files_by_pr: dict[int, list[str]] = field(default_factory=dict)
+    #: ``{number: (body, commit_text)}`` for ``pr_precommit_context``.
+    precommit_by_pr: dict[int, tuple[str, str]] = field(default_factory=dict)
+    #: ``{number: diff}`` for ``pr_diff``.
+    diff_by_pr: dict[int, str] = field(default_factory=dict)
+    #: Recorded post_review_comment outcomes; controls inline 422 simulation.
+    inline_review_fails: bool = False
+    create_pull_url: str = "https://github.com/o/r/pull/999"
 
     def _record(self, method: str, **kwargs: Any) -> None:
         self.calls.append((method, kwargs))
@@ -443,6 +1228,183 @@ class MockGhClient:
 
     def check_auth(self) -> None:
         self._record("check_auth")
+
+    # -- extended surface (PR / review / comment) ---------------------------
+
+    def issue_comments(self, owner: str, repo: str, number: int) -> list[dict[str, Any]]:
+        self._record("issue_comments", owner=owner, repo=repo, number=number)
+        return list(self.issue_comments_by_number.get(number, []))
+
+    def issue_comment_bodies(self, owner: str, repo: str, number: int) -> list[str]:
+        self._record("issue_comment_bodies", owner=owner, repo=repo, number=number)
+        return [str(c.get("body") or "") for c in self.issue_comments_by_number.get(number, [])]
+
+    def update_issue(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        add_labels: list[str] | None = None,
+        remove_labels: list[str] | None = None,
+    ) -> bool:
+        self._record(
+            "update_issue",
+            owner=owner,
+            repo=repo,
+            number=number,
+            title=title,
+            body=body,
+            add_labels=add_labels,
+            remove_labels=remove_labels,
+        )
+        return True
+
+    def get_issue_state(self, owner: str, repo: str, number: int) -> str | None:
+        self._record("get_issue_state", owner=owner, repo=repo, number=number)
+        issue = self.issues.get((owner, repo, number))
+        return issue.state.upper() if issue else None
+
+    def close_issue(self, owner: str, repo: str, number: int, *, reason: str | None = None) -> bool:
+        self._record("close_issue", owner=owner, repo=repo, number=number, reason=reason)
+        return True
+
+    def create_label(self, owner: str, repo: str, name: str, color: str, description: str) -> bool:
+        self._record(
+            "create_label", owner=owner, repo=repo, name=name, color=color, description=description
+        )
+        return True
+
+    def create_pull(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        title: str,
+        body: str,
+        head: str,
+        base: str,
+        draft: bool = False,
+    ) -> str:
+        self._record(
+            "create_pull",
+            owner=owner,
+            repo=repo,
+            title=title,
+            body=body,
+            head=head,
+            base=base,
+            draft=draft,
+        )
+        return self.create_pull_url
+
+    def add_pr_label(self, owner: str, repo: str, number: int, labels: list[str]) -> bool:
+        self._record("add_pr_label", owner=owner, repo=repo, number=number, labels=list(labels))
+        return True
+
+    def remove_pr_label(self, owner: str, repo: str, number: int, label: str) -> bool:
+        self._record("remove_pr_label", owner=owner, repo=repo, number=number, label=label)
+        return True
+
+    def pr_comment(self, owner: str, repo: str, number: int, body: str) -> bool:
+        self._record("pr_comment", owner=owner, repo=repo, number=number, body=body)
+        return True
+
+    def pr_changed_lines(self, owner: str, repo: str, number: int) -> int:
+        self._record("pr_changed_lines", owner=owner, repo=repo, number=number)
+        pr = self.pulls.get((owner, repo, number))
+        return (pr.additions + pr.deletions) if pr else 0
+
+    def pr_changed_files(self, owner: str, repo: str, number: int) -> list[str]:
+        self._record("pr_changed_files", owner=owner, repo=repo, number=number)
+        return list(self.pr_files_by_pr.get(number, []))
+
+    def pr_diff(self, owner: str, repo: str, number: int) -> str:
+        self._record("pr_diff", owner=owner, repo=repo, number=number)
+        return self.diff_by_pr.get(number, "")
+
+    def pr_precommit_context(self, owner: str, repo: str, number: int) -> tuple[str, str]:
+        self._record("pr_precommit_context", owner=owner, repo=repo, number=number)
+        return self.precommit_by_pr.get(number, ("", ""))
+
+    def pr_status_failed(self, owner: str, repo: str, number: int) -> bool:
+        self._record("pr_status_failed", owner=owner, repo=repo, number=number)
+        return self.pr_status_failed_by_pr.get(number, False)
+
+    def list_open_prs(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        label: str | None = None,
+        head: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        self._record("list_open_prs", owner=owner, repo=repo, label=label, head=head, limit=limit)
+        out = self.open_prs_response
+        if label:
+            out = [p for p in out if label in {lab.get("name") for lab in p.get("labels") or []}]
+        if head is not None:
+            out = [p for p in out if p.get("headRefName") == head]
+        return [dict(p) for p in out[:limit]]
+
+    def find_pr_by_head(self, owner: str, repo: str, head: str) -> dict[str, Any] | None:
+        self._record("find_pr_by_head", owner=owner, repo=repo, head=head)
+        found = self.pr_by_head.get(head)
+        return dict(found) if found else None
+
+    def latest_critic_report(self, owner: str, repo: str, number: int) -> str:
+        self._record("latest_critic_report", owner=owner, repo=repo, number=number)
+        return self.critic_report_by_pr.get(number, "")
+
+    def review_threads(self, owner: str, repo: str, number: int) -> list[dict[str, Any]]:
+        self._record("review_threads", owner=owner, repo=repo, number=number)
+        return list(self.review_threads_by_pr.get(number, []))
+
+    def review_threads_batch(
+        self, owner: str, repo: str, numbers: list[int]
+    ) -> dict[int, list[dict[str, Any]]]:
+        self._record("review_threads_batch", owner=owner, repo=repo, numbers=list(numbers))
+        return {n: list(self.review_threads_by_pr.get(n, [])) for n in numbers}
+
+    def post_review_comment(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        body: str,
+        *,
+        file: str | None = None,
+        line: int | None = None,
+    ) -> bool:
+        # Mirror the real fallback: inline attempt → on failure, plain comment
+        # with the location prepended. Records BOTH attempts so tests can assert
+        # the #234 fallback fired.
+        if file is not None and line is not None:
+            self._record(
+                "post_review_comment_inline",
+                owner=owner,
+                repo=repo,
+                number=number,
+                body=body,
+                file=file,
+                line=line,
+            )
+            if not self.inline_review_fails:
+                return True
+            body = f"`{file}:{line}` — {body}"
+        self._record("post_review_comment_plain", owner=owner, repo=repo, number=number, body=body)
+        return True
+
+    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
+        self._record("enable_pr_auto_merge", owner=owner, repo=repo, number=number)
+        return True
+
+    def disable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
+        self._record("disable_pr_auto_merge", owner=owner, repo=repo, number=number)
+        return True
 
     def _next_number(self) -> int:
         existing = [n for (_, _, n) in self.issues]

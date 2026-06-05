@@ -220,7 +220,7 @@ def _manifesto_suggester_factory(
     timeout_s: int = 300,
 ) -> Any:
     """Construct the default ManifestoSuggester (#134). Tests monkeypatch this."""
-    from forge_loop import gh as gh_module
+    from forge_loop import gh_issues as gh_module
     from forge_loop.manifesto_suggest import ManifestoSuggester
 
     return ManifestoSuggester(

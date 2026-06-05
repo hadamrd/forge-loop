@@ -29,7 +29,7 @@ def _default_manifesto_suggester_factory(
     timeout_s: int = 300,
 ) -> Any:
     """Construct the default ManifestoSuggester (issue #134). Tests stub this."""
-    from forge_loop import gh as gh_module
+    from forge_loop import gh_issues as gh_module
     from forge_loop.manifesto_suggest import ManifestoSuggester
 
     return ManifestoSuggester(

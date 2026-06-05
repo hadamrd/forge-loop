@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 from forge_loop import attempts as _attempts
-from forge_loop import gh as _gh
+from forge_loop import gh_issues as _gh
 from forge_loop import runner as _runner
 from forge_loop import worker as _worker
 from forge_loop.config import (

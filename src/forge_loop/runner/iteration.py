@@ -14,15 +14,16 @@ This module gives the runner a state machine:
   3. After N attempts without merge → label the GH issue ``loop:needs-human``,
      emit ``worker_iterations_exhausted``, comment with diagnostic.
 
-The probe is read-only (subprocess calls to ``git`` / ``gh``).
-The brief router returns ``None`` for terminal states (merged, or healthy PR
-where ``gh pr merge --auto`` is the action — no LLM needed).
+The probe is read-only: ``git`` state via the injectable ``run`` shim, GitHub
+state (PRs, CI, critic comments, auto-merge, labels) via the SDK client
+(:mod:`forge_loop.gh_issues`). The brief router returns ``None`` for terminal
+states (merged, or healthy PR where enabling auto-merge is the action — no LLM
+needed).
 """
 
 from __future__ import annotations
 
 import contextlib
-import json
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -136,31 +137,12 @@ def probe_worker_state(
         return WorkerState.CLEAN_NOTHING, ctx
 
     # 2. PR exists for this branch?
+    from forge_loop import gh_issues as _gh
+
     pr_view: dict[str, Any] | None = None
     try:
-        r = run(
-            [
-                "gh",
-                "pr",
-                "list",
-                "--repo",
-                repo,
-                "--head",
-                branch,
-                "--state",
-                "all",
-                "--json",
-                "url,number,state,mergeable,mergeStateStatus,isDraft",
-                "--limit",
-                "1",
-            ],
-            worktree,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            arr = json.loads(r.stdout)
-            if arr:
-                pr_view = arr[0]
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        pr_view = _gh.find_pr_by_head(branch, repo=repo)
+    except Exception:  # noqa: BLE001 — read-only probe: API down → no PR seen
         pr_view = None
 
     if pr_view:
@@ -232,11 +214,11 @@ def probe_worker_state(
         mergeable = (pr_view.get("mergeable") or "").upper()
         if mss == "DIRTY" or mergeable == "CONFLICTING":
             return WorkerState.PR_OPEN_CONFLICT, ctx
-        # CI / checks state via pr view.
-        ci_failed = _ci_failed(run, worktree, pr_view.get("number"))
+        # CI / checks state via the GitHub client.
+        ci_failed = _ci_failed(repo, pr_view.get("number"))
         if ci_failed:
             return WorkerState.PR_OPEN_CI_FAILED, ctx
-        critic_report = _fetch_critic_report(run, worktree, repo, issue_n, pr_view.get("number"))
+        critic_report = _fetch_critic_report(repo, pr_view.get("number"))
         if mss == "BLOCKED" or critic_report:
             ctx.critic_report = critic_report or "(critic report not found; rerun the critic check)"
             return WorkerState.PR_OPEN_BLOCKED, ctx
@@ -265,72 +247,35 @@ def probe_worker_state(
     return WorkerState.CLEAN_NOTHING, ctx
 
 
-def _ci_failed(run: RunFn, worktree: Path, pr_number: int | None) -> bool:
-    """True if any required PR check is in a failing terminal state."""
+def _ci_failed(repo: str, pr_number: int | None) -> bool:
+    """True if any required PR check is in a failing terminal state.
+
+    Read-only via the GitHub client; False on any failure so a probe error
+    never falsely reports CI failure.
+    """
     if pr_number is None:
         return False
+    from forge_loop import gh_issues as _gh
+
     try:
-        r = run(
-            ["gh", "pr", "view", str(pr_number), "--json", "statusCheckRollup"],
-            worktree,
-        )
-        if r.returncode != 0 or not r.stdout.strip():
-            return False
-        data = json.loads(r.stdout)
-        checks = data.get("statusCheckRollup") or []
-        for c in checks:
-            # GitHub returns either "conclusion" (check runs) or "state" (statuses).
-            conclusion = (c.get("conclusion") or "").upper()
-            state = (c.get("state") or "").upper()
-            if conclusion in {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}:
-                return True
-            if state in {"FAILURE", "ERROR"}:
-                return True
-        return False
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return _gh.pr_status_failed(pr_number, repo=repo)
+    except Exception:  # noqa: BLE001
         return False
 
 
-def _fetch_critic_report(
-    run: RunFn,
-    worktree: Path,
-    repo: str,
-    issue_n: int,
-    pr_number: int | None,
-) -> str:
+def _fetch_critic_report(repo: str, pr_number: int | None) -> str:
     """Best-effort fetch of the latest critic comment body on the PR.
 
-    The critic posts findings as a PR comment prefixed with ``critic-report``
-    (see ``critic_actions.py``). We grep the last 5 comments for that marker.
-    Returns ``""`` if no critic report exists.
+    The critic posts findings as a PR comment carrying ``critic-report`` (see
+    ``critic_actions.py``). Returns ``""`` if no critic report exists.
     """
     if pr_number is None:
         return ""
+    from forge_loop import gh_issues as _gh
+
     try:
-        r = run(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr_number),
-                "--repo",
-                repo,
-                "--json",
-                "comments",
-            ],
-            worktree,
-        )
-        if r.returncode != 0 or not r.stdout.strip():
-            return ""
-        data = json.loads(r.stdout)
-        comments = data.get("comments") or []
-        # Walk in reverse — most recent first.
-        for c in reversed(comments[-10:]):
-            body = c.get("body") or ""
-            if "critic-report" in body.lower() or "sev1" in body.lower() or "sev2" in body.lower():
-                return body[:4000]
-        return ""
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return _gh.latest_critic_report(pr_number, repo=repo)
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -411,29 +356,20 @@ def brief_kind_for(state: WorkerState) -> str | None:
 def enable_auto_merge(
     pr_url: str,
     *,
-    worktree: Path,
-    run: RunFn = _default_run,
+    repo: str,
 ) -> bool:
-    """Healthy PR shortcut — turn on ``gh pr merge --auto`` and return success.
+    """Healthy PR shortcut — enable squash auto-merge, return success.
 
     Used when ``probe_worker_state`` returns ``PR_OPEN_HEALTHY``: no LLM is
     needed, we just tell GitHub to merge as soon as required checks pass.
     """
+    if not pr_url:
+        return False
+    from forge_loop import gh_issues as _gh
+
     try:
-        r = run(
-            [
-                "gh",
-                "pr",
-                "merge",
-                pr_url,
-                "--squash",
-                "--auto",
-                "--delete-branch",
-            ],
-            worktree,
-        )
-        return r.returncode == 0
-    except (subprocess.SubprocessError, OSError):
+        return _gh.enable_pr_auto_merge(pr_url, repo=repo)
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -496,12 +432,12 @@ def run_iteration_loop(
             # was thrown away. Label the issue so it doesn't keep popping
             # back to the dispatcher every tick, and post a diagnostic
             # comment pointing at the closed PR for operator review.
-            escalate_to_human(issue_n, repo, state, worktree, ctx.pr_url, run=run)
+            escalate_to_human(issue_n, repo, state, worktree, ctx.pr_url)
             return current
         if is_terminal(state):
             return current
         if state in NON_LLM_STATES:
-            ok = enable_auto_merge(ctx.pr_url or "", worktree=worktree, run=run)
+            ok = enable_auto_merge(ctx.pr_url or "", repo=repo)
             emit("worker_iteration_automerge", {"issue": issue_n, "ok": ok, "pr": ctx.pr_url})
             if ok and ctx.pr_url:
                 # Mutate outcome to reflect we have a merging PR.
@@ -541,7 +477,7 @@ def run_iteration_loop(
             "pr_url": final_ctx.pr_url,
         },
     )
-    escalate_to_human(issue_n, repo, final_state, worktree, final_ctx.pr_url, run=run)
+    escalate_to_human(issue_n, repo, final_state, worktree, final_ctx.pr_url)
     return current
 
 
@@ -551,14 +487,14 @@ def escalate_to_human(
     state: WorkerState,
     worktree: Path,
     pr_url: str | None,
-    *,
-    run: RunFn = _default_run,
 ) -> bool:
     """After N attempts without merge: label issue + post diagnostic comment.
 
     Best-effort. Returns True if at least the label landed; the comment is
     cosmetic. Never raises.
     """
+    from forge_loop import gh_issues as _gh
+
     # Add loop:needs-human AND remove loop:ready in one call so the
     # dispatcher stops re-picking the issue on the next tick. Before
     # this, escalated issues kept reappearing in `top_issues` because
@@ -567,23 +503,13 @@ def escalate_to_human(
     # reliable" — same stuck issue served on every tick).
     label_ok = False
     try:
-        r = run(
-            [
-                "gh",
-                "issue",
-                "edit",
-                str(issue_n),
-                "--repo",
-                repo,
-                "--add-label",
-                "loop:needs-human",
-                "--remove-label",
-                "loop:ready",
-            ],
-            worktree,
+        label_ok = _gh.update_issue(
+            issue_n,
+            add_labels=["loop:needs-human"],
+            remove_labels=["loop:ready"],
+            repo=repo,
         )
-        label_ok = r.returncode == 0
-    except (subprocess.SubprocessError, OSError):
+    except Exception:  # noqa: BLE001
         label_ok = False
 
     diag = (
@@ -596,18 +522,6 @@ def escalate_to_human(
         f"The branch is left in place for human inspection. Run "
         f"`cd {worktree} && git status` to pick up where the loop stopped.\n"
     )
-    with contextlib.suppress(subprocess.SubprocessError, OSError):
-        run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                str(issue_n),
-                "--repo",
-                repo,
-                "--body",
-                diag,
-            ],
-            worktree,
-        )
+    with contextlib.suppress(Exception):
+        _gh.comment(issue_n, diag, repo=repo)
     return label_ok

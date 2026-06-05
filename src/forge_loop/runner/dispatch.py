@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from forge_loop import gh as _gh
+from forge_loop import gh_issues as _gh
 from forge_loop import master_log as _mlog
 from forge_loop.config import Config
 from forge_loop.control.boot import canonical_task_saga_path

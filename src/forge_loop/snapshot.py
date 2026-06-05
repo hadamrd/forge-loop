@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import subprocess
 import time
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
@@ -44,16 +43,18 @@ from forge_loop.config import Config
 # of these clears the issue from the in-flight set. Kept in lockstep with
 # ``cli_tui._compute_inflight`` so the dashboard / CLI / snapshot all
 # agree on what "still running" means.
-_TERMINAL_KINDS: frozenset[str] = frozenset({
-    "worker_done",
-    "worker_failed",
-    "worker_skip_in_flight",
-    "worker_skip_cooldown",
-    "budget_worker_killed",
-    "watchdog_worker_killed",
-    "worker_completed",
-    "worker_merged",
-})
+_TERMINAL_KINDS: frozenset[str] = frozenset(
+    {
+        "worker_done",
+        "worker_failed",
+        "worker_skip_in_flight",
+        "worker_skip_cooldown",
+        "budget_worker_killed",
+        "watchdog_worker_killed",
+        "worker_completed",
+        "worker_merged",
+    }
+)
 
 _HALT_FILENAME = "loop-runner.HALT"
 
@@ -137,10 +138,15 @@ def build_snapshot(
     # but adds dependency latency) and lets ``now`` be injected for
     # deterministic windowing in tests.
     events_in_window, events_extended = _load_events(
-        cfg.events_file, now=now, since_minutes=since_minutes,
+        cfg.events_file,
+        now=now,
+        since_minutes=since_minutes,
     )
     in_flight = _compute_in_flight(
-        events_extended, wt_root=wt_root, now=now, cfg=cfg,
+        events_extended,
+        wt_root=wt_root,
+        now=now,
+        cfg=cfg,
     )
     recent_kinds: dict[str, int] = {}
     for ev in events_in_window:
@@ -340,15 +346,17 @@ def _compute_in_flight(
         branch = _read_worktree_branch(worktree) if worktree.exists() else None
         sdk_size = _sdk_log_size(cfg.logs_dir, issue)
         last_age = _age_seconds(entry.get("last_event_ts"), now=now)
-        in_flight.append({
-            "issue": issue,
-            "branch": branch,
-            "worktree": str(worktree) if worktree.exists() else None,
-            "started_ts": entry.get("started_ts"),
-            "last_event_ts": entry.get("last_event_ts"),
-            "last_event_age_s": last_age,
-            "sdk_log_size": sdk_size,
-        })
+        in_flight.append(
+            {
+                "issue": issue,
+                "branch": branch,
+                "worktree": str(worktree) if worktree.exists() else None,
+                "started_ts": entry.get("started_ts"),
+                "last_event_ts": entry.get("last_event_ts"),
+                "last_event_age_s": last_age,
+                "sdk_log_size": sdk_size,
+            }
+        )
 
     return in_flight
 
@@ -373,7 +381,7 @@ def _read_worktree_branch(worktree: Path) -> str | None:
                 with contextlib.suppress(OSError):
                     content = head2.read_text(encoding="utf-8", errors="replace").strip()
         if content.startswith("ref: refs/heads/"):
-            return content[len("ref: refs/heads/"):]
+            return content[len("ref: refs/heads/") :]
         if content:
             # Detached HEAD — return the short sha.
             return content[:12]
@@ -391,7 +399,7 @@ def _sdk_log_size(logs_dir: Path, issue: int) -> int:
             if not name.startswith("worker-"):
                 continue
             # Strip "worker-" prefix; match issue at the head.
-            rest = name[len("worker-"):]
+            rest = name[len("worker-") :]
             if rest.startswith(f"{issue}-") or rest == f"{issue}.log":
                 with contextlib.suppress(OSError):
                     total += p.stat().st_size
@@ -439,32 +447,21 @@ def _last_drift_event(events: Iterable[dict[str, Any]]) -> dict[str, Any] | None
 
 
 # ---------------------------------------------------------------------------
-# Default gh CLI shell-outs (overridable in tests)
+# Default GitHub reads (overridable in tests) — all via the SDK client.
 # ---------------------------------------------------------------------------
 def _default_queue_depth(repo: str, label: str) -> int:
-    """Count open issues carrying ``label`` via ``gh issue list``.
+    """Count open issues carrying ``label`` via the GitHub client.
 
-    Uses ``--json number`` + ``jq``-free parsing. ``gh`` paginates to
-    1000 by default; we explicitly bump ``--limit 200`` because the
-    snapshot is a hot-path read and the queue is rarely larger.
+    The snapshot is a hot-path read and the queue is rarely large; we read up
+    to 200 issues. Any failure degrades to 0 (caller surfaces "unknown").
     """
     if not repo:
         return 0
-    cmd = [
-        "gh", "issue", "list",
-        "--repo", repo,
-        "--state", "open",
-        "--label", label,
-        "--limit", "200",
-        "--json", "number",
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=15)
-    if r.returncode != 0:
-        return 0
+    from forge_loop import gh_issues as _gh
+
     try:
-        rows = json.loads(r.stdout)
-        return len(rows) if isinstance(rows, list) else 0
-    except json.JSONDecodeError:
+        return len(_gh.top_issues(label, 200, repo=repo))
+    except Exception:  # noqa: BLE001 — best-effort hot-path read
         return 0
 
 
@@ -472,28 +469,20 @@ def _default_open_prs(repo: str) -> list[dict[str, Any]]:
     """List open PRs in ``repo`` as ``[{number, title, branch}, ...]``."""
     if not repo:
         return []
-    cmd = [
-        "gh", "pr", "list",
-        "--repo", repo,
-        "--state", "open",
-        "--limit", "50",
-        "--json", "number,title,headRefName",
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=15)
-    if r.returncode != 0:
-        return []
+    from forge_loop import gh_issues as _gh
+
     try:
-        rows = json.loads(r.stdout)
-    except json.JSONDecodeError:
+        rows = _gh.open_prs(50, repo=repo)
+    except Exception:  # noqa: BLE001 — best-effort hot-path read
         return []
-    out: list[dict[str, Any]] = []
-    for row in rows if isinstance(rows, list) else []:
-        out.append({
-            "number": int(row.get("number", 0)),
-            "title": str(row.get("title", "")),
-            "branch": str(row.get("headRefName", "")),
-        })
-    return out
+    return [
+        {
+            "number": int(row.get("number") or 0),
+            "title": str(row.get("title") or ""),
+            "branch": str(row.get("headRefName") or ""),
+        }
+        for row in rows
+    ]
 
 
 # Kept for callers that prefer ``time.time()`` over ``datetime``.

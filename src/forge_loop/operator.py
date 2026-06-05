@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -94,28 +93,22 @@ def _format_question_body(req: AskRequest) -> str:
     )
 
 
-def post_github_issue(
-    req: AskRequest,
-    *,
-    runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
-) -> bool:
+def post_github_issue(req: AskRequest) -> bool:
     """Post the question as a comment on ``req.issue``. Returns True on success."""
     if not req.issue or not req.repo:
         raise OperatorError("post_github_issue requires AskRequest.issue and .repo to be set")
+    from forge_loop import gh_issues as _gh
+
     body = _format_question_body(req)
-    cmd = [
-        "gh",
-        "issue",
-        "comment",
-        str(req.issue),
-        "--repo",
-        req.repo,
-        "--body",
-        body,
-    ]
-    runner = runner or _default_runner
-    code, _out, _err = runner(cmd)
-    return code == 0
+    # ``_gh.comment`` swallows errors (it is fire-and-forget for the loop). The
+    # operator channel needs the post-status, so go through the client directly
+    # and report failure honestly.
+    try:
+        owner, name = _gh.split_repo(req.repo)
+        _gh.client().add_comment(owner, name, req.issue, body)
+    except Exception:  # noqa: BLE001 — a failed post is reported, not raised
+        return False
+    return True
 
 
 def post_webhook(
@@ -186,11 +179,6 @@ def post_slack(
     return 200 <= int(code) < 300
 
 
-def _default_runner(cmd: list[str]) -> tuple[int, str, str]:
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    return r.returncode, r.stdout, r.stderr
-
-
 def _default_opener(request: urllib.request.Request) -> Any:
     return urllib.request.urlopen(request, timeout=10)  # noqa: S310
 
@@ -198,36 +186,14 @@ def _default_opener(request: urllib.request.Request) -> Any:
 # ── Reply polling ───────────────────────────────────────────────────────────
 
 
-def fetch_issue_comments(
-    issue: int,
-    repo: str,
-    *,
-    runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
-) -> list[dict[str, Any]]:
+def fetch_issue_comments(issue: int, repo: str) -> list[dict[str, Any]]:
     """Return the comments on ``issue`` (oldest first).
 
-    Each entry has at least ``body`` and ``createdAt`` keys.
+    Each entry has at least ``body`` and ``createdAt`` keys. [] on failure.
     """
-    runner = runner or _default_runner
-    cmd = [
-        "gh",
-        "issue",
-        "view",
-        str(issue),
-        "--repo",
-        repo,
-        "--json",
-        "comments",
-    ]
-    code, out, _err = runner(cmd)
-    if code != 0:
-        return []
-    try:
-        payload = json.loads(out)
-    except json.JSONDecodeError:
-        return []
-    raw = payload.get("comments") or []
-    return [c for c in raw if isinstance(c, dict)]
+    from forge_loop import gh_issues as _gh
+
+    return _gh.issue_comments(issue, repo=repo)
 
 
 def match_answer(
@@ -272,7 +238,6 @@ def ask(
     emit: Callable[[str, dict[str, Any]], None] | None = None,
     webhook_url: str | None = None,
     slack_url: str | None = None,
-    runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
     opener: Callable[[urllib.request.Request], Any] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
@@ -319,7 +284,7 @@ def ask(
     for ch in channels:
         ok = False
         if ch == "github":
-            ok = post_github_issue(req, runner=runner)
+            ok = post_github_issue(req)
         elif ch == "webhook" and webhook_url:
             ok = post_webhook(req, webhook_url, opener=opener)
         elif ch == "slack" and slack_url:
@@ -350,7 +315,7 @@ def ask(
     raw_reply: str | None = None
     while monotonic() < deadline:
         if req.issue and req.repo:
-            comments = fetch_issue_comments(req.issue, req.repo, runner=runner)
+            comments = fetch_issue_comments(req.issue, req.repo)
             answer, raw_reply = match_answer(
                 comments,
                 req.options,
