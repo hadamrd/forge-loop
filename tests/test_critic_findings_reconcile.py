@@ -27,17 +27,17 @@ def test_reconcile_inserts_then_converges_to_zero() -> None:
     store = SqliteCriticFindingsStore(":memory:")
     f1, f2 = _f("a", line=1), _f("b", line=2)
 
-    r1 = store.reconcile(PR, 42, 1, [f1, f2])
+    r1 = store.reconcile(PR, 42, [f1, f2])
     assert (r1.inserted, r1.open_count) == (2, 2)
 
     # f1 fixed (gone), f2 still present.
-    r2 = store.reconcile(PR, 42, 2, [f2])
+    r2 = store.reconcile(PR, 42, [f2])
     assert r2.kept_open == 1
     assert r2.closed == 1  # f1 resolved
     assert r2.open_count == 1
 
     # f2 fixed too → drained.
-    r3 = store.reconcile(PR, 42, 3, [])
+    r3 = store.reconcile(PR, 42, [])
     assert r3.closed == 1
     assert r3.open_count == 0
 
@@ -47,7 +47,7 @@ def test_reconcile_reopens_worker_addressed_but_still_present() -> None:
     on re-review → critic reopens it. No false convergence."""
     store = SqliteCriticFindingsStore(":memory:")
     f1 = _f("still-here", line=5)
-    stored = store.reconcile(PR, 42, 1, [f1])
+    stored = store.reconcile(PR, 42, [f1])
     assert stored.open_count == 1
 
     fid = store.open_findings(PR)[0].finding_id
@@ -55,7 +55,7 @@ def test_reconcile_reopens_worker_addressed_but_still_present() -> None:
     assert store.open_count(PR) == 0  # worker's claim, pre re-review
 
     # Re-review still sees f1 → reopen.
-    result = store.reconcile(PR, 42, 2, [f1])
+    result = store.reconcile(PR, 42, [f1])
     assert result.reopened == 1
     assert result.open_count == 1
     assert store.get(fid) is not None and store.get(fid).status is FindingStatus.OPEN
@@ -65,11 +65,11 @@ def test_reconcile_respects_wontfix() -> None:
     """A ``wontfix`` finding is never auto-reopened even if still present."""
     store = SqliteCriticFindingsStore(":memory:")
     f1 = _f("acceptable", line=7)
-    store.reconcile(PR, 42, 1, [f1])
+    store.reconcile(PR, 42, [f1])
     fid = store.open_findings(PR)[0].finding_id
     store.set_status(fid, FindingStatus.WONTFIX)
 
-    result = store.reconcile(PR, 42, 2, [f1])
+    result = store.reconcile(PR, 42, [f1])
     assert result.reopened == 0
     assert result.open_count == 0
     assert store.get(fid).status is FindingStatus.WONTFIX

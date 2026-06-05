@@ -25,7 +25,7 @@ PR = "https://github.com/acme/widgets/pull/3"
 def _seed(repo) -> str:  # noqa: ANN001
     store = open_critic_findings_store(repo)
     f = Finding(severity="sev1", category="security", file="s.py", line=4, message="leak")
-    stored = store.upsert(PR, 242, 1, f)
+    stored = store.upsert(PR, 242, f)
     return stored.finding_id
 
 

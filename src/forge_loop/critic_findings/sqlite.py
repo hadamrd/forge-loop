@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS critic_findings (
     finding_id TEXT PRIMARY KEY,
     pr TEXT NOT NULL,
     issue INTEGER NOT NULL,
-    attempt INTEGER NOT NULL,
     severity TEXT NOT NULL,
     category TEXT NOT NULL,
     file TEXT,
@@ -65,14 +64,14 @@ class SqliteCriticFindingsStore:
 
     # ── writes ────────────────────────────────────────────────────────────
 
-    def upsert(self, pr: str, issue: int, attempt: int, finding: Finding) -> StoredFinding:
+    def upsert(self, pr: str, issue: int, finding: Finding) -> StoredFinding:
         """Insert (status=open) or update one finding idempotently by id.
 
-        On conflict the *content* (severity/category/file/line/message) and the
-        last-observed ``attempt`` are refreshed but the existing ``status`` and
-        ``note`` are preserved — a worker's ``addressed``/``wontfix`` decision
-        is never silently clobbered by a re-write. Lifecycle transitions go
-        through :meth:`set_status` / :meth:`reconcile`.
+        On conflict the *content* (severity/category/file/line/message) is
+        refreshed but the existing ``status`` and ``note`` are preserved — a
+        worker's ``addressed``/``wontfix`` decision is never silently clobbered
+        by a re-write. Lifecycle transitions go through :meth:`set_status` /
+        :meth:`reconcile`.
         """
 
         pr = canonical_pr_key(pr)
@@ -82,13 +81,12 @@ class SqliteCriticFindingsStore:
             self._connection.execute(
                 """
                 INSERT INTO critic_findings (
-                    finding_id, pr, issue, attempt, severity, category,
+                    finding_id, pr, issue, severity, category,
                     file, line, message, status, note, schema_version,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(finding_id) DO UPDATE SET
-                    attempt = excluded.attempt,
                     severity = excluded.severity,
                     category = excluded.category,
                     file = excluded.file,
@@ -100,7 +98,6 @@ class SqliteCriticFindingsStore:
                     finding_id,
                     pr,
                     issue,
-                    attempt,
                     finding.severity,
                     finding.category,
                     finding.file,
@@ -136,7 +133,7 @@ class SqliteCriticFindingsStore:
         return self.get(finding_id)
 
     def reconcile(
-        self, pr: str, issue: int, attempt: int, findings: list[Finding]
+        self, pr: str, issue: int, findings: list[Finding]
     ) -> ReconcileResult:
         """Closed-loop re-review reconciliation — see protocol docstring."""
 
@@ -149,7 +146,7 @@ class SqliteCriticFindingsStore:
         # 1. Findings still present on this re-review.
         for fid, finding in current.items():
             prior = existing.get(fid)
-            self.upsert(pr, issue, attempt, finding)
+            self.upsert(pr, issue, finding)
             if prior is None:
                 inserted += 1
             elif prior.status is FindingStatus.ADDRESSED:
@@ -217,7 +214,6 @@ class SqliteCriticFindingsStore:
             finding_id=row["finding_id"],
             pr=row["pr"],
             issue=row["issue"],
-            attempt=row["attempt"],
             severity=row["severity"],
             category=row["category"],
             file=row["file"],

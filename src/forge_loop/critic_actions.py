@@ -144,7 +144,6 @@ def apply_critic_report(
     *,
     findings_store: CriticFindingsStore | None = None,
     issue: int | None = None,
-    attempt: int = 1,
 ) -> CriticActionPlan:
     """Compute the plan and execute it via ``gh``. Returns the plan so the
     runner can log a summary event.
@@ -167,14 +166,13 @@ def apply_critic_report(
     # AC2/AC6: durable findings FIRST — load-bearing data is handed to the
     # repair worker via the store, never round-tripped through GitHub (Q10).
     if findings_store is not None and issue is not None:
-        result = findings_store.reconcile(pr_url, issue, attempt, list(report.findings))
+        result = findings_store.reconcile(pr_url, issue, list(report.findings))
         if emit is not None:
             emit(
                 "critic_findings_persisted",
                 {
                     "pr": pr_url,
                     "issue": issue,
-                    "attempt": attempt,
                     "inserted": result.inserted,
                     "kept_open": result.kept_open,
                     "reopened": result.reopened,

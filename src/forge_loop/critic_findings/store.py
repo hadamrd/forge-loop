@@ -46,7 +46,6 @@ class StoredFinding:
     finding_id: str
     pr: str
     issue: int
-    attempt: int
     severity: str
     category: str
     file: str | None
@@ -75,7 +74,6 @@ class StoredFinding:
             "finding_id": self.finding_id,
             "pr": self.pr,
             "issue": self.issue,
-            "attempt": self.attempt,
             "severity": self.severity,
             "category": self.category,
             "file": self.file,
@@ -102,7 +100,7 @@ class ReconcileResult:
 class CriticFindingsStore(Protocol):
     """Persistence boundary for first-class critic findings."""
 
-    def upsert(self, pr: str, issue: int, attempt: int, finding: Finding) -> StoredFinding:
+    def upsert(self, pr: str, issue: int, finding: Finding) -> StoredFinding:
         """Insert (status=open) or update one finding idempotently by id."""
         ...
 
@@ -129,7 +127,7 @@ class CriticFindingsStore(Protocol):
         ...
 
     def reconcile(
-        self, pr: str, issue: int, attempt: int, findings: list[Finding]
+        self, pr: str, issue: int, findings: list[Finding]
     ) -> ReconcileResult:
         """Closed-loop re-review reconciliation (AC6).
 
