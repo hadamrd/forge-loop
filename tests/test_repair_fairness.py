@@ -202,6 +202,44 @@ def test_record_block_and_clear_roundtrip(tmp_path: Path) -> None:
     assert reloaded.block_count("u1") == 0
 
 
+def test_prune_stale_drops_aged_entries_keeps_recent() -> None:
+    """A PR that merged via a non-repair path (never clear_pr'd) ages out.
+
+    Entry older than ``cooldown_s * retention_multiplier`` is dropped; an entry
+    still inside that horizon is kept (it could still gate selection).
+    """
+    now = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
+    state = _rb.RepairBackoffState()
+    # last block 4h ago, cooldown 1h, retention 3 → horizon 3h → stale.
+    _rb.record_block(state, "stale", now_iso=(now - timedelta(hours=4)).isoformat())
+    # last block 30m ago → inside horizon → kept.
+    _rb.record_block(state, "fresh", now_iso=(now - timedelta(minutes=30)).isoformat())
+    removed = _rb.prune_stale(state, cooldown_s=3600, now=now, retention_multiplier=3)
+    assert removed == 1
+    assert "stale" not in state.prs
+    assert "fresh" in state.prs
+
+
+def test_prune_stale_noop_when_cooldown_disabled() -> None:
+    """cooldown_s<=0 (feature off) ⇒ no pruning, state untouched."""
+    now = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
+    state = _rb.RepairBackoffState()
+    _rb.record_block(state, "old", now_iso=(now - timedelta(days=30)).isoformat())
+    assert _rb.prune_stale(state, cooldown_s=0, now=now) == 0
+    assert "old" in state.prs
+
+
+def test_prune_stale_ignores_unparseable_timestamp() -> None:
+    """An entry with a missing/garbage timestamp can't be aged → left in place."""
+    now = datetime(2026, 6, 5, 12, 0, 0, tzinfo=UTC)
+    state = _rb.RepairBackoffState()
+    state.prs["bad"] = {"blocks": 2, "last_block": "not-a-timestamp"}
+    state.prs["none"] = {"blocks": 1, "last_block": None}
+    assert _rb.prune_stale(state, cooldown_s=3600, now=now) == 0
+    assert "bad" in state.prs
+    assert "none" in state.prs
+
+
 # --------------------------------------------------------------------------- #
 # Unit: blocking_pr_repairs backoff filter + event emission
 # --------------------------------------------------------------------------- #
@@ -373,9 +411,9 @@ def test_starvation_regression_yields_within_k_ticks(
     # through to dispatch and a ready issue is picked up.
     assert returns[-1] is False, returns
     assert any(r is False for r in returns[:3])
-    # the freed-slot decision is observable
+    # the yield decision is observable
     events = _read_events(cfg)
-    assert any(e["kind"] == "repair_slot_reserved" for e in events)
+    assert any(e["kind"] == "repair_phase_yielded" for e in events)
 
 
 def test_pre_dispatch_repairs_falls_through_on_yield_tick(

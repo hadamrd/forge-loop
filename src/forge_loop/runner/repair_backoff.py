@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -127,10 +128,57 @@ def clear_pr(state: RepairBackoffState, pr_url: str) -> None:
     state.prs.pop(pr_url, None)
 
 
+def _parse_iso(ts: Any) -> datetime | None:
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def prune_stale(
+    state: RepairBackoffState,
+    *,
+    cooldown_s: int,
+    now: datetime,
+    retention_multiplier: int = 3,
+) -> int:
+    """Drop PR entries whose last block aged out of the cooldown window.
+
+    ``clear_pr`` only fires when a PR is resolved *through the repair path*. A
+    blocking PR that later merges via a non-repair path (auto-merge) never
+    reaches ``clear_pr``, so without pruning its ``{blocks, last_block}`` record
+    would live in the sidecar forever — one dead entry per ever-blocked PR over
+    a long-running loop (issue #248 sev3 follow-up).
+
+    An entry is stale once its ``last_block`` is older than
+    ``cooldown_s * retention_multiplier`` — well past any cooldown that could
+    still gate selection (``classify_repair_backoff`` only suppresses a PR for
+    ``cooldown_s``), so dropping it can never change a live decision. Entries
+    with a missing/unparseable timestamp are left untouched (they cannot be
+    aged and are harmless). Returns the number of entries removed.
+    """
+    if cooldown_s <= 0 or retention_multiplier <= 0:
+        return 0
+    horizon = cooldown_s * retention_multiplier
+    stale = [
+        url
+        for url, rec in state.prs.items()
+        if (when := _parse_iso(rec.get("last_block") if isinstance(rec, dict) else None))
+        is not None
+        and (now - when).total_seconds() >= horizon
+    ]
+    for url in stale:
+        state.prs.pop(url, None)
+    return len(stale)
+
+
 __all__ = [
     "RepairBackoffState",
     "clear_pr",
     "load_state",
+    "prune_stale",
     "record_block",
     "save_state",
 ]

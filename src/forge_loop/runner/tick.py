@@ -618,9 +618,12 @@ def _run_fair_blocking_repairs(
     # consecutive repair-only ticks with ready work waiting, yield this whole
     # tick to dispatch so the ready backlog cannot be starved (bounded K).
     if ready_exist and state.streak >= rf.max_repair_streak:
+        # The whole repair phase yields to dispatch this tick (round-robin, not a
+        # slot reservation — slot reservation was removed in review because this
+        # is a terminal tick body). Event name matches the implemented mechanism.
         append_event(
             cfg.events_file,
-            "repair_slot_reserved",
+            "repair_phase_yielded",
             tick=tick,
             consecutive_repair_ticks=state.streak,
             deferred_prs=[pr.get("url") for _, pr, _ in repairs],
@@ -657,6 +660,8 @@ def _record_repair_block_outcomes(
     consecutive-block counter; a cleared/merged PR resets it. Reloads the
     sidecar so the streak persisted just before the repair ran is preserved.
     """
+    from datetime import UTC, datetime
+
     from forge_loop.runner import repair_backoff as _rb
     from forge_loop.state import now_iso
 
@@ -670,6 +675,10 @@ def _record_repair_block_outcomes(
             _rb.record_block(state, url, now_iso=stamp)
         elif o.status in {"open", "merged"}:
             _rb.clear_pr(state, url)
+    # Drop entries aged past the cooldown window so a PR that merged via a
+    # non-repair path (auto-merge, never reaching ``clear_pr``) cannot leave a
+    # dead record growing the sidecar forever (issue #248 sev3 follow-up).
+    _rb.prune_stale(state, cooldown_s=cfg.repair_fairness.cooldown_s, now=datetime.now(UTC))
     _rb.save_state(state_path, state)
 
 
