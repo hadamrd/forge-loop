@@ -14,7 +14,11 @@ from typing import Any, Protocol
 from forge_loop.critic import CriticReport, Finding
 from forge_loop.critic_format import finding_tag
 
-MIN_SUSPICIOUS_APPROVE_LINES = 100
+MIN_SUSPICIOUS_APPROVE_LINES = 600  # calibrated 2026-06-05 from live data:
+# scope-capped clean PRs run ~350-500 changed lines and legitimately have 0
+# findings; only a 0-findings approval on a VERY large diff (e.g. the ~1050-line
+# gamed rubber-stamp this guard correctly caught) is implausible. The old floor
+# of 100 false-positived EVERY clean approval and blocked all auto-merges.
 
 #: Heading the teaching critic stamps on its minimal-path-to-green comment.
 #: Stable so the repair worker (and a human) can find the acceptance predicate

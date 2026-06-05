@@ -106,7 +106,7 @@ def test_sev2_blocks_when_knob_set() -> None:
 
 def test_zero_findings_large_pr_is_suspicious() -> None:
     rep = _report("approve", [])
-    plan = plan_actions(rep, pr_changed_lines=200, block_on_sev2=False, min_findings_for_approve=50)
+    plan = plan_actions(rep, pr_changed_lines=1000, block_on_sev2=False, min_findings_for_approve=50)
     assert plan.suspicious_approve is True
     assert plan.block_merge is True
     assert "critic:suspicious" in plan.labels_to_add
@@ -234,7 +234,7 @@ def test_apply_approve_zero_findings_large_pr_blocks_and_labels_suspicious() -> 
     plan = apply_critic_report(
         rep,
         "https://gh.com/o/r/pull/9",
-        pr_changed_lines=200,
+        pr_changed_lines=1000,
         block_on_sev2=False,
         min_findings_for_approve=50,
         gh=gh,
