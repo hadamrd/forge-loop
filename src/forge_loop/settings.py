@@ -172,6 +172,9 @@ class CriticSettings(BaseSettings):
     model: str = "claude-sonnet-4-6"
     thinking: str = "off"
     provider: str = "claude"
+    # Teaching-critic (Ch9): rounds after which sev3 nits are demoted to
+    # non-blocking follow-ups. sev1/sev2 are never demoted. 0 disables.
+    sev3_demotion_round_threshold: int = 3
 
     @field_validator("provider")
     @classmethod
@@ -179,6 +182,15 @@ class CriticSettings(BaseSettings):
         if v not in _AGENT_PROVIDERS:
             raise ConfigError(f"critic.provider={v!r} — expected one of {sorted(_AGENT_PROVIDERS)}")
         return str(v)
+
+    @field_validator("sev3_demotion_round_threshold")
+    @classmethod
+    def _demotion_threshold_nonneg(cls, v: int) -> int:
+        if v < 0:
+            raise ConfigError(
+                f"critic.sev3_demotion_round_threshold={v!r} — must be >= 0 (0 disables)"
+            )
+        return int(v)
 
     @field_validator("thinking", mode="before")
     @classmethod
@@ -602,6 +614,7 @@ ENV_MAP: tuple[tuple[str, str, Any], ...] = (
     ("LOOP_CRITIC_PROVIDER", "critic.provider", str),
     ("LOOP_CRITIC_BLOCK_ON_SEV2", "critic.block_on_sev2", _coerce_bool),
     ("LOOP_CRITIC_MIN_FINDINGS", "critic.min_findings_for_approve", int),
+    ("LOOP_CRITIC_SEV3_DEMOTION_ROUND", "critic.sev3_demotion_round_threshold", int),
     # PO
     ("LOOP_PO_MODEL", "po.model", str),
     ("LOOP_PO_THINKING", "po.thinking", str),

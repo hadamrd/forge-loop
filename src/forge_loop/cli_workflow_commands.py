@@ -158,10 +158,15 @@ class WorkflowCommandsMixin:
                 github_repo=args.repo or "<owner/repo>",
             )
         elif kind == "critic":
+            from forge_loop.critic import _round_guidance
+
             out = render_brief(
                 "critic",
                 pr_url=args.pr or "<pr-url>",
                 issue_number=issue["number"],
+                manifestos="<manifestos block>",
+                round_number=0,
+                round_guidance=_round_guidance(0, 3),
             )
         else:
             sys.stderr.write(f"[brief] unknown kind: {kind}\n")

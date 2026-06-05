@@ -16,6 +16,47 @@ from forge_loop.critic_format import finding_tag
 
 MIN_SUSPICIOUS_APPROVE_LINES = 100
 
+#: Heading the teaching critic stamps on its minimal-path-to-green comment.
+#: Stable so the repair worker (and a human) can find the acceptance predicate
+#: at a glance in the review thread it reads back via ``pr_review_context``.
+MINIMAL_PATH_HEADING = "## Minimal path to green (must-fix to merge)"
+FOLLOW_UPS_HEADING = "### Optional follow-ups (do NOT block merge)"
+
+
+def render_minimal_path_comment(report: CriticReport) -> str:
+    """Render the teaching critic's must-fix path + follow-ups as a PR comment.
+
+    Ch9 §9.5.1: the worker must never have to GUESS the acceptance predicate.
+    This renders the critic's ordered, minimal must-fix set (clearly separated
+    from optional polish) into one comment that leads the review thread, so the
+    next repair round's brief carries it verbatim.
+
+    Returns "" when there is nothing to teach — no must-fix steps and no
+    follow-ups — so a clean approval does not spam the PR.
+    """
+    must_fix = [s for s in report.minimal_path_to_green if s.strip()]
+    follow_ups = report.follow_ups
+    if not must_fix and not follow_ups:
+        return ""
+
+    parts: list[str] = [MINIMAL_PATH_HEADING]
+    if must_fix:
+        parts.extend(f"{i}. {step.strip()}" for i, step in enumerate(must_fix, start=1))
+    else:
+        # overall == approve (or all blockers demoted): nothing blocks merge.
+        parts.append("_Nothing blocks merge._")
+
+    if follow_ups:
+        parts.append("")
+        parts.append(FOLLOW_UPS_HEADING)
+        parts.extend(
+            f"- {finding_tag(f.severity, f.category)} "
+            f"{f.file or ''}{':' + str(f.line) if f.line else ''}"
+            f"{' — ' if (f.file or f.line) else ''}{f.message}"
+            for f in follow_ups
+        )
+    return "\n".join(parts)
+
 
 class GhClient(Protocol):
     """The slice of forge_loop.gh that we need. Allows tests to inject a
@@ -153,6 +194,20 @@ def apply_critic_report(
 
     if plan.block_merge:
         gh.disable_pr_auto_merge(pr_url, repo=repo)
+
+    # Teaching critic (Ch9): post the explicit minimal-path-to-green FIRST so it
+    # leads the review thread the repair worker reads back via
+    # ``gh.pr_review_context`` — the acceptance predicate, stated, not guessed.
+    mptg_body = render_minimal_path_comment(report)
+    if mptg_body:
+        mutation_failed |= _record_mutation_result(
+            "post_review_comment",
+            gh.post_review_comment(pr_url, mptg_body, repo=repo),
+            gh=gh,
+            pr_url=pr_url,
+            emit=emit,
+        )
+
     if plan.labels_to_add:
         mutation_failed |= _record_mutation_result(
             "add_pr_label",

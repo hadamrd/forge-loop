@@ -86,6 +86,11 @@ class CriticConfig:
     model: str = "claude-sonnet-4-6"
     thinking: str = "off"
     provider: str = "claude"
+    # Teaching-critic (Ch9 convergence): once a PR has had this many critic
+    # reviews, cosmetic (sev3) findings are demoted to non-blocking follow-ups
+    # so rounds are not burned on nits. sev1/sev2 are NEVER demoted — this is
+    # triage, not standard erosion. ``0`` disables demotion entirely.
+    sev3_demotion_round_threshold: int = 3
 
 
 @dataclass(frozen=True)
@@ -280,6 +285,7 @@ def _from_settings(s: Settings) -> Config:
             model=s.critic.model,
             thinking=s.critic.thinking,
             provider=s.critic.provider,
+            sev3_demotion_round_threshold=s.critic.sev3_demotion_round_threshold,
         ),
         po=POConfig(
             enabled=s.po.enabled,
