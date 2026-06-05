@@ -12,8 +12,6 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-import pytest
-
 from forge_loop.runner import Runner
 from forge_loop.runner.drift import _check_drift_and_maybe_halt
 from forge_loop.runner.state import RunnerState

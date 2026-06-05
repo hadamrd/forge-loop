@@ -29,7 +29,6 @@ from forge_loop.adapters import (
 from forge_loop.adapters.git import GitResult, _run
 from forge_loop.container import Container, get_container
 
-
 # ---------------------------------------------------------------------------
 # Clock
 # ---------------------------------------------------------------------------

@@ -23,7 +23,6 @@ production gate stays loud.
 from __future__ import annotations
 
 import importlib
-import os
 
 # Sentinel dependencies that ship inside the [experimental] extra. If
 # ANY one of them is importable, we treat the extra as installed (we do

@@ -36,13 +36,13 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from forge_loop.events import EventBase, StuckSweepDemotedEvent, emit
 from forge_loop.log import get_logger
-
 
 # ---------------------------------------------------------------------------
 # Public types

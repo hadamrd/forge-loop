@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -24,7 +24,6 @@ from forge_loop.events import (
     WorktreeReapedEvent,
     emit,
 )
-
 
 # ---------------------------------------------------------------------------
 # Strategies — bounded to the field constraints declared on the EventBase
