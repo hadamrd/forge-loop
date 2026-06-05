@@ -1,18 +1,23 @@
 """Unit tests for ``forge_loop.runner.iteration.probe_worker_state`` (issue #78).
 
-The probe is read-only — it shells out to ``git`` / ``gh``. We inject a fake
-``run`` shim so every state branch is testable without forking subprocesses
-or touching the network.
+The probe is read-only: ``git`` state via the injectable ``run`` shim, GitHub
+state (the PR for a head branch, CI status, the critic report) via the
+GhClient. We seed a ``MockGhClient`` for the GitHub side and a fake ``run`` for
+git, so every state branch is testable without forking subprocesses or hitting
+the network (issue #223).
 """
 
 from __future__ import annotations
 
-import json
 import subprocess
+from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from forge_loop import gh_issues
+from forge_loop.gh_client import MockGhClient
 from forge_loop.runner.iteration import (
     NON_LLM_STATES,
     TERMINAL_STATES,
@@ -31,7 +36,7 @@ def _make_fake_run(
     plan: dict[tuple[str, ...], subprocess.CompletedProcess[str]],
     default: subprocess.CompletedProcess[str] | None = None,
 ):
-    """Build a ``run`` shim that returns canned output keyed by argv prefix."""
+    """git-only ``run`` shim keyed by argv prefix (gh state is on the client)."""
     default = default if default is not None else _completed("", 0)
 
     def _run(args, _cwd):
@@ -41,6 +46,29 @@ def _make_fake_run(
         return default
 
     return _run
+
+
+def _seed_pr(
+    head: str,
+    pr: dict[str, Any] | None,
+    *,
+    status_failed: bool = False,
+    critic_report: str = "",
+) -> MockGhClient:
+    client = MockGhClient(
+        pr_by_head={head: pr} if pr else {},
+        pr_status_failed_by_pr={int(pr["number"]): status_failed} if pr else {},
+        critic_report_by_pr={int(pr["number"]): critic_report} if pr else {},
+    )
+    gh_issues.set_client(client)
+    return client
+
+
+@pytest.fixture(autouse=True)
+def _reset_client() -> Generator[None, None, None]:
+    gh_issues.set_client(None)
+    yield
+    gh_issues.set_client(None)
 
 
 @pytest.fixture()
@@ -58,7 +86,8 @@ def worktree(tmp_path: Path) -> Path:
 
 
 def test_done_merged_when_pr_state_merged(worktree: Path) -> None:
-    pr = [
+    _seed_pr(
+        "b",
         {
             "url": "https://x/1",
             "number": 1,
@@ -66,21 +95,17 @@ def test_done_merged_when_pr_state_merged(worktree: Path) -> None:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
             "isDraft": False,
-        }
-    ]
-    run = _make_fake_run(
-        {
-            ("gh", "pr", "list"): _completed(json.dumps(pr)),
-        }
+        },
     )
-    state, ctx = probe_worker_state(worktree, "b", "owner/r", 1, run=run)
+    state, ctx = probe_worker_state(worktree, "b", "owner/r", 1, run=_make_fake_run({}))
     assert state == WorkerState.DONE_MERGED
     assert ctx.pr_url == "https://x/1"
     assert is_terminal(state)
 
 
 def test_pr_open_healthy_when_clean_no_critic(worktree: Path) -> None:
-    pr = [
+    _seed_pr(
+        "b",
         {
             "url": "https://x/2",
             "number": 2,
@@ -88,20 +113,11 @@ def test_pr_open_healthy_when_clean_no_critic(worktree: Path) -> None:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
             "isDraft": False,
-        }
-    ]
-    run = _make_fake_run(
-        {
-            ("gh", "pr", "list"): _completed(json.dumps(pr)),
-            ("git", "status", "--porcelain"): _completed(""),
-            ("gh", "pr", "view", "2", "--json", "statusCheckRollup"): _completed(
-                json.dumps({"statusCheckRollup": [{"conclusion": "SUCCESS"}]})
-            ),
-            ("gh", "pr", "view", "2", "--repo", "owner/r"): _completed(
-                json.dumps({"comments": []})
-            ),
-        }
+        },
+        status_failed=False,
+        critic_report="",
     )
+    run = _make_fake_run({("git", "status", "--porcelain"): _completed("")})
     state, _ = probe_worker_state(worktree, "b", "owner/r", 2, run=run)
     assert state == WorkerState.PR_OPEN_HEALTHY
     assert state in NON_LLM_STATES
@@ -113,7 +129,8 @@ def test_pr_open_healthy_when_clean_no_critic(worktree: Path) -> None:
 
 
 def test_pr_open_ci_failed(worktree: Path) -> None:
-    pr = [
+    _seed_pr(
+        "b",
         {
             "url": "https://x/3",
             "number": 3,
@@ -121,23 +138,17 @@ def test_pr_open_ci_failed(worktree: Path) -> None:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "UNSTABLE",
             "isDraft": False,
-        }
-    ]
-    run = _make_fake_run(
-        {
-            ("gh", "pr", "list"): _completed(json.dumps(pr)),
-            ("git", "status", "--porcelain"): _completed(""),
-            ("gh", "pr", "view", "3", "--json", "statusCheckRollup"): _completed(
-                json.dumps({"statusCheckRollup": [{"conclusion": "FAILURE"}]})
-            ),
-        }
+        },
+        status_failed=True,
     )
+    run = _make_fake_run({("git", "status", "--porcelain"): _completed("")})
     state, _ = probe_worker_state(worktree, "b", "owner/r", 3, run=run)
     assert state == WorkerState.PR_OPEN_CI_FAILED
 
 
 def test_pr_open_blocked_when_critic_report_present(worktree: Path) -> None:
-    pr = [
+    _seed_pr(
+        "b",
         {
             "url": "https://x/4",
             "number": 4,
@@ -145,26 +156,19 @@ def test_pr_open_blocked_when_critic_report_present(worktree: Path) -> None:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "BLOCKED",
             "isDraft": False,
-        }
-    ]
-    comments = {"comments": [{"body": "critic-report: sev1: bad regex"}]}
-    run = _make_fake_run(
-        {
-            ("gh", "pr", "list"): _completed(json.dumps(pr)),
-            ("git", "status", "--porcelain"): _completed(""),
-            ("gh", "pr", "view", "4", "--json", "statusCheckRollup"): _completed(
-                json.dumps({"statusCheckRollup": []})
-            ),
-            ("gh", "pr", "view", "4", "--repo", "owner/r"): _completed(json.dumps(comments)),
-        }
+        },
+        status_failed=False,
+        critic_report="critic-report: sev1: bad regex",
     )
+    run = _make_fake_run({("git", "status", "--porcelain"): _completed("")})
     state, ctx = probe_worker_state(worktree, "b", "owner/r", 4, run=run)
     assert state == WorkerState.PR_OPEN_BLOCKED
     assert "sev1" in ctx.critic_report
 
 
 def test_pr_open_conflict(worktree: Path) -> None:
-    pr = [
+    _seed_pr(
+        "b",
         {
             "url": "https://x/5",
             "number": 5,
@@ -172,33 +176,24 @@ def test_pr_open_conflict(worktree: Path) -> None:
             "mergeable": "CONFLICTING",
             "mergeStateStatus": "DIRTY",
             "isDraft": False,
-        }
-    ]
-    run = _make_fake_run(
-        {
-            ("gh", "pr", "list"): _completed(json.dumps(pr)),
-            ("git", "status", "--porcelain"): _completed(""),
-        }
+        },
     )
+    run = _make_fake_run({("git", "status", "--porcelain"): _completed("")})
     state, _ = probe_worker_state(worktree, "b", "owner/r", 5, run=run)
     assert state == WorkerState.PR_OPEN_CONFLICT
 
 
 def test_dirty_no_commit_when_no_pr_and_worktree_dirty(worktree: Path) -> None:
-    run = _make_fake_run(
-        {
-            ("gh", "pr", "list"): _completed("[]"),
-            ("git", "status", "--porcelain"): _completed(" M file.py\n"),
-        }
-    )
+    _seed_pr("b", None)
+    run = _make_fake_run({("git", "status", "--porcelain"): _completed(" M file.py\n")})
     state, _ = probe_worker_state(worktree, "b", "owner/r", 6, run=run)
     assert state == WorkerState.DIRTY_NO_COMMIT
 
 
 def test_committed_not_pushed(worktree: Path) -> None:
+    _seed_pr("b", None)
     run = _make_fake_run(
         {
-            ("gh", "pr", "list"): _completed("[]"),
             # origin/<branch> exists (new probe added by the pushed_no_pr
             # misclassification hot-fix); rev-list returns 2 ahead.
             ("git", "rev-parse", "--verify"): _completed("abc123\n"),
@@ -211,9 +206,9 @@ def test_committed_not_pushed(worktree: Path) -> None:
 
 
 def test_pushed_no_pr(worktree: Path) -> None:
+    _seed_pr("b", None)
     run = _make_fake_run(
         {
-            ("gh", "pr", "list"): _completed("[]"),
             # origin/<branch> exists AND local matches it (ahead=0).
             ("git", "rev-parse", "--verify"): _completed("abc123\n"),
             ("git", "status", "--porcelain"): _completed(""),
@@ -241,9 +236,15 @@ def test_gh_failure_degrades_gracefully(worktree: Path) -> None:
     is SAFER than the old "guess PUSHED_NO_PR" verdict — the worker
     won't try to open a PR on a branch that doesn't exist remotely."""
 
+    from forge_loop.gh_client import GhError
+
+    # Simulate the GitHub API being down: find_pr_by_head raises -> the probe
+    # degrades to "no PR seen" without crashing.
+    gh_issues.set_client(
+        MockGhClient(raise_on={"find_pr_by_head": GhError("find_pr_by_head", 503, "down")})
+    )
+
     def _run(args, _cwd):
-        if args[0] == "gh":
-            raise subprocess.SubprocessError("gh down")
         if args[0] == "git" and args[1] == "status":
             return _completed("")
         if args[0] == "git" and args[1] == "rev-list":

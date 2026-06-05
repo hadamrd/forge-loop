@@ -18,12 +18,15 @@ Fixes:
 
 from __future__ import annotations
 
-import json
 import subprocess
+from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from forge_loop import gh_issues
+from forge_loop.gh_client import MockGhClient
 from forge_loop.runner.iteration import (
     TERMINAL_STATES,
     WorkerState,
@@ -38,6 +41,7 @@ def _completed(stdout: str = "", returncode: int = 0) -> subprocess.CompletedPro
 
 
 def _make_fake_run(plan, default=None):
+    """git-only ``run`` shim (gh state is seeded on the client now)."""
     default = default if default is not None else _completed("", 0)
 
     def _run(args, _cwd):
@@ -47,6 +51,30 @@ def _make_fake_run(plan, default=None):
         return default
 
     return _run
+
+
+def _seed_pr(
+    head: str,
+    pr: dict[str, Any] | None,
+    *,
+    status_failed: bool = False,
+    critic_report: str = "",
+) -> MockGhClient:
+    """Seed the GhClient with a PR (or none) for ``head`` + CI / critic state."""
+    client = MockGhClient(
+        pr_by_head={head: pr} if pr else {},
+        pr_status_failed_by_pr={int(pr["number"]): status_failed} if pr else {},
+        critic_report_by_pr={int(pr["number"]): critic_report} if pr else {},
+    )
+    gh_issues.set_client(client)
+    return client
+
+
+@pytest.fixture(autouse=True)
+def _reset_client() -> Generator[None, None, None]:
+    gh_issues.set_client(None)
+    yield
+    gh_issues.set_client(None)
 
 
 @pytest.fixture()
@@ -65,18 +93,18 @@ def worktree(tmp_path: Path) -> Path:
 def test_closed_pr_returns_abandoned_terminal_state(worktree: Path) -> None:
     """The headline regression pin — a CLOSED-but-not-merged PR no
     longer triggers the COMMITTED_NOT_PUSHED push-forever loop."""
-    closed_pr = [{
-        "url": "https://github.com/o/r/pull/42",
-        "number": 42,
-        "state": "CLOSED",
-        "mergeable": "",
-        "mergeStateStatus": "",
-        "isDraft": False,
-    }]
-    run = _make_fake_run({
-        ("gh", "pr", "list"): _completed(json.dumps(closed_pr)),
-    })
-    state, ctx = probe_worker_state(worktree, "loop/1-demo", "o/r", 1, run=run)
+    _seed_pr(
+        "loop/1-demo",
+        {
+            "url": "https://github.com/o/r/pull/42",
+            "number": 42,
+            "state": "CLOSED",
+            "mergeable": "",
+            "mergeStateStatus": "",
+            "isDraft": False,
+        },
+    )
+    state, ctx = probe_worker_state(worktree, "loop/1-demo", "o/r", 1, run=_make_fake_run({}))
     assert state == WorkerState.CLOSED_PR_ABANDONED
     assert ctx.pr_url == "https://github.com/o/r/pull/42"
 
@@ -97,39 +125,37 @@ def test_closed_pr_abandoned_brief_kind_is_none() -> None:
 def test_merged_pr_still_takes_precedence_over_closed_branch(worktree: Path) -> None:
     """Defensive: when the PR is MERGED (vs CLOSED-without-merge) we
     return DONE_MERGED, not CLOSED_PR_ABANDONED."""
-    merged_pr = [{
-        "url": "https://github.com/o/r/pull/99",
-        "number": 99,
-        "state": "MERGED",
-        "mergeable": "MERGEABLE",
-        "mergeStateStatus": "CLEAN",
-        "isDraft": False,
-    }]
-    run = _make_fake_run({
-        ("gh", "pr", "list"): _completed(json.dumps(merged_pr)),
-    })
-    state, _ctx = probe_worker_state(worktree, "loop/1-demo", "o/r", 1, run=run)
+    _seed_pr(
+        "loop/1-demo",
+        {
+            "url": "https://github.com/o/r/pull/99",
+            "number": 99,
+            "state": "MERGED",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "isDraft": False,
+        },
+    )
+    state, _ctx = probe_worker_state(worktree, "loop/1-demo", "o/r", 1, run=_make_fake_run({}))
     assert state == WorkerState.DONE_MERGED
 
 
 def test_open_pr_still_classified_normally_not_closed(worktree: Path) -> None:
     """Defensive: OPEN PR continues to flow through the normal
     PR_OPEN_* dispatch."""
-    open_pr = [{
-        "url": "https://github.com/o/r/pull/5",
-        "number": 5,
-        "state": "OPEN",
-        "mergeable": "MERGEABLE",
-        "mergeStateStatus": "CLEAN",
-        "isDraft": False,
-    }]
-    run = _make_fake_run({
-        ("gh", "pr", "list"): _completed(json.dumps(open_pr)),
-        # No CI failure, no critic block — healthy path.
-        ("gh", "pr", "view"): _completed(json.dumps({"statusCheckRollup": []})),
-        ("gh", "issue", "view"): _completed(json.dumps({"comments": []})),
-    })
-    state, _ctx = probe_worker_state(worktree, "loop/5", "o/r", 5, run=run)
+    _seed_pr(
+        "loop/5",
+        {
+            "url": "https://github.com/o/r/pull/5",
+            "number": 5,
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "isDraft": False,
+        },
+    )
+    # No CI failure, no critic block — healthy path (client defaults).
+    state, _ctx = probe_worker_state(worktree, "loop/5", "o/r", 5, run=_make_fake_run({}))
     # Anything in the PR_OPEN_* family is fine for this test — we're
     # just pinning that CLOSED handling didn't break the OPEN path.
     assert state != WorkerState.CLOSED_PR_ABANDONED
@@ -145,12 +171,11 @@ def test_probe_fetches_origin_branch_before_ahead_count(worktree: Path) -> None:
     """The probe must refresh ``origin/<branch>`` before measuring
     ``origin/branch..HEAD`` — otherwise a successful push from a prior
     session still shows as 'local commits ahead'."""
+    _seed_pr("loop/1-demo", None)  # no PR for this branch
     calls: list[list[str]] = []
 
     def fake_run(args, _cwd):
         calls.append(list(args))
-        if args[:3] == ["gh", "pr", "list"]:
-            return _completed("[]")  # no PR
         if args[:2] == ["git", "fetch"]:
             return _completed("")
         if args[:1] == ["git"] and "status" in args:
@@ -188,19 +213,21 @@ def test_iteration_loop_escalates_to_human_on_closed_pr(
     the dispatcher doesn't keep picking up the issue every tick."""
     from forge_loop.runner.iteration import run_iteration_loop
 
-    closed_pr = [{
-        "url": "https://github.com/o/r/pull/42",
-        "number": 42,
-        "state": "CLOSED",
-        "mergeable": "",
-        "mergeStateStatus": "",
-        "isDraft": False,
-    }]
-    run = _make_fake_run({
-        ("gh", "pr", "list"): _completed(json.dumps(closed_pr)),
-    })
+    _seed_pr(
+        "loop/1-demo",
+        {
+            "url": "https://github.com/o/r/pull/42",
+            "number": 42,
+            "state": "CLOSED",
+            "mergeable": "",
+            "mergeStateStatus": "",
+            "isDraft": False,
+        },
+    )
+    run = _make_fake_run({})
 
     dispatches: list = []
+
     def dispatch(*args, **kwargs):
         dispatches.append((args, kwargs))
         # Sentinel — should never be called.
@@ -219,7 +246,7 @@ def test_iteration_loop_escalates_to_human_on_closed_pr(
         status = "open"
         pr_url = None
 
-    final = run_iteration_loop(
+    run_iteration_loop(
         _Outcome(),
         {"number": 1, "title": "demo", "body": ""},
         repo="o/r",
@@ -244,9 +271,9 @@ def test_probe_fetch_failure_is_non_fatal(worktree: Path) -> None:
     """Adversarial: a fetch failure (network down, branch already
     deleted on origin) must NOT crash the probe — we degrade to the
     best-effort ahead-count just like before."""
+    _seed_pr("loop/1-demo", None)  # no PR for this branch
+
     def fake_run(args, _cwd):
-        if args[:3] == ["gh", "pr", "list"]:
-            return _completed("[]")
         if args[:2] == ["git", "fetch"]:
             # Simulate offline / remote-gone — fetch fails hard.
             raise subprocess.SubprocessError("network unreachable")

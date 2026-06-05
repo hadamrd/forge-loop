@@ -21,7 +21,7 @@ from mcp.server.fastmcp import FastMCP
 from forge_loop import attempts as _attempts
 from forge_loop import controlled_exec as _cx
 from forge_loop import eventdb as _eventdb
-from forge_loop import gh as _gh
+from forge_loop import gh_issues as _gh
 from forge_loop import manual as _manual
 from forge_loop import operator as _operator
 from forge_loop import state as _state

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from forge_loop import gh as _gh
+from forge_loop import gh_issues as _gh
 
 MARKER = "<!-- forge-loop-attempt -->"
 COMMENT_RE = re.compile(re.escape(MARKER) + r".*?```json\s*\n(.*?)\n```", re.DOTALL)

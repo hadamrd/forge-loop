@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,7 +28,6 @@ from typer.testing import CliRunner
 from forge_loop import axis as _axis
 from forge_loop import cli
 
-
 # ---------------------------------------------------------------------------
 # Pure axis helpers
 # ---------------------------------------------------------------------------
@@ -38,8 +36,8 @@ from forge_loop import cli
 def test_extract_axes_picks_lowercased_slugs_only() -> None:
     labels = [
         {"name": "axis:dispatch"},
-        {"name": "Axis:CLI"},          # mixed case → lowercase
-        {"name": "axis:"},              # empty slug → dropped
+        {"name": "Axis:CLI"},  # mixed case → lowercase
+        {"name": "axis:"},  # empty slug → dropped
         {"name": "loop:ready"},
         "axis:observability",
     ]
@@ -63,8 +61,8 @@ def test_group_by_axis_buckets_and_dedupes_unaligned() -> None:
     issues = [
         {"number": 1, "labels": [{"name": "axis:dispatch"}]},
         {"number": 2, "labels": [{"name": "axis:cli"}, {"name": "axis:dispatch"}]},
-        {"number": 3, "labels": [{"name": "loop:ready"}]},     # unaligned
-        {"number": 4, "labels": [{"name": "axis:"}]},          # malformed → unaligned
+        {"number": 3, "labels": [{"name": "loop:ready"}]},  # unaligned
+        {"number": 4, "labels": [{"name": "axis:"}]},  # malformed → unaligned
     ]
     buckets, unaligned = _axis.group_by_axis(issues)
 
@@ -103,8 +101,13 @@ def test_parse_filter_env_dedupes_and_lowercases() -> None:
 
 
 @pytest.fixture
-def _status_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub ``cli.load()`` so ``_cmd_status`` runs against a temp dir."""
+def _status_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Stub ``cli.load()`` so ``_cmd_status`` runs against a temp dir.
+
+    Also resets the ``gh_issues`` client singleton after the test so a seeded
+    MockGhClient never leaks into another test.
+    """
+    from forge_loop import gh_issues
 
     class _Labels:
         ready = "loop:ready"
@@ -119,28 +122,46 @@ def _status_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(cli, "load", lambda: cfg)
     monkeypatch.delenv(_axis.AXIS_FILTER_ENV, raising=False)
+    yield cfg
+    gh_issues.set_client(None)
 
 
 def _seed_subprocess(monkeypatch: pytest.MonkeyPatch, payload: list[dict[str, Any]]) -> None:
-    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            args=args[0] if args else [],
-            returncode=0,
-            stdout=json.dumps(payload),
-            stderr="",
-        )
+    """Seed the ready-issue query via the GhClient (status no longer shells out).
 
-    monkeypatch.setattr("forge_loop.cli.subprocess.run", fake_run)
+    ``forge-loop status`` reads the ready queue through ``gh_issues.top_issues``
+    (GhClient), so we inject a ``MockGhClient`` returning the payload as typed
+    ``Issue`` objects. The ``_status_cfg`` fixture resets the client afterward.
+    """
+    from forge_loop import gh_issues
+    from forge_loop.gh_client import Issue, MockGhClient
+
+    issues = [
+        Issue(
+            number=int(row.get("number", 0)),
+            title=str(row.get("title", "")),
+            labels=[str(lab.get("name", "")) for lab in row.get("labels", [])],
+        )
+        for row in payload
+    ]
+    gh_issues.set_client(MockGhClient(issues_by_label_response=issues))
 
 
 def test_status_json_groups_by_axis(
     _status_cfg: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _seed_subprocess(monkeypatch, [
-        {"number": 1, "title": "a", "labels": [{"name": "axis:dispatch"}]},
-        {"number": 2, "title": "b", "labels": [{"name": "axis:cli"}, {"name": "axis:dispatch"}]},
-        {"number": 3, "title": "c", "labels": [{"name": "loop:ready"}]},
-    ])
+    _seed_subprocess(
+        monkeypatch,
+        [
+            {"number": 1, "title": "a", "labels": [{"name": "axis:dispatch"}]},
+            {
+                "number": 2,
+                "title": "b",
+                "labels": [{"name": "axis:cli"}, {"name": "axis:dispatch"}],
+            },
+            {"number": 3, "title": "c", "labels": [{"name": "loop:ready"}]},
+        ],
+    )
     rc = cli._cmd_status(SimpleNamespace(json=True, axis=[]))
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
@@ -153,9 +174,12 @@ def test_status_json_groups_by_axis(
 def test_status_human_warns_on_unaligned(
     _status_cfg: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _seed_subprocess(monkeypatch, [
-        {"number": 7, "title": "alone", "labels": [{"name": "loop:ready"}]},
-    ])
+    _seed_subprocess(
+        monkeypatch,
+        [
+            {"number": 7, "title": "alone", "labels": [{"name": "loop:ready"}]},
+        ],
+    )
     cli._cmd_status(SimpleNamespace(json=False, axis=[]))
     out = capsys.readouterr().out
     assert "warning" in out
@@ -165,9 +189,12 @@ def test_status_human_warns_on_unaligned(
 def test_status_human_no_warning_when_aligned(
     _status_cfg: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _seed_subprocess(monkeypatch, [
-        {"number": 1, "title": "x", "labels": [{"name": "axis:dispatch"}]},
-    ])
+    _seed_subprocess(
+        monkeypatch,
+        [
+            {"number": 1, "title": "x", "labels": [{"name": "axis:dispatch"}]},
+        ],
+    )
     cli._cmd_status(SimpleNamespace(json=False, axis=[]))
     out = capsys.readouterr().out
     assert "no axis" not in out
@@ -176,10 +203,13 @@ def test_status_human_no_warning_when_aligned(
 def test_status_json_axis_filter_narrows_view(
     _status_cfg: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _seed_subprocess(monkeypatch, [
-        {"number": 1, "title": "a", "labels": [{"name": "axis:dispatch"}]},
-        {"number": 2, "title": "b", "labels": [{"name": "axis:cli"}]},
-    ])
+    _seed_subprocess(
+        monkeypatch,
+        [
+            {"number": 1, "title": "a", "labels": [{"name": "axis:dispatch"}]},
+            {"number": 2, "title": "b", "labels": [{"name": "axis:cli"}]},
+        ],
+    )
     rc = cli._cmd_status(SimpleNamespace(json=True, axis=["dispatch"]))
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
@@ -229,9 +259,7 @@ def test_cli_run_accepts_repeated_axis_flag(monkeypatch: pytest.MonkeyPatch) -> 
         return 0
 
     monkeypatch.setattr(cli, "_cmd_run", _stub)
-    result = runner.invoke(
-        cli.app, ["run", "--axis", "dispatch", "--axis", "cli"]
-    )
+    result = runner.invoke(cli.app, ["run", "--axis", "dispatch", "--axis", "cli"])
     assert result.exit_code == 0
     assert captured["axis"] == ["dispatch", "cli"]
 

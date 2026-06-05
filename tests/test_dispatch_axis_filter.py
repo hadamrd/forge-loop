@@ -233,7 +233,7 @@ def test_ready_issue_with_existing_open_pr_is_selected_for_repair(
 def test_repaired_pr_gets_automerge_after_threads_are_clear(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    from forge_loop import gh
+    from forge_loop import gh_issues as gh
     from forge_loop.config import Config
     from forge_loop.runner import merge_gate
     from forge_loop.runner import tick as tick_mod

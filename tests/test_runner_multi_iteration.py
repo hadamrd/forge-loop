@@ -11,19 +11,27 @@ Drive ``run_iteration_loop`` with a fake ``dispatch_worker`` + a programmable
 
 from __future__ import annotations
 
-import json
 import subprocess
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from forge_loop import gh_issues
 from forge_loop.runner.iteration import (
     WorkerState,
     run_iteration_loop,
 )
 from forge_loop.runner.tick import _should_run_worker_iterations
+
+
+@pytest.fixture(autouse=True)
+def _reset_client() -> Generator[None, None, None]:
+    gh_issues.set_client(None)
+    yield
+    gh_issues.set_client(None)
 
 
 @dataclass
@@ -49,14 +57,85 @@ def worktree(tmp_path: Path) -> Path:
     return wt
 
 
+class _ScriptedClient:
+    """GhClient double whose answers track the current attempt's stage.
+
+    The probe reads the PR / CI / critic state for the *current* attempt off
+    ``owner.stages[owner._attempt_idx]``; auto-merge + escalation are recorded
+    on the owner. git state stays on the ``run`` shim.
+    """
+
+    auth_source = "scripted"
+
+    def __init__(self, owner: Scripted) -> None:
+        self._owner = owner
+
+    def _stage(self) -> dict[str, Any]:
+        idx = self._owner._attempt_idx
+        stages = self._owner.stages
+        return stages[idx] if idx < len(stages) else {}
+
+    def find_pr_by_head(self, owner: str, repo: str, head: str) -> dict[str, Any] | None:
+        prs = self._stage().get("pr_list", [])
+        if not prs:
+            return None
+        pr = dict(prs[0])
+        return {
+            "url": pr.get("url", ""),
+            "number": pr.get("number"),
+            "state": str(pr.get("state", "")).upper(),
+            "mergeable": str(pr.get("mergeable", "")).upper(),
+            "mergeStateStatus": str(pr.get("mergeStateStatus", "")).upper(),
+            "isDraft": bool(pr.get("isDraft", False)),
+        }
+
+    def pr_status_failed(self, owner: str, repo: str, number: int) -> bool:
+        checks = self._stage().get("checks", [])
+        for c in checks:
+            if str(c.get("conclusion", "")).upper() in {
+                "FAILURE",
+                "TIMED_OUT",
+                "CANCELLED",
+                "ACTION_REQUIRED",
+            }:
+                return True
+            if str(c.get("state", "")).upper() in {"FAILURE", "ERROR"}:
+                return True
+        return False
+
+    def latest_critic_report(self, owner: str, repo: str, number: int) -> str:
+        for c in self._stage().get("comments", []):
+            body = str(c.get("body", ""))
+            low = body.lower()
+            if "critic-report" in low or "sev1" in low or "sev2" in low:
+                return body
+        return ""
+
+    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
+        # The owner records the PR URL it expects to auto-merge.
+        prs = self._stage().get("pr_list", [])
+        url = prs[0].get("url", "") if prs else ""
+        self._owner.automerge_calls.append(url or str(number))
+        return True
+
+    def update_issue(self, owner: str, repo: str, number: int, **kwargs: Any) -> bool:
+        add = kwargs.get("add_labels") or []
+        self._owner.label_calls.append((number, add[0] if add else ""))
+        return True
+
+    def comment(self, *a: Any, **k: Any) -> None:  # pragma: no cover - diagnostic only
+        pass
+
+
 @dataclass
 class Scripted:
     """Per-attempt scripting of (probe response, dispatch outcome).
 
-    ``stages[attempt]`` is the canned ``gh pr list`` payload + ``git status``
-    + ``rev-list`` output the probe will see at the START of that attempt's
-    iteration. ``dispatch_results[attempt]`` is the outcome the fake worker
-    returns AFTER the brief is rendered.
+    ``stages[attempt]`` is the PR / CI / critic state the probe will see at the
+    START of that attempt's iteration (served via :class:`_ScriptedClient`),
+    plus the ``git status`` / ``rev-list`` output served via the ``run`` shim.
+    ``dispatch_results[attempt]`` is the outcome the fake worker returns AFTER
+    the brief is rendered.
     """
 
     stages: list[dict[str, Any]] = field(default_factory=list)
@@ -67,43 +146,23 @@ class Scripted:
 
     _attempt_idx: int = 0
 
+    def __post_init__(self) -> None:
+        gh_issues.set_client(_ScriptedClient(self))
+
     def make_run(self):
+        """git-only ``run`` shim (GitHub state is served by the client)."""
+
         def _run(args, _cwd):
-            # gh pr list:
-            if args[0] == "gh" and args[1] == "pr" and args[2] == "list":
-                stage = self.stages[self._attempt_idx]
-                return _cp(json.dumps(stage.get("pr_list", [])))
             if args[0] == "git" and args[1] == "status":
-                stage = self.stages[self._attempt_idx]
+                stage = (
+                    self.stages[self._attempt_idx] if self._attempt_idx < len(self.stages) else {}
+                )
                 return _cp(stage.get("status", ""))
             if args[0] == "git" and args[1] == "rev-list":
-                stage = self.stages[self._attempt_idx]
+                stage = (
+                    self.stages[self._attempt_idx] if self._attempt_idx < len(self.stages) else {}
+                )
                 return _cp(stage.get("rev_list", "0\n"))
-            if (
-                args[0] == "gh"
-                and args[1] == "pr"
-                and args[2] == "view"
-                and "statusCheckRollup" in args
-            ):
-                stage = self.stages[self._attempt_idx]
-                return _cp(json.dumps({"statusCheckRollup": stage.get("checks", [])}))
-            if args[0] == "gh" and args[1] == "pr" and args[2] == "view":
-                stage = self.stages[self._attempt_idx]
-                return _cp(json.dumps({"comments": stage.get("comments", [])}))
-            if args[0] == "gh" and args[1] == "pr" and args[2] == "merge":
-                self.automerge_calls.append(args[3])
-                return _cp("", 0)
-            if args[0] == "gh" and args[1] == "issue" and args[2] == "edit":
-                # The escalation hot-fix calls `--add-label X --remove-label Y`
-                # in a single invocation. Capture the ADDED label (the one
-                # the test cares about) by scanning for --add-label.
-                added = ""
-                for i, a in enumerate(args):
-                    if a == "--add-label" and i + 1 < len(args):
-                        added = args[i + 1]
-                        break
-                self.label_calls.append((int(args[3]), added or args[-1]))
-                return _cp("", 0)
             if args[0] == "git" and args[1] == "rev-parse":
                 return _cp("loop/78-x\n", 0)
             return _cp("", 0)

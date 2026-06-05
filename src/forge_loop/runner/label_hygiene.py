@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from forge_loop.config import Config
-from forge_loop.gh import unlabel
+from forge_loop.gh_issues import unlabel
 from forge_loop.state import append_event
 
 

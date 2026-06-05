@@ -297,7 +297,7 @@ def test_selector_skips_when_issue_fetch_fails(tmp_path: Path) -> None:
 # _enable_automerge_for_adopted_prs — adoption merge gates (sev2b sad paths)
 # ---------------------------------------------------------------------------
 
-from forge_loop import gh as _ghmod  # noqa: E402
+from forge_loop import gh_issues as _ghmod  # noqa: E402
 from forge_loop.runner.tick import (  # noqa: E402
     _enable_automerge_for_adopted_prs,
     _run_adoption_tick,
@@ -693,16 +693,19 @@ def test_real_selector_excludes_approved_pr_across_n_ticks(tmp_path: Path, monke
     repair worker is ever dispatched against it (the #229 ~5h stall cannot
     recur). A sibling ``critic:blocking`` PR in the same batch IS selected each
     tick, proving repair is not disabled wholesale."""
+    from forge_loop.gh_client import MockGhClient
     from forge_loop.runner.repairs import blocking_pr_repairs
 
     cfg = _cfg(tmp_path)
     open_list = [_open_pr(229), _open_pr(300, blocked=True)]
     critic = _critic_thread()
-    monkeypatch.setattr(_ghmod, "_open_prs", lambda limit, repo: list(open_list))
     monkeypatch.setattr(
         _ghmod,
-        "review_threads_batch",
-        lambda numbers, repo=None: {229: [critic], 300: [critic]},
+        "_GH_CLIENT",
+        MockGhClient(
+            open_prs_response=list(open_list),
+            review_threads_by_pr={229: [critic], 300: [critic]},
+        ),
     )
 
     for _ in range(3):  # N consecutive ticks
@@ -731,13 +734,20 @@ def test_tick_merges_approved_pr_and_dispatches_no_repair(tmp_path: Path, monkey
     the selector runs first but excludes the PR (defence in depth), so merge
     always wins over repair regardless of step order — the approved PR can never
     be dispatched to a repair worker."""
+    from forge_loop.gh_client import MockGhClient
     from forge_loop.runner.repairs import blocking_pr_repairs
 
     cfg = _cfg(tmp_path)
     approved = _open_pr(229)
     critic = _critic_thread()
-    monkeypatch.setattr(_ghmod, "_open_prs", lambda limit, repo: [approved])
-    monkeypatch.setattr(_ghmod, "review_threads_batch", lambda numbers, repo=None: {229: [critic]})
+    monkeypatch.setattr(
+        _ghmod,
+        "_GH_CLIENT",
+        MockGhClient(
+            open_prs_response=[approved],
+            review_threads_by_pr={229: [critic]},
+        ),
+    )
 
     # Repair selector (real): the approved PR is NOT selected for repair.
     repairs = blocking_pr_repairs(

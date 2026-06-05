@@ -279,31 +279,11 @@ def ensure_labels_via_gh(repo: str, labels: list[tuple[str, str, str]]) -> list[
 
     Each label is ``(name, color_hex, description)``. Returns the list of
     label names that were CREATED (already-existing ones are silently skipped).
+    Goes through the GitHub SDK client — no ``gh`` CLI.
     """
-    import subprocess
+    from forge_loop import gh_issues as _gh
 
-    created: list[str] = []
-    for name, color, desc in labels:
-        r = subprocess.run(
-            [
-                "gh",
-                "label",
-                "create",
-                name,
-                "--repo",
-                repo,
-                "--color",
-                color,
-                "--description",
-                desc,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if r.returncode == 0:
-            created.append(name)
-    return created
+    return _gh.create_labels(repo, labels)
 
 
 DEFAULT_LABELS: list[tuple[str, str, str]] = [

@@ -160,31 +160,14 @@ class StatusCommandsMixin:
         queue_depth = 0
         ready_issues: list[dict[str, Any]] = []
         if cfg.github_repo:
+            from forge_loop import gh_issues as _gh
+
             try:
-                r = self.subprocess.run(
-                    [
-                        "gh",
-                        "issue",
-                        "list",
-                        "--repo",
-                        cfg.github_repo,
-                        "--label",
-                        cfg.labels.ready,
-                        "--state",
-                        "open",
-                        "--limit",
-                        "200",
-                        "--json",
-                        "number,title,labels",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if r.returncode == 0:
-                    ready_issues = json.loads(r.stdout or "[]")
-                    queue_depth = len(ready_issues)
-            except (self.subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+                # top_issues returns dicts with number/title/labels — the exact
+                # fields the axis bucketing below reads.
+                ready_issues = _gh.top_issues(cfg.labels.ready, 200, repo=cfg.github_repo)
+                queue_depth = len(ready_issues)
+            except Exception:  # noqa: BLE001 — degrade to "unknown" on any API failure
                 queue_depth = -1
         else:
             queue_depth = -1

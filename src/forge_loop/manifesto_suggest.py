@@ -39,7 +39,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from forge_loop import gh as _gh_module
+from forge_loop import gh_issues as _gh_module
 from forge_loop.log import get_logger
 from forge_loop.manifestos import QUALITY_REL, TESTING_REL, discover_manifestos
 
@@ -207,28 +207,32 @@ def assemble_bug_context(
 
     Every fetch is wrapped so a missing/unfetchable piece degrades to an
     empty value rather than raising — mirroring the swallow-and-return
-    convention in :mod:`forge_loop.gh`. The PR ref passed to ``gh`` is the
-    bare number; ``gh`` resolves it against the repo in ``repo_path``.
+    convention in :mod:`forge_loop.gh_issues`. PR data is fetched via the
+    GhClient, addressed by ``owner/repo``; ``repo_path`` is retained for
+    call-site back-compat (used for the local checkout in the apply step).
     """
     gh = gh_module or _gh_module
     pr_ref = str(pr_number)
+    # The GhClient-backed PR helpers address the repo by ``owner/name``; the
+    # local checkout ``repo_path`` is no longer how PR data is fetched (#223).
+    repo_slug = f"{owner}/{repo}" if owner and repo else ""
 
     body = ""
     commit_metadata = ""
     try:
-        body, commit_metadata = gh.pr_precommit_context(pr_ref, repo_path)
+        body, commit_metadata = gh.pr_precommit_context(pr_ref, repo_slug)
     except Exception as exc:  # noqa: BLE001 — boundary; degrade gracefully
         _log.warning("manifesto_suggest_pr_context_unavailable", pr=pr_number, error=str(exc))
 
     diff = ""
     try:
-        diff = gh.pr_diff(pr_ref, repo_path)
+        diff = gh.pr_diff(pr_ref, repo_slug)
     except Exception as exc:  # noqa: BLE001 — boundary; degrade gracefully
         _log.warning("manifesto_suggest_pr_diff_unavailable", pr=pr_number, error=str(exc))
 
     changed: list[str] = []
     try:
-        changed = gh.pr_changed_files(pr_ref, repo_path)
+        changed = gh.pr_changed_files(pr_ref, repo_slug)
     except Exception as exc:  # noqa: BLE001 — boundary; degrade gracefully
         _log.warning("manifesto_suggest_pr_files_unavailable", pr=pr_number, error=str(exc))
     test_files = tuple(p for p in changed if isinstance(p, str) and _is_test_file(p))
@@ -595,24 +599,15 @@ def open_manifesto_pr(
     _run(["git", "add", *rel_paths])
     _run(["git", "commit", "-m", plan.commit_message])
     _run(["git", "push", "-u", "origin", plan.branch])
-    created = _run(
-        [
-            "gh",
-            "pr",
-            "create",
-            "--repo",
-            github_repo,
-            "--base",
-            base_branch,
-            "--head",
-            plan.branch,
-            "--title",
-            plan.title,
-            "--body",
-            plan.body,
-        ]
+    # The branch is pushed; open the PR through the GitHub SDK client (git
+    # stays on the injectable ``runner``; the PR open does not shell out).
+    return _gh_module.create_pull(
+        plan.title,
+        plan.body,
+        plan.branch,
+        base_branch,
+        github_repo,
     )
-    return (getattr(created, "stdout", "") or "").strip()
 
 
 # ---------------------------------------------------------------------------

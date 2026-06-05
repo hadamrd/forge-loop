@@ -7,7 +7,6 @@ no behaviour change, no signature change.
 from __future__ import annotations
 
 import contextlib
-import subprocess
 import time
 
 from forge_loop.config import Config
@@ -23,9 +22,7 @@ from forge_loop.state import append_event
 _RECENT_OUTCOMES = get_default_state().recent_outcomes
 
 
-def _check_drift_and_maybe_halt(
-    cfg: Config, state: RunnerState | None = None
-) -> bool:
+def _check_drift_and_maybe_halt(cfg: Config, state: RunnerState | None = None) -> bool:
     """Returns True if the loop should halt due to drift.
 
     ``state`` defaults to the legacy module-level singleton so existing
@@ -41,8 +38,7 @@ def _check_drift_and_maybe_halt(
     sigs = {sig for had_w, all_failed, sig in outcomes if had_w and all_failed}
     if len(sigs) == 1 and all(had_w and all_failed for had_w, all_failed, _ in outcomes):
         sig = next(iter(sigs))
-        append_event(cfg.events_file, "loop_drift_halt", signature=sig,
-                     last_3=list(outcomes))
+        append_event(cfg.events_file, "loop_drift_halt", signature=sig, last_3=list(outcomes))
         # File a loop:halt issue so the operator wakes up to a clear signal.
         title = f"loop: drift halt — 3 ticks in a row failed ({sig})"
         body = (
@@ -54,17 +50,11 @@ def _check_drift_and_maybe_halt(
             "Resolve the root cause and remove the `docs/ops/loop-runner.stop` "
             "file to resume."
         )
-        with contextlib.suppress(subprocess.TimeoutExpired, FileNotFoundError):
-            if not cfg.github_repo:
-                raise FileNotFoundError
-            subprocess.run(
-                ["gh", "issue", "create",
-                 "--repo", cfg.github_repo,
-                 "--title", title,
-                 "--label", "loop:halt",
-                 "--body", body],
-                capture_output=True, timeout=30,
-            )
+        if cfg.github_repo:
+            from forge_loop import gh_issues as _gh
+
+            with contextlib.suppress(Exception):
+                _gh.create_issue(title, body, ["loop:halt"], repo=cfg.github_repo)
         # Best-effort push notification via tput-bell + a marker file the
         # operator can grep for.
         with contextlib.suppress(OSError):
@@ -86,14 +76,13 @@ def _maybe_deploy_drift_halt(cfg: Config, ok: bool) -> None:
     """
     fails = _consecutive_deploy_fails_impl(cfg.events_file)
     if not ok and fails >= 3:
-        append_event(cfg.events_file, "deploy_drift_warn",
-                     consecutive_fails=fails)
+        append_event(cfg.events_file, "deploy_drift_warn", consecutive_fails=fails)
         # Settings-driven (issue #84): was env LOOP_DEPLOY_DRIFT_HALT,
         # now deploy.drift_halt with the unified env > yaml > default precedence.
         from forge_loop.settings import Settings as _Settings
+
         if _Settings.load().deploy.drift_halt:
-            append_event(cfg.events_file, "deploy_drift_halt",
-                         consecutive_fails=fails)
+            append_event(cfg.events_file, "deploy_drift_halt", consecutive_fails=fails)
             with contextlib.suppress(OSError):
                 (cfg.state_dir / "loop-runner.HALT").write_text(
                     "deploy: 3 consecutive failures (opt-in halt)\n"
