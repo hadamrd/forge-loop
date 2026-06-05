@@ -182,3 +182,57 @@ def test_make_repair_brief_injects_verify_commands(tmp_path: Path) -> None:
     )
     assert "DEFINITION OF DONE" in brief
     assert "`python -m pytest -q`" in brief
+
+
+# ---------------------------------------------------------------------------
+# Upfront SCOPE DISCIPLINE — the #261 convergence failure (PR grew, not shrank).
+# ---------------------------------------------------------------------------
+
+
+def test_make_brief_includes_scope_discipline_with_default_cap(tmp_path: Path) -> None:
+    brief = make_brief({"number": 5, "title": "x", "body": "y"}, tmp_path / "w")
+    assert "SCOPE DISCIPLINE" in brief
+    assert "ONE mechanism" in brief
+    # The default cap (150) is cited as a concrete soft net-LOC ceiling.
+    assert "~150 LOC" in brief
+    # The minimal-diff philosophy line is present.
+    assert "shrinks under review, it never grows" in brief
+
+
+def test_make_brief_scope_cap_number_is_configurable(tmp_path: Path) -> None:
+    brief = make_brief(
+        {"number": 5, "title": "x", "body": "y"},
+        tmp_path / "w",
+        scope_soft_loc_cap=42,
+    )
+    assert "~42 LOC" in brief
+    assert "~150 LOC" not in brief
+
+
+def test_make_brief_scope_cap_zero_drops_the_number(tmp_path: Path) -> None:
+    brief = make_brief(
+        {"number": 5, "title": "x", "body": "y"},
+        tmp_path / "w",
+        scope_soft_loc_cap=0,
+    )
+    # Single-mechanism prose survives; no LOC number is cited.
+    assert "SCOPE DISCIPLINE" in brief
+    assert "ONE mechanism" in brief
+    assert "LOC:" not in brief
+    assert "~0 LOC" not in brief
+
+
+def test_make_repair_brief_includes_cut_not_grow_directive(tmp_path: Path) -> None:
+    issue = {"number": 261, "title": "fix", "body": "z"}
+    pr = {"number": 7, "url": "https://x/pull/7", "headRefName": "loop/261-fix"}
+    brief = make_repair_brief(
+        issue,
+        tmp_path / "wt",
+        pr=pr,
+        review_context="ctx",
+    )
+    assert "SCOPE DISCIPLINE" in brief
+    # The repair variant MUST tell the worker to CUT, not grow (the #261 mode).
+    assert "THIS IS A REPAIR" in brief
+    assert "CUT, do not grow" in brief
+    assert "never ship a larger diff than you started with" in brief

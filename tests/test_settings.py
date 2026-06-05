@@ -374,3 +374,49 @@ def test_worker_env_threads_onto_legacy_config(
     assert cfg.worker.env_vars == {"VIRTUAL_ENV": ".venv"}
     assert cfg.worker.env_require == ("pytest",)
     assert cfg.worker.verify_commands == ("python -m pytest -q",)
+
+
+# ---------------------------------------------------------------------------
+# Worker scope-cap discipline (the #261 convergence failure).
+# ---------------------------------------------------------------------------
+
+
+def test_scope_soft_loc_cap_default(fake_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOOP_GH_REPO", "owner/repo")
+    s = Settings.load()
+    assert s.worker.scope_soft_loc_cap == 150
+
+
+def test_scope_soft_loc_cap_env_override(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LOOP_GH_REPO", "owner/repo")
+    monkeypatch.setenv("LOOP_WORKER_SCOPE_SOFT_LOC_CAP", "42")
+    s = Settings.load()
+    assert s.worker.scope_soft_loc_cap == 42
+
+
+def test_scope_soft_loc_cap_rejects_negative(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LOOP_GH_REPO", "owner/repo")
+    monkeypatch.setenv("LOOP_WORKER_SCOPE_SOFT_LOC_CAP", "-1")
+    with pytest.raises(ConfigError, match="scope_soft_loc_cap"):
+        Settings.load()
+
+
+def test_scope_soft_loc_cap_threads_onto_legacy_config(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge_loop import config as config_mod
+
+    monkeypatch.setattr("forge_loop.config._settings_mod._repo_root", lambda: fake_repo)
+    monkeypatch.setenv("LOOP_GH_REPO", "owner/repo")
+    (fake_repo / "forge-loop.yaml").write_text(dedent("""
+        repo:
+          github: owner/repo
+        worker:
+          scope_soft_loc_cap: 80
+    """))
+    cfg = config_mod.load()
+    assert cfg.worker.scope_soft_loc_cap == 80

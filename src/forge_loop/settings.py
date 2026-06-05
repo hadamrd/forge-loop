@@ -269,6 +269,22 @@ class WorkerSettings(BaseSettings):
     env_vars: dict[str, str] = Field(default_factory=dict)
     env_require: tuple[str, ...] = ()
     verify_commands: tuple[str, ...] = ()
+    # Upfront scope-cap discipline (the #261 convergence failure: a worker
+    # grew a too-big PR +1013 -> +1033 -> +1128 over 3 rounds instead of
+    # cutting scope). The worker brief cites this soft NET-LOC ceiling so it
+    # ships the smallest single-mechanism change by default and proposes
+    # follow-up sub-tickets past the cap instead of monolithing. ``0`` keeps
+    # the single-mechanism prose without a number; negatives are rejected.
+    scope_soft_loc_cap: int = 150
+
+    @field_validator("scope_soft_loc_cap")
+    @classmethod
+    def _scope_cap_nonneg(cls, v: int) -> int:
+        if v < 0:
+            raise ConfigError(
+                f"worker.scope_soft_loc_cap={v!r} — must be >= 0 (0 disables the LOC number)"
+            )
+        return int(v)
 
     @field_validator("env_path_prepend", "env_require", mode="before")
     @classmethod
@@ -627,6 +643,7 @@ ENV_MAP: tuple[tuple[str, str, Any], ...] = (
     ("LOOP_WORKER_LOAD_TIMEOUT_MS", "worker.load_timeout_ms", int),
     ("LOOP_WORKER_STRICT_MCP", "worker.strict_mcp_config", _coerce_bool),
     ("LOOP_WORKER_RESCUE_FORMAT_CMD", "worker.rescue_format_cmd", str),
+    ("LOOP_WORKER_SCOPE_SOFT_LOC_CAP", "worker.scope_soft_loc_cap", int),
     # Lumen
     ("LOOP_LUMEN_TOP_K", "lumen.top_k", int),
     # Attempts
