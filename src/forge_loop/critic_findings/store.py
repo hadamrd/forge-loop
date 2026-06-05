@@ -148,28 +148,3 @@ class CriticFindingsStore(Protocol):
         - brand-new finding → insert as ``open``.
         """
         ...
-
-
-def render_findings_block(findings: tuple[StoredFinding, ...] | list[StoredFinding]) -> str:
-    """Render durable findings as the AUTHORITATIVE repair-brief baseline.
-
-    This is the single rendering path shared by the repair-dispatch wiring and
-    tests. It is tool-free and deterministic: the worker has the findings even
-    if it never calls an MCP tool AND even if GitHub posting 422'd (AC3/AC5).
-    Returns ``""`` for an empty list so callers can concatenate unconditionally.
-    """
-
-    if not findings:
-        return ""
-    lines = [
-        "DURABLE CRITIC FINDINGS (authoritative — from the .forge control "
-        "plane, NOT re-fetched from GitHub):",
-        "These are the source of truth for what to repair. Address every one; "
-        "the PR converges when the open-count drains to 0.",
-    ]
-    for f in findings:
-        loc = ""
-        if f.file:
-            loc = f" {f.file}" + (f":{f.line}" if f.line is not None else "")
-        lines.append(f"- [{f.severity}/{f.category}]{loc} — {f.message} (id={f.finding_id})")
-    return "\n".join(lines)

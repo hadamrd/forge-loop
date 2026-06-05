@@ -451,6 +451,18 @@ def latest_critic_report(pr: int | str, repo: str | None = None) -> str:
     return client().latest_critic_report(owner, name, _pr_number(pr))
 
 
+def pr_head_branch(pr: int | str, repo: str | None = None) -> str | None:
+    """Return a PR's head branch name, or ``None`` if it can't be fetched.
+
+    Used only as a degenerate-case fallback so the critic persist path can
+    recover a missing ``issue`` from a ``loop/<n>-`` branch rather than dropping
+    every finding (#242 review fix).
+    """
+    owner, name = _owner_name(repo)
+    pull = client().get_pull(owner, name, _pr_number(pr))
+    return pull.head_ref if pull is not None else None
+
+
 # --------------------------------------------------------------------------- #
 # Review threads
 # --------------------------------------------------------------------------- #

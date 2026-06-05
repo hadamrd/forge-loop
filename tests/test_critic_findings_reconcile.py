@@ -14,7 +14,8 @@ from __future__ import annotations
 from forge_loop.critic import CriticReport, Finding
 from forge_loop.critic_actions import apply_critic_report
 from forge_loop.critic_findings import SqliteCriticFindingsStore
-from forge_loop.critic_findings.store import FindingStatus, render_findings_block
+from forge_loop.critic_findings.store import FindingStatus
+from forge_loop.worker_brief import render_findings_block
 
 PR = "https://github.com/acme/widgets/pull/42"
 

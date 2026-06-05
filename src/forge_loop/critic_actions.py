@@ -8,6 +8,7 @@ spinning up subprocesses or threads. The runner imports
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -25,6 +26,8 @@ class GhClient(Protocol):
     def add_pr_label(self, pr: int | str, labels: list[str], repo: str | None = None) -> bool: ...
 
     def disable_pr_auto_merge(self, pr: int | str, repo: str | None = None) -> bool: ...
+
+    def pr_head_branch(self, pr: int | str, repo: str | None = None) -> str | None: ...
 
     def post_review_comment(
         self,
@@ -132,6 +135,38 @@ def plan_actions(
     return plan
 
 
+def _recover_issue_from_branch(
+    gh: GhClient,
+    pr_url: str,
+    repo: str | None,
+    emit: Callable[[str, dict[str, Any]], None] | None,
+) -> int | None:
+    """Best-effort: derive the loop issue from the PR's head branch (#242 fix).
+
+    A degenerate-case fallback for the durable persist path: when the caller
+    didn't supply ``issue``, recover it from the PR's canonical ``loop/<n>-``
+    head branch instead of dropping every finding (which would blind the
+    worker). Network/parse failures degrade to ``None`` so the loud-skip path
+    still fires; on success a ``critic_findings_issue_recovered`` event records
+    that the fallback was exercised.
+    """
+
+    # Lazy import: avoids a module-load cycle (repairs imports worker_brief /
+    # gh_issues; this module is imported by the runner that also imports repairs).
+    from forge_loop.runner.repairs import issue_from_loop_branch
+
+    branch: str | None = None
+    with suppress(Exception):
+        branch = gh.pr_head_branch(pr_url, repo=repo)
+    issue = issue_from_loop_branch(branch)
+    if issue is not None and emit is not None:
+        emit(
+            "critic_findings_issue_recovered",
+            {"pr": pr_url, "issue": issue, "source": "head_branch"},
+        )
+    return issue
+
+
 def apply_critic_report(
     report: CriticReport,
     pr_url: str,
@@ -167,10 +202,13 @@ def apply_critic_report(
     # repair worker via the store, never round-tripped through GitHub (Q10).
     # ``issue`` is REQUIRED for the persist branch: dropping it silently would
     # no-op the entire durable data path and shove the worker back onto the
-    # lossy GitHub round-trip (the exact #242/Q10 blind-repair failure). When a
-    # store is supplied but ``issue`` is missing we make the drop LOUD via a
-    # warning event instead of vanishing the findings.
+    # lossy GitHub round-trip (the exact #242/Q10 blind-repair failure). Before
+    # dropping, we try to RECOVER a missing issue from the PR's canonical
+    # ``loop/<n>-`` head branch (#242 review fix); only if that also fails do we
+    # make the drop LOUD via a warning event instead of vanishing the findings.
     if findings_store is not None:
+        if issue is None:
+            issue = _recover_issue_from_branch(gh, pr_url, repo, emit)
         if issue is None:
             if emit is not None:
                 emit(

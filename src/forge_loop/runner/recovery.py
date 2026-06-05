@@ -28,24 +28,19 @@ get a single auditable trail of what happened to each session.
 from __future__ import annotations
 
 import contextlib
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from forge_loop.events import WorkerSessionRecoveredEvent, emit
 from forge_loop.gh_client import GhClient
+from forge_loop.pr_ref import parse_pr_url
 from forge_loop.worker_sessions import (
     WorkerSession,
     WorkerSessionStore,
     recoverable_sessions,
 )
 from forge_loop.worker_state import WorkerState
-
-# PR URL form: ``https://github.com/<owner>/<repo>/pull/<n>``.
-_PR_URL_RE = re.compile(
-    r"^https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)(?:[/?#].*)?$"
-)
 
 
 @dataclass(frozen=True)
@@ -85,15 +80,10 @@ def _default_worktree_probe(session: WorkerSession) -> bool:
 def _parse_pr_url(pr_url: str | None) -> tuple[str, str, int] | None:
     """Return ``(owner, repo, number)`` for a github PR URL, else None.
 
-    Tolerates trailing slashes, query strings, anchors — anything past
-    the PR number is ignored.
+    Thin alias over the shared :func:`forge_loop.pr_ref.parse_pr_url` parser
+    (#242 review fix — one regex for every PR-URL path in the codebase).
     """
-    if not pr_url:
-        return None
-    m = _PR_URL_RE.match(pr_url.strip())
-    if not m:
-        return None
-    return m.group(1), m.group(2), int(m.group(3))
+    return parse_pr_url(pr_url)
 
 
 def _pr_exists(

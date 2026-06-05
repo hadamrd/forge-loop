@@ -182,3 +182,40 @@ def test_make_repair_brief_injects_verify_commands(tmp_path: Path) -> None:
     )
     assert "DEFINITION OF DONE" in brief
     assert "`python -m pytest -q`" in brief
+
+
+def test_render_findings_block_lives_in_worker_brief() -> None:
+    """sev3/architecture review fix: brief presentation lives in the brief
+    layer, not in the findings-store data contract module."""
+    from forge_loop.critic_findings.store import FindingStatus, StoredFinding
+    from forge_loop.worker_brief import render_findings_block
+
+    assert render_findings_block(()) == ""
+    rows = (
+        StoredFinding(
+            finding_id="abc123",
+            pr="acme/widgets#7",
+            issue=42,
+            severity="sev2",
+            category="correctness",
+            file="src/x.py",
+            line=10,
+            message="off-by-one",
+            status=FindingStatus.OPEN,
+            note=None,
+            created_at="t0",
+            updated_at="t0",
+        ),
+    )
+    block = render_findings_block(rows)
+    assert "DURABLE CRITIC FINDINGS" in block
+    assert "src/x.py:10" in block
+    assert "off-by-one" in block
+    assert "abc123" in block
+
+
+def test_store_module_no_longer_exposes_presentation() -> None:
+    """The data-contract module must not carry brief-rendering code anymore."""
+    import forge_loop.critic_findings.store as store_mod
+
+    assert not hasattr(store_mod, "render_findings_block")

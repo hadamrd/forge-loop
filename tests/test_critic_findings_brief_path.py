@@ -157,6 +157,74 @@ def test_missing_issue_is_loud_not_a_silent_drop() -> None:
     assert not any(n == "critic_findings_persisted" for n, _ in events)
 
 
+def test_missing_issue_recovered_from_loop_branch() -> None:
+    """sev3/correctness review fix: a missing ``issue`` is RECOVERED from the
+    PR's canonical ``loop/<n>-`` head branch before any drop — so findings still
+    persist instead of shoving the worker onto the GitHub round-trip."""
+
+    class _BranchGh(_FailingGh):
+        def pr_head_branch(self, pr, repo=None):  # noqa: ANN001
+            return "loop/242-fix-the-thing"
+
+    store = SqliteCriticFindingsStore(":memory:")
+    events: list[tuple[str, dict]] = []
+
+    apply_critic_report(
+        _report(),
+        PR,
+        500,
+        block_on_sev2=False,
+        min_findings_for_approve=0,
+        gh=_BranchGh(),
+        repo="acme/widgets",
+        emit=lambda name, payload: events.append((name, payload)),
+        findings_store=store,
+        issue=None,
+    )
+
+    # The branch carried issue 242 → findings persisted, NOT dropped.
+    assert store.open_count(PR) == 2
+    recovered = [p for n, p in events if n == "critic_findings_issue_recovered"]
+    assert len(recovered) == 1
+    assert recovered[0]["issue"] == 242
+    assert recovered[0]["source"] == "head_branch"
+    # The persist succeeded → no loud skip.
+    assert not any(n == "critic_findings_persist_skipped" for n, _ in events)
+    persisted = [p for n, p in events if n == "critic_findings_persisted"]
+    assert persisted and persisted[0]["issue"] == 242
+
+
+def test_unrecoverable_issue_still_loud_drops() -> None:
+    """If the head branch is NOT a loop branch (no issue derivable), the drop is
+    still loud — the fallback never masks a genuinely-missing issue."""
+
+    class _NonLoopGh(_FailingGh):
+        def pr_head_branch(self, pr, repo=None):  # noqa: ANN001
+            return "feature/manual-work"
+
+    store = SqliteCriticFindingsStore(":memory:")
+    events: list[tuple[str, dict]] = []
+
+    apply_critic_report(
+        _report(),
+        PR,
+        500,
+        block_on_sev2=False,
+        min_findings_for_approve=0,
+        gh=_NonLoopGh(),
+        repo="acme/widgets",
+        emit=lambda name, payload: events.append((name, payload)),
+        findings_store=store,
+        issue=None,
+    )
+
+    assert store.open_count(PR) == 0
+    assert not any(n == "critic_findings_issue_recovered" for n, _ in events)
+    skipped = [p for n, p in events if n == "critic_findings_persist_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "issue_missing"
+
+
 def test_posting_raise_does_not_lose_findings() -> None:
     """Even if the poster RAISES (not just returns False), findings written
     before the posting step are already durable."""

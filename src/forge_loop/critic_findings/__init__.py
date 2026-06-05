@@ -15,7 +15,6 @@ from forge_loop.critic_findings.store import (
     FindingStatus,
     ReconcileResult,
     StoredFinding,
-    render_findings_block,
 )
 
 
@@ -43,5 +42,4 @@ __all__ = [
     "StoredFinding",
     "critic_findings_db_path",
     "open_critic_findings_store",
-    "render_findings_block",
 ]

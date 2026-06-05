@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from forge_loop.config import Config
-from forge_loop.critic_findings import open_critic_findings_store, render_findings_block
+from forge_loop.critic_findings import open_critic_findings_store
 from forge_loop.critic_findings.store import CriticFindingsStore
 from forge_loop.gh_issues import (
     CRITIC_BLOCK_LABELS,
@@ -18,6 +18,7 @@ from forge_loop.gh_issues import (
 )
 from forge_loop.state import append_event
 from forge_loop.worker import WorkerOutcome
+from forge_loop.worker_brief import render_findings_block
 
 #: Marker label the #213 adoption scan stamps on a PR once it has been
 #: re-critic'd + put back on the merge conveyor. The selector excludes PRs
@@ -62,6 +63,20 @@ def _compose_review_context(
     return block or supplementary
 
 
+def issue_from_loop_branch(branch: str | None) -> int | None:
+    """Return the issue number iff ``branch`` is a canonical ``loop/<n>-...``.
+
+    The string-level primitive behind :func:`loop_issue_from_branch`; shared so
+    the critic persist path can derive a missing ``issue`` from a PR's head
+    branch instead of dropping all findings (#242 review fix — a missing
+    ``wr['issue']`` must not shove the worker back onto the GitHub round-trip).
+    """
+    if not isinstance(branch, str):
+        return None
+    match = _LOOP_BRANCH_RE.match(branch)
+    return int(match.group(1)) if match else None
+
+
 def loop_issue_from_branch(pr: dict[str, Any]) -> int | None:
     """Return the issue number iff the PR's head branch is ``loop/<n>-...``.
 
@@ -69,11 +84,7 @@ def loop_issue_from_branch(pr: dict[str, Any]) -> int | None:
     ``fixes #n`` text): adoption only ever touches PRs the loop itself
     authored, identified by their canonical head branch.
     """
-    head = pr.get("headRefName")
-    if not isinstance(head, str):
-        return None
-    match = _LOOP_BRANCH_RE.match(head)
-    return int(match.group(1)) if match else None
+    return issue_from_loop_branch(pr.get("headRefName"))
 
 
 def issue_number_from_pr(pr: dict[str, Any]) -> int | None:

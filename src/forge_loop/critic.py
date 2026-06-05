@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from forge_loop import critic_format
+from forge_loop.pr_ref import parse_pr_url, repo_slug
 from forge_loop.worker import ensure_subagent_trusted
 
 VALID_OVERALL = {"approve", "request_changes", "block"}
@@ -118,17 +119,6 @@ class Finding:
         )
 
 
-#: Matches a GitHub PR identity in either the HTML url
-#: (``github.com/{owner}/{repo}/pull/{n}``) or the REST api url
-#: (``api.github.com/repos/{owner}/{repo}/pulls/{n}``), with or without a
-#: trailing slash / fragment. Capturing ``owner``, ``repo`` and the PR number
-#: lets us collapse every shape to ONE canonical key.
-_PR_URL_RE = re.compile(
-    r"github\.com/(?:repos/)?(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls?/(?P<num>\d+)",
-    re.IGNORECASE,
-)
-
-
 def canonical_pr_key(pr: str | int) -> str:
     """Collapse any PR reference to ONE stable key (#242 review fix).
 
@@ -150,11 +140,9 @@ def canonical_pr_key(pr: str | int) -> str:
     if isinstance(pr, int):
         return f"#{pr}"
     text = pr.strip()
-    match = _PR_URL_RE.search(text)
-    if match:
-        owner = match.group("owner")
-        repo = match.group("repo")
-        num = match.group("num")
+    parsed = parse_pr_url(text)
+    if parsed is not None:
+        owner, repo, num = parsed
         return f"{owner}/{repo}#{num}"
     bare = text.rstrip("/").strip()
     if bare.lstrip("#").isdigit():
@@ -375,12 +363,10 @@ def _repo_slug_from_pr_url(pr_url: str) -> str:
 
     The critic's ``repo`` arg is the LOCAL checkout path, but the GitHub
     client addresses repos by ``owner/name``. The PR URL carries it:
-    ``https://github.com/<owner>/<name>/pull/<n>``.
+    ``https://github.com/<owner>/<name>/pull/<n>``. Delegates to the shared
+    :func:`forge_loop.pr_ref.repo_slug` parser (#242 review fix — one regex).
     """
-    m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/(?:pull|issues)/\d+", pr_url)
-    if m:
-        return f"{m.group(1)}/{m.group(2)}"
-    return ""
+    return repo_slug(pr_url)
 
 
 def _fetch_pr_precommit_context(pr_url: str, _repo: Path) -> tuple[str, str]:
