@@ -89,7 +89,14 @@ def _thread(id_: str, *, resolved: bool = False) -> dict[str, Any]:
     }
 
 
-def test_prs_requiring_repair_detects_threads_without_critic_label(monkeypatch) -> None:
+def test_prs_requiring_repair_excludes_approved_mergeable_with_only_sev3_threads(
+    monkeypatch,
+) -> None:
+    """#230: a critic-approved (no block label) + CLEAN PR whose only open
+    threads are leftover sev3 critic inline comments is NOT returned as a
+    repair — it is terminal and belongs on the merge conveyor. The exclusion is
+    surfaced via ``on_skip`` (no silent drop), never as a repair worker."""
+
     def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         if cmd[:3] == ["gh", "pr", "list"]:
             return _completed(
@@ -120,11 +127,83 @@ def test_prs_requiring_repair_detects_threads_without_critic_label(monkeypatch) 
 
     monkeypatch.setattr(gh.subprocess, "run", fake_run)
 
-    prs = gh.prs_requiring_repair(5, repo="o/r")
+    skipped: list[dict[str, Any]] = []
+    prs = gh.prs_requiring_repair(5, repo="o/r", on_skip=skipped.append)
 
-    assert [p["number"] for p in prs] == [7]
-    assert prs[0]["repairReasons"] == ["unresolved_review_threads"]
-    assert prs[0]["unresolvedReviewThreads"][0]["id"] == "thread-1"
+    # NOT eligible for a repair worker.
+    assert prs == []
+    # But surfaced, not silently dropped.
+    assert [p["number"] for p in skipped] == [7]
+    assert skipped[0]["approvedMergeableSkip"] is True
+    assert skipped[0]["unresolvedReviewThreads"][0]["id"] == "thread-1"
+
+
+def test_prs_requiring_repair_no_on_skip_is_silent_but_still_excludes(monkeypatch) -> None:
+    """Adversarial: with no ``on_skip`` callback the approved-mergeable PR is
+    still excluded from the repair set (the default path must not raise)."""
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return _completed(
+                [
+                    {
+                        "number": 7,
+                        "url": "https://github.com/o/r/pull/7",
+                        "labels": [],
+                        "updatedAt": "2026-01-01T00:00:00Z",
+                        "mergeStateStatus": "CLEAN",
+                    }
+                ]
+            )
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            return _completed(
+                {
+                    "data": {
+                        "repository": {"pr0": {"reviewThreads": {"nodes": [_thread("thread-1")]}}}
+                    }
+                }
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(gh.subprocess, "run", fake_run)
+    assert gh.prs_requiring_repair(5, repo="o/r") == []
+
+
+def test_prs_requiring_repair_blocking_label_still_selected_despite_clean(monkeypatch) -> None:
+    """#230 regression guard: a ``critic:blocking`` PR is STILL selected for
+    repair even when CLEAN with sev3 threads (it is NOT approved-mergeable)."""
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return _completed(
+                [
+                    {
+                        "number": 8,
+                        "url": "https://github.com/o/r/pull/8",
+                        "headRefName": "loop/43-blocked",
+                        "labels": [{"name": "critic:blocking"}],
+                        "updatedAt": "2026-01-01T00:00:00Z",
+                        "mergeStateStatus": "CLEAN",
+                    }
+                ]
+            )
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            return _completed(
+                {
+                    "data": {
+                        "repository": {"pr0": {"reviewThreads": {"nodes": [_thread("thread-2")]}}}
+                    }
+                }
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(gh.subprocess, "run", fake_run)
+    skipped: list[dict[str, Any]] = []
+    prs = gh.prs_requiring_repair(5, repo="o/r", on_skip=skipped.append)
+
+    assert [p["number"] for p in prs] == [8]
+    assert prs[0]["repairReasons"] == ["critic:blocking", "unresolved_review_threads"]
+    assert skipped == []  # not skipped — genuinely blocked
 
 
 def test_prs_requiring_repair_issues_one_graphql_call_for_many_prs(monkeypatch) -> None:
@@ -204,11 +283,14 @@ def test_prs_requiring_repair_preserves_decisions_across_reasons(monkeypatch) ->
             "mergeStateStatus": "DIRTY",
         },
         {
+            # #230: an unresolved thread is a repair reason ONLY when the PR is
+            # not approved-mergeable. CONFLICTING keeps PR #3 out of the
+            # approved-mergeable set, so the thread reason survives batching.
             "number": 3,
             "url": "u3",
             "labels": [],
             "updatedAt": "2026-01-03T00:00:00Z",
-            "mergeStateStatus": "CLEAN",
+            "mergeStateStatus": "CONFLICTING",
         },
         {
             "number": 4,
@@ -244,10 +326,11 @@ def test_prs_requiring_repair_preserves_decisions_across_reasons(monkeypatch) ->
     prs = gh.prs_requiring_repair(50, repo="o/r")
     by_num = {p["number"]: p for p in prs}
 
-    assert set(by_num) == {1, 2, 3}  # PR #4 (resolved-only) excluded
+    assert set(by_num) == {1, 2, 3}  # PR #4 (resolved-only, approved+CLEAN) excluded
     assert by_num[1]["repairReasons"] == ["critic:blocking"]
     assert by_num[2]["repairReasons"] == ["merge_state:dirty"]
-    assert by_num[3]["repairReasons"] == ["unresolved_review_threads"]
+    # CONFLICTING + unresolved thread → both reasons survive batching.
+    assert by_num[3]["repairReasons"] == ["merge_state:conflicting", "unresolved_review_threads"]
     assert by_num[3]["unresolvedReviewThreads"][0]["id"] == "t3"
 
 
@@ -354,3 +437,35 @@ def test_review_threads_batch_maps_aliases_back_to_pr_numbers(monkeypatch) -> No
     assert set(out) == {11, 22}
     assert out[11][0]["id"] == "a"
     assert out[22] == []
+
+
+# ---------------------------------------------------------------------------
+# is_approved_mergeable helper (issue #230)
+# ---------------------------------------------------------------------------
+
+
+def test_is_approved_mergeable_true_when_clean_and_no_block_labels() -> None:
+    """verdict=approved (no block label) + CLEAN → True."""
+    pr = {"labels": [{"name": "loop:adopted"}], "mergeStateStatus": "CLEAN"}
+    assert gh.is_approved_mergeable(pr) is True
+    # No labels at all is also "no block label".
+    assert gh.is_approved_mergeable({"labels": [], "mergeStateStatus": "CLEAN"}) is True
+
+
+def test_is_approved_mergeable_false_when_blocking_label_present() -> None:
+    """A block label means NOT approved, regardless of merge state."""
+    for label in ("critic:blocking", "critic:suspicious"):
+        pr = {"labels": [{"name": label}], "mergeStateStatus": "CLEAN"}
+        assert gh.is_approved_mergeable(pr) is False, label
+
+
+def test_is_approved_mergeable_false_when_not_clean() -> None:
+    """Any non-CLEAN merge state means NOT mergeable, so NOT terminal."""
+    for state in ("DIRTY", "CONFLICTING", "BEHIND", "BLOCKED", "UNKNOWN", "", None):
+        pr = {"labels": [], "mergeStateStatus": state}
+        assert gh.is_approved_mergeable(pr) is False, state
+
+
+def test_is_approved_mergeable_missing_fields_is_false() -> None:
+    """Adversarial: empty dict (no labels, no merge state) → not mergeable."""
+    assert gh.is_approved_mergeable({}) is False

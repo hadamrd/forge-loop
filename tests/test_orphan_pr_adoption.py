@@ -414,3 +414,190 @@ def test_adoption_tick_stamps_only_terminal_prs(tmp_path: Path, monkeypatch) -> 
     assert behind.status == "open"
     # Only the merged PR is stamped; the transient-skipped one stays adoptable.
     assert stamped == [clean.pr_url]
+
+
+# ---------------------------------------------------------------------------
+# Issue #230 — approved-mergeable PRs must MERGE, not re-enter the repair loop
+# ---------------------------------------------------------------------------
+
+
+def test_adopted_automerge_merges_clean_despite_sev3_threads(tmp_path: Path, monkeypatch) -> None:
+    """#230: an approved + CLEAN PR that still carries unresolved sev3 critic
+    inline-comment threads MUST auto-merge — the leftover threads no longer
+    gate the merge (that gating caused the #229 multi-hour stall). The thread
+    count is recorded on the enabled event for observability."""
+    cfg = _cfg(tmp_path)
+    sev3 = [{"id": "t-sev3", "isResolved": False, "comments": []}]
+    merged = _patch_gh(monkeypatch, threads=sev3)
+    o = _outcome(70)
+    pr = {"number": 70, "url": o.pr_url, "mergeStateStatus": "CLEAN", "labels": []}
+
+    _enable_automerge_for_adopted_prs(cfg, [(o, pr)], refused_issues=set(), emit=None)
+
+    assert merged == [o.pr_url]  # merged DESPITE the sev3 thread
+    assert o.status == "merged"
+    enabled = [e for e in _events(cfg) if e["kind"] == "orphan_pr_automerge_enabled"]
+    assert len(enabled) == 1
+    assert enabled[0]["over_unresolved_sev3_threads"] == 1
+    # No skip emitted for unresolved threads anymore.
+    skips = [e for e in _events(cfg) if e["kind"] == "orphan_pr_skipped"]
+    assert skips == []
+
+
+def test_adopted_automerge_idempotent_second_pass_is_noop(tmp_path: Path, monkeypatch) -> None:
+    """AC4: re-running the adopted-automerge step on an already-merged outcome
+    enables auto-merge AT MOST once (the second pass is a terminal no-op)."""
+    cfg = _cfg(tmp_path)
+    sev3 = [{"id": "t-sev3", "isResolved": False, "comments": []}]
+    merged = _patch_gh(monkeypatch, threads=sev3)
+    o = _outcome(71)
+    pr = {"number": 71, "url": o.pr_url, "mergeStateStatus": "CLEAN", "labels": []}
+
+    _enable_automerge_for_adopted_prs(cfg, [(o, pr)], refused_issues=set(), emit=None)
+    # Second pass: outcome.status is now "merged" → skipped at the top guard.
+    _enable_automerge_for_adopted_prs(cfg, [(o, pr)], refused_issues=set(), emit=None)
+
+    assert merged == [o.pr_url]  # enable_pr_auto_merge called exactly once
+    enabled = [e for e in _events(cfg) if e["kind"] == "orphan_pr_automerge_enabled"]
+    assert len(enabled) == 1
+
+
+def _import_repaired_automerge():
+    from forge_loop.runner.repairs import enable_automerge_for_repaired_prs
+
+    return enable_automerge_for_repaired_prs
+
+
+def test_repaired_automerge_merges_despite_sev3_threads(tmp_path: Path, monkeypatch) -> None:
+    """#230: after a repair worker fixes a PR and the re-critic APPROVES it
+    (no ``outcome.error``), auto-merge is enabled even though the approve verdict
+    left sev3 inline-comment threads open."""
+    cfg = _cfg(tmp_path)
+    enable_automerge_for_repaired_prs = _import_repaired_automerge()
+    merged: list[str] = []
+    monkeypatch.setattr(
+        _ghmod, "enable_pr_auto_merge", lambda url, repo=None: merged.append(url) or True
+    )
+    # unresolved_review_threads must NOT be consulted any more — make it explode
+    # if it ever is, to prove the gate is truly gone.
+    monkeypatch.setattr(
+        _ghmod,
+        "unresolved_review_threads",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("thread gate must be gone")),
+    )
+    monkeypatch.setattr(
+        "forge_loop.runner.merge_gate.apply_issue_closed_gate", lambda outcomes, **_k: []
+    )
+    o = _outcome(72)  # status=open, error=None → approved
+
+    enable_automerge_for_repaired_prs(cfg, [o], lambda *_a, **_k: None)
+
+    assert merged == [o.pr_url]
+    assert o.status == "merged"
+    assert "repair_automerge_enabled" in cfg.events_file.read_text()
+
+
+def test_repaired_automerge_skips_when_critic_reblocked(tmp_path: Path, monkeypatch) -> None:
+    """Regression guard: a repaired PR the re-critic RE-BLOCKED (``outcome.error``
+    set) is NOT auto-merged — it stays for the repair loop."""
+    cfg = _cfg(tmp_path)
+    enable_automerge_for_repaired_prs = _import_repaired_automerge()
+    merged: list[str] = []
+    monkeypatch.setattr(
+        _ghmod, "enable_pr_auto_merge", lambda url, repo=None: merged.append(url) or True
+    )
+    monkeypatch.setattr(
+        "forge_loop.runner.merge_gate.apply_issue_closed_gate", lambda outcomes, **_k: []
+    )
+    o = _outcome(73, error="critic blocked merge: [sev1/correctness] boom")
+
+    enable_automerge_for_repaired_prs(cfg, [o], lambda *_a, **_k: None)
+
+    assert merged == []  # never auto-merged
+    assert o.status == "open"
+    reasons = {
+        (e["issue"], e["reason"]) for e in _events(cfg) if e["kind"] == "repair_automerge_skipped"
+    }
+    assert (73, "critic_blocked") in reasons
+
+
+def test_blocking_pr_repairs_emits_skip_for_approved_mergeable(tmp_path: Path) -> None:
+    """#230 AC1/AC5: when the selector excludes an approved-mergeable PR (via the
+    ``on_skip`` callback), ``blocking_pr_repairs`` emits a structured
+    ``repair_pr_skipped`` event with ``reason="approved_mergeable"`` and does
+    NOT add it to the repair set (no repair worker)."""
+    from forge_loop.runner.repairs import blocking_pr_repairs
+
+    cfg = _cfg(tmp_path)
+    skipped_pr = {
+        "number": 229,
+        "url": "https://github.com/o/r/pull/229",
+        "headRefName": "loop/229-debt-fix",
+        "approvedMergeableSkip": True,
+    }
+
+    def fake_selector(limit, repo=None, *, on_skip=None):
+        # The real selector excludes the approved-mergeable PR and notifies via
+        # on_skip; here we mimic exactly that contract.
+        if on_skip is not None:
+            on_skip(skipped_pr)
+        return []
+
+    repairs = blocking_pr_repairs(
+        cfg,
+        prs_requiring_repair_fn=fake_selector,
+        fetch_issue_fn=lambda *_a, **_k: {"number": 229, "title": "t", "labels": []},
+        pr_review_context_fn=lambda *_a, **_k: "ctx",
+    )
+
+    assert repairs == []  # no repair worker for the approved PR
+    skips = {
+        (e.get("pr"), e.get("reason")) for e in _events(cfg) if e["kind"] == "repair_pr_skipped"
+    }
+    assert (skipped_pr["url"], "approved_mergeable") in skips
+
+
+def test_blocking_pr_repairs_selects_blocked_but_skips_approved_in_same_batch(
+    tmp_path: Path,
+) -> None:
+    """E2E adversarial (#230): in ONE batch carrying both a still-``critic:blocking``
+    PR and an approved-mergeable PR, the blocked one IS selected for a repair
+    worker while the approved one is skipped — proving the fix doesn't disable
+    repair wholesale (and the #229 stall cannot recur for the approved PR)."""
+    from forge_loop.runner.repairs import blocking_pr_repairs
+
+    cfg = _cfg(tmp_path)
+    blocked_pr = {
+        "number": 300,
+        "url": "https://github.com/o/r/pull/300",
+        "headRefName": "loop/300-blocked",
+        "repairReasons": ["critic:blocking"],
+    }
+    approved_pr = {
+        "number": 229,
+        "url": "https://github.com/o/r/pull/229",
+        "headRefName": "loop/229-debt-fix",
+        "approvedMergeableSkip": True,
+    }
+
+    def fake_selector(limit, repo=None, *, on_skip=None):
+        if on_skip is not None:
+            on_skip(approved_pr)
+        return [blocked_pr]
+
+    repairs = blocking_pr_repairs(
+        cfg,
+        prs_requiring_repair_fn=fake_selector,
+        fetch_issue_fn=lambda num, repo=None: {"number": num, "title": "t", "labels": []},
+        pr_review_context_fn=lambda *_a, **_k: "ctx",
+    )
+
+    # The blocked PR gets a repair; the approved PR does not.
+    assert [pr["number"] for _issue, pr, _ctx in repairs] == [300]
+    events = _events(cfg)
+    assert any(
+        e["kind"] == "repair_pr_skipped" and e.get("reason") == "approved_mergeable" for e in events
+    )
+    assert any(
+        e["kind"] == "repair_pr_selected" and e.get("pr") == blocked_pr["url"] for e in events
+    )

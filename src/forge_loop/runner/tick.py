@@ -194,9 +194,14 @@ def _enable_automerge_for_adopted_prs(
     Issue #213, acceptance criterion 2/3. Mirrors
     ``_enable_automerge_for_reviewed_outcomes`` but adds the adoption-specific
     gates: skip if the critic just blocked (``outcome.error`` set), if the
-    source issue closed mid-tick (``refused_issues``), if the PR is not
-    ``mergeStateStatus == CLEAN``, or if it has unresolved review threads.
-    Every skip emits ``orphan_pr_skipped`` with a ``reason`` — no silent drop.
+    source issue closed mid-tick (``refused_issues``), or if the PR is not
+    ``mergeStateStatus == CLEAN``. Every skip emits ``orphan_pr_skipped`` with
+    a ``reason`` — no silent drop.
+
+    Issue #230: unresolved review threads are NOT a gate here. A critic-approved
+    PR keeps its sev3 inline-comment threads open forever; gating on them held
+    approved + CLEAN PRs back indefinitely (the #229 multi-hour stall). The
+    thread count is recorded on ``orphan_pr_automerge_enabled`` for visibility.
     """
     from forge_loop import gh as _gh
 
@@ -231,17 +236,16 @@ def _enable_automerge_for_adopted_prs(
                 reason=f"not_mergeable:{merge_state.lower() or 'unknown'}",
             )
             continue
+        # #230: an approved + CLEAN PR whose only open review threads are
+        # leftover sev3 critic inline comments is TERMINAL — it must merge, not
+        # be held back. We have already required CLEAN above and skipped the
+        # critic-blocked case (``outcome.error``), so the remaining unresolved
+        # threads are informational. Blocking on them is exactly what produced
+        # the #229 multi-hour stall (a critic-approved PR keeps its sev3 threads
+        # open forever, so the gate never lets it land). GitHub's branch
+        # protection still gates the real merge once auto-merge is enabled. We
+        # record the count for observability rather than gating on it.
         threads = _gh.unresolved_review_threads(outcome.pr_url, repo=cfg.github_repo)
-        if threads:
-            append_event(
-                cfg.events_file,
-                "orphan_pr_skipped",
-                issue=outcome.issue,
-                pr=outcome.pr_url,
-                reason="unresolved_review_threads",
-                unresolved=len(threads),
-            )
-            continue
         if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
             outcome.status = "merged"
             append_event(
@@ -249,6 +253,7 @@ def _enable_automerge_for_adopted_prs(
                 "orphan_pr_automerge_enabled",
                 issue=outcome.issue,
                 pr=outcome.pr_url,
+                over_unresolved_sev3_threads=len(threads),
             )
         else:
             append_event(

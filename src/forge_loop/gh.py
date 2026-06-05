@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -258,7 +259,47 @@ def prs_by_label(label: str, limit: int, repo: str | None = None) -> list[dict[s
     return sorted(result, key=lambda p: str(p.get("updatedAt") or ""))
 
 
-def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, Any]]:
+#: Critic verdict labels that mean a PR is NOT approved — it is still the
+#: repair loop's job and is NOT eligible for terminal auto-merge. Declared here
+#: (the lowest-level ``gh`` module) so the repair selector AND the adoption /
+#: automerge steps share ONE source of truth instead of re-spelling the string
+#: literals on each side (manifesto: no stringly-typed cross-module
+#: discriminator — a typo on one side silently breaks the gate).
+CRITIC_BLOCK_LABELS = frozenset({"critic:blocking", "critic:suspicious"})
+
+
+def _pr_label_names(pr: dict[str, Any]) -> set[str]:
+    return {str(label.get("name") or "") for label in pr.get("labels") or []}
+
+
+def is_approved_mergeable(pr: dict[str, Any]) -> bool:
+    """Return ``True`` iff a loop PR is critic-approved AND cleanly mergeable.
+
+    Issue #230. "Approved" is represented operationally by the *absence* of a
+    critic block label: the runner removes ``critic:blocking`` /
+    ``critic:suspicious`` the moment the critic's latest verdict is *approve*
+    (see ``dispatch.py``), so a PR carrying neither label has a latest verdict
+    of approved. "Mergeable" is ``mergeStateStatus == CLEAN``.
+
+    Such a PR is *terminal* for the repair loop. The critic posts sev3 findings
+    as inline comments, which remain unresolved review threads even after an
+    APPROVE verdict — those leftover threads must NOT, on their own, re-enter
+    the PR into the repair set (the #229 multi-hour stall). A genuinely blocked
+    PR keeps a block label; a human "request changes" review drops
+    ``mergeStateStatus`` off CLEAN under branch protection — both fail this
+    predicate and remain eligible for repair (acceptance criterion 3).
+    """
+    if _pr_label_names(pr) & CRITIC_BLOCK_LABELS:
+        return False
+    return str(pr.get("mergeStateStatus") or "").upper() == "CLEAN"
+
+
+def prs_requiring_repair(
+    limit: int,
+    repo: str | None = None,
+    *,
+    on_skip: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
     """Return open PRs the repair loop should revisit.
 
     A PR needs repair when it is explicitly critic-blocked, has unresolved
@@ -266,6 +307,13 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
     exposed by ``gh pr list`` or ``gh pr view --comments``, so this function
     enriches the open PR list with a GraphQL pass before the dispatcher decides
     whether to spawn a repair worker.
+
+    Issue #230: a critic-approved, CLEAN PR (see :func:`is_approved_mergeable`)
+    is NOT returned even if it still carries unresolved sev3 review threads —
+    it is terminal and belongs on the merge conveyor, not the repair loop.
+    Re-dispatching a repair worker against such a PR caused a multi-hour stall
+    (#229). Each excluded PR is passed to ``on_skip`` (when provided) so the
+    caller can emit a structured skip event — no silent drop.
     """
     repo = _require_repo(repo)
     prs = _open_prs(limit=max(limit, 50), repo=repo)
@@ -283,7 +331,7 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
     repairs: list[dict[str, Any]] = []
     for pr in prs:
         reasons: list[str] = []
-        labels = {str(label.get("name") or "") for label in pr.get("labels") or []}
+        labels = _pr_label_names(pr)
         if "critic:blocking" in labels:
             reasons.append("critic:blocking")
 
@@ -293,7 +341,14 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
 
         all_threads = threads_by_pr.get(int(pr["number"]), [])
         threads = [t for t in all_threads if not bool(t.get("isResolved"))]
-        if threads:
+
+        # #230: leftover sev3 critic threads on an APPROVED + CLEAN PR are not,
+        # on their own, a repair trigger. They only count when the PR is
+        # otherwise blocked (block label / DIRTY / CONFLICTING — i.e. NOT
+        # approved-mergeable), where a human review or merge conflict is the
+        # real driver.
+        approved_mergeable = is_approved_mergeable(pr)
+        if threads and not approved_mergeable:
             reasons.append("unresolved_review_threads")
 
         if reasons:
@@ -301,6 +356,13 @@ def prs_requiring_repair(limit: int, repo: str | None = None) -> list[dict[str, 
             enriched["repairReasons"] = reasons
             enriched["unresolvedReviewThreads"] = threads
             repairs.append(enriched)
+        elif threads and approved_mergeable and on_skip is not None:
+            # Approved + CLEAN with only leftover sev3 critic threads → terminal.
+            # Surface the exclusion so the caller emits a skip event (#230 AC1/AC5).
+            enriched = dict(pr)
+            enriched["unresolvedReviewThreads"] = threads
+            enriched["approvedMergeableSkip"] = True
+            on_skip(enriched)
 
     return sorted(repairs, key=lambda p: str(p.get("updatedAt") or ""))[:limit]
 
