@@ -6,15 +6,15 @@
       "mcp__forge-loop__*",
       "mcp__lumen__*",
       "mcp__github__*",
-      "Write(/tmp/forge-forge-loop/wt-loop-224/**)",
-      "Edit(/tmp/forge-forge-loop/wt-loop-224/**)",
+      "Write(/tmp/forge-forge-loop/wt-loop-272/**)",
+      "Edit(/tmp/forge-forge-loop/wt-loop-272/**)",
       "Bash(*)",
       "Read(/home/hexalgo/forge-loop/**)",
       "Grep(/home/hexalgo/forge-loop/**)",
       "Glob(/home/hexalgo/forge-loop/**)",
-      "Read(/tmp/forge-forge-loop/wt-loop-224/**)",
-      "Grep(/tmp/forge-forge-loop/wt-loop-224/**)",
-      "Glob(/tmp/forge-forge-loop/wt-loop-224/**)"
+      "Read(/tmp/forge-forge-loop/wt-loop-272/**)",
+      "Grep(/tmp/forge-forge-loop/wt-loop-272/**)",
+      "Glob(/tmp/forge-forge-loop/wt-loop-272/**)"
     ],
     "defaultMode": "default",
     "deny": []

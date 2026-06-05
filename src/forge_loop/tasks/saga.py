@@ -21,6 +21,22 @@ class TaskState(StrEnum):
     QUARANTINED = "quarantined"
 
 
+class CompensationKind(StrEnum):
+    """Cross-module discriminator for a saga compensation's action.
+
+    ``Compensation.kind`` stays a free-form ``str`` (no model/schema change,
+    issue #272), but the *known* kinds are declared here as a shared enum so
+    producer (``runner/dispatch.py``) and consumer (``control/recovery.py``)
+    cannot drift on a string literal — the cross-module-enum manifesto rule.
+    Being a :class:`StrEnum`, each member compares equal to its wire string and
+    JSON-serialises to it, so the stored shape is unchanged.
+    """
+
+    REMOVE_WORKTREE = "remove-worktree"
+    DELETE_BRANCH = "delete-branch"
+    CLOSE_PR = "close-pr"
+
+
 @dataclass(frozen=True)
 class Compensation:
     """A cleanup or rollback action registered for a task saga."""

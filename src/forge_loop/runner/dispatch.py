@@ -7,6 +7,7 @@ no behaviour change, no signature change.
 from __future__ import annotations
 
 import contextlib
+import re
 import sqlite3
 import threading
 import time
@@ -43,7 +44,14 @@ from forge_loop.runner.persistent_dispatch import (
 )
 from forge_loop.sandbox import CapabilityPolicy, FilesystemScope, McpGrant, NetworkPolicy
 from forge_loop.state import append_event
-from forge_loop.tasks import Compensation, SqliteTaskSagaStore, TaskSaga, TaskSagaStore, TaskState
+from forge_loop.tasks import (
+    Compensation,
+    CompensationKind,
+    SqliteTaskSagaStore,
+    TaskSaga,
+    TaskSagaStore,
+    TaskState,
+)
 from forge_loop.worker import WorkerOutcome, run_repair_worker, run_worker
 from forge_loop.worker_sessions import WorkerSessionStore
 
@@ -264,13 +272,7 @@ def record_worker_task_policy(
             issue=issue,
             branch=branch,
             worktree=worktree_path,
-            compensations=(
-                Compensation(
-                    kind="remove-worktree",
-                    target=worktree_path,
-                    reason="cleanup worker worktree after task terminal state",
-                ),
-            ),
+            compensations=_seed_compensations(worktree_path, branch),
             capability_policy=capability_policy,
         )
     )
@@ -307,15 +309,65 @@ def _seed_worker_saga(
         issue=n,
         branch=branch,
         worktree=worktree_path,
-        compensations=(
-            Compensation(
-                kind="remove-worktree",
-                target=worktree_path,
-                reason="cleanup after worker task terminal state",
-            ),
-        ),
+        compensations=_seed_compensations(worktree_path, branch),
         capability_policy=capability_policy,
     )
+
+
+def _seed_compensations(worktree_path: str, branch: str) -> tuple[Compensation, ...]:
+    """Compensations known at dispatch: the worktree and the pushed branch (#272).
+
+    The ``close-pr`` compensation is NOT seeded here — the PR number is unknown
+    until the worker opens its PR, so it is *appended* later via
+    :func:`_append_close_pr_compensation`.
+    """
+    return (
+        Compensation(
+            kind=CompensationKind.REMOVE_WORKTREE,
+            target=worktree_path,
+            reason="cleanup worker worktree after task terminal state",
+        ),
+        Compensation(
+            kind=CompensationKind.DELETE_BRANCH,
+            target=branch,
+            reason="delete abandoned pushed branch on stale-saga recovery",
+        ),
+    )
+
+
+def _pr_number_from_url(pr_url: str) -> str | None:
+    """Extract the trailing PR number from a GitHub PR URL, else ``None``."""
+    match = re.search(r"/pull/(\d+)", pr_url)
+    return match.group(1) if match else None
+
+
+def _append_close_pr_compensation(
+    saga_store: TaskSagaStore | None,
+    *,
+    task_id: str,
+    pr_url: str | None,
+) -> None:
+    """Durably append a ``close-pr`` compensation once the worker opens its PR.
+
+    Best-effort (#272): a missing store, an unparsable URL, or a store hiccup
+    (e.g. the saga already finalised) is swallowed — recording the compensation
+    must never mask or break the real worker outcome. Recovery only *uses* it
+    if the saga is later abandoned (process killed before merge).
+    """
+    if saga_store is None or not pr_url:
+        return
+    number = _pr_number_from_url(pr_url)
+    if number is None:
+        return
+    with contextlib.suppress(Exception):
+        saga_store.append_compensation(
+            task_id,
+            Compensation(
+                kind=CompensationKind.CLOSE_PR,
+                target=number,
+                reason="close abandoned never-merged PR on stale-saga recovery",
+            ),
+        )
 
 
 def _worker_task_id(issue_number: int) -> str:
@@ -611,6 +663,9 @@ def _run_worker_with_saga(
         except BaseException:
             _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
             raise
+        _append_close_pr_compensation(
+            saga_store, task_id=task_id, pr_url=legacy_outcome.pr_url
+        )
         _finalize_worker_saga(saga_store, task_id=task_id, status=legacy_outcome.status)
         return legacy_outcome
 
@@ -682,6 +737,9 @@ def _run_worker_with_saga(
                 outcome=synthetic,
                 events_file=cfg.events_file,
             )
+        # Issue #272: if the crashed worker had already opened its PR, record the
+        # close-pr compensation so a later stale-saga recovery can reverse it.
+        _append_close_pr_compensation(saga_store, task_id=task_id, pr_url=recovered_pr)
         _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
         raise
 
@@ -691,6 +749,7 @@ def _run_worker_with_saga(
         outcome=outcome,
         events_file=cfg.events_file,
     )
+    _append_close_pr_compensation(saga_store, task_id=task_id, pr_url=outcome.pr_url)
     _finalize_worker_saga(saga_store, task_id=task_id, status=outcome.status)
     return outcome
 

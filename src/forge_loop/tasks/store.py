@@ -113,6 +113,16 @@ class TaskSagaStore(Protocol):
         """Return non-terminal sagas with expired leases."""
         ...
 
+    def append_compensation(self, task_id: str, compensation: Compensation) -> TaskSaga:
+        """Append a compensation to a non-terminal saga, durably.
+
+        The seeded ``delete-branch`` ref is known at dispatch, but the PR number
+        is unknown until the worker opens its PR (#272). This appends the late
+        ``close-pr`` compensation without mutating the frozen dataclass — it
+        ``put``s a replaced saga so the new list survives a store reload.
+        """
+        ...
+
     def mark_completed(self, task_id: str, *, reason: str | None = None) -> TaskSaga:
         """Mark a task completed."""
         ...
@@ -533,6 +543,12 @@ class SqliteTaskSagaStore:
             and saga.lease_expires_at is not None
             and saga.lease_expires_at <= now
         )
+
+    @_synchronized
+    def append_compensation(self, task_id: str, compensation: Compensation) -> TaskSaga:
+        saga = self._require_mutable(task_id)
+        updated = _replace_saga(saga, compensations=(*saga.compensations, compensation))
+        return self.put(updated)
 
     @_synchronized
     def mark_completed(self, task_id: str, *, reason: str | None = None) -> TaskSaga:

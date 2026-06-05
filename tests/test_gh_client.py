@@ -178,6 +178,59 @@ def test_gh_error_truncates_long_body() -> None:
 
 
 # ---------------------------------------------------------------------------
+# close_pull (#272) — mirrors close_issue: state="closed" + bool contract
+# ---------------------------------------------------------------------------
+
+
+def test_mock_close_pull_records_call_and_returns_true() -> None:
+    gh = MockGhClient()
+    assert gh.close_pull("o", "r", 5) is True
+    assert gh.calls == [("close_pull", {"owner": "o", "repo": "r", "number": 5})]
+
+
+def test_mock_close_pull_returns_false_when_configured_to_fail() -> None:
+    gh = MockGhClient(close_pull_fails=True)
+    assert gh.close_pull("o", "r", 5) is False
+
+
+class _UpdateRecorder:
+    """Minimal githubkit ``_gh`` double recording ``rest.pulls.update`` calls."""
+
+    def __init__(self, *, raises: bool = False) -> None:
+        from types import SimpleNamespace
+
+        self.calls: list[dict[str, object]] = []
+        self._raises = raises
+
+        def _update(**kwargs: object) -> object:
+            self.calls.append(kwargs)
+            if raises:
+                raise RuntimeError("boom")
+            return SimpleNamespace(status_code=200)
+
+        self.rest = SimpleNamespace(pulls=SimpleNamespace(update=_update))
+
+
+def test_real_close_pull_issues_state_closed_update() -> None:
+    from forge_loop.gh_client import GithubkitClient
+
+    client = GithubkitClient(token="x")
+    recorder = _UpdateRecorder()
+    client._gh = recorder  # type: ignore[assignment]
+    assert client.close_pull("o", "r", 7) is True
+    assert recorder.calls == [{"owner": "o", "repo": "r", "pull_number": 7, "state": "closed"}]
+
+
+def test_real_close_pull_returns_false_on_failure() -> None:
+    """Adversarial: a transport failure yields the False bool contract, not a raise."""
+    from forge_loop.gh_client import GithubkitClient
+
+    client = GithubkitClient(token="x")
+    client._gh = _UpdateRecorder(raises=True)  # type: ignore[assignment]
+    assert client.close_pull("o", "r", 7) is False
+
+
+# ---------------------------------------------------------------------------
 # Issue / PullRequest dataclasses — defaults sane
 # ---------------------------------------------------------------------------
 

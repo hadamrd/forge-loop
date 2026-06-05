@@ -68,6 +68,70 @@ def test_dispatch_seeds_leases_then_completes_saga(monkeypatch: Any, tmp_path: A
     assert _saga_store(cfg).list_in_flight() == ()
 
 
+def test_dispatch_seeds_delete_branch_and_appends_close_pr(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    """#272: dispatch seeds a delete-branch compensation (target=branch) at the
+    saga, and appends a close-pr compensation (target=PR number) once the worker
+    opens its PR — so a later abandonment can reverse both side-effects."""
+    cfg = _make_cfg(tmp_path)
+
+    seeded_branch: dict[str, str] = {}
+
+    def fake_run_worker(*args: Any, **kwargs: Any) -> WorkerOutcome:
+        live = _saga_store(cfg).get("task-7-worker")
+        assert live is not None
+        kinds = {c.kind for c in live.compensations}
+        assert "remove-worktree" in kinds
+        assert "delete-branch" in kinds
+        # The delete-branch target is the branch ref recorded on the saga.
+        branch_comp = next(c for c in live.compensations if c.kind == "delete-branch")
+        assert branch_comp.target == live.branch
+        seeded_branch["b"] = live.branch or ""
+        return WorkerOutcome(
+            issue=7,
+            title="t",
+            pr_url="https://github.com/o/r/pull/4242",
+            status="open",
+            duration_s=1.0,
+            stdout_tail="",
+        )
+
+    monkeypatch.setattr(dispatch_mod, "run_worker", fake_run_worker)
+
+    dispatch_mod._dispatch_one_worker(
+        cfg, _issue(7), _meta(), tick=1, bus_emit=lambda *a, **k: None, store=None
+    )
+
+    saga = _saga_store(cfg).get("task-7-worker")
+    assert saga is not None
+    kinds = [c.kind for c in saga.compensations]
+    assert kinds == ["remove-worktree", "delete-branch", "close-pr"]
+    close = next(c for c in saga.compensations if c.kind == "close-pr")
+    assert close.target == "4242"
+    assert seeded_branch["b"]  # the branch was actually seeded mid-flight
+
+
+def test_record_worker_task_policy_seeds_delete_branch(tmp_path: Any) -> None:
+    """#272 (both seed paths): the fallback policy-recording path also seeds a
+    delete-branch compensation alongside remove-worktree."""
+    from forge_loop.sandbox import CapabilityPolicy
+
+    repo = tmp_path
+    saga = dispatch_mod.record_worker_task_policy(
+        repo=repo,
+        task_id="task-7-worker",
+        saga_id="saga-7-worker",
+        issue=7,
+        branch="loop/7-feat",
+        worktree_path="/tmp/wt-loop-7",
+        capability_policy=CapabilityPolicy(),
+    )
+    by_kind = {c.kind: c.target for c in saga.compensations}
+    assert by_kind["remove-worktree"] == "/tmp/wt-loop-7"
+    assert by_kind["delete-branch"] == "loop/7-feat"
+
+
 def test_legacy_crash_marks_saga_failed(monkeypatch: Any, tmp_path: Any) -> None:
     cfg = _make_cfg(tmp_path)
 

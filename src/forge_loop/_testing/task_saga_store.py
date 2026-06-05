@@ -132,6 +132,11 @@ class FakeTaskSagaStore:
             and saga.lease_expires_at <= now
         )
 
+    def append_compensation(self, task_id: str, compensation: Compensation) -> TaskSaga:
+        saga = self._require_mutable(task_id)
+        updated = _replace_saga(saga, compensations=(*saga.compensations, compensation))
+        return self.put(updated)
+
     def mark_completed(self, task_id: str, *, reason: str | None = None) -> TaskSaga:
         return self._mark_terminal(task_id, TaskState.COMPLETED, reason=reason)
 

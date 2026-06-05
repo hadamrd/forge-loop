@@ -314,6 +314,77 @@ def test_recovery_walk_does_not_leak_session_across_simulated_restart(
 
 
 # ---------------------------------------------------------------------------
+# Restart e2e (#272): an abandoned task-saga that pushed a branch AND opened a
+# draft PR is fully compensated on the next boot — branch deleted + PR closed,
+# not just the worktree reaped.
+# ---------------------------------------------------------------------------
+
+
+def test_abandoned_saga_with_branch_and_pr_is_fully_compensated_on_boot(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from forge_loop.control.recovery import reconcile_stale_sagas
+    from forge_loop.tasks import Compensation, SqliteTaskSagaStore, TaskState
+
+    db_file = tmp_path / "tasks.db"
+
+    # Boot #1 — a worker leases issue 30, pushes loop/30, opens draft PR #888,
+    # then is hard-killed (no graceful close: we just drop the store handle).
+    store_a = SqliteTaskSagaStore(db_file)
+    store_a.create(
+        task_id="task-30-worker",
+        saga_id="saga-30-worker",
+        issue=30,
+        branch="loop/30-feat",
+        worktree="/tmp/wt-loop-30",
+        compensations=(
+            Compensation(
+                kind="remove-worktree", target="/tmp/wt-loop-30", reason="cleanup"
+            ),
+            Compensation(kind="delete-branch", target="loop/30-feat", reason="branch"),
+        ),
+    )
+    acquired = datetime.now(UTC) - timedelta(minutes=10)
+    store_a.acquire_lease(
+        "task-30-worker",
+        owner_id="worker-30",
+        expires_at=acquired + timedelta(minutes=1),  # already expired
+        acquired_at=acquired,
+    )
+    # The worker opened its PR before dying → close-pr appended durably.
+    store_a.append_compensation(
+        "task-30-worker",
+        Compensation(kind="close-pr", target="888", reason="close abandoned PR"),
+    )
+    store_a.close()
+
+    # Boot #2 — recovery walk with fake gh callbacks wired (the online path).
+    gh = MockGhClient()
+    reaped: list[int] = []
+    store_b = SqliteTaskSagaStore(db_file)
+    report = reconcile_stale_sagas(
+        store_b,
+        reap_worktree=reaped.append,
+        delete_branch=lambda b: gh.delete_branch("o", "r", b),
+        close_pr=lambda n: gh.close_pull("o", "r", int(n)),
+    )
+
+    # Saga is fully compensated and drains from the in-flight view.
+    assert store_b.get("task-30-worker").state == TaskState.COMPENSATED
+    assert store_b.list_in_flight() == ()
+    # Both gh callbacks fired with the right coordinates.
+    assert ("delete_branch", {"owner": "o", "repo": "r", "branch": "loop/30-feat"}) in gh.calls
+    assert ("close_pull", {"owner": "o", "repo": "r", "number": 888}) in gh.calls
+    assert reaped == [30]
+    # The report names the reversed side-effects, not just the worktree.
+    rec = report.recovered[0]
+    assert rec.branches_deleted == ("loop/30-feat",)
+    assert rec.prs_closed == ("888",)
+
+
+# ---------------------------------------------------------------------------
 # Event schema — typed model validates required fields.
 # ---------------------------------------------------------------------------
 

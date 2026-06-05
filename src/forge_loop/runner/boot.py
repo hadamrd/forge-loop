@@ -102,9 +102,15 @@ def _run_boot_recovery(cfg: Config) -> Any:
     path = canonical_task_saga_path(cfg.repo)
     if not path.exists():
         return None
+    delete_branch_cb, close_pr_cb = _recovery_gh_callbacks(cfg)
     try:
         store = SqliteTaskSagaStore(path)
-        report = reconcile_stale_sagas(store, reap_worktree=partial(reap_worktree, cfg.repo))
+        report = reconcile_stale_sagas(
+            store,
+            reap_worktree=partial(reap_worktree, cfg.repo),
+            delete_branch=delete_branch_cb,
+            close_pr=close_pr_cb,
+        )
     except Exception as exc:  # noqa: BLE001 - recovery must never block boot
         append_event(cfg.events_file, "boot_recovery_failed", error=str(exc))
         return None
@@ -116,6 +122,37 @@ def _run_boot_recovery(cfg: Config) -> Any:
             errors=len(report.errors),
         )
     return report
+
+
+def _recovery_gh_callbacks(
+    cfg: Config,
+) -> tuple[Any, Any]:
+    """Build gh-backed ``delete_branch`` / ``close_pr`` callbacks for recovery.
+
+    Issue #272: stale-saga recovery deletes the abandoned branch and closes the
+    never-merged PR through these callbacks. Offline-safe by construction — if
+    ``github_repo`` is unset/malformed or a real :class:`GithubkitClient` cannot
+    be constructed (no token, an offline boot), this returns ``(None, None)`` so
+    recovery skips those compensations cleanly instead of failing the boot.
+    """
+    repo_slug = getattr(cfg, "github_repo", None)
+    if not repo_slug or "/" not in repo_slug:
+        return None, None
+    try:
+        from forge_loop.gh_client import GithubkitClient
+
+        owner, name = repo_slug.split("/", 1)
+        gh = GithubkitClient()
+    except Exception:  # noqa: BLE001 - no token / offline: recovery stays offline-safe
+        return None, None
+
+    def _delete_branch(branch: str) -> bool:
+        return gh.delete_branch(owner, name, branch)
+
+    def _close_pr(number: str) -> bool:
+        return gh.close_pull(owner, name, int(number))
+
+    return _delete_branch, _close_pr
 
 
 def _install_signal_handlers(cfg: Config, state: RunnerState | None = None) -> None:

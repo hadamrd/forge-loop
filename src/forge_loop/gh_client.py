@@ -262,6 +262,8 @@ class GhClient(Protocol):
         self, owner: str, repo: str, number: int, *, method: MergeMethod = ...
     ) -> MergeResult: ...
 
+    def close_pull(self, owner: str, repo: str, number: int) -> bool: ...
+
     def delete_branch(self, owner: str, repo: str, branch: str) -> bool: ...
 
     # -- auth ----------------------------------------------------------------
@@ -1153,6 +1155,22 @@ class GithubkitClient:
             return False
         return True
 
+    def close_pull(self, owner: str, repo: str, number: int) -> bool:
+        """Close a pull request (``state="closed"`` update). Best-effort: False on fail.
+
+        Mirrors :meth:`close_issue` but targets the pulls endpoint — a PR closes
+        via the same ``state="closed"`` update path, so no new transport. Used by
+        stale-saga recovery (#272) to reverse an abandoned, never-merged PR.
+        """
+        try:
+            resp = self._gh.rest.pulls.update(
+                owner=owner, repo=repo, pull_number=number, state="closed"
+            )
+            self._raise_if_error(f"close_pull({number})", resp)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
     def disable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
         """Disable auto-merge on a PR (GraphQL). Best-effort: False on failure.
 
@@ -1293,6 +1311,8 @@ class MockGhClient:
     merge_fail_reason: str | None = None
     #: When True, ``delete_branch`` reports failure (still non-fatal).
     delete_branch_fails: bool = False
+    #: When True, ``close_pull`` reports failure (still non-fatal, #272).
+    close_pull_fails: bool = False
 
     def _record(self, method: str, **kwargs: Any) -> None:
         self.calls.append((method, kwargs))
@@ -1537,6 +1557,10 @@ class MockGhClient:
         if self.merge_fail_reason is not None:
             return MergeResult(False, self.merge_fail_reason)
         return MergeResult(True)
+
+    def close_pull(self, owner: str, repo: str, number: int) -> bool:
+        self._record("close_pull", owner=owner, repo=repo, number=number)
+        return not self.close_pull_fails
 
     def delete_branch(self, owner: str, repo: str, branch: str) -> bool:
         self._record("delete_branch", owner=owner, repo=repo, branch=branch)

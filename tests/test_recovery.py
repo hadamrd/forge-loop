@@ -77,7 +77,18 @@ def test_reconcile_leaves_healthy_sagas_untouched(tmp_path: Path) -> None:
     assert store.get("task-9-worker").state == TaskState.RUNNING
 
 
-def test_reconcile_continues_past_a_failing_saga(tmp_path: Path) -> None:
+def _add_compensation(
+    store: SqliteTaskSagaStore, *, issue: int, kind: str, target: str
+) -> None:
+    store.append_compensation(
+        f"task-{issue}-worker",
+        Compensation(kind=kind, target=target, reason=f"{kind} for #{issue}"),
+    )
+
+
+def test_reconcile_compensation_failure_is_best_effort(tmp_path: Path) -> None:
+    """A failing compensation no longer aborts the saga (#272): it still reaches
+    COMPENSATED, the failure is captured, and the sweep continues."""
     store = _store(tmp_path)
     _stale_running(store, issue=1)
     _stale_running(store, issue=2)
@@ -88,11 +99,105 @@ def test_reconcile_continues_past_a_failing_saga(tmp_path: Path) -> None:
 
     report = reconcile_stale_sagas(store, reap_worktree=flaky_reap)
 
-    # Issue 1's compensation blew up; issue 2 still got reconciled.
-    assert [r.issue for r in report.recovered] == [2]
-    assert any("saga-1-worker" in e for e in report.errors)
+    # Both sagas reconciled; issue 1's reap failure is captured but non-fatal.
+    assert sorted(r.issue for r in report.recovered) == [1, 2]
+    assert any("saga-1-worker" in e and "remove-worktree" in e for e in report.errors)
+    assert store.get("task-1-worker").state == TaskState.COMPENSATED
     assert store.get("task-2-worker").state == TaskState.COMPENSATED
-    assert store.get("task-1-worker").state == TaskState.RUNNING  # untouched, still stale
+
+
+def test_reconcile_runs_delete_branch_and_close_pr_callbacks(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _stale_running(store, issue=7)
+    _add_compensation(store, issue=7, kind="delete-branch", target="loop/7-feat")
+    _add_compensation(store, issue=7, kind="close-pr", target="321")
+
+    reaped: list[int] = []
+    deleted: list[str] = []
+    closed: list[str] = []
+
+    report = reconcile_stale_sagas(
+        store,
+        reap_worktree=reaped.append,
+        delete_branch=deleted.append,
+        close_pr=closed.append,
+    )
+
+    assert reaped == [7]
+    assert deleted == ["loop/7-feat"]
+    assert closed == ["321"]
+    rec = report.recovered[0]
+    assert rec.branches_deleted == ("loop/7-feat",)
+    assert rec.prs_closed == ("321",)
+    assert "deleted-branch loop/7-feat" in report.summary()
+    assert "closed-pr 321" in report.summary()
+    assert store.get("task-7-worker").state == TaskState.COMPENSATED
+
+
+def test_reconcile_runs_full_list_in_registered_order(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _stale_running(store, issue=3)  # seeds remove-worktree first
+    _add_compensation(store, issue=3, kind="delete-branch", target="loop/3")
+    _add_compensation(store, issue=3, kind="close-pr", target="99")
+
+    order: list[str] = []
+    reconcile_stale_sagas(
+        store,
+        reap_worktree=lambda _: order.append("worktree"),
+        delete_branch=lambda b: order.append(f"branch:{b}"),
+        close_pr=lambda n: order.append(f"pr:{n}"),
+    )
+
+    assert order == ["worktree", "branch:loop/3", "pr:99"]
+
+
+def test_reconcile_offline_safe_without_gh_callbacks(tmp_path: Path) -> None:
+    """Offline boot: absent delete_branch/close_pr callbacks, the saga still
+    reaches COMPENSATED with no error (the design constraint)."""
+    store = _store(tmp_path)
+    _stale_running(store, issue=8)
+    _add_compensation(store, issue=8, kind="delete-branch", target="loop/8")
+    _add_compensation(store, issue=8, kind="close-pr", target="55")
+
+    report = reconcile_stale_sagas(store, reap_worktree=lambda _: None)
+
+    assert report.errors == ()
+    rec = report.recovered[0]
+    assert rec.branches_deleted == ()  # callback absent → skipped, not attempted
+    assert rec.prs_closed == ()
+    assert store.get("task-8-worker").state == TaskState.COMPENSATED
+
+
+def test_reconcile_close_pr_failure_does_not_block_other_compensations(
+    tmp_path: Path,
+) -> None:
+    """Adversarial sad-path: close-pr raises → delete-branch + remove-worktree
+    still run, saga still COMPENSATED, failure captured, sweep continues."""
+    store = _store(tmp_path)
+    _stale_running(store, issue=4)
+    _add_compensation(store, issue=4, kind="delete-branch", target="loop/4")
+    _add_compensation(store, issue=4, kind="close-pr", target="77")
+    _stale_running(store, issue=5)  # an unrelated saga the sweep must still reach
+
+    reaped: list[int] = []
+    deleted: list[str] = []
+
+    def boom_close(_: str) -> None:
+        raise RuntimeError("422 close failed")
+
+    report = reconcile_stale_sagas(
+        store,
+        reap_worktree=reaped.append,
+        delete_branch=deleted.append,
+        close_pr=boom_close,
+    )
+
+    # close-pr blew up, but the other two compensations for #4 still ran.
+    assert 4 in reaped and deleted == ["loop/4"]
+    assert any("saga-4-worker" in e and "close-pr" in e for e in report.errors)
+    assert store.get("task-4-worker").state == TaskState.COMPENSATED
+    # The sweep continued to the unrelated stale saga.
+    assert store.get("task-5-worker").state == TaskState.COMPENSATED
 
 
 def test_runner_boot_recovery_reconciles_and_emits_event(tmp_path: Path) -> None:

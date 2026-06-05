@@ -50,6 +50,38 @@ def test_task_saga_store_round_trips_saga_after_reopen(tmp_path: Path) -> None:
     assert reopened.get("task-165-a") == expected
 
 
+def test_append_compensation_persists_across_reload(tmp_path: Path) -> None:
+    """#272: a late ``close-pr`` compensation appended after PR-open survives a
+    store reload (the durability the abandoned-PR recovery relies on)."""
+    db = tmp_path / "tasks.db"
+    SqliteTaskSagaStore(db).put(_saga("task-165-a", state=TaskState.RUNNING))
+
+    SqliteTaskSagaStore(db).append_compensation(
+        "task-165-a",
+        Compensation(kind="close-pr", target="321", reason="close abandoned PR"),
+    )
+
+    reopened = SqliteTaskSagaStore(db).get("task-165-a")
+    assert reopened is not None
+    kinds = [c.kind for c in reopened.compensations]
+    assert kinds == ["remove-worktree", "close-pr"]
+    assert reopened.compensations[-1].target == "321"
+
+
+def test_append_compensation_rejects_terminal_saga(tmp_path: Path) -> None:
+    """Adversarial: appending to a terminal saga raises, never silently no-ops."""
+    db = tmp_path / "tasks.db"
+    store = SqliteTaskSagaStore(db)
+    store.put(_saga("task-165-done", state=TaskState.RUNNING))
+    store.mark_completed("task-165-done", reason="merged")
+
+    with pytest.raises(TerminalTaskMutationError):
+        store.append_compensation(
+            "task-165-done",
+            Compensation(kind="close-pr", target="9", reason="late"),
+        )
+
+
 def test_create_without_policy_records_explicit_empty_policy() -> None:
     store = FakeTaskSagaStore()
 
