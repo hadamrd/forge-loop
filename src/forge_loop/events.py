@@ -37,7 +37,7 @@ import warnings
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar, Protocol, cast
+from typing import Any, ClassVar, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -110,8 +110,10 @@ class EventBase(BaseModel):
 
 EVENT_REGISTRY: dict[str, type[EventBase]] = {}
 
+_EventT = TypeVar("_EventT", bound=EventBase)
 
-def register_event(cls: type[EventBase]) -> type[EventBase]:
+
+def register_event(cls: type[_EventT]) -> type[_EventT]:
     """Class decorator: register a typed event so the loose-shape path
     can warn when callers emit it without going through ``emit()``.
     """

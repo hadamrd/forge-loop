@@ -732,7 +732,10 @@ def main(argv: list[str] | None = None) -> int:
         result = app(args=argv, standalone_mode=False)
     except typer.Exit as exc:
         return int(exc.exit_code or 0)
-    except click.exceptions.Exit as exc:
+    # typer 0.26 vendors click under typer._click, so typer.Exit and the real
+    # click.exceptions.Exit are distinct classes at runtime — this clause is a
+    # genuine defensive catch, not dead. pyright collapses them by name.
+    except click.exceptions.Exit as exc:  # pyright: ignore[reportUnusedExcept]
         return int(exc.exit_code or 0)
     except click.ClickException as exc:
         raise SystemExit(exc.exit_code) from exc
