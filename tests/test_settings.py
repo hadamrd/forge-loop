@@ -48,7 +48,7 @@ def test_defaults_apply_when_no_yaml_no_env(fake_repo: Path, monkeypatch: pytest
     s = Settings.load()
     assert s.scheduling.parallel == 3
     assert s.scheduling.tick_interval_s == 60
-    assert s.worker.model == "claude-opus-4-7"
+    assert s.worker.model == "claude-opus-4-8"
     assert s.worker.thinking == "medium"
     assert s.critic.enabled is True
     assert s.po.enabled is True
