@@ -248,10 +248,12 @@ def test_repaired_pr_gets_automerge_after_threads_are_clear(
         lambda outcomes, **_kwargs: gate_calls.extend(o.pr_url or "" for o in outcomes) or [],
     )
     monkeypatch.setattr(gh, "unresolved_review_threads", lambda *_a, **_k: [])
+    from forge_loop.gh_issues import MergeOutcome as _MergeOutcome
+
     monkeypatch.setattr(
         gh,
-        "enable_pr_auto_merge",
-        lambda pr, **_kwargs: merge_calls.append(str(pr)) or True,
+        "ensure_pr_merged",
+        lambda pr, **_kwargs: (merge_calls.append(str(pr)), _MergeOutcome(True, "auto"))[1],
     )
     outcome = WorkerOutcome(
         issue=99,

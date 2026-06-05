@@ -166,13 +166,16 @@ def _enable_automerge_for_reviewed_outcomes(
             continue
         if outcome.error:
             continue
-        if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
+        result = _gh.ensure_pr_merged(outcome.pr_url, repo=cfg.github_repo)
+        if result.merged:
             outcome.status = "merged"
             append_event(
                 cfg.events_file,
                 "post_critic_automerge_enabled",
                 issue=outcome.issue,
                 pr=outcome.pr_url,
+                method=result.method,
+                detail=result.reason or None,
             )
         else:
             append_event(
@@ -180,6 +183,7 @@ def _enable_automerge_for_reviewed_outcomes(
                 "post_critic_automerge_failed",
                 issue=outcome.issue,
                 pr=outcome.pr_url,
+                reason=result.reason,
             )
 
 
@@ -263,7 +267,8 @@ def _enable_automerge_for_adopted_prs(
                 unresolved_human_threads=len(human_threads),
             )
             continue
-        if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
+        result = _gh.ensure_pr_merged(outcome.pr_url, repo=cfg.github_repo)
+        if result.merged:
             outcome.status = "merged"
             append_event(
                 cfg.events_file,
@@ -271,6 +276,8 @@ def _enable_automerge_for_adopted_prs(
                 issue=outcome.issue,
                 pr=outcome.pr_url,
                 over_unresolved_critic_threads=len(threads),
+                method=result.method,
+                detail=result.reason or None,
             )
         else:
             append_event(
@@ -278,6 +285,7 @@ def _enable_automerge_for_adopted_prs(
                 "orphan_pr_automerge_failed",
                 issue=outcome.issue,
                 pr=outcome.pr_url,
+                reason=result.reason,
             )
 
 

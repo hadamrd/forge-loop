@@ -300,6 +300,7 @@ def test_selector_skips_when_issue_fetch_fails(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 from forge_loop import gh_issues as _ghmod  # noqa: E402
+from forge_loop.gh_issues import MergeOutcome as _MergeOutcome  # noqa: E402
 from forge_loop.runner.tick import (  # noqa: E402
     _enable_automerge_for_adopted_prs,
     _run_adoption_tick,
@@ -330,11 +331,13 @@ def _human_thread(id_: str = "t-human") -> dict[str, Any]:
 
 
 def _patch_gh(monkeypatch, *, threads: list[Any] | None = None) -> list[str]:
-    """Stub gh so adoption never touches the network; return the auto-merge log."""
+    """Stub gh so adoption never touches the network; return the merge log."""
     merged: list[str] = []
     monkeypatch.setattr(_ghmod, "unresolved_review_threads", lambda *_a, **_k: threads or [])
     monkeypatch.setattr(
-        _ghmod, "enable_pr_auto_merge", lambda url, repo=None: merged.append(url) or True
+        _ghmod,
+        "ensure_pr_merged",
+        lambda url, repo=None: (merged.append(url), _MergeOutcome(True, "auto"))[1],
     )
     return merged
 
@@ -506,7 +509,9 @@ def test_repaired_automerge_merges_despite_sev3_threads(tmp_path: Path, monkeypa
     enable_automerge_for_repaired_prs = _import_repaired_automerge()
     merged: list[str] = []
     monkeypatch.setattr(
-        _ghmod, "enable_pr_auto_merge", lambda url, repo=None: merged.append(url) or True
+        _ghmod,
+        "ensure_pr_merged",
+        lambda url, repo=None: (merged.append(url), _MergeOutcome(True, "auto"))[1],
     )
     # The leftover threads are the critic's OWN sev3 notes — they must NOT hold
     # the PR back (that gating caused the #229 stall).
@@ -531,7 +536,9 @@ def test_repaired_automerge_skips_unresolved_human_thread(tmp_path: Path, monkey
     enable_automerge_for_repaired_prs = _import_repaired_automerge()
     merged: list[str] = []
     monkeypatch.setattr(
-        _ghmod, "enable_pr_auto_merge", lambda url, repo=None: merged.append(url) or True
+        _ghmod,
+        "ensure_pr_merged",
+        lambda url, repo=None: (merged.append(url), _MergeOutcome(True, "auto"))[1],
     )
     monkeypatch.setattr(
         _ghmod, "unresolved_review_threads", lambda *_a, **_k: [_human_thread(), _critic_thread()]
@@ -558,7 +565,9 @@ def test_repaired_automerge_skips_when_critic_reblocked(tmp_path: Path, monkeypa
     enable_automerge_for_repaired_prs = _import_repaired_automerge()
     merged: list[str] = []
     monkeypatch.setattr(
-        _ghmod, "enable_pr_auto_merge", lambda url, repo=None: merged.append(url) or True
+        _ghmod,
+        "ensure_pr_merged",
+        lambda url, repo=None: (merged.append(url), _MergeOutcome(True, "auto"))[1],
     )
     monkeypatch.setattr(
         "forge_loop.runner.merge_gate.apply_issue_closed_gate", lambda outcomes, **_k: []

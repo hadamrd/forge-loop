@@ -358,17 +358,18 @@ def enable_auto_merge(
     *,
     repo: str,
 ) -> bool:
-    """Healthy PR shortcut — enable squash auto-merge, return success.
+    """Healthy PR shortcut — land the PR, return success.
 
     Used when ``probe_worker_state`` returns ``PR_OPEN_HEALTHY``: no LLM is
-    needed, we just tell GitHub to merge as soon as required checks pass.
+    needed. Tries GitHub auto-merge, then falls back to a direct squash merge
+    (issue #255) so a repo without the auto-merge feature still self-lands.
     """
     if not pr_url:
         return False
     from forge_loop import gh_issues as _gh
 
     try:
-        return _gh.enable_pr_auto_merge(pr_url, repo=repo)
+        return _gh.ensure_pr_merged(pr_url, repo=repo).merged
     except Exception:  # noqa: BLE001
         return False
 

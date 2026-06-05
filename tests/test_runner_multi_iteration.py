@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from forge_loop import gh_issues
+from forge_loop.gh_client import AutoMergeResult, MergeResult
 from forge_loop.runner.iteration import (
     WorkerState,
     run_iteration_loop,
@@ -111,11 +112,21 @@ class _ScriptedClient:
                 return body
         return ""
 
-    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
+    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> AutoMergeResult:
         # The owner records the PR URL it expects to auto-merge.
         prs = self._stage().get("pr_list", [])
         url = prs[0].get("url", "") if prs else ""
         self._owner.automerge_calls.append(url or str(number))
+        return AutoMergeResult(True)
+
+    def merge_pull_request(  # pragma: no cover - PR_OPEN_HEALTHY enables auto-merge
+        self, owner: str, repo: str, number: int, *, method: str = "squash"
+    ) -> MergeResult:
+        return MergeResult(True)
+
+    def delete_branch(  # pragma: no cover - not reached on the auto-merge path
+        self, owner: str, repo: str, branch: str
+    ) -> bool:
         return True
 
     def update_issue(self, owner: str, repo: str, number: int, **kwargs: Any) -> bool:
