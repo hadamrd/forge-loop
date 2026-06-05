@@ -62,6 +62,46 @@ def issue_number_from_pr(pr: dict[str, Any]) -> int | None:
     return None
 
 
+def _is_backed_off(
+    cfg: Config,
+    pr: dict[str, Any],
+    issue_num: int,
+    *,
+    backoff_state: Any,
+    max_consecutive_blocks: int,
+    cooldown_s: int,
+    now: Any,
+) -> bool:
+    """Issue #248 per-PR repair backoff gate.
+
+    Returns True (and emits ``repair_pr_backoff``) when ``pr`` has re-blocked
+    ``>= max_consecutive_blocks`` consecutive ticks and is still inside its
+    cooldown window. Inert (always False) when backoff is disabled
+    (``max_consecutive_blocks <= 0`` or no ``backoff_state``).
+    """
+    if backoff_state is None or max_consecutive_blocks <= 0:
+        return False
+    url = pr.get("url")
+    decision = classify_repair_backoff(
+        backoff_state.block_count(url),
+        backoff_state.last_block_ts(url),
+        max_consecutive_blocks=max_consecutive_blocks,
+        cooldown_s=cooldown_s,
+        now=now,
+    )
+    if not decision.skip:
+        return False
+    append_event(
+        cfg.events_file,
+        "repair_pr_backoff",
+        pr=url,
+        issue=issue_num,
+        consecutive_blocks=decision.consecutive_blocks,
+        cooldown_remaining_s=decision.cooldown_remaining_s,
+    )
+    return True
+
+
 def blocking_pr_repairs(
     cfg: Config,
     *,
@@ -75,14 +115,9 @@ def blocking_pr_repairs(
 ) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
     """Select critic-blocked / conflicted PRs needing a repair worker.
 
-    Issue #248: when ``max_consecutive_blocks > 0`` and a ``backoff_state``
-    (:class:`forge_loop.runner.repair_backoff.RepairBackoffState`) is supplied,
-    a PR that has re-blocked ``>= max_consecutive_blocks`` times in a row and is
-    still inside its ``cooldown_s`` window is excluded from selection — it
-    yields its slot to new dispatch instead of pinning it forever — and emits a
-    ``repair_pr_backoff`` event. With ``max_consecutive_blocks == 0`` (the
-    default, and the path taken when repair-fairness is disabled) the backoff is
-    inert and selection is byte-identical to the legacy behaviour.
+    Issue #248: per-PR backoff (via :func:`_is_backed_off`) excludes a PR stuck
+    on ``critic:blocking`` for too long; inert when ``max_consecutive_blocks <=
+    0`` so selection is byte-identical to the legacy behaviour.
     """
     from forge_loop.axis import matches_axes, parse_filter_env
 
@@ -109,28 +144,15 @@ def blocking_pr_repairs(
                 reason="source_issue_not_found",
             )
             continue
-        # #248: per-PR repair backoff. A PR stuck on critic:blocking for N
-        # consecutive ticks yields its slot until a cooldown elapses, so the
-        # ready backlog is no longer starved by a perpetually-reblocking PR.
-        if backoff_state is not None and max_consecutive_blocks > 0:
-            url = pr.get("url")
-            decision = classify_repair_backoff(
-                backoff_state.block_count(url),
-                backoff_state.last_block_ts(url),
-                max_consecutive_blocks=max_consecutive_blocks,
-                cooldown_s=cooldown_s,
-                now=now,
-            )
-            if decision.skip:
-                append_event(
-                    cfg.events_file,
-                    "repair_pr_backoff",
-                    pr=url,
-                    issue=issue_num,
-                    consecutive_blocks=decision.consecutive_blocks,
-                    cooldown_remaining_s=decision.cooldown_remaining_s,
-                )
-                continue
+        # #248: a PR re-blocked for too long yields its slot (see _is_backed_off).
+        if _is_backed_off(
+            cfg, pr, issue_num,
+            backoff_state=backoff_state,
+            max_consecutive_blocks=max_consecutive_blocks,
+            cooldown_s=cooldown_s,
+            now=now,
+        ):
+            continue
         issue = fetch_issue_fn(issue_num, repo=cfg.github_repo)
         if not issue:
             append_event(

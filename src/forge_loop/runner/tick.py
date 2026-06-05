@@ -415,7 +415,6 @@ def _run_adoption_tick(
         {"state": "between-ticks", "tick": tick, "last_summary": summary},
     )
     short_sleep(cfg.tick_interval_s, cfg)
-    return outcomes
 
 
 def _should_run_worker_iterations(cfg: Any, outcomes: Sequence[object]) -> bool:
@@ -496,6 +495,7 @@ def _run_repair_tick(
         {"state": "between-ticks", "tick": tick, "last_summary": summary},
     )
     short_sleep(cfg.tick_interval_s, cfg)
+    return outcomes
 
 
 # --------------------------------------------------------------------------- #
