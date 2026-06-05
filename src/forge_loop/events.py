@@ -302,6 +302,29 @@ class WorkerPreCommitInstalledEvent(EventBase):
 
 
 @register_event
+class CriticReviewErroredEvent(EventBase):
+    """A critic re-review returned ``verdict=error`` (issue #245).
+
+    An ``error`` verdict is a critic CRASH / timeout / parse-failure — NOT a
+    real adjudication. The review has no opinion, so the runner MUST NOT carry
+    a prior round's ``critic:blocking`` label forward unevaluated (that froze
+    PR #231 for ~2.5h). This typed event makes the crash observable LOUD
+    instead of silent: the runner clears the stale block labels and leaves the
+    PR in an explicit needs-re-review state that the next tick re-derives from
+    the current head.
+
+    ``error`` carries the tail of the underlying failure (timeout / parse /
+    SDK transport) so an operator can triage without grepping critic-*.log.
+    """
+
+    KIND: ClassVar[str] = "critic_review_errored"
+    issue: int = Field(ge=0, default=0)
+    pr: str | None = None
+    verdict: str = "error"
+    error: str = ""
+
+
+@register_event
 class WorkerPolicyEnforcedEvent(EventBase):
     """Deny-by-default worker settings were planted from the saga grant (#200).
 
@@ -455,6 +478,7 @@ __all__ = [
     "EVENT_REGISTRY",
     "AuditCleanEvent",
     "AuditViolationFiledEvent",
+    "CriticReviewErroredEvent",
     "EventBase",
     "LoopStartEvent",
     "LoopStopEvent",

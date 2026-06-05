@@ -21,6 +21,8 @@ from forge_loop.config import Config
 from forge_loop.control.boot import canonical_task_saga_path
 from forge_loop.critic import review_pr as _critic_review
 from forge_loop.critic_actions import apply_critic_report
+from forge_loop.events import CriticReviewErroredEvent
+from forge_loop.events import emit as _emit_typed
 from forge_loop.runner.critic_flow import (
     NEEDS_HUMAN_LABEL,
     NEEDS_REVIEW_LABEL,
@@ -833,6 +835,34 @@ def _run_repair_workers(
     return outcomes
 
 
+def _clear_stale_critic_block_labels(
+    pr_url: str,
+    *,
+    repo: str | None,
+    bus_emit: Any,
+) -> None:
+    """Remove ``critic:blocking`` / ``critic:suspicious`` from a PR.
+
+    Shared by the non-blocking plan path AND the ``verdict=error`` path
+    (issue #245) so a block label is only ever held when the CURRENT head's
+    verdict actually says so — a crashed review re-derives "no block" rather
+    than carrying a prior round's label forward. Each removal is best-effort;
+    a failure is surfaced via ``critic_actions_failed`` and never raises.
+    """
+    for label in ("critic:blocking", "critic:suspicious"):
+        ok = _gh.remove_pr_label(pr_url, label, repo=repo)
+        if not ok:
+            bus_emit(
+                "critic_actions_failed",
+                {
+                    "pr": pr_url,
+                    "method": "remove_pr_label",
+                    "label": label,
+                    "auth_source": getattr(_gh, "auth_source", "github-client"),
+                },
+            )
+
+
 def _run_critic_for_outcomes(
     cfg: Config,
     outcomes: list[WorkerOutcome],
@@ -885,26 +915,39 @@ def _run_critic_for_outcomes(
                             note = f"critic blocked merge: {reason}"[:200]
                             o.error = f"{o.error}; {note}" if o.error else note
                         else:
-                            for label in ("critic:blocking", "critic:suspicious"):
-                                ok = _gh.remove_pr_label(
-                                    o.pr_url,
-                                    label,
-                                    repo=cfg.github_repo,
-                                )
-                                if not ok:
-                                    bus_emit(
-                                        "critic_actions_failed",
-                                        {
-                                            "pr": o.pr_url,
-                                            "method": "remove_pr_label",
-                                            "label": label,
-                                            "auth_source": getattr(
-                                                _gh,
-                                                "auth_source",
-                                                "github-client",
-                                            ),
-                                        },
-                                    )
+                            _clear_stale_critic_block_labels(
+                                o.pr_url, repo=cfg.github_repo, bus_emit=bus_emit
+                            )
+                    except Exception as act_ex:
+                        append_event(
+                            cfg.events_file,
+                            "critic_actions_failed",
+                            issue=o.issue,
+                            err=str(act_ex)[:200],
+                        )
+                else:
+                    # verdict == "error": a crashed / timed-out / parse-failed
+                    # re-review has NO opinion (issue #245). It MUST NOT carry a
+                    # prior round's critic:blocking forward unevaluated — that
+                    # froze PR #231 for ~2.5h. Re-derive the block from the
+                    # CURRENT head (no real verdict → no block) by clearing the
+                    # stale labels, surface the crash LOUD via a typed event, and
+                    # leave the PR open so the next tick re-reviews from scratch.
+                    # Never auto-approve: an error is never an approval.
+                    o.status = "open"
+                    _emit_typed(
+                        cfg.events_file,
+                        CriticReviewErroredEvent(
+                            issue=o.issue,
+                            pr=o.pr_url,
+                            verdict=critic_outcome.verdict,
+                            error=(critic_outcome.error or "")[:200],
+                        ),
+                    )
+                    try:
+                        _clear_stale_critic_block_labels(
+                            o.pr_url, repo=cfg.github_repo, bus_emit=bus_emit
+                        )
                     except Exception as act_ex:
                         append_event(
                             cfg.events_file,

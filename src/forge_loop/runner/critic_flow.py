@@ -128,6 +128,28 @@ def handle_critic_verdict(
 
     overall = str(getattr(report, "overall", "")).lower()
 
+    if report is None or overall == "error":
+        # A critic CRASH / timeout / parse-failure (issue #245): the review has
+        # NO opinion, so it must NOT preserve a prior round's block label. Clear
+        # any stale critic:blocking / critic:suspicious so the block is
+        # re-derived from the current head, surface the error LOUD (typed
+        # event), and leave the session in AWAITING_CRITIC so the next tick
+        # re-reviews from scratch. Never merge, never abandon — an error is
+        # neither an approval nor an adjudicated block.
+        if pr_url:
+            _clear_stale_critic_block_labels(
+                gh, pr_url, repo=repo, emit=emit, issue=sess.issue
+            )
+        _emit_best_effort(
+            emit,
+            "critic_review_errored",
+            issue=sess.issue,
+            session_id=session_id,
+            pr=pr_url,
+            error=str(getattr(report, "raw", "") or "")[:200],
+        )
+        return "errored"
+
     if overall == "approve":
         store.transition_to(session_id, WorkerState.MERGED, reason="critic approved")
         _emit_best_effort(
@@ -240,6 +262,34 @@ def _label_pr_best_effort(
         gh.add_pr_label(pr_url, [label], repo=repo)
     except Exception as ex_:  # noqa: BLE001
         _emit_best_effort(emit, event, issue=issue, err=str(ex_)[:200])
+
+
+def _clear_stale_critic_block_labels(
+    gh: Any,
+    pr_url: str,
+    *,
+    repo: str | None,
+    emit: Any,
+    issue: int,
+) -> None:
+    """Remove ``critic:blocking`` / ``critic:suspicious`` from a PR (issue #245).
+
+    Used by the ``verdict=error`` branch so a crashed review re-derives "no
+    block" from the current head instead of carrying a prior round's label
+    forward unevaluated. Best-effort: a removal failure is surfaced via
+    ``critic_label_clear_failed`` and never raises.
+    """
+    for label in ("critic:blocking", "critic:suspicious"):
+        try:
+            gh.remove_pr_label(pr_url, label, repo=repo)
+        except Exception as ex_:  # noqa: BLE001
+            _emit_best_effort(
+                emit,
+                "critic_label_clear_failed",
+                issue=issue,
+                label=label,
+                err=str(ex_)[:200],
+            )
 
 
 def _comment_pr_best_effort(

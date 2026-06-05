@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -395,6 +396,110 @@ def test_run_critic_reports_failed_cleanup_label_removal(monkeypatch, tmp_path) 
     ]
     assert all(failure["method"] == "remove_pr_label" for failure in failures)
     assert all(failure["auth_source"] == "gh cli" for failure in failures)
+
+
+def test_run_critic_error_verdict_clears_stale_block_and_emits(monkeypatch, tmp_path) -> None:
+    """Issue #245: a critic verdict=error (report is None) on a previously
+    blocked PR must NOT leave the stale critic:blocking label, must emit the
+    typed ``critic_review_errored`` event, and must leave the PR open for the
+    next tick to re-review from scratch — never a silent stale block, never an
+    auto-approve."""
+    cfg = Config(
+        repo=tmp_path,
+        github_repo="o/r",
+        critic=CriticConfig(enabled=True, timeout_s=10),
+    )
+    outcome = WorkerOutcome(
+        issue=230,
+        title="addressed every finding",
+        pr_url="https://github.com/o/r/pull/231",
+        status="open",
+        duration_s=1.0,
+        stdout_tail="",
+    )
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_critic_review",
+        lambda *_a, **_kw: CriticOutcome(
+            verdict="error",
+            reasons=[],
+            duration_s=1.0,
+            stdout_tail="(timeout)",
+            report=None,
+            error="critic exceeded 10s",
+        ),
+    )
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        dispatch_mod._gh,
+        "remove_pr_label",
+        lambda pr, label, repo=None: (removed.append((pr, label, repo)), True)[1],
+    )
+    # apply_critic_report / pr_changed_lines must NOT be reached on the error
+    # branch (report is None) — make them explode if they are.
+    monkeypatch.setattr(
+        dispatch_mod._gh,
+        "pr_changed_lines",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("must not be called")),
+    )
+
+    dispatch_mod._run_critic_for_outcomes(cfg, [outcome], lambda *_a, **_kw: None)
+
+    # PR is left OPEN (needs re-review), never auto-approved/merged.
+    assert outcome.status == "open"
+    # Stale block labels are re-derived (removed), not carried forward.
+    assert {label for _, label, _ in removed} == {"critic:blocking", "critic:suspicious"}
+    # The typed error event landed on disk.
+    lines = cfg.events_file.read_text().splitlines()
+    errored = [json.loads(ln) for ln in lines if '"critic_review_errored"' in ln]
+    assert len(errored) == 1
+    assert errored[0]["kind"] == "critic_review_errored"
+    assert errored[0]["issue"] == 230
+    assert errored[0]["pr"] == "https://github.com/o/r/pull/231"
+    assert errored[0]["verdict"] == "error"
+    assert "10s" in errored[0]["error"]
+
+
+def test_run_critic_error_label_clear_failure_is_reported(monkeypatch, tmp_path) -> None:
+    """Adversarial: a gh remove failure on the error branch is surfaced via
+    critic_actions_failed and does not raise or freeze the PR."""
+    cfg = Config(
+        repo=tmp_path,
+        github_repo="o/r",
+        critic=CriticConfig(enabled=True, timeout_s=10),
+    )
+    outcome = WorkerOutcome(
+        issue=230,
+        title="x",
+        pr_url="https://github.com/o/r/pull/231",
+        status="open",
+        duration_s=1.0,
+        stdout_tail="",
+    )
+    emitted: list[tuple[str, dict]] = []
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_critic_review",
+        lambda *_a, **_kw: CriticOutcome(
+            verdict="error",
+            reasons=[],
+            duration_s=1.0,
+            stdout_tail="",
+            report=None,
+            error="parse failed",
+        ),
+    )
+    monkeypatch.setattr(dispatch_mod._gh, "auth_source", "gh cli", raising=False)
+    monkeypatch.setattr(dispatch_mod._gh, "remove_pr_label", lambda *_a, **_kw: False)
+
+    dispatch_mod._run_critic_for_outcomes(cfg, [outcome], lambda k, p: emitted.append((k, p)))
+
+    assert outcome.status == "open"
+    failures = [p for k, p in emitted if k == "critic_actions_failed"]
+    assert [f["label"] for f in failures] == ["critic:blocking", "critic:suspicious"]
+    assert all(f["method"] == "remove_pr_label" for f in failures)
 
 
 if __name__ == "__main__":
