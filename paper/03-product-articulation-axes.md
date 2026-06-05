@@ -85,9 +85,14 @@ it.
 
 ## 3.4 The anti-cosmetic guardrail as a Goodhart defense
 
-There is a well-known failure of optimization: when a measure becomes a
-target, it ceases to be a good measure. An autonomous agent optimizing
-"ship PRs" will ship the easiest PRs — which are exactly the cosmetic ones.
+There is a well-known failure of optimization — **Goodhart's law**: when a
+measure becomes a target, it ceases to be a good measure. An autonomous
+agent optimizing "ship PRs" will ship the easiest PRs — which are exactly the
+cosmetic ones. This is not speculative for AI coding specifically: the
+2024–2025 developer surveys (Stack Overflow; Google's DORA) report that the
+top practitioner frustration with AI assistance is *"almost-right" output*
+that looks done and is not — output optimized to the visible proxy (a
+plausible diff) rather than the latent goal [1].
 The `rejected_as_cosmetic` list is a direct structural defense: it removes
 the easiest proxies from the set of admissible work, forcing the
 optimizer's pressure back onto the axes that actually represent value.
@@ -108,6 +113,28 @@ out — and worse, *confidently and at scale*. The leverage of this surface
 is real, but it is leverage on the operator's clarity, which means it
 amplifies a poor value model as faithfully as a good one. This is the
 upfront cost named in Section 2, located precisely.
+
+That the *cheapest* place to spend this clarity is up front is the oldest
+result in the field: Boehm and Basili's defect data show issues rooted in
+the requirements/specification stage are the most expensive to correct later
+(on the order of 100× post-delivery), with ~40–50% of project effort going to
+avoidable rework [2]. The axis schema is that lesson applied to an agent
+workforce — pay for value-clarity once, in a typed artifact, instead of in a
+thousand misdirected PRs.
+
+## References
+
+1. Stack Overflow Developer Survey 2025; Google DORA, *State of DevOps* 2024
+   & 2025. *Near-universal AI adoption with low/falling trust; the top
+   frustration is "almost-right" AI output; full discussion + citations in
+   Section 2.*
+2. B. Boehm and V. R. Basili. "Software Defect Reduction Top 10 List." *IEEE
+   Computer* 34(1), 2001. *Requirements/design-stage defects are the most
+   expensive to fix late; ~40–50% of effort is avoidable rework.* (Full entry
+   and the Menzies 2017 qualifier in Section 5.)
+
+*(All references verified against primary sources before citation; "Goodhart's
+law" is named as the standard attribution for the measure-as-target effect.)*
 
 ---
 

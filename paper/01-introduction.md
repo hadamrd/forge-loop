@@ -19,6 +19,16 @@ drift. The system keeps moving. PRs keep opening. Tests keep passing. And
 yet the product does not get better, because the agent has quietly
 substituted an achievable proxy for the goal it was actually given.
 
+That drift is hard to see precisely because it *feels* like speed. The
+sharpest evidence is the METR 2025 randomized trial: 16 experienced
+open-source developers working on their own mature repositories were measured
+**19% slower** when allowed AI tools — while they had forecast a 24% speedup
+and, even after the fact, still believed AI had sped them up ~20% [1]. A
+~40-point gap between perceived and actual productivity is the governance
+problem in one number: if practitioners cannot feel the cost on their own
+keyboards, an unattended swarm certainly will not flag it. (The optimistic
+counter-evidence is real but narrow — see Section 2.)
+
 ## 1.2 Three failure modes of the unsupervised agent
 
 An autonomous coding system left without governance exhibits three
@@ -55,6 +65,16 @@ is that human attention is the scarce resource and machine action is cheap.
 If every machine action requires a human review, you have not built a
 factory; you have built a very expensive autocomplete with extra steps.
 
+And the human-everywhere mitigation is not even as strong as it sounds:
+empirically, code review is a weak defect net — defect-related comments are
+~14% of review output and mostly superficial (Bacchelli & Bird 2013), and at
+Google review has converged to a single reviewer whose job is readability and
+gatekeeping more than bug-finding (Sadowski et al. 2018). Reviewing a *stream*
+of machine output then invites automation bias and complacency, which resist
+training and worsen under load (Parasuraman & Manzey 2010) — the "LGTM"
+rubber-stamp. (These are developed in Section 4.) So a human in every loop is
+both the most expensive option and a leaky one.
+
 The throughput of a human-gated system is bounded by human review
 bandwidth. The throughput of an *ungoverned* autonomous system is unbounded
 but its **value** is unbounded in both directions — it can subtract as
@@ -84,6 +104,17 @@ loops (what gets admitted and what is learned from failure), and
 code-quality imperatives (how it must be built). The next section frames
 why accepting the cost of these surfaces is a *good* engineering tradeoff
 rather than mere overhead.
+
+## References
+
+1. J. Becker, N. Rush, E. Barnes, D. Rein (METR). "Measuring the Impact of
+   Early-2025 AI on Experienced Open-Source Developer Productivity."
+   arXiv:2507.09089, 2025. *Independent RCT: experienced devs were 19% slower
+   with AI yet believed they were ~20% faster (forecast +24%).* Review/
+   automation-bias citations (Bacchelli & Bird 2013; Sadowski et al. 2018;
+   Parasuraman & Manzey 2010) are listed in Section 4.
+
+*(All references verified against primary sources before citation.)*
 
 ---
 

@@ -838,12 +838,20 @@ def post_review_comment(
     line: int | None = None,
     repo: str | None = None,
 ) -> bool:
-    """Post a review on a PR. When ``file``+``line`` are provided, post as a
-    single inline comment via the GitHub API (``gh api``). Otherwise post a
-    plain ``--comment`` review with ``body`` as the summary.
+    """Post a critic finding to a PR so it ALWAYS lands.
 
-    Returns True on success, False on API failure (caller decides whether to
-    fall back to a summary comment).
+    When ``file``+``line`` are provided, an inline review comment is attempted
+    first via the GitHub API. GitHub **422-rejects an inline comment whose line
+    is not part of the PR's diff** — a routine case, since critic findings often
+    reference lines outside the changed hunks. On any such failure we **fall
+    back** to a plain ``--comment`` review with the location prepended to the
+    text, rather than dropping the finding.
+
+    This fallback is load-bearing, not cosmetic: the repair worker rebuilds its
+    brief from the posted review context (see ``pr_review_context``), so a
+    silently-dropped finding blinds the repair loop and it never converges. The
+    finding must reach the PR by *some* path; inline is a nicety, landing it is
+    the contract. Returns True if the finding was posted by either path.
     """
     repo = _require_repo(repo)
     if file is not None and line is not None:
@@ -867,7 +875,12 @@ def post_review_comment(
             capture_output=True,
             check=False,
         )
-        return r.returncode == 0
+        if r.returncode == 0:
+            return True
+        # Inline rejected (commonly a 422: line not in the diff). Fall back to a
+        # plain review comment so the finding still reaches the repair worker,
+        # with the location preserved in text.
+        body = f"`{file}:{line}` — {body}"
     r = subprocess.run(
         ["gh", "pr", "review", str(pr), "--repo", repo, "--comment", "--body", body],
         capture_output=True,

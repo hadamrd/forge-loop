@@ -32,6 +32,26 @@ environment's signal (production bugs).
 The critic is the system's reviewer-of-record. Its design has two
 properties worth defending.
 
+This matters because the human review it stands in for is, empirically, a
+weak defect net — and weakest exactly where AI output stresses it. Bacchelli
+and Bird's classification of modern code review (ICSE 2013) found
+defect-related comments were only about **one-eighth (~14%) of review
+output**, and the defects caught were overwhelmingly superficial logical
+slips rather than the conceptual or design problems reviewers believe they
+catch [1]. Google's own large-scale study (Sadowski et al., ICSE-SEIP 2018,
+across ~9M reviewed changes) reports review has converged to a *single*
+reviewer (median = 1) whose purpose is readability, education, and
+gatekeeping, with defect-finding "welcomed but not the only focus" [2]. Layer
+on the human-factors literature on reviewing *automated* output —
+*automation bias* and *complacency*: over-trust of imperfect automation that
+produces both omission and commission errors, intensifies under
+multiple-task load, and is **not eliminable by training or warnings**
+(Parasuraman & Manzey 2010; Skitka, Mosier & Burdick 1999) [3][4]. The
+"LGTM" rubber-stamp on a stream of AI PRs is not a discipline failure; it is
+the predicted equilibrium. A typed, mechanical gate is the response: it does
+not get bored, does not rubber-stamp, and renders a verdict the loop can act
+on without a human in the path.
+
 **It emits a typed verdict, not prose.** A `CriticReport` carries
 structured findings, each with a *severity* (sev1/sev2/sev3) and a
 *category* (correctness / security / style / tests / docs). This typing is
@@ -107,6 +127,25 @@ the bug, decide it is worth a rule, and write the rule well. The system
 *supports* the ratchet (it drafts the delta); it does not *guarantee* it.
 The mechanism is sound; its yield is bounded by operator discipline — once
 again locating the cost exactly where Section 2 said it would be.
+
+## References
+
+1. A. Bacchelli and C. Bird. "Expectations, Outcomes, and Challenges of
+   Modern Code Review." *ICSE 2013.* DOI 10.1109/ICSE.2013.6606617.
+   *Defect-related comments are ~14% of review output and mostly superficial.*
+2. C. Sadowski, E. Söderberg, L. Church, M. Sipko, A. Bacchelli. "Modern Code
+   Review: A Case Study at Google." *ICSE-SEIP 2018.* DOI
+   10.1145/3183519.3183525. *Review converged to a single reviewer; its
+   purpose is readability/gatekeeping, not primarily defect-finding.*
+3. R. Parasuraman and D. H. Manzey. "Complacency and Bias in Human Use of
+   Automation: An Attentional Integration." *Human Factors* 52(3), 2010.
+   *Automation bias/complacency cause omission+commission errors, worsen under
+   load, and resist training.*
+4. L. J. Skitka, K. L. Mosier, M. Burdick. "Does automation bias
+   decision-making?" *Int. J. Human-Computer Studies* 51(5), 1999.
+   *Defined automation bias; accountability reduces but does not remove it.*
+
+*(All references verified against primary sources before citation.)*
 
 ---
 

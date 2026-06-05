@@ -192,6 +192,33 @@ LOC did — the rule and that probe ship together; until the probe exists this
 rule is enforced per-PR on the diff only, and that limit is stated here on
 purpose rather than pretended away.
 
+### Q10. Load-bearing data must not round-trip through a best-effort side-effect.
+
+When component A produces data that component B needs, **hand it over
+directly** (in-memory value, explicit argument). Do **not** write it to an
+external system (GitHub, a file, a queue) and have B re-read it when a direct
+hand-off exists — a failure in the side-effect then *silently starves* B with
+no error at the consumer. Corollaries: (a) a side-effect on a critical path
+must **fail loud or fall back**, never fail-soft-and-continue — and a function
+whose docstring promises a fallback must implement it; (b) a cross-component
+data flow needs a **seam test** asserting the data actually arrives at the
+consumer, because per-PR-diff review is structurally blind to a broken seam.
+Routing required data through a fallible, silently-degrading side-effect is
+**sev2** (it yields non-converging degradation, not a crash — the hardest kind
+to detect).
+
+**Rationale.** The 2026-06-05 incident: the critic posted findings as *inline*
+review comments (`file:line`); GitHub 422-rejects inline comments on lines not
+in the PR diff; `post_review_comment` returned `False` with **no fallback**
+(its own docstring promised one). The repair worker rebuilds its brief from the
+*fetched* posted review — so with the findings dropped it repaired **blind**,
+and one PR churned 44 minutes across repair rounds without ever converging,
+burning model budget. Four slop patterns stacked: in-memory data round-tripped
+through GitHub, a fail-soft post on the critical path, an unimplemented
+documented fallback, and no seam test. The loop's own per-PR critic could not
+catch it because the break was *between* components. This rule + the
+findings-always-land fix ship together.
+
 ## How to apply this manifesto
 
 * When reviewing a forge-loop PR, scan the diff for each rule. A

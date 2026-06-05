@@ -85,6 +85,25 @@ The two regimes cross early. Past the crossover, governance is strictly
 cheaper for the same safety — and unlike review, it does not bottleneck
 throughput on human availability.
 
+**The empirical case: raw AI speed is real, narrow, and not yet value.** The
+productivity evidence is sharply bimodal and the split is the whole argument.
+Vendor-affiliated RCTs show large gains on narrow tasks — Peng et al. (2023)
+measured a single greenfield HTTP-server task completed **55.8% faster** with
+Copilot [1], and a pooled three-experiment field study of 4,867 developers
+found a **26% increase** in completed tasks [2] — but those gains concentrate
+in *junior* developers and shrink toward zero for senior ones [2]. Against
+that, the independent METR 2025 RCT found experienced developers on their own
+mature repositories were **19% slower** with AI [3]. The reconciliation is
+the load-bearing finding for this paper: Google's DORA program concludes AI
+is an **amplifier** — it raises individual throughput while *decreasing
+software-delivery stability* unless the team is wrapped in strong control
+systems (automated testing, version control, fast feedback), and that the ROI
+"comes from the system around the AI, not the tool itself" [4]. That is
+precisely the thesis of the governance triad: raw generation speed is the
+input; the control surfaces are what convert it into bounded, durable value.
+Without them you do not get the speed for free — you get throughput with
+falling stability, which is value moving in both directions (Section 1).
+
 ## 2.4 When the tradeoff is *bad*
 
 Intellectual honesty requires stating where this design loses. The
@@ -103,6 +122,29 @@ The tradeoff is *good* precisely in the regime forge-loop targets: a
 product with a knowable value model, a meaningful backlog, and an operator
 willing to invest in specification once to harvest leverage many times. The
 following three sections defend each leg of the triad in that context.
+
+## References
+
+1. S. Peng, E. Kalliamvakou, P. Cihon, M. Demirer. "The Impact of AI on
+   Developer Productivity: Evidence from GitHub Copilot." arXiv:2302.06590,
+   2023. *RCT (n=95): a greenfield HTTP-server task completed 55.8% faster.*
+   **Vendor-affiliated; single boilerplate task.**
+2. M. Demirer et al. "The Effects of Generative AI on High-Skilled Work:
+   Evidence from Three Field Experiments with Software Developers."
+   *Management Science*, 2026 (SSRN 4945566). *4,867 developers; +26% completed
+   tasks, concentrated in junior/recent hires, ~0 for seniors.* **Vendor-
+   affiliated.**
+3. J. Becker, N. Rush, E. Barnes, D. Rein (METR). "Measuring the Impact of
+   Early-2025 AI on Experienced Open-Source Developer Productivity."
+   arXiv:2507.09089, 2025. *Independent RCT: experienced devs 19% slower with
+   AI on their own mature repos (they believed they were faster).*
+4. Google / DORA. *State of DevOps Report* 2024 & 2025. *AI as an amplifier:
+   raises throughput, lowers delivery stability without strong delivery
+   controls; ROI comes from the surrounding system, not the tool.*
+
+*(Sources flagged vendor-affiliated vs independent; all verified against
+primary sources before citation. "AI writes X% of code"/acceptance-rate
+figures were checked and treated as vendor marketing — not cited.)*
 
 ---
 
