@@ -269,3 +269,516 @@ def test_refusal_comment_is_actionable() -> None:
     # Unknown state is named explicitly so the operator knows gh failed.
     body_unknown = _refusal_comment(47, None)
     assert "could not be fetched" in body_unknown
+
+
+# ===========================================================================
+# Verify-clean ratchet (issue #241).
+#
+# Mirrors the matrix in the issue body:
+#  - clean repo          → not refused, merge proceeds
+#  - non-clean ruff      → refused + outcome flipped + typed event emitted
+#  - non-clean pyright   → same
+#  - tool missing        → refused (fail-loud, never silent-pass)
+#  - runner crash/timeout→ fail-closed (treated non-clean), tick survives
+#  - flag OFF            → no-op even when red (dependency-ordering escape hatch)
+#  - repo-wide violation → still refused (proves repo-wide, not diff-scoped)
+# ===========================================================================
+
+from forge_loop.runner.merge_gate import (  # noqa: E402
+    SubprocessVerifyRunner,
+    VerifyResult,
+    apply_verify_clean_gate,
+    run_verify_suite,
+)
+
+
+@dataclass
+class _FakeVerifyRunner:
+    """Spy implementing the VerifyRunner Protocol slice.
+
+    ``results`` maps a verify command → the VerifyResult to return. A command
+    not in the map defaults to clean (returncode 0). ``raises_for`` names a
+    command for which the runner blows up (subprocess crash / timeout sim).
+    """
+    results: dict[str, VerifyResult] = field(default_factory=dict)
+    raises_for: str | None = None
+    calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def run_verify(self, command, *, cwd, env):  # type: ignore[no-untyped-def]
+        self.calls.append((command, cwd))
+        if self.raises_for is not None and command == self.raises_for:
+            raise RuntimeError("simulated verify subprocess crash")
+        return self.results.get(
+            command, VerifyResult(command=command, returncode=0, output_tail="")
+        )
+
+
+# A PATH dir that actually contains the tool, so missing_tools() is satisfied
+# for the happy/failing-command cases (tool present, but command non-clean).
+def _env_with_tools(tmp_path: Path, *tools: str) -> dict[str, str]:
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    for t in tools:
+        exe = bindir / t
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
+    return {"PATH": str(bindir)}
+
+
+_RUFF = "ruff check src/ tests/"
+_PYRIGHT = "pyright src/forge_loop"
+
+
+def test_verify_clean_repo_merge_proceeds(tmp_path: Path) -> None:
+    """All verify commands clean → gate is a no-op, nothing flipped."""
+    runner = _FakeVerifyRunner()  # everything clean
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+    events: list = []
+
+    refused = apply_verify_clean_gate(
+        [o],
+        runner=runner,
+        gh=_FakeGh(),
+        repo="o/r",
+        commands=[_RUFF, _PYRIGHT],
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff", "pyright"),
+        require=["ruff", "pyright"],
+        enabled=True,
+        events_file=tmp_path / "events.jsonl",
+        emit=lambda k, p: events.append((k, p)),
+    )
+
+    assert refused == []
+    assert o.status == "merged"  # untouched
+    assert events == []
+    # Both commands were actually run (repo-wide check ran end-to-end).
+    assert [c for c, _ in runner.calls] == [_RUFF, _PYRIGHT]
+
+
+def test_verify_ruff_unclean_refuses_and_flips(tmp_path: Path) -> None:
+    """Non-clean ruff → refuse: auto-merge disabled, comment, typed event,
+    outcome flipped merged→open."""
+    runner = _FakeVerifyRunner(results={
+        _RUFF: VerifyResult(_RUFF, 1, "src/foo.py:1:1: F401 imported but unused"),
+    })
+    gh = _FakeGh()
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+    events_path = tmp_path / "events.jsonl"
+    captured: list = []
+
+    refused = apply_verify_clean_gate(
+        [o],
+        runner=runner,
+        gh=gh,
+        repo="o/r",
+        commands=[_RUFF, _PYRIGHT],
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff", "pyright"),
+        require=["ruff", "pyright"],
+        enabled=True,
+        events_file=events_path,
+        emit=lambda k, p: captured.append((k, p)),
+    )
+
+    assert refused == [241]
+    # PR side effects.
+    assert gh.disable_calls == [("https://gh/u/r/pull/9", "o/r")]
+    assert len(gh.comment_calls) == 1
+    body = gh.comment_calls[0]["body"]
+    assert "ruff" in body
+    assert "verify gate" in body.lower()
+    # Typed bus event names which command failed + the tail.
+    assert captured[0][0] == "merge_refused_verify_unclean"
+    payload = captured[0][1]
+    assert payload["command"] == _RUFF
+    assert payload["returncode"] == 1
+    assert "F401" in payload["output_tail"]
+    # File event lands too.
+    evt = json.loads(events_path.read_text().strip().splitlines()[-1])
+    assert evt["kind"] == "merge_refused_verify_unclean"
+    assert evt["command"] == _RUFF
+    # Ledger reflects truth.
+    assert o.status == "open"
+    # Pyright never ran — we short-circuit on the FIRST failure.
+    assert [c for c, _ in runner.calls] == [_RUFF]
+
+
+def test_verify_pyright_unclean_refuses(tmp_path: Path) -> None:
+    """Ruff clean but pyright dirty → still refused (second command checked)."""
+    runner = _FakeVerifyRunner(results={
+        _PYRIGHT: VerifyResult(_PYRIGHT, 1, "src/forge_loop/x.py:3:9 - error: bad"),
+    })
+    gh = _FakeGh()
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+    captured: list = []
+
+    refused = apply_verify_clean_gate(
+        [o],
+        runner=runner,
+        gh=gh,
+        repo="o/r",
+        commands=[_RUFF, _PYRIGHT],
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff", "pyright"),
+        require=["ruff", "pyright"],
+        enabled=True,
+        events_file=tmp_path / "events.jsonl",
+        emit=lambda k, p: captured.append((k, p)),
+    )
+
+    assert refused == [241]
+    assert captured[0][1]["command"] == _PYRIGHT
+    assert o.status == "open"
+    # Both ran: ruff clean, pyright dirty.
+    assert [c for c, _ in runner.calls] == [_RUFF, _PYRIGHT]
+
+
+def test_verify_tool_missing_fails_loud(tmp_path: Path) -> None:
+    """A required tool absent from the DECLARED env PATH → refuse (manifesto
+    Q11 fail-loud). Must NOT silently pass even though no command 'failed'."""
+    runner = _FakeVerifyRunner()  # would be clean IF it ran
+    gh = _FakeGh()
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+    captured: list = []
+
+    refused = apply_verify_clean_gate(
+        [o],
+        runner=runner,
+        gh=gh,
+        repo="o/r",
+        commands=[_RUFF, _PYRIGHT],
+        cwd=str(tmp_path),
+        # PATH has ruff but NOT pyright → pyright is missing.
+        env=_env_with_tools(tmp_path, "ruff"),
+        require=["ruff", "pyright"],
+        enabled=True,
+        events_file=tmp_path / "events.jsonl",
+        emit=lambda k, p: captured.append((k, p)),
+    )
+
+    assert refused == [241]
+    assert o.status == "open"
+    # We refused on the PREFLIGHT — no verify command was ever run.
+    assert runner.calls == []
+    payload = captured[0][1]
+    assert "pyright" in payload["command"]
+    assert "unavailable" in payload["output_tail"].lower()
+
+
+def test_verify_runner_crash_is_fail_closed(tmp_path: Path) -> None:
+    """A verify subprocess that raises (crash / timeout) is treated as
+    NON-clean (fail-closed), not a crashed tick."""
+    runner = _FakeVerifyRunner(raises_for=_RUFF)
+    gh = _FakeGh()
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+    captured: list = []
+
+    refused = apply_verify_clean_gate(
+        [o],
+        runner=runner,
+        gh=gh,
+        repo="o/r",
+        commands=[_RUFF],
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff"),
+        require=["ruff"],
+        enabled=True,
+        events_file=tmp_path / "events.jsonl",
+        emit=lambda k, p: captured.append((k, p)),
+    )
+
+    assert refused == [241]
+    assert o.status == "open"
+    assert captured[0][1]["returncode"] == -1
+    assert "error" in captured[0][1]["output_tail"].lower()
+
+
+def test_verify_gate_disabled_is_noop_even_when_red(tmp_path: Path) -> None:
+    """Flag OFF → gate is a no-op and the merge proceeds even with a dirty
+    repo. Proves the dependency-ordering escape hatch."""
+    runner = _FakeVerifyRunner(results={
+        _RUFF: VerifyResult(_RUFF, 1, "lots of violations"),
+    })
+    gh = _FakeGh()
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+    events: list = []
+
+    refused = apply_verify_clean_gate(
+        [o],
+        runner=runner,
+        gh=gh,
+        repo="o/r",
+        commands=[_RUFF],
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff"),
+        require=["ruff"],
+        enabled=False,  # <-- the escape hatch
+        events_file=tmp_path / "events.jsonl",
+        emit=lambda k, p: events.append((k, p)),
+    )
+
+    assert refused == []
+    assert o.status == "merged"  # NOT flipped
+    assert runner.calls == []  # never even ran verify
+    assert events == []
+
+
+def test_verify_repo_wide_violation_still_refuses(tmp_path: Path) -> None:
+    """A pre-existing repo-wide violation (the diff itself is clean) must
+    STILL refuse — proves the gate is repo-wide, not diff-scoped. We model
+    'repo-wide dirty' by the runner reporting the whole-tree command dirty."""
+    runner = _FakeVerifyRunner(results={
+        _RUFF: VerifyResult(_RUFF, 1, "src/forge_loop/legacy.py:99: E501 line too long"),
+    })
+    gh = _FakeGh()
+    # Outcome's own diff is fine; status merged because the worker + critic
+    # were happy. The repo-wide command is what trips the gate.
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+
+    refused = apply_verify_clean_gate(
+        [o],
+        runner=runner,
+        gh=gh,
+        repo="o/r",
+        commands=[_RUFF],
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff"),
+        require=["ruff"],
+        enabled=True,
+        events_file=tmp_path / "events.jsonl",
+    )
+
+    assert refused == [241]
+    assert o.status == "open"
+
+
+def test_verify_gate_no_pr_outcomes_skipped(tmp_path: Path) -> None:
+    """An outcome without a PR (worker bailed) is not eligible; with no
+    eligible outcomes the suite never runs."""
+    runner = _FakeVerifyRunner(results={
+        _RUFF: VerifyResult(_RUFF, 1, "dirty"),
+    })
+    o = _outcome(241, pr=None, status="failed")
+
+    refused = apply_verify_clean_gate(
+        [o],
+        runner=runner,
+        gh=_FakeGh(),
+        repo="o/r",
+        commands=[_RUFF],
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff"),
+        require=["ruff"],
+        enabled=True,
+        events_file=tmp_path / "events.jsonl",
+    )
+
+    assert refused == []
+    assert o.status == "failed"
+    assert runner.calls == []
+
+
+def test_verify_multi_outcome_all_refused(tmp_path: Path) -> None:
+    """One repo-wide failure refuses EVERY merge-eligible outcome (the dirty
+    tree blocks the whole train), not just one."""
+    runner = _FakeVerifyRunner(results={
+        _RUFF: VerifyResult(_RUFF, 1, "dirty"),
+    })
+    gh = _FakeGh()
+    outcomes = [
+        _outcome(241, pr="https://gh/u/r/pull/9", status="merged"),
+        _outcome(242, pr="https://gh/u/r/pull/10", status="open"),
+        _outcome(243, pr=None, status="failed"),  # not eligible
+    ]
+
+    refused = apply_verify_clean_gate(
+        outcomes,
+        runner=runner,
+        gh=gh,
+        repo="o/r",
+        commands=[_RUFF],
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff"),
+        require=["ruff"],
+        enabled=True,
+        events_file=tmp_path / "events.jsonl",
+    )
+
+    assert sorted(refused) == [241, 242]
+    assert [o.status for o in outcomes] == ["open", "open", "failed"]
+    # Suite ran ONCE (repo-wide), not once-per-outcome.
+    assert [c for c, _ in runner.calls] == [_RUFF]
+
+
+# ---------------------------------------------------------------------------
+# run_verify_suite direct unit coverage (first-failure short-circuit + clean).
+# ---------------------------------------------------------------------------
+
+def test_run_verify_suite_returns_none_when_clean(tmp_path: Path) -> None:
+    runner = _FakeVerifyRunner()
+    res = run_verify_suite(
+        [_RUFF, _PYRIGHT],
+        runner=runner,
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff", "pyright"),
+        require=["ruff", "pyright"],
+    )
+    assert res is None
+
+
+def test_run_verify_suite_skips_blank_commands(tmp_path: Path) -> None:
+    runner = _FakeVerifyRunner()
+    res = run_verify_suite(
+        ["", "   ", _RUFF],
+        runner=runner,
+        cwd=str(tmp_path),
+        env=_env_with_tools(tmp_path, "ruff"),
+        require=["ruff"],
+    )
+    assert res is None
+    assert [c for c, _ in runner.calls] == [_RUFF]  # blanks skipped
+
+
+# ---------------------------------------------------------------------------
+# VerifyResult.ok — both branches (T3: returncode ==0 and !=0).
+# ---------------------------------------------------------------------------
+
+def test_verify_result_ok_property() -> None:
+    assert VerifyResult("x", 0, "").ok is True
+    assert VerifyResult("x", 1, "boom").ok is False
+    assert VerifyResult("x", 127, "missing").ok is False
+
+
+# ---------------------------------------------------------------------------
+# Contract test (manifesto T4 / T3): the REAL SubprocessVerifyRunner returns
+# the same VerifyResult shape the fake does, on representative inputs — clean
+# command (exit 0) AND failing command (exit !=0). Uses portable shell builtins
+# so it needs no project toolchain on PATH.
+# ---------------------------------------------------------------------------
+
+def test_subprocess_verify_runner_real_clean_and_dirty(tmp_path: Path) -> None:
+    import os
+
+    runner = SubprocessVerifyRunner(timeout_s=30.0)
+    env = dict(os.environ)
+
+    clean = runner.run_verify("true", cwd=str(tmp_path), env=env)
+    assert isinstance(clean, VerifyResult)
+    assert clean.ok is True
+    assert clean.returncode == 0
+
+    dirty = runner.run_verify(
+        "echo boom-on-stderr 1>&2; exit 3", cwd=str(tmp_path), env=env
+    )
+    assert dirty.ok is False
+    assert dirty.returncode == 3
+    assert "boom-on-stderr" in dirty.output_tail
+
+
+# ===========================================================================
+# Integration: drive the tick verify-gate phase (tick._run_verify_gate) with a
+# fake gh client and a worktree containing a seeded lint error. Uses the REAL
+# SubprocessVerifyRunner + REAL ruff (if present). Asserts the refusal event
+# lands and auto-merge is refused (outcome flipped). Mirrors the issue's
+# Integration row.
+# ===========================================================================
+
+import shutil  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+def _make_cfg_for_verify(tmp_path: Path, *, enabled: bool, commands):  # type: ignore[no-untyped-def]
+    from forge_loop.config import (
+        AttemptsConfig,
+        Briefs,
+        Config,
+        CriticConfig,
+        Labels,
+        LumenConfig,
+        POConfig,
+        WorkerConfig,
+    )
+
+    return Config(
+        repo=tmp_path,
+        github_repo="o/r",
+        parallel=1,
+        tick_interval_s=0,
+        max_ticks=1,
+        worker_timeout_s=60,
+        deploy_task="",
+        labels=Labels(),
+        briefs=Briefs(),
+        critic=CriticConfig(enabled=False, timeout_s=10),
+        po=POConfig(enabled=False, timeout_s=10, max_to_expand_per_tick=0),
+        attempts=AttemptsConfig(enabled=False, max_history_in_brief=5),
+        lumen=LumenConfig(),
+        worker=WorkerConfig(
+            verify_commands=tuple(commands),
+            env_require=("ruff",),
+            verify_gate_enabled=enabled,
+        ),
+    )
+
+
+@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff not on PATH")
+def test_tick_verify_gate_refuses_on_seeded_lint_error(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    from forge_loop import gh_issues as _gh
+    from forge_loop.runner import tick as _tick
+
+    # Seed a real lint error: an unused import (ruff F401).
+    (tmp_path / "bad.py").write_text("import os\n\nx = 1\n")
+
+    disabled: list = []
+    comments: list = []
+    monkeypatch.setattr(_gh, "disable_pr_auto_merge",
+                        lambda pr, repo=None: disabled.append((pr, repo)) or True)
+    monkeypatch.setattr(_gh, "pr_comment",
+                        lambda pr, body, repo=None: comments.append((pr, body)) or True)
+
+    cfg = _make_cfg_for_verify(
+        tmp_path, enabled=True, commands=["ruff check bad.py"]
+    )
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+    emitted: list = []
+
+    refused = _tick._run_verify_gate(cfg, [o], bus_emit=lambda k, p: emitted.append((k, p)))
+
+    assert refused == [241]
+    assert o.status == "open"  # auto-merge NOT enabled — flipped back
+    assert disabled == [("https://gh/u/r/pull/9", "o/r")]
+    assert comments and "ruff" in comments[0][1]
+    # Refusal event landed in the event log (file) and on the bus.
+    assert emitted and emitted[0][0] == "merge_refused_verify_unclean"
+    evt = json.loads(cfg.events_file.read_text().strip().splitlines()[-1])
+    assert evt["kind"] == "merge_refused_verify_unclean"
+    assert "ruff" in evt["command"]
+
+
+@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff not on PATH")
+def test_tick_verify_gate_passes_on_clean_repo(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    from forge_loop import gh_issues as _gh
+    from forge_loop.runner import tick as _tick
+
+    # A clean file — no lint errors.
+    (tmp_path / "ok.py").write_text("x = 1\n")
+    monkeypatch.setattr(_gh, "disable_pr_auto_merge", lambda pr, repo=None: True)
+    monkeypatch.setattr(_gh, "pr_comment", lambda pr, body, repo=None: True)
+
+    cfg = _make_cfg_for_verify(
+        tmp_path, enabled=True, commands=["ruff check ok.py"]
+    )
+    o = _outcome(241, pr="https://gh/u/r/pull/9", status="merged")
+    emitted: list = []
+
+    refused = _tick._run_verify_gate(cfg, [o], bus_emit=lambda k, p: emitted.append((k, p)))
+
+    assert refused == []
+    assert o.status == "merged"  # proceeds
+    assert emitted == []

@@ -303,7 +303,10 @@ def check_verify_clean_gate(
         "output_tail": result.output_tail[-_VERIFY_TAIL_CHARS:],
     }
     if events_file is not None:
-        append_event(events_file, "merge_refused_verify_unclean", **payload)
+        # Typed emission (manifesto Q4) — this kind has a registered model.
+        from forge_loop.events import MergeRefusedVerifyUncleanEvent
+        from forge_loop.events import emit as _emit
+        _emit(events_file, MergeRefusedVerifyUncleanEvent(**payload))
     if emit is not None:
         emit("merge_refused_verify_unclean", payload)
 
@@ -371,6 +374,15 @@ def apply_verify_clean_gate(
     return refused
 
 
+def _as_text(raw: str | bytes | None) -> str:
+    """Coerce subprocess output (str, bytes, or None) to a str tail."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return raw
+
+
 class SubprocessVerifyRunner:
     """Production :class:`VerifyRunner` — runs a verify command via subprocess.
 
@@ -400,7 +412,9 @@ class SubprocessVerifyRunner:
                 timeout=self._timeout_s,
             )
         except subprocess.TimeoutExpired as ex:
-            tail = (ex.stdout or "") + (ex.stderr or "")
+            # TimeoutExpired.{stdout,stderr} are typed bytes|None even under
+            # text=True; normalise to str for the operator-facing tail.
+            tail = _as_text(ex.stdout) + _as_text(ex.stderr)
             return VerifyResult(
                 command=command,
                 returncode=124,  # conventional timeout code
