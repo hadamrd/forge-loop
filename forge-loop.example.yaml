@@ -69,7 +69,7 @@ critic:
 # until `enabled: true`.
 repair_fairness:
   # Master switch. false = legacy terminal-repair behaviour (no backoff,
-  # no slot reservation, no round-robin yield).
+  # no round-robin yield).
   enabled: false
   # A PR re-blocked this many consecutive repair ticks enters a cooldown and is
   # excluded from blocking-PR repair selection until it elapses, freeing its slot.
@@ -77,11 +77,9 @@ repair_fairness:
   # Seconds a backed-off PR stays excluded before it is retried (mirrors
   # attempts.cooldown_s / LOOP_RETRY_COOLDOWN_S semantics).
   cooldown_s: 3600
-  # Worker slots held back for NEW dispatch whenever ready issues are waiting,
-  # so blocking repairs can never claim all `scheduling.parallel` slots.
-  reserve_dispatch_slots: 1
-  # After this many consecutive repair-only ticks with ready issues waiting, the
-  # next tick yields the repair phase to new dispatch. Bounds starvation to
+  # Forward-progress guarantee (the single AC1 mechanism): after this many
+  # consecutive repair-only ticks with ready issues waiting, the next tick
+  # yields the repair phase to new dispatch. Bounds starvation to
   # K = max_repair_streak + 1 ticks (default K=3).
   max_repair_streak: 2
 

@@ -139,7 +139,7 @@ class RepairFairnessConfig:
     """
 
     #: Master switch. Off ⇒ legacy terminal-repair behaviour, no backoff, no
-    #: slot reservation, no round-robin yield.
+    #: round-robin yield.
     enabled: bool = False
     #: N — a PR re-blocked this many consecutive ticks enters a cooldown and is
     #: excluded from ``blocking_pr_repairs`` until the window elapses (AC2).
@@ -147,10 +147,6 @@ class RepairFairnessConfig:
     #: Seconds a backed-off PR stays excluded before it is retried. Mirrors the
     #: ``attempts.cooldown_s`` retry-cooldown semantics.
     cooldown_s: int = 3600
-    #: Worker slots held back for NEW dispatch whenever ready issues are waiting,
-    #: so blocking repairs can never claim every ``parallel`` slot (AC1 / slot
-    #: reservation math).
-    reserve_dispatch_slots: int = 1
     #: Forward-progress guarantee (AC1 / round-robin): after this many
     #: consecutive repair-only ticks with ready issues waiting, the next tick
     #: yields the blocking-repair phase so new dispatch runs. Bounds starvation
@@ -349,7 +345,6 @@ def _from_settings(s: Settings) -> Config:
             enabled=s.repair_fairness.enabled,
             max_consecutive_blocks=s.repair_fairness.max_consecutive_blocks,
             cooldown_s=s.repair_fairness.cooldown_s,
-            reserve_dispatch_slots=s.repair_fairness.reserve_dispatch_slots,
             max_repair_streak=s.repair_fairness.max_repair_streak,
         ),
         lumen=LumenConfig(top_k=s.lumen.top_k),

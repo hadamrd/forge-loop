@@ -23,7 +23,8 @@ reads as empty state so a scheduling sidecar hiccup never breaks the tick.
 
 The classification itself lives in :func:`forge_loop.attempts.classify_repair_backoff`
 — this module reuses that (one cooldown mechanism, not a fork) and only adds the
-state IO + the slot-reservation math.
+durable state IO. Forward progress (AC1) is the round-robin streak yield in
+``runner.tick._run_fair_blocking_repairs``; this module just persists ``streak``.
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from forge_loop.log import get_logger
+
+_log = get_logger(__name__)
 
 
 @dataclass
@@ -60,7 +65,17 @@ def load_state(path: Path) -> RepairBackoffState:
     """Load the sidecar, returning empty state on any read/parse failure."""
     try:
         raw = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return RepairBackoffState()
+    except (OSError, ValueError) as exc:
+        # Corrupt/unreadable sidecar — read as empty (failure-soft) but log so a
+        # wedged scheduler sidecar is diagnosable instead of silently ignored.
+        _log.debug(
+            "repair_backoff_state_unreadable",
+            path=str(path),
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         return RepairBackoffState()
     if not isinstance(raw, dict):
         return RepairBackoffState()
@@ -88,8 +103,14 @@ def save_state(path: Path, state: RepairBackoffState) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2, default=str))
         tmp.replace(path)
-    except OSError:
+    except OSError as exc:
         # Scheduling state is advisory — a write failure must not break the tick.
+        _log.debug(
+            "repair_backoff_state_unwritable",
+            path=str(path),
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         return
 
 
@@ -106,36 +127,10 @@ def clear_pr(state: RepairBackoffState, pr_url: str) -> None:
     state.prs.pop(pr_url, None)
 
 
-def reserve_repair_slots(
-    repairs: list[Any],
-    *,
-    parallel: int,
-    reserve: int,
-    ready_issues_exist: bool,
-) -> list[Any]:
-    """Cap the repairs selected this tick so ``reserve`` slots stay for dispatch.
-
-    Slot-reservation math (issue #248 AC1 option a). When ready issues are
-    waiting, never let blocking repairs claim every one of ``cfg.parallel``
-    worker slots: keep at most ``parallel - reserve`` for repairs so ``reserve``
-    (default 1) remain for new dispatch. With no ready issues waiting there is
-    nothing to starve, so repairs may use the full width.
-
-    Returns the (possibly shortened) prefix of ``repairs`` to run this tick. The
-    order of ``repairs`` is preserved, so the highest-priority repairs (as
-    ordered by the selector) keep their slots.
-    """
-    if not ready_issues_exist or reserve <= 0:
-        return list(repairs)
-    cap = max(0, parallel - reserve)
-    return list(repairs[:cap])
-
-
 __all__ = [
     "RepairBackoffState",
     "clear_pr",
     "load_state",
     "record_block",
-    "reserve_repair_slots",
     "save_state",
 ]

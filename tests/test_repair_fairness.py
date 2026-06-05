@@ -203,45 +203,6 @@ def test_record_block_and_clear_roundtrip(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Unit: slot-reservation math (modelled on test_dispatch_slot_accounting.py)
-# --------------------------------------------------------------------------- #
-
-
-def test_reserve_caps_repairs_leaving_dispatch_slot() -> None:
-    """parallel=2, ready present ⇒ at most 1 repair runs so >=1 slot is free."""
-    repairs = ["A", "B", "C"]
-    selected = _rb.reserve_repair_slots(
-        repairs, parallel=2, reserve=1, ready_issues_exist=True
-    )
-    assert selected == ["A"]
-    assert 2 - len(selected) >= 1  # at least one slot remains for new dispatch
-
-
-def test_reserve_no_cap_when_no_ready_issues() -> None:
-    repairs = ["A", "B", "C"]
-    selected = _rb.reserve_repair_slots(
-        repairs, parallel=2, reserve=1, ready_issues_exist=False
-    )
-    assert selected == ["A", "B", "C"]
-
-
-def test_reserve_zero_disables_cap() -> None:
-    repairs = ["A", "B"]
-    selected = _rb.reserve_repair_slots(
-        repairs, parallel=2, reserve=0, ready_issues_exist=True
-    )
-    assert selected == ["A", "B"]
-
-
-def test_reserve_ge_parallel_yields_no_repair_slots() -> None:
-    repairs = ["A", "B"]
-    selected = _rb.reserve_repair_slots(
-        repairs, parallel=2, reserve=2, ready_issues_exist=True
-    )
-    assert selected == []
-
-
-# --------------------------------------------------------------------------- #
 # Unit: blocking_pr_repairs backoff filter + event emission
 # --------------------------------------------------------------------------- #
 
@@ -404,7 +365,7 @@ def test_starvation_regression_yields_within_k_ticks(
     cfg = _make_cfg(
         tmp_path,
         fairness=RepairFairnessConfig(
-            enabled=True, max_consecutive_blocks=3, max_repair_streak=2, reserve_dispatch_slots=1
+            enabled=True, max_consecutive_blocks=3, max_repair_streak=2
         ),
     )
     returns = _drive_phase(tmp_path, monkeypatch, cfg=cfg, ready_exist=True, ticks=3)
@@ -415,6 +376,66 @@ def test_starvation_regression_yields_within_k_ticks(
     # the freed-slot decision is observable
     events = _read_events(cfg)
     assert any(e["kind"] == "repair_slot_reserved" for e in events)
+
+
+def test_pre_dispatch_repairs_falls_through_on_yield_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock the terminal-vs-fallthrough coupling at the ``_tick`` boundary.
+
+    ``_tick`` runs ``if _run_pre_dispatch_repairs(...): return`` — a True return
+    is terminal (dispatch is skipped); a False return falls through to
+    ``_select_dispatch_set`` / dispatch. With two perpetually re-blocking PRs and
+    ready work waiting, the round-robin yield MUST make ``_run_pre_dispatch_repairs``
+    return False within K<=3 ticks so a ready issue actually gets dispatched.
+    """
+    cfg = _make_cfg(
+        tmp_path,
+        fairness=RepairFairnessConfig(
+            enabled=True, max_consecutive_blocks=3, max_repair_streak=2
+        ),
+    )
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    prs = [_pr(241, "https://gh/pr/241"), _pr(242, "https://gh/pr/242")]
+    _stub_selectors(monkeypatch, prs)
+    monkeypatch.setattr(_tick_mod, "prs_requiring_repair", _repairs.prs_requiring_repair)
+    monkeypatch.setattr(_tick_mod, "fetch_issue", _repairs.fetch_issue)
+    monkeypatch.setattr(_tick_mod, "pr_review_context", _repairs.pr_review_context)
+    monkeypatch.setattr(_tick_mod, "_ready_issues_exist", lambda _cfg: True)
+    # Isolate the blocking-repair phase: stuck sweep + adoption do nothing here.
+    monkeypatch.setattr(_tick_mod, "_run_stuck_sweep", lambda *_a, **_k: None)
+    monkeypatch.setattr(_tick_mod, "_orphaned_clean_pr_adoptions", lambda _cfg: [])
+
+    def _fake_repair_tick(
+        cfg_: Config,
+        tick_: int,
+        repairs: list[tuple[dict[str, Any], dict[str, Any], str]],
+        **_kw: Any,
+    ) -> list[WorkerOutcome]:
+        return [
+            WorkerOutcome(
+                issue=issue["number"],
+                title=issue["title"],
+                pr_url=pr["url"],
+                status="open",
+                duration_s=0.0,
+                stdout_tail="",
+                error="critic blocked merge: still failing",
+            )
+            for issue, pr, _ctx in repairs
+        ]
+
+    monkeypatch.setattr(_tick_mod, "_run_repair_tick", _fake_repair_tick)
+
+    returns = [
+        _tick_mod._run_pre_dispatch_repairs(
+            cfg, t, bus_emit=lambda *_a, **_k: None, short_sleep=lambda *_a, **_k: None
+        )
+        for t in range(1, 4)
+    ]
+    # Within K<=3 ticks the terminal body yields (False) so _tick reaches dispatch.
+    assert returns[-1] is False, returns
+    assert any(r is False for r in returns)
 
 
 def test_disabled_feature_never_yields_starves_backlog(

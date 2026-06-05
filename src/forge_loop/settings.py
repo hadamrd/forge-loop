@@ -361,7 +361,6 @@ class RepairFairnessSettings(BaseSettings):
     enabled: bool = False
     max_consecutive_blocks: int = 3
     cooldown_s: int = 3600
-    reserve_dispatch_slots: int = 1
     max_repair_streak: int = 2
 
 
@@ -652,7 +651,6 @@ ENV_MAP: tuple[tuple[str, str, Any], ...] = (
     ("LOOP_REPAIR_FAIRNESS", "repair_fairness.enabled", _coerce_bool),
     ("LOOP_REPAIR_MAX_CONSECUTIVE_BLOCKS", "repair_fairness.max_consecutive_blocks", int),
     ("LOOP_REPAIR_COOLDOWN_S", "repair_fairness.cooldown_s", int),
-    ("LOOP_REPAIR_RESERVE_DISPATCH_SLOTS", "repair_fairness.reserve_dispatch_slots", int),
     ("LOOP_REPAIR_MAX_STREAK", "repair_fairness.max_repair_streak", int),
     # Iteration
     ("LOOP_WORKER_MAX_ITERATIONS", "iteration.max_iterations", int),

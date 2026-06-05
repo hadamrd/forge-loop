@@ -15,11 +15,14 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from githubkit.exception import GitHubException
+
 from forge_loop import attempts as _attempts
 from forge_loop import master_log as _mlog
 from forge_loop import worker as _worker
 from forge_loop.config import Config
 from forge_loop.deploy import redeploy
+from forge_loop.log import get_logger
 from forge_loop.gh_issues import (
     fetch_issue,
     open_prs,
@@ -113,11 +116,20 @@ def _ready_issues_exist(cfg: Config) -> bool:
 
     Failure-soft: a ``gh`` error reads as "no ready issues", so a transient
     list failure never triggers a starvation yield (it just preserves the
-    legacy terminal-repair behaviour for that tick).
+    legacy terminal-repair behaviour for that tick). The failure is *logged*
+    first (EH-001): catching only the classes ``top_issues`` can raise —
+    ``RuntimeError`` (client/config errors) and githubkit's ``GitHubException``
+    (transport/auth/rate-limit) — so a real gh/auth bug surfaces in the log
+    instead of hiding behind a silently-green tick.
     """
     try:
         return bool(top_issues(cfg.labels.ready, max(cfg.parallel, 1), repo=cfg.github_repo))
-    except Exception:  # noqa: BLE001 — best-effort existence probe
+    except (RuntimeError, GitHubException) as exc:
+        get_logger(__name__).warning(
+            "ready_issues_probe_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         return False
 
 
@@ -567,12 +579,21 @@ def _run_fair_blocking_repairs(
     bus_emit: Any,
     short_sleep: Any,
 ) -> bool:
-    """Fair blocking-PR repair selection + slot reservation (issue #248).
+    """Fair blocking-PR repair selection (issue #248).
 
-    Returns True iff a (possibly slot-capped) repair tick ran. Returns False —
-    falling through to new dispatch — when there are no selectable repairs OR
-    when the round-robin / reservation guard yields this tick so the ready
-    backlog cannot be starved.
+    Returns True iff a repair tick ran. Returns False — falling through to new
+    dispatch — when there are no selectable repairs OR when the round-robin
+    streak guard yields this tick so the ready backlog cannot be starved.
+
+    Forward progress (AC1) comes from exactly ONE mechanism: the round-robin
+    streak yield (option c). After ``max_repair_streak`` consecutive
+    repair-only ticks with ready work waiting, the next tick yields the whole
+    repair phase to dispatch, bounding starvation to ``K = max_repair_streak +
+    1`` ticks. Per-PR backoff (AC2) independently retires re-blocking PRs from
+    selection. There is deliberately no slot *reservation*: because this phase
+    is a terminal tick body (a repair tick returns before dispatch runs),
+    capping repairs to ``parallel - reserve`` would only idle the "reserved"
+    slot, not hand it to dispatch.
     """
     from datetime import UTC, datetime
 
@@ -593,22 +614,14 @@ def _run_fair_blocking_repairs(
         return False
 
     ready_exist = _ready_issues_exist(cfg)
-    selected = _rb.reserve_repair_slots(
-        repairs,
-        parallel=cfg.parallel,
-        reserve=rf.reserve_dispatch_slots,
-        ready_issues_exist=ready_exist,
-    )
-    # Forward-progress guarantee: after ``max_repair_streak`` consecutive
-    # repair-only ticks with ready work waiting — OR when reservation leaves no
-    # repair slots at all — yield this tick to dispatch (AC1, bounded K).
-    streak_exhausted = ready_exist and state.streak >= rf.max_repair_streak
-    if ready_exist and (streak_exhausted or not selected):
+    # Forward-progress guarantee (AC1, option c): after ``max_repair_streak``
+    # consecutive repair-only ticks with ready work waiting, yield this whole
+    # tick to dispatch so the ready backlog cannot be starved (bounded K).
+    if ready_exist and state.streak >= rf.max_repair_streak:
         append_event(
             cfg.events_file,
             "repair_slot_reserved",
             tick=tick,
-            reserved=rf.reserve_dispatch_slots,
             consecutive_repair_ticks=state.streak,
             deferred_prs=[pr.get("url") for _, pr, _ in repairs],
         )
@@ -621,7 +634,7 @@ def _run_fair_blocking_repairs(
     outcomes = _run_repair_tick(
         cfg,
         tick,
-        selected,
+        repairs,
         bus_emit=bus_emit,
         short_sleep=short_sleep,
         start_event="repair_tick_start",
