@@ -134,6 +134,55 @@ def free_dispatch_slots(store: WorkerSessionStore, parallel: int) -> int:
     return max(0, parallel - store.active_count())
 
 
+# #262: how many dispatch slots a tick reserves for NEW work when repair work
+# would otherwise claim the whole tick. A single reserved slot is enough to
+# guarantee forward progress on the backlog (a stuck repair can no longer
+# starve every ``loop:ready`` issue) without a fairness-queue rewrite.
+RESERVED_NEW_WORK_SLOTS = 1
+
+
+def reserved_new_work_slots(
+    parallel: int,
+    *,
+    repairs_pending: int,
+    ready_count: int,
+    reserve: int = RESERVED_NEW_WORK_SLOTS,
+) -> int:
+    """Slots to steal back from repairs for NEW dispatch this tick (issue #262).
+
+    The tick is structured so repair work is a terminal tick body: when a
+    repair path fires the loop returns early and fresh ``loop:ready`` issues
+    are never picked up. A single perpetually-blocked repair therefore starves
+    the whole backlog to zero forward progress. This helper is the ONE fairness
+    mechanism that prevents it: when repair work is in flight AND a ready
+    candidate is waiting, it reserves ``>=1`` of the ``parallel`` worker slots
+    for new dispatch.
+
+    Args:
+        parallel: the configured worker-parallelism cap.
+        repairs_pending: number of repairs the tick is running (``0`` ⇒ no
+            repair work in flight).
+        ready_count: number of dispatchable ``loop:ready`` candidates waiting.
+        reserve: the desired reserve count (defaults to
+            :data:`RESERVED_NEW_WORK_SLOTS`).
+
+    Returns:
+        The reserved-slot count, clamped to ``[0, parallel - 1]``:
+
+        * ``0`` when there are no repairs in flight (new work already gets all
+          ``parallel`` slots) OR no ready candidates (repairs take all slots) —
+          both cases are byte-identical to the pre-#262 behaviour.
+        * otherwise ``min(reserve, parallel - 1)`` — repairs always keep at
+          least one slot. The ``parallel - 1`` ceiling is the documented
+          tie-break: on ``parallel == 1`` the reservation is ``0`` and
+          **repairs win the whole tick** (raise ``parallel`` to enable the
+          anti-starvation pre-emption).
+    """
+    if repairs_pending <= 0 or ready_count <= 0 or reserve <= 0:
+        return 0
+    return max(0, min(reserve, parallel - 1))
+
+
 def _branch_for_issue(issue: dict[str, Any]) -> str:
     """Recompute the branch the worker subprocess will use.
 
