@@ -140,7 +140,7 @@ class OperatorCommandsMixin:
         if cfg_load_error:
             line("red", "config load failed", cfg_load_error)
 
-        if cfg_ok:
+        if cfg is not None:
             halt = cfg.state_dir / "loop-runner.HALT"
             stop = cfg.stop_file
             if halt.exists():
@@ -170,7 +170,7 @@ class OperatorCommandsMixin:
             except _sp.SubprocessError:
                 line("yellow", "tmux probe failed")
 
-        if cfg_ok:
+        if cfg is not None:
             from forge_loop.worker_worktree import worktree_base
 
             orphan_glob = str(worktree_base(cfg.repo) / "wt-loop-*")
@@ -186,7 +186,7 @@ class OperatorCommandsMixin:
         else:
             line("green", "no orphan worktrees")
 
-        if cfg_ok:
+        if cfg is not None:
             try:
                 local = _sp.run(
                     ["git", "rev-parse", "HEAD"],
