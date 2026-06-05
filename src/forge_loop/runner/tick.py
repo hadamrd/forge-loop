@@ -150,6 +150,36 @@ def _record_merged_memory(cfg: Config, merged: list[WorkerOutcome]) -> None:
         append_event(cfg.events_file, "memory_promote_failed", err=str(ex_)[:200])
 
 
+# Issue #267 (safety): the affirmative critic verdict token that — and ONLY
+# which — clears a PR for auto-merge. Any other token (changes_requested,
+# blocked, error) withholds the merge. A ``None`` verdict means the legacy
+# critic recorded NO opinion (critic disabled / pipeline-driven / PR never
+# reviewable) and the gate falls back to its pre-critic behaviour.
+_CRITIC_VERDICT_APPROVED = "approved"
+
+
+def _automerge_withheld_reason(outcome: WorkerOutcome) -> str | None:
+    """Return a non-``None`` reason iff auto-merge must be WITHHELD (issue #267).
+
+    The historic deny-list (skip on ``risk_gated`` / ``refused`` / ``error``)
+    let a critic verdict=error — which populates NONE of those sets — fall
+    through and AUTO-MERGE an unreviewed PR (the real #267 incident on PR #267).
+
+    This is the principled allow-list dual: auto-merge requires an AFFIRMATIVE
+    ``critic_verdict == "approved"``. A verdict that is set but NOT ``approved``
+    (``error`` / ``blocked`` / ``changes_requested``) withholds the merge. A
+    ``None`` verdict means the legacy critic recorded no opinion (critic
+    disabled, pipeline-driven, or PR not reviewable) — there is no critic gate
+    to fail, so the pre-critic behaviour is preserved and merge proceeds.
+
+    Returns the reason string for the withheld event, or ``None`` to allow.
+    """
+    verdict = outcome.critic_verdict
+    if verdict is not None and verdict != _CRITIC_VERDICT_APPROVED:
+        return f"critic_verdict_not_approved:{verdict}"
+    return None
+
+
 def _enable_automerge_for_reviewed_outcomes(
     cfg: Config,
     outcomes: list[WorkerOutcome],
@@ -157,7 +187,17 @@ def _enable_automerge_for_reviewed_outcomes(
     risk_gated_issues: set[int],
     refused_issues: set[int],
 ) -> None:
-    """Enable auto-merge only after critic and merge gates have passed."""
+    """Enable auto-merge only after critic and merge gates have passed.
+
+    Issue #267 (safety): auto-merge now requires the critic to have AFFIRMATIVELY
+    ``approved`` the PR (an allow-list), instead of the old deny-list that merged
+    anything not explicitly refused/risk-gated/errored. A critic verdict=error
+    (a crashed/timed-out review) populated none of the deny-list sets, so the
+    errored PR auto-merged UNREVIEWED — exactly the #267 hole. A non-approved
+    verdict now emits ``post_critic_automerge_withheld`` and is left for the next
+    tick to re-review (the #245/#264 stale-block clearing already happened in the
+    critic pass, so this withholding does NOT reintroduce a stale block).
+    """
     from forge_loop import gh_issues as _gh
 
     for outcome in outcomes:
@@ -166,6 +206,16 @@ def _enable_automerge_for_reviewed_outcomes(
         if outcome.issue in risk_gated_issues or outcome.issue in refused_issues:
             continue
         if outcome.error:
+            continue
+        withheld = _automerge_withheld_reason(outcome)
+        if withheld is not None:
+            append_event(
+                cfg.events_file,
+                "post_critic_automerge_withheld",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason=withheld,
+            )
             continue
         result = _gh.ensure_pr_merged(outcome.pr_url, repo=cfg.github_repo)
         if result.merged:
@@ -228,6 +278,22 @@ def _enable_automerge_for_adopted_prs(
                 issue=outcome.issue,
                 pr=outcome.pr_url,
                 reason="critic_blocked",
+            )
+            continue
+        # Issue #267 (safety): the same allow-list as the dispatch merge gate.
+        # A critic verdict=error on an adopted PR sets status="open" but NOT
+        # ``outcome.error`` (a crashed review is not an adjudicated block), so
+        # without this guard it would fall through and auto-merge an unreviewed
+        # PR. Require an affirmative ``approved``; withhold (re-review next scan)
+        # otherwise. The PR is left UNstamped so the next adoption scan retries.
+        withheld = _automerge_withheld_reason(outcome)
+        if withheld is not None:
+            append_event(
+                cfg.events_file,
+                "orphan_pr_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason=withheld,
             )
             continue
         merge_state = str(pr.get("mergeStateStatus") or "").upper()

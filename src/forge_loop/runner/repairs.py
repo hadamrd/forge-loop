@@ -339,6 +339,24 @@ def enable_automerge_for_repaired_prs(
                 reason="critic_blocked",
             )
             continue
+        # Issue #267 (safety): allow-list the critic verdict, the dual of the
+        # #267 dispatch-gate fix. A re-critic verdict=error sets status="open"
+        # but NOT ``outcome.error`` (a crashed review is not an adjudicated
+        # block), so without this guard the deny-list above lets the errored PR
+        # fall through and auto-merge UNREVIEWED. Require an affirmative
+        # ``approved``; a set-but-not-approved verdict withholds the merge and
+        # leaves the PR for the next tick's re-review. ``None`` (critic disabled
+        # / not run) preserves the pre-critic behaviour.
+        verdict = outcome.critic_verdict
+        if verdict is not None and verdict != "approved":
+            append_event(
+                cfg.events_file,
+                "repair_automerge_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason=f"critic_verdict_not_approved:{verdict}",
+            )
+            continue
         # AC3: an unresolved *human* request-changes thread still holds the PR
         # back. A human inline-comment thread leaves merge state CLEAN, so we
         # inspect authorship explicitly (``human_unresolved_threads`` filters
