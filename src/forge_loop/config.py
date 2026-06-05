@@ -129,6 +129,36 @@ class AttemptsConfig:
 
 
 @dataclass(frozen=True)
+class RepairFairnessConfig:
+    """Fair repair scheduling knobs (issue #248).
+
+    Defaults preserve today's behaviour: ``enabled=False`` makes the whole
+    feature inert (blocking-PR repair selection + slot allocation are
+    byte-identical to the pre-#248 path). Turn ``enabled`` on to stop in-flight
+    repairs from starving the ready backlog.
+    """
+
+    #: Master switch. Off ⇒ legacy terminal-repair behaviour, no backoff, no
+    #: slot reservation, no round-robin yield.
+    enabled: bool = False
+    #: N — a PR re-blocked this many consecutive ticks enters a cooldown and is
+    #: excluded from ``blocking_pr_repairs`` until the window elapses (AC2).
+    max_consecutive_blocks: int = 3
+    #: Seconds a backed-off PR stays excluded before it is retried. Mirrors the
+    #: ``attempts.cooldown_s`` retry-cooldown semantics.
+    cooldown_s: int = 3600
+    #: Worker slots held back for NEW dispatch whenever ready issues are waiting,
+    #: so blocking repairs can never claim every ``parallel`` slot (AC1 / slot
+    #: reservation math).
+    reserve_dispatch_slots: int = 1
+    #: Forward-progress guarantee (AC1 / round-robin): after this many
+    #: consecutive repair-only ticks with ready issues waiting, the next tick
+    #: yields the blocking-repair phase so new dispatch runs. Bounds starvation
+    #: to ``K = max_repair_streak + 1`` ticks (default K=3).
+    max_repair_streak: int = 2
+
+
+@dataclass(frozen=True)
 class LumenConfig:
     top_k: int = 3
 
@@ -162,6 +192,7 @@ class Config:
     po: POConfig = field(default_factory=POConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     attempts: AttemptsConfig = field(default_factory=AttemptsConfig)
+    repair_fairness: RepairFairnessConfig = field(default_factory=RepairFairnessConfig)
     lumen: LumenConfig = field(default_factory=LumenConfig)
 
     worker_max_iterations: int = 3
@@ -314,6 +345,13 @@ def _from_settings(s: Settings) -> Config:
             enabled=s.attempts.enabled,
             max_history_in_brief=s.attempts.max_history_in_brief,
         ),
+        repair_fairness=RepairFairnessConfig(
+            enabled=s.repair_fairness.enabled,
+            max_consecutive_blocks=s.repair_fairness.max_consecutive_blocks,
+            cooldown_s=s.repair_fairness.cooldown_s,
+            reserve_dispatch_slots=s.repair_fairness.reserve_dispatch_slots,
+            max_repair_streak=s.repair_fairness.max_repair_streak,
+        ),
         lumen=LumenConfig(top_k=s.lumen.top_k),
         worker_max_iterations=s.iteration.max_iterations,
         stuck_threshold_attempts=s.maintenance.stuck_threshold_attempts,
@@ -340,6 +378,7 @@ __all__ = [
     "LumenConfig",
     "ModelConfigError",
     "POConfig",
+    "RepairFairnessConfig",
     "WorkerConfig",
     "load",
 ]

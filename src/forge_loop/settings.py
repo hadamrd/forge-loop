@@ -350,6 +350,21 @@ class AttemptsSettings(BaseSettings):
     cooldown_s: int = 3600
 
 
+class RepairFairnessSettings(BaseSettings):
+    """Fair repair scheduling (issue #248).
+
+    Off by default ⇒ byte-identical legacy behaviour. See
+    :class:`forge_loop.config.RepairFairnessConfig` for the field semantics.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+    enabled: bool = False
+    max_consecutive_blocks: int = 3
+    cooldown_s: int = 3600
+    reserve_dispatch_slots: int = 1
+    max_repair_streak: int = 2
+
+
 class LumenSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
     top_k: int = 3
@@ -470,6 +485,7 @@ class Settings(BaseSettings):
     po: POSettings = Field(default_factory=POSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     attempts: AttemptsSettings = Field(default_factory=AttemptsSettings)
+    repair_fairness: RepairFairnessSettings = Field(default_factory=RepairFairnessSettings)
     lumen: LumenSettings = Field(default_factory=LumenSettings)
     operator: OperatorSettings = Field(default_factory=OperatorSettings)
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
@@ -507,6 +523,7 @@ class Settings(BaseSettings):
             "po": {**(y.get("po") or {})},
             "worker": {**(y.get("worker") or {})},
             "attempts": {**(y.get("attempts") or {})},
+            "repair_fairness": {**(y.get("repair_fairness") or {})},
             "lumen": {**(y.get("lumen") or {})},
             "operator": {**(y.get("operator") or {})},
             "dashboard": {**(y.get("dashboard") or {})},
@@ -631,6 +648,12 @@ ENV_MAP: tuple[tuple[str, str, Any], ...] = (
     ("LOOP_LUMEN_TOP_K", "lumen.top_k", int),
     # Attempts
     ("LOOP_RETRY_COOLDOWN_S", "attempts.cooldown_s", int),
+    # Repair fairness (issue #248)
+    ("LOOP_REPAIR_FAIRNESS", "repair_fairness.enabled", _coerce_bool),
+    ("LOOP_REPAIR_MAX_CONSECUTIVE_BLOCKS", "repair_fairness.max_consecutive_blocks", int),
+    ("LOOP_REPAIR_COOLDOWN_S", "repair_fairness.cooldown_s", int),
+    ("LOOP_REPAIR_RESERVE_DISPATCH_SLOTS", "repair_fairness.reserve_dispatch_slots", int),
+    ("LOOP_REPAIR_MAX_STREAK", "repair_fairness.max_repair_streak", int),
     # Iteration
     ("LOOP_WORKER_MAX_ITERATIONS", "iteration.max_iterations", int),
     ("LOOP_PIPELINE_DRIVEN", "iteration.pipeline_driven", _coerce_bool),
@@ -696,6 +719,7 @@ __all__ = [
     "POSettings",
     "WorkerSettings",
     "AttemptsSettings",
+    "RepairFairnessSettings",
     "LumenSettings",
     "OperatorSettings",
     "DashboardSettings",

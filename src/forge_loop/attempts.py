@@ -339,6 +339,72 @@ def classify_skip(
     return SkipDecision()
 
 
+# ---------------------------------------------------------------------------
+# Repair backoff classification (issue #248)
+#
+# The NEW-dispatch path already has a backoff (``classify_skip`` above). The
+# blocking-PR *repair* path had no equivalent: a PR stuck on ``critic:blocking``
+# was re-selected every tick with no fairness, pinning worker slots forever and
+# starving the ready backlog. ``classify_repair_backoff`` mirrors the cooldown
+# branch of ``classify_skip`` for repairs — it does NOT fork the mechanism, it
+# reuses the same "N strikes then a timed cooldown" shape, keyed on a per-PR
+# consecutive-block count rather than a brief fingerprint.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RepairBackoffDecision:
+    """Result of evaluating a blocking PR's consecutive-block history.
+
+    ``skip`` is True when the PR has re-blocked ``>= max_consecutive_blocks``
+    times in a row AND the most recent block is still within the cooldown
+    window — i.e. it should yield its repair slot this tick.
+    """
+
+    skip: bool = False
+    consecutive_blocks: int = 0
+    cooldown_remaining_s: int = 0
+
+
+def classify_repair_backoff(
+    consecutive_blocks: int,
+    last_block_ts: str | None,
+    *,
+    max_consecutive_blocks: int,
+    cooldown_s: int,
+    now: datetime | None = None,
+) -> RepairBackoffDecision:
+    """Decide whether a blocking PR should be skipped this tick for backoff.
+
+    Mirrors the cooldown arm of :func:`classify_skip`:
+
+    * ``max_consecutive_blocks <= 0`` disables the feature entirely — the PR is
+      never skipped (byte-identical legacy behaviour).
+    * Fewer than ``max_consecutive_blocks`` recorded consecutive blocks ⇒ the
+      PR is still selectable (it has not earned a cooldown yet).
+    * ``>= max_consecutive_blocks`` AND the last block landed within
+      ``cooldown_s`` ⇒ ``skip=True`` with the remaining seconds, freeing the
+      slot for new dispatch.
+    * Once the cooldown elapses the PR becomes selectable again (the next block
+      restarts the count), so a genuinely stuck PR is retried periodically
+      rather than abandoned.
+    """
+    decision = RepairBackoffDecision(consecutive_blocks=consecutive_blocks)
+    if max_consecutive_blocks <= 0:
+        return decision
+    if consecutive_blocks < max_consecutive_blocks:
+        return decision
+    when = _parse_iso(last_block_ts)
+    if when is None:
+        return decision
+    now = now or datetime.now(UTC)
+    elapsed = (now - when).total_seconds()
+    if elapsed < cooldown_s:
+        decision.skip = True
+        decision.cooldown_remaining_s = int(cooldown_s - elapsed)
+    return decision
+
+
 def cooldown_from_env(default_s: int = DEFAULT_RETRY_COOLDOWN_S) -> int:
     """Resolve the cooldown window via the unified Settings layer (issue #84).
 
@@ -358,7 +424,9 @@ __all__ = [
     "MARKER",
     "DEFAULT_RETRY_COOLDOWN_S",
     "IssueAttempts",
+    "RepairBackoffDecision",
     "SkipDecision",
+    "classify_repair_backoff",
     "classify_skip",
     "compute_fingerprint",
     "cooldown_from_env",
