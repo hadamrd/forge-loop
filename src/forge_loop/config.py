@@ -115,6 +115,9 @@ class WorkerConfig:
     env_vars: dict[str, str] = field(default_factory=dict)
     env_require: tuple[str, ...] = ()
     verify_commands: tuple[str, ...] = ()
+    # Issue #241: enforce verify_commands as a repo-wide pre-merge ratchet.
+    # OFF by default (ship-before-cleanup dependency-ordering escape hatch).
+    verify_gate_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -303,6 +306,7 @@ def _from_settings(s: Settings) -> Config:
             env_vars=dict(s.worker.env_vars),
             env_require=s.worker.env_require,
             verify_commands=s.worker.verify_commands,
+            verify_gate_enabled=s.worker.verify_gate_enabled,
         ),
         attempts=AttemptsConfig(
             enabled=s.attempts.enabled,

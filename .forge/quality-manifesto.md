@@ -246,6 +246,43 @@ toolchain was an IMPLICIT, unverified, silently-degrading dependency — the
 environment it needs. This rule + the ``worker_env`` provisioning/preflight and
 the declared per-project contract ship together.
 
+### Q12. The definition-of-done (`worker.verify`) must be a programmatic, repo-wide MERGE GATE — not just prose in the brief.
+
+A command that defines "done" (``ruff check src/ tests/``, ``pyright
+src/forge_loop``, ``python -m pytest -q``) MUST be enforced by something that
+**deterministically blocks the merge** when it fails — not merely injected into
+the worker brief as an instruction the LLM may self-report satisfying. The gate
+runs the configured ``worker.verify`` commands against the **whole repo /
+worktree** (NOT just the diff), AFTER the critic and BEFORE auto-merge is
+enabled, mirroring ``merge_gate.apply_issue_closed_gate``: on a non-clean
+result it disables auto-merge, posts a PR comment, emits a typed
+``merge_refused_verify_unclean`` event (which command failed + a truncated
+output tail), and flips the worker outcome ``merged`` → ``open`` so the attempts
+ledger reflects the truth. Tools are resolved via the **declared** ``worker.env``
+contract (Q11), never ambient ``PATH``; a missing tool fails LOUD (refuse), never
+silently passes. Shipping a verify list with no gate behind it, or a gate that
+checks only the diff rather than the whole repo, is **sev2**. The gate may ship
+behind an enable flag defaulting to off ONLY while the baseline is red (a
+non-clean repo would block every PR); the flip-to-enforce is then a tracked
+follow-up.
+
+**Rationale.** Issue #241. forge-loop has no GitHub Actions CI (``Taskfile.yml``
+documents that decision — it is its own CI), so ``gh pr merge --auto`` had no
+required check to wait on, and the only real pre-merge gate
+(``runner/merge_gate.py``) checked just one thing: whether the source issue was
+closed mid-flight. The repo accreted **30 ruff + 61 pyright** violations
+PR-by-PR — each diff looked locally clean to the per-PR critic while the LLM
+worker self-reported "definition of done met" and repo-wide ``ruff`` / ``pyright``
+were red. Per the boiling-frog meta-rule ("a metric with no gate drifts"), an
+unenforced verify list is decoration. This rule + the
+``apply_verify_clean_gate`` ratchet ship together.
+
+**State-gate.** Per the "state-based rules need a state-based gate" meta-rule:
+the cumulative clean-tree invariant is enforced by the gate itself running the
+repo-wide commands every merge cycle. Once the ruff/pyright baseline is green
+and ``worker.verify_gate_enabled`` is flipped on, a regression cannot accrete —
+the next merge that would introduce a violation is refused deterministically.
+
 ## How to apply this manifesto
 
 * When reviewing a forge-loop PR, scan the diff for each rule. A

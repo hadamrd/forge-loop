@@ -300,6 +300,27 @@ class WorkerPreCommitInstalledEvent(EventBase):
 
 
 @register_event
+class MergeRefusedVerifyUncleanEvent(EventBase):
+    """The repo-wide verify ratchet refused a merge (issue #241).
+
+    Emitted by ``runner.merge_gate.apply_verify_clean_gate`` when a configured
+    ``worker.verify`` command (``ruff check src/ tests/`` / ``pyright
+    src/forge_loop``) is non-clean against the whole repo AFTER the critic and
+    BEFORE auto-merge. Carries WHICH command failed, its return code, and a
+    bounded tail of its output so an operator skimming the bus knows why the
+    loop stopped. The offending PR's auto-merge is disabled and the worker
+    outcome is flipped ``merged`` → ``open``.
+    """
+
+    KIND: ClassVar[str] = "merge_refused_verify_unclean"
+    issue: int = 0
+    pr: str | None = None
+    command: str = ""
+    returncode: int = 0
+    output_tail: str = ""
+
+
+@register_event
 class WorkerPolicyEnforcedEvent(EventBase):
     """Deny-by-default worker settings were planted from the saga grant (#200).
 

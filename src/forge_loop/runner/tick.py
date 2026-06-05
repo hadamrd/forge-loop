@@ -972,17 +972,71 @@ def _run_merge_gate(
         events_file=cfg.events_file,
         emit=bus_emit,
     )
+    # Issue #241: repo-wide verify ratchet. Runs the configured worker.verify
+    # commands against the whole worktree AFTER the critic, BEFORE auto-merge.
+    # No-op unless verify_gate_enabled (dependency-ordering escape hatch).
+    verify_refused = _run_verify_gate(cfg, outcomes, bus_emit=bus_emit)
+    all_refused = set(refused) | set(verify_refused)
     _enable_automerge_for_reviewed_outcomes(
         cfg,
         outcomes,
         risk_gated_issues=risk_gated_issues,
-        refused_issues=set(refused),
+        refused_issues=all_refused,
     )
     if refused:
         _mlog.info(
             master_log_path,
             f"merge gate refused {len(refused)} PR(s) — closed issues: {refused}",
         )
+    if verify_refused:
+        _mlog.info(
+            master_log_path,
+            f"verify gate refused {len(verify_refused)} PR(s) — "
+            f"repo-wide verify non-clean: {verify_refused}",
+        )
+
+
+def _run_verify_gate(
+    cfg: Config,
+    outcomes: list[WorkerOutcome],
+    *,
+    bus_emit: Any,
+) -> list[int]:
+    """Repo-wide verify ratchet (issue #241).
+
+    Resolves ruff/pyright via the DECLARED ``worker.env`` contract (manifesto
+    Q11) — builds the worker env from ``env_path_prepend`` / ``env_vars`` and
+    preflights ``env_require`` — then runs the configured ``verify_commands``
+    against ``cfg.repo``. Returns the issue numbers whose merge was refused
+    (empty when the gate is disabled or the repo is clean).
+    """
+    from forge_loop import gh_issues as _gh
+    from forge_loop._worker_sdk import _clean_sdk_env
+    from forge_loop.runner.merge_gate import (
+        SubprocessVerifyRunner,
+        apply_verify_clean_gate,
+    )
+    from forge_loop.worker_env import build_worker_env
+
+    env = build_worker_env(
+        _clean_sdk_env(),
+        repo=cfg.repo,
+        path_prepend=cfg.worker.env_path_prepend,
+        vars=cfg.worker.env_vars,
+    )
+    return apply_verify_clean_gate(
+        outcomes,
+        runner=SubprocessVerifyRunner(),
+        gh=_gh,
+        repo=cfg.github_repo,
+        commands=cfg.worker.verify_commands,
+        cwd=str(cfg.repo),
+        env=env,
+        require=cfg.worker.env_require,
+        enabled=cfg.worker.verify_gate_enabled,
+        events_file=cfg.events_file,
+        emit=bus_emit,
+    )
 
 
 def _record_attempts(

@@ -257,6 +257,12 @@ class WorkerSettings(BaseSettings):
     env_vars: dict[str, str] = Field(default_factory=dict)
     env_require: tuple[str, ...] = ()
     verify_commands: tuple[str, ...] = ()
+    # Issue #241: enforce ``verify_commands`` as a deterministic, repo-wide
+    # PRE-MERGE gate (anti-slop ratchet). Defaults OFF: the gate must ship
+    # BEFORE the lint/pyright cleanup tickets land, and an enforcing gate
+    # against a red baseline would block every PR. Flip to true once the repo
+    # is clean (``ruff check src/ tests/`` + ``pyright src/forge_loop`` green).
+    verify_gate_enabled: bool = False
 
     @field_validator("env_path_prepend", "env_require", mode="before")
     @classmethod
