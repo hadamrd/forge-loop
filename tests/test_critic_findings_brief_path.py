@@ -126,6 +126,37 @@ def test_repair_brief_renders_store_findings_with_empty_github_context(tmp_path)
     assert "DURABLE CRITIC FINDINGS" in brief
 
 
+def test_missing_issue_is_loud_not_a_silent_drop() -> None:
+    """sev2/correctness regression guard: a store supplied with ``issue=None``
+    must NOT silently no-op the durable data path (which would shove the worker
+    back onto the lossy GitHub round-trip — the #242/Q10 failure). It emits a
+    ``critic_findings_persist_skipped`` warning event instead."""
+    store = SqliteCriticFindingsStore(":memory:")
+    events: list[tuple[str, dict]] = []
+
+    apply_critic_report(
+        _report(),
+        PR,
+        500,
+        block_on_sev2=False,
+        min_findings_for_approve=0,
+        gh=_FailingGh(),
+        repo="acme/widgets",
+        emit=lambda name, payload: events.append((name, payload)),
+        findings_store=store,
+        issue=None,
+    )
+
+    # Nothing persisted (no issue key), but the drop is OBSERVABLE.
+    assert store.open_count(PR) == 0
+    skipped = [p for n, p in events if n == "critic_findings_persist_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "issue_missing"
+    assert skipped[0]["dropped_findings"] == 2
+    # And no false "persisted" event was emitted.
+    assert not any(n == "critic_findings_persisted" for n, _ in events)
+
+
 def test_posting_raise_does_not_lose_findings() -> None:
     """Even if the poster RAISES (not just returns False), findings written
     before the posting step are already durable."""

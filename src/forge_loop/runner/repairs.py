@@ -99,7 +99,36 @@ def blocking_pr_repairs(
 ) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
     from forge_loop.axis import matches_axes, parse_filter_env
 
+    # The store is opened per runner tick on this hot path; close a
+    # self-created connection before returning so we don't leak a WAL handle
+    # every tick. An injected store is owned by the caller — leave it open.
+    owns_store = findings_store is None
     store = findings_store or open_critic_findings_store(cfg.repo)
+    try:
+        return _collect_blocking_repairs(
+            cfg,
+            store,
+            prs_requiring_repair_fn=prs_requiring_repair_fn,
+            fetch_issue_fn=fetch_issue_fn,
+            pr_review_context_fn=pr_review_context_fn,
+            matches_axes=matches_axes,
+            parse_filter_env=parse_filter_env,
+        )
+    finally:
+        if owns_store:
+            store.close()
+
+
+def _collect_blocking_repairs(
+    cfg: Config,
+    store: CriticFindingsStore,
+    *,
+    prs_requiring_repair_fn: Any,
+    fetch_issue_fn: Any,
+    pr_review_context_fn: Any,
+    matches_axes: Any,
+    parse_filter_env: Any,
+) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
     axis_filter = parse_filter_env()
     repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
 
@@ -175,7 +204,31 @@ def ready_issue_open_pr_repairs(
     if not ready_by_number:
         return []
 
+    # Per-tick hot path: close a self-created store before returning so the WAL
+    # connection isn't leaked every tick. An injected store stays caller-owned.
+    owns_store = findings_store is None
     store = findings_store or open_critic_findings_store(cfg.repo)
+    try:
+        return _collect_ready_issue_repairs(
+            cfg,
+            store,
+            ready_by_number,
+            open_prs_fn=open_prs_fn,
+            pr_review_context_fn=pr_review_context_fn,
+        )
+    finally:
+        if owns_store:
+            store.close()
+
+
+def _collect_ready_issue_repairs(
+    cfg: Config,
+    store: CriticFindingsStore,
+    ready_by_number: dict[int, dict[str, Any]],
+    *,
+    open_prs_fn: Any,
+    pr_review_context_fn: Any,
+) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
     repairs: list[tuple[dict[str, Any], dict[str, Any], str]] = []
     seen_issues: set[int] = set()
     limit = max(cfg.parallel, 50)

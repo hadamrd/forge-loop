@@ -105,13 +105,35 @@ def test_crash_safe_reopen_of_existing_db(tmp_path) -> None:
     db = tmp_path / ".forge" / "critic_findings.db"
     store = SqliteCriticFindingsStore(db)
     stored = store.upsert(PR, 242, _finding("durable"))
-    store._connection.close()  # simulate process exit
+    store.close()  # simulate process exit via the public lifecycle API
 
     reopened = SqliteCriticFindingsStore(db)
     again = reopened.get(stored.finding_id)
     assert again is not None
     assert again.message == "durable"
     assert again.status is FindingStatus.OPEN
+    reopened.close()
+
+
+def test_close_releases_connection_and_is_usable_as_context_manager(tmp_path) -> None:
+    """sev2/performance regression guard: the repair hot path opens a store per
+    tick, so the store MUST release its WAL connection deterministically rather
+    than leak one every tick. ``close()`` shuts the connection; the ``with``
+    form closes on exit; both must persist the written row across a re-open."""
+    db = tmp_path / ".forge" / "critic_findings.db"
+
+    with SqliteCriticFindingsStore(db) as store:
+        fid = store.upsert(PR, 242, _finding("scoped")).finding_id
+    # After the context exits the connection is closed — further use raises.
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.get(fid)
+
+    # The row survived the close, proving the data was durably committed.
+    reopened = SqliteCriticFindingsStore(db)
+    assert reopened.get(fid) is not None
+    reopened.close()
+    # close() is safe to call again (idempotent shutdown).
+    reopened.close()
 
 
 @pytest.mark.parametrize(

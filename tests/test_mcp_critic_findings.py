@@ -8,6 +8,8 @@ server, which the worker allow-list (``allowed_mcp_tools`` default includes
 
 from __future__ import annotations
 
+import asyncio
+from fnmatch import fnmatch
 from typing import Any
 
 import pytest
@@ -75,13 +77,29 @@ def test_mark_finding_addressed_missing_id_returns_error(
     assert "error" in result
 
 
-def test_tools_reachable_under_worker_allow_list() -> None:
-    """Both tools live on the ``forge-loop`` server, which the default
-    allow-list grants — proving they are reachable to the worker (AC4)."""
-    patterns = build_allowed_tools_patterns(("forge-loop",))
-    assert any("forge-loop" in p for p in patterns)
-    # The wildcard grant covers any tool registered on the server.
-    assert any(p == "mcp__forge-loop" or p.startswith("mcp__forge-loop") for p in patterns)
+def test_tools_reachable_under_worker_allow_list(tmp_path) -> None:  # noqa: ANN001
+    """Both tools are reachable under the REAL worker default allow-list (AC4).
+
+    Not a tautology on a literal input: we resolve the patterns from the actual
+    ``cfg.worker.allowed_mcp_tools`` default and assert each concrete tool name
+    (``mcp__forge-loop__critic_findings`` / ``mcp__forge-loop__mark_finding_addressed``)
+    is matched by a resolved glob pattern — exactly how the SDK/CLI gates them.
+    """
+    cfg = Config(repo=tmp_path, github_repo="acme/widgets")
+    # The default worker allow-list must actually grant the forge-loop server.
+    assert "forge-loop" in cfg.worker.allowed_mcp_tools
+
+    patterns = build_allowed_tools_patterns(cfg.worker.allowed_mcp_tools)
+    for tool in (
+        "mcp__forge-loop__critic_findings",
+        "mcp__forge-loop__mark_finding_addressed",
+    ):
+        assert any(fnmatch(tool, pattern) for pattern in patterns), (
+            f"{tool} not reachable under worker allow-list {patterns}"
+        )
+    # And both tools are really registered on the server (not just glob-matched).
+    registered = {t.name for t in asyncio.run(mcp_server.mcp.list_tools())}
+    assert {"critic_findings", "mark_finding_addressed"} <= registered
 
 
 def test_empty_when_no_findings(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -126,6 +126,15 @@ class CriticFindingsStore(Protocol):
         """Number of ``open`` findings for ``pr`` (convergence == 0)."""
         ...
 
+    def close(self) -> None:
+        """Release any backing resources (e.g. a SQLite connection).
+
+        The repair hot path opens a store per tick, so an owner that creates a
+        store must be able to release it deterministically rather than leak a
+        connection every tick.
+        """
+        ...
+
     def reconcile(
         self, pr: str, issue: int, findings: list[Finding]
     ) -> ReconcileResult:

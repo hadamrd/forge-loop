@@ -165,21 +165,37 @@ def apply_critic_report(
 
     # AC2/AC6: durable findings FIRST — load-bearing data is handed to the
     # repair worker via the store, never round-tripped through GitHub (Q10).
-    if findings_store is not None and issue is not None:
-        result = findings_store.reconcile(pr_url, issue, list(report.findings))
-        if emit is not None:
-            emit(
-                "critic_findings_persisted",
-                {
-                    "pr": pr_url,
-                    "issue": issue,
-                    "inserted": result.inserted,
-                    "kept_open": result.kept_open,
-                    "reopened": result.reopened,
-                    "closed": result.closed,
-                    "open_count": result.open_count,
-                },
-            )
+    # ``issue`` is REQUIRED for the persist branch: dropping it silently would
+    # no-op the entire durable data path and shove the worker back onto the
+    # lossy GitHub round-trip (the exact #242/Q10 blind-repair failure). When a
+    # store is supplied but ``issue`` is missing we make the drop LOUD via a
+    # warning event instead of vanishing the findings.
+    if findings_store is not None:
+        if issue is None:
+            if emit is not None:
+                emit(
+                    "critic_findings_persist_skipped",
+                    {
+                        "pr": pr_url,
+                        "reason": "issue_missing",
+                        "dropped_findings": len(report.findings),
+                    },
+                )
+        else:
+            result = findings_store.reconcile(pr_url, issue, list(report.findings))
+            if emit is not None:
+                emit(
+                    "critic_findings_persisted",
+                    {
+                        "pr": pr_url,
+                        "issue": issue,
+                        "inserted": result.inserted,
+                        "kept_open": result.kept_open,
+                        "reopened": result.reopened,
+                        "closed": result.closed,
+                        "open_count": result.open_count,
+                    },
+                )
 
     mutation_failed = False
 

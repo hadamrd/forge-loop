@@ -62,6 +62,26 @@ class SqliteCriticFindingsStore:
             self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.executescript(_SCHEMA)
 
+    # ── lifecycle ─────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection.
+
+        The repair hot path (``blocking_pr_repairs`` /
+        ``ready_issue_open_pr_repairs``) opens a store per runner tick; without
+        an explicit close that leaks a WAL connection (and its file handles)
+        every tick. Callers that own the store close it; ``__exit__`` makes the
+        ``with`` form do so automatically. Idempotent.
+        """
+
+        self._connection.close()
+
+    def __enter__(self) -> SqliteCriticFindingsStore:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
     # ── writes ────────────────────────────────────────────────────────────
 
     def upsert(self, pr: str, issue: int, finding: Finding) -> StoredFinding:
