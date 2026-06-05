@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from forge_loop.events import read_events
 from forge_loop.worker import _subagent_env, ensure_subagent_trusted
 
 DEFAULT_BRIEF = """You are the backlog-maintenance subagent for the forge-loop sprint loop.
@@ -128,17 +129,9 @@ def run_maintenance(
 def _parse_outcome(log_path: Path) -> dict[str, Any]:
     """Pull the final JSON object from claude's last `result` event."""
     last = ""
-    with open(log_path, "rb") as f:
-        for raw in f:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if e.get("type") == "result":
-                last = e.get("result", "") or ""
+    for e in read_events(log_path):
+        if e.get("type") == "result":
+            last = e.get("result", "") or ""
 
     for chunk in reversed(last.strip().splitlines()):
         chunk = chunk.strip()

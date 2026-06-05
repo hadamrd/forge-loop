@@ -37,6 +37,7 @@ from typing import Any
 
 import yaml
 
+from ..events import read_events
 from ..observability import render_prometheus
 
 # ---------------------------------------------------------------------------
@@ -95,20 +96,7 @@ def _read_events(events_path: Path, limit: int | None = None) -> list[dict[str, 
     """Return events as a list of dicts, oldest-first. Skip junk lines."""
     if not events_path.exists():
         return []
-    out: list[dict[str, Any]] = []
-    with open(events_path) as f:
-        lines = f.readlines()
-    if limit is not None:
-        lines = lines[-limit:]
-    for raw in lines:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            out.append(json.loads(raw))
-        except json.JSONDecodeError:
-            continue
-    return out
+    return list(read_events(events_path, tail=limit))
 
 
 def _append_audit(

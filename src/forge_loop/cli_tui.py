@@ -23,6 +23,8 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from forge_loop.events import read_events
+
 if TYPE_CHECKING:
     # For the type-checker textual is always present: annotate against the
     # real classes so ``App[None]`` / ``ComposeResult`` resolve correctly.
@@ -58,16 +60,9 @@ def _tail_jsonl(path: Path, n: int = 20) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()[-n:]
+        return list(read_events(path, tail=n))
     except OSError:
         return []
-    out: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
 
 
 def _compute_queue_depth(state_dir: Path) -> int:

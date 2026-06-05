@@ -34,7 +34,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import warnings
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Protocol, TypeVar, cast
@@ -70,6 +71,55 @@ class _BestEffortDurableMirror:
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def read_events(path: Path, *, tail: int | None = None) -> Iterator[dict[str, Any]]:
+    """Yield decoded event records from a JSONL log — the ONE shared reader.
+
+    This is the single home for the "open → iterate lines → ``json.loads``
+    → skip ``JSONDecodeError``" tail-loop that was copy-pasted across ~12
+    modules (issue #224). ``events.py`` owns event *emission*; this is the
+    matching *consumption* primitive. Consumers MUST use this instead of
+    re-rolling their own decode loop.
+
+    Behaviour contract (the union of what the old call sites did):
+
+    * Lines are read in binary and decoded as UTF-8 with
+      ``errors="replace"`` so a half-written or non-UTF-8 line can never
+      raise mid-stream (the TUI / dashboard must not crash on a line the
+      runner is still flushing).
+    * Blank lines are skipped.
+    * Lines that fail ``json.loads`` (partial flush, corruption) are
+      skipped silently.
+    * Only JSON objects are yielded; non-dict scalars/arrays are dropped
+      (the return type is ``Iterator[dict]``).
+    * ``tail`` — when given — bounds the result to the last ``tail``
+      yielded records (``tail=0`` yields nothing). Memory stays bounded
+      via a ``deque`` so tailing a huge log never materialises it whole.
+
+    ``OSError`` from opening ``path`` is deliberately NOT swallowed:
+    callers that treat a missing/unreadable log specially keep their own
+    ``path.exists()`` / ``try/except OSError`` guard, exactly as before.
+    """
+    if tail is not None and tail < 0:
+        raise ValueError(f"tail must be >= 0, got {tail!r}")
+
+    def _decoded() -> Iterator[dict[str, Any]]:
+        with open(path, "rb") as f:
+            for raw in f:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    yield rec
+
+    if tail is None:
+        return _decoded()
+    return iter(deque(_decoded(), maxlen=tail))
 
 
 class EventBase(BaseModel):
@@ -492,5 +542,6 @@ __all__ = [
     "WorktreeReapedEvent",
     "append_event_with_registry_check",
     "emit",
+    "read_events",
     "register_event",
 ]

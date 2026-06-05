@@ -12,6 +12,7 @@ from typing import Any
 
 import typer
 
+from forge_loop.events import read_events
 from forge_loop.state import tail_events
 
 
@@ -48,26 +49,21 @@ class RepoCommandsMixin:
         )
         if sidecar.exists():
             try:
-                with open(sidecar) as f:
-                    for line in f.readlines()[-1000:]:
-                        try:
-                            e = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if e.get("kind") in {
-                            "repo_tick_done",
-                            "repo_skipped",
-                            "repo_tick_start",
-                            "repo_tick_error",
-                        }:
-                            repo = e.get("repo")
-                            if repo:
-                                last_activity[repo] = {
-                                    "ts": e.get("ts"),
-                                    "kind": e.get("kind"),
-                                    "reason": e.get("reason") or "",
-                                    "tick": e.get("tick"),
-                                }
+                for e in read_events(sidecar, tail=1000):
+                    if e.get("kind") in {
+                        "repo_tick_done",
+                        "repo_skipped",
+                        "repo_tick_start",
+                        "repo_tick_error",
+                    }:
+                        repo = e.get("repo")
+                        if repo:
+                            last_activity[repo] = {
+                                "ts": e.get("ts"),
+                                "kind": e.get("kind"),
+                                "reason": e.get("reason") or "",
+                                "tick": e.get("tick"),
+                            }
             except OSError:
                 pass
 

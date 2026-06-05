@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from forge_loop.events import read_events
 from forge_loop.state import append_event, rotate_events_file_if_needed
 
 # ---------------------------------------------------------------------------
@@ -183,16 +184,11 @@ def consecutive_deploy_fails(events_file: Path) -> int:
     if not events_file.exists():
         return 0
     try:
-        with open(events_file) as f:
-            lines = f.readlines()[-200:]
+        recent = list(read_events(events_file, tail=200))
     except OSError:
         return 0
     count = 0
-    for line in reversed(lines):
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for e in reversed(recent):
         if e.get("kind") != "redeploy":
             continue
         if e.get("ok"):

@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from forge_loop import critic_format
+from forge_loop.events import read_events
 from forge_loop.worker import ensure_subagent_trusted
 
 VALID_OVERALL = {"approve", "request_changes", "block"}
@@ -251,14 +252,10 @@ def _worker_command_context(issue_number: int, logs_dir: Path) -> str:
     for pattern in (f"worker-{issue_number}-*.log", f"repair-{issue_number}-*.log"):
         for path in sorted(logs_dir.glob(pattern)):
             try:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                events = list(read_events(path))
             except OSError:
                 continue
-            for line in lines:
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+            for event in events:
                 item = event.get("item")
                 if not isinstance(item, dict):
                     continue
@@ -778,17 +775,9 @@ def parse_report_from_log(log_path: Path) -> tuple[CriticReport | None, str | No
     """
     last_result = ""
     try:
-        with open(log_path, "rb") as f:
-            for raw in f:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    e = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if e.get("type") == "result":
-                    last_result = e.get("result", "") or ""
+        for e in read_events(log_path):
+            if e.get("type") == "result":
+                last_result = e.get("result", "") or ""
     except OSError as ex:
         return None, f"log_read_failed: {ex}"
 
@@ -966,17 +955,9 @@ def _extract_verdict(log_path: Path) -> tuple[str, list[str]]:
 
     last = ""
     try:
-        with open(log_path, "rb") as f:
-            for raw in f:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    e = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if e.get("type") == "result":
-                    last = e.get("result", "") or ""
+        for e in read_events(log_path):
+            if e.get("type") == "result":
+                last = e.get("result", "") or ""
     except OSError:
         return "error", []
 

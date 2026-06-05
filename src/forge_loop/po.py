@@ -52,6 +52,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from forge_loop.events import read_events
 from forge_loop.worker import ensure_subagent_trusted
 
 
@@ -252,17 +253,9 @@ def _run_one(
 
 def _extract_outcome(log_path: Path) -> dict[str, Any]:
     last = ""
-    with open(log_path, "rb") as f:
-        for raw in f:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if e.get("type") == "result":
-                last = e.get("result", "") or ""
+    for e in read_events(log_path):
+        if e.get("type") == "result":
+            last = e.get("result", "") or ""
 
     for chunk in reversed(last.strip().splitlines()):
         chunk = chunk.strip()
