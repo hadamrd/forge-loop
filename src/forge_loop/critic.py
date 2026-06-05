@@ -118,6 +118,50 @@ class Finding:
         )
 
 
+#: Matches a GitHub PR identity in either the HTML url
+#: (``github.com/{owner}/{repo}/pull/{n}``) or the REST api url
+#: (``api.github.com/repos/{owner}/{repo}/pulls/{n}``), with or without a
+#: trailing slash / fragment. Capturing ``owner``, ``repo`` and the PR number
+#: lets us collapse every shape to ONE canonical key.
+_PR_URL_RE = re.compile(
+    r"github\.com/(?:repos/)?(?P<owner>[^/]+)/(?P<repo>[^/]+)/pulls?/(?P<num>\d+)",
+    re.IGNORECASE,
+)
+
+
+def canonical_pr_key(pr: str | int) -> str:
+    """Collapse any PR reference to ONE stable key (#242 review fix).
+
+    The durable critic-findings store is keyed on the PR across three
+    independent paths — the critic *writes* with ``wr["pr_url"]``, the repair
+    dispatch *reads* with ``pr.get("url")``, and the MCP tool takes a free-form
+    ``pr`` arg. Any format drift between those (trailing slash, ``html_url`` vs
+    the REST ``api.github.com`` url's ``/pulls/`` spelling, a bare PR number vs
+    a full url) would make ``open_findings(pr)`` silently return ``[]`` and the
+    worker repair BLIND — reintroducing the very Q10 failure this issue kills.
+
+    So every write/read/MCP path runs its PR reference through this single
+    helper. A recognised GitHub PR url collapses to ``{owner}/{repo}#{num}``
+    (HTML and REST api urls converge); a bare integer / numeric string becomes
+    ``#{num}``; anything else is whitespace- and trailing-slash-trimmed and
+    returned verbatim so unknown shapes still compare consistently.
+    """
+
+    if isinstance(pr, int):
+        return f"#{pr}"
+    text = pr.strip()
+    match = _PR_URL_RE.search(text)
+    if match:
+        owner = match.group("owner")
+        repo = match.group("repo")
+        num = match.group("num")
+        return f"{owner}/{repo}#{num}"
+    bare = text.rstrip("/").strip()
+    if bare.lstrip("#").isdigit():
+        return f"#{bare.lstrip('#')}"
+    return bare
+
+
 def derive_finding_id(pr: str | int, issue: int, finding: Finding) -> str:
     """Derive a STABLE, globally-addressable id for a critic finding (#242).
 
@@ -127,10 +171,14 @@ def derive_finding_id(pr: str | int, issue: int, finding: Finding) -> str:
     attempts is idempotent, never duplicated — acceptance criterion 2). Encoding
     ``pr`` + ``issue`` into the hash makes the id unique across PRs so the MCP
     ``mark_finding_addressed(finding_id)`` tool can address a row by id alone.
+
+    ``pr`` is run through :func:`canonical_pr_key` first so the same PR referred
+    to by its HTML url, REST api url or a trailing-slash variant always hashes to
+    the SAME id (the #242 review fix — no format-drift duplicates).
     """
 
     parts = [
-        str(pr),
+        canonical_pr_key(pr),
         str(issue),
         finding.category,
         finding.file or "",

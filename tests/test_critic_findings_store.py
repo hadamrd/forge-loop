@@ -13,7 +13,7 @@ import sqlite3
 
 import pytest
 
-from forge_loop.critic import Finding, derive_finding_id
+from forge_loop.critic import Finding, canonical_pr_key, derive_finding_id
 from forge_loop.critic_findings import (
     SqliteCriticFindingsStore,
     critic_findings_db_path,
@@ -114,6 +114,54 @@ def test_crash_safe_reopen_of_existing_db(tmp_path) -> None:
     assert again is not None
     assert again.message == "durable"
     assert again.status is FindingStatus.OPEN
+
+
+@pytest.mark.parametrize(
+    ("write_pr", "read_pr"),
+    [
+        # html_url written, same with a trailing slash read back.
+        (PR, PR + "/"),
+        # html_url written, REST api url (``/repos/.../pulls/``) read back.
+        (PR, "https://api.github.com/repos/acme/widgets/pulls/7"),
+        # api url written, html_url read back (the reverse drift).
+        ("https://api.github.com/repos/acme/widgets/pulls/7", PR),
+        # trailing-slash html_url written, clean html_url read back.
+        (PR + "/", PR),
+    ],
+)
+def test_pr_key_drift_still_resolves(write_pr: str, read_pr: str) -> None:
+    """#242 review fix: any PR-URL format drift between the critic WRITE path and
+    the worker READ path must still resolve to the same findings.
+
+    Without canonicalisation, ``open_findings(read_pr)`` returns ``[]`` and the
+    worker repairs BLIND — reintroducing the Q10 failure mode. The store keys on
+    a single canonical PR id so write/read/MCP paths converge.
+    """
+    store = SqliteCriticFindingsStore(":memory:")
+    store.upsert(write_pr, 242, 1, _finding("drift"))
+
+    open_rows = store.open_findings(read_pr)
+    assert [r.message for r in open_rows] == ["drift"]
+    assert store.open_count(read_pr) == 1
+    assert len(store.all_findings(read_pr)) == 1
+    # The finding_id is itself stable across the format drift.
+    assert open_rows[0].finding_id == derive_finding_id(read_pr, 242, _finding("drift"))
+
+
+def test_canonical_pr_key_collapses_known_shapes() -> None:
+    """The single canonicalisation helper used by every write/read/MCP path."""
+    canonical = "acme/widgets#7"
+    assert canonical_pr_key("https://github.com/acme/widgets/pull/7") == canonical
+    assert canonical_pr_key("https://github.com/acme/widgets/pull/7/") == canonical
+    assert canonical_pr_key("https://api.github.com/repos/acme/widgets/pulls/7") == canonical
+    # A bare number (int or str) collapses to a stable ``#n`` key.
+    assert canonical_pr_key(7) == "#7"
+    assert canonical_pr_key("7") == "#7"
+    assert canonical_pr_key("#7") == "#7"
+    # The helper is idempotent — re-canonicalising a canonical key is a no-op.
+    assert canonical_pr_key(canonical) == canonical
+    # An unrecognised shape is trimmed but otherwise preserved (consistent compare).
+    assert canonical_pr_key("  weird-key/  ") == "weird-key"
 
 
 def test_db_path_and_factory_use_dot_forge(tmp_path) -> None:

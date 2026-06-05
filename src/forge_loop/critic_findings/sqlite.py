@@ -13,7 +13,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from forge_loop.critic import Finding, derive_finding_id
+from forge_loop.critic import Finding, canonical_pr_key, derive_finding_id
 from forge_loop.critic_findings.store import (
     FindingStatus,
     ReconcileResult,
@@ -75,6 +75,7 @@ class SqliteCriticFindingsStore:
         through :meth:`set_status` / :meth:`reconcile`.
         """
 
+        pr = canonical_pr_key(pr)
         finding_id = derive_finding_id(pr, issue, finding)
         now = _now()
         with self._connection:
@@ -139,6 +140,7 @@ class SqliteCriticFindingsStore:
     ) -> ReconcileResult:
         """Closed-loop re-review reconciliation — see protocol docstring."""
 
+        pr = canonical_pr_key(pr)
         current = {derive_finding_id(pr, issue, f): f for f in findings}
         existing = {row.finding_id: row for row in self.all_findings(pr)}
 
@@ -190,7 +192,7 @@ class SqliteCriticFindingsStore:
         rows = self._connection.execute(
             "SELECT * FROM critic_findings WHERE pr = ? AND status = ? "
             "ORDER BY created_at ASC, finding_id ASC",
-            (pr, FindingStatus.OPEN.value),
+            (canonical_pr_key(pr), FindingStatus.OPEN.value),
         ).fetchall()
         return tuple(self._row(row) for row in rows)
 
@@ -198,14 +200,14 @@ class SqliteCriticFindingsStore:
         rows = self._connection.execute(
             "SELECT * FROM critic_findings WHERE pr = ? "
             "ORDER BY created_at ASC, finding_id ASC",
-            (pr,),
+            (canonical_pr_key(pr),),
         ).fetchall()
         return tuple(self._row(row) for row in rows)
 
     def open_count(self, pr: str) -> int:
         row = self._connection.execute(
             "SELECT COUNT(*) AS n FROM critic_findings WHERE pr = ? AND status = ?",
-            (pr, FindingStatus.OPEN.value),
+            (canonical_pr_key(pr), FindingStatus.OPEN.value),
         ).fetchone()
         return int(row["n"]) if row is not None else 0
 
