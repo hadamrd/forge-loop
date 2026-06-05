@@ -399,6 +399,43 @@ def test_adopted_automerge_happy_path_merges_clean(tmp_path: Path, monkeypatch) 
     assert o.status == "merged"
 
 
+def test_adopted_automerge_skips_critic_error_verdict(tmp_path: Path, monkeypatch) -> None:
+    """Issue #267: a verdict=error adopted PR is NOT merged (allow-list dual).
+
+    The #267 hole: a crashed critic review sets status=open WITHOUT
+    ``outcome.error`` (an error is not an adjudicated block), so the
+    ``if outcome.error`` deny-list above does NOT catch it. Without the
+    allow-list it would auto-merge an UNREVIEWED PR. It must be withheld and
+    left UNstamped for the next adoption scan to re-review.
+    """
+    cfg = _cfg(tmp_path)
+    merged = _patch_gh(monkeypatch)
+    o = _outcome(54)
+    o.critic_verdict = "error"  # crashed review — no affirmative approval
+    pr = {"number": 54, "url": o.pr_url, "mergeStateStatus": "CLEAN"}
+
+    _enable_automerge_for_adopted_prs(cfg, [(o, pr)], refused_issues=set(), emit=None)
+
+    assert merged == []  # unreviewed PR never merged
+    assert o.status == "open"
+    reasons = {(e["issue"], e["reason"]) for e in _events(cfg) if e["kind"] == "orphan_pr_skipped"}
+    assert (54, "critic_verdict_not_approved:error") in reasons
+
+
+def test_adopted_automerge_merges_approved_verdict(tmp_path: Path, monkeypatch) -> None:
+    """Issue #267 happy path: an affirmatively-approved adopted PR still merges."""
+    cfg = _cfg(tmp_path)
+    merged = _patch_gh(monkeypatch)
+    o = _outcome(55)
+    o.critic_verdict = "approved"
+    pr = {"number": 55, "url": o.pr_url, "mergeStateStatus": "CLEAN"}
+
+    _enable_automerge_for_adopted_prs(cfg, [(o, pr)], refused_issues=set(), emit=None)
+
+    assert merged == [o.pr_url]
+    assert o.status == "merged"
+
+
 def test_adoption_tick_stamps_only_terminal_prs(tmp_path: Path, monkeypatch) -> None:
     """sev2a regression: the loop:adopted marker must NOT land on a PR skipped
     for a transient reason, or the selector would permanently re-orphan it.

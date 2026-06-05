@@ -58,6 +58,16 @@ class WorkerOutcome:
     duration_s: float
     stdout_tail: str
     error: str | None = None
+    # Issue #267 (safety): the critic's verdict for this outcome's PR, as set by
+    # the legacy ``_run_critic_for_outcomes`` review pass. ``None`` means "no
+    # legacy critic verdict was recorded" (critic disabled, pipeline-driven, or
+    # the PR was never reviewable) — the merge gate then falls back to its
+    # pre-critic behaviour. A non-``None`` value is one of the critic verdict
+    # tokens (``approved | changes_requested | blocked | error``); auto-merge
+    # requires an AFFIRMATIVE ``"approved"`` and is withheld for every other
+    # token. This closes the #267 hole where a verdict=error (a crashed review)
+    # fell through the deny-list and auto-merged an UNREVIEWED PR.
+    critic_verdict: str | None = None
     events: list[dict[str, Any]] | None = None  # appended by subagent via sprint-events.jsonl
     cost_usd: float = 0.0
     usage: dict[str, Any] | None = None

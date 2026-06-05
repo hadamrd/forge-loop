@@ -317,6 +317,96 @@ def test_attempt_record_uses_post_critic_status(fake_world, monkeypatch) -> None
     assert state.history[99][0]["note"] == "critic blocked"
 
 
+# ---------------------------------------------------------------------------
+# Issue #267 (safety): a critic verdict=error must NOT auto-merge.
+#
+# The real incident: a crashed/errored critic review produces verdict=error
+# with no findings. The old deny-list (skip on risk_gated / refused /
+# outcome.error) populated NONE of those for an error, so the unreviewed PR
+# fell through and AUTO-MERGED. The fix is an allow-list: auto-merge requires
+# an AFFIRMATIVE ``critic_verdict == "approved"``. An error/blocked/missing
+# verdict withholds the merge — without reintroducing the #245 stale block.
+# ---------------------------------------------------------------------------
+
+
+def test_critic_error_verdict_is_not_automerged(fake_world, monkeypatch) -> None:
+    """verdict=error ⇒ NO ensure_pr_merged, NO stale critic:blocking label (#267)."""
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    state.scripted_status = "open"
+    state.scripted_pr = "https://github.com/o/r/pull/100"
+    state.scripted_error = None
+
+    def critic_errored(_cfg, outcomes, _emit):
+        # Mirror the real verdict=error branch: status stays open, NO
+        # outcome.error is set (an error is not an adjudicated block), and the
+        # verdict token is recorded on the outcome.
+        for o in outcomes:
+            o.critic_verdict = "error"
+            o.status = "open"
+
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", critic_errored)
+
+    _runner._tick(cfg, tick=1)
+
+    # The unreviewed PR must NOT have been merged.
+    assert state.automerge_calls == []
+    assert state.history[99][0]["status"] == "open"
+    # And no stale critic:blocking label was left behind (#245/#264 intact).
+    assert "critic:blocking" not in state.pr_labels.get(
+        "https://github.com/o/r/pull/100", []
+    )
+    # The withheld decision is surfaced, not silently dropped.
+    events = _read_events(cfg)
+    withheld = next(e for e in events if e["kind"] == "post_critic_automerge_withheld")
+    assert withheld["issue"] == 99
+    assert withheld["reason"] == "critic_verdict_not_approved:error"
+
+
+def test_critic_approved_verdict_is_automerged(fake_world, monkeypatch) -> None:
+    """The happy path still works: verdict=approved + clean ⇒ auto-merge (#267)."""
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    state.scripted_status = "open"
+    state.scripted_pr = "https://github.com/o/r/pull/100"
+    state.scripted_error = None
+
+    def critic_approved(_cfg, outcomes, _emit):
+        for o in outcomes:
+            o.critic_verdict = "approved"
+
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", critic_approved)
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.automerge_calls == [("https://github.com/o/r/pull/100", "o/r")]
+    assert state.history[99][0]["status"] == "merged"
+    events = _read_events(cfg)
+    assert "post_critic_automerge_enabled" in _kinds(events)
+
+
+def test_critic_changes_requested_verdict_is_not_automerged(fake_world, monkeypatch) -> None:
+    """A non-error non-approval (changes_requested) also withholds auto-merge (#267)."""
+    state, cfg, _ = fake_world
+    cfg = replace(cfg, critic=replace(cfg.critic, enabled=True))
+    state.scripted_status = "open"
+    state.scripted_pr = "https://github.com/o/r/pull/100"
+    state.scripted_error = None
+
+    def critic_changes(_cfg, outcomes, _emit):
+        for o in outcomes:
+            o.critic_verdict = "changes_requested"
+
+    monkeypatch.setattr(_tick_mod, "_run_critic_for_outcomes", critic_changes)
+
+    _runner._tick(cfg, tick=1)
+
+    assert state.automerge_calls == []
+    events = _read_events(cfg)
+    withheld = next(e for e in events if e["kind"] == "post_critic_automerge_withheld")
+    assert withheld["reason"] == "critic_verdict_not_approved:changes_requested"
+
+
 def test_failure_then_cooldown_skip_then_release(fake_world, monkeypatch) -> None:
     state, cfg, _ = fake_world
     monkeypatch.setenv("LOOP_RETRY_COOLDOWN_S", "3600")
