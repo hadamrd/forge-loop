@@ -198,10 +198,12 @@ def _enable_automerge_for_adopted_prs(
     ``mergeStateStatus == CLEAN``. Every skip emits ``orphan_pr_skipped`` with
     a ``reason`` — no silent drop.
 
-    Issue #230: unresolved review threads are NOT a gate here. A critic-approved
-    PR keeps its sev3 inline-comment threads open forever; gating on them held
-    approved + CLEAN PRs back indefinitely (the #229 multi-hour stall). The
-    thread count is recorded on ``orphan_pr_automerge_enabled`` for visibility.
+    Issue #230: leftover *critic* sev3 inline-comment threads are NOT a gate
+    here — a critic-approved PR keeps them open forever, and gating on them held
+    approved + CLEAN PRs back indefinitely (the #229 multi-hour stall). But an
+    unresolved *human* request-changes thread DOES gate (AC3): it skips with
+    ``reason="human_review_unresolved"``. The leftover critic-thread count is
+    recorded on ``orphan_pr_automerge_enabled`` for visibility.
     """
     from forge_loop import gh as _gh
 
@@ -237,15 +239,29 @@ def _enable_automerge_for_adopted_prs(
             )
             continue
         # #230: an approved + CLEAN PR whose only open review threads are
-        # leftover sev3 critic inline comments is TERMINAL — it must merge, not
-        # be held back. We have already required CLEAN above and skipped the
-        # critic-blocked case (``outcome.error``), so the remaining unresolved
-        # threads are informational. Blocking on them is exactly what produced
+        # leftover sev3 *critic* inline comments is TERMINAL — it must merge,
+        # not be held back. Blocking on those threads is exactly what produced
         # the #229 multi-hour stall (a critic-approved PR keeps its sev3 threads
-        # open forever, so the gate never lets it land). GitHub's branch
-        # protection still gates the real merge once auto-merge is enabled. We
-        # record the count for observability rather than gating on it.
+        # open forever, so the gate never lets it land). AC3, however, requires
+        # an unresolved *human* request-changes thread to still hold the PR
+        # back: a human inline-comment thread does NOT flip merge state off
+        # CLEAN, so we must inspect authorship explicitly rather than trust
+        # mergeStateStatus alone. ``human_unresolved_threads`` filters out the
+        # critic's own leftover findings (the call is now load-bearing, not
+        # decorative). GitHub branch protection still gates the real merge once
+        # auto-merge is enabled.
         threads = _gh.unresolved_review_threads(outcome.pr_url, repo=cfg.github_repo)
+        human_threads = _gh.human_unresolved_threads(threads)
+        if human_threads:
+            append_event(
+                cfg.events_file,
+                "orphan_pr_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason="human_review_unresolved",
+                unresolved_human_threads=len(human_threads),
+            )
+            continue
         if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):
             outcome.status = "merged"
             append_event(
@@ -253,7 +269,7 @@ def _enable_automerge_for_adopted_prs(
                 "orphan_pr_automerge_enabled",
                 issue=outcome.issue,
                 pr=outcome.pr_url,
-                over_unresolved_sev3_threads=len(threads),
+                over_unresolved_critic_threads=len(threads),
             )
         else:
             append_event(

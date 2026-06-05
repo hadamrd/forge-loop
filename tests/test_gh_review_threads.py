@@ -78,14 +78,35 @@ def test_pr_review_context_includes_unresolved_inline_threads(monkeypatch) -> No
     assert any(c[:3] == ["gh", "api", "graphql"] for c in calls)
 
 
-def _thread(id_: str, *, resolved: bool = False) -> dict[str, Any]:
+def _thread(
+    id_: str,
+    *,
+    resolved: bool = False,
+    body: str = "**[sev3/correctness]** leftover critic finding",
+    author: str = "critic-bot",
+) -> dict[str, Any]:
+    """A review thread node. Defaults to a CRITIC-authored sev3 thread (the
+    ``**[sevN/...]**`` body signature ``critic_actions`` emits) so existing
+    approved-mergeable tests model the real #230 case. Pass a non-critic
+    ``body`` to model a human request-changes thread (#230 AC3)."""
     return {
         "id": id_,
         "isResolved": resolved,
         "isOutdated": False,
         "path": "src/app.py",
         "line": 12,
-        "comments": {"nodes": []},
+        "comments": {
+            "nodes": [
+                {
+                    "author": {"login": author},
+                    "body": body,
+                    "url": "https://github.com/o/r/pull/7#discussion",
+                    "path": "src/app.py",
+                    "line": 12,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                }
+            ]
+        },
     }
 
 
@@ -469,3 +490,82 @@ def test_is_approved_mergeable_false_when_not_clean() -> None:
 def test_is_approved_mergeable_missing_fields_is_false() -> None:
     """Adversarial: empty dict (no labels, no merge state) → not mergeable."""
     assert gh.is_approved_mergeable({}) is False
+
+
+# ---------------------------------------------------------------------------
+# critic-vs-human thread classification + AC3 human-thread gating (issue #230)
+# ---------------------------------------------------------------------------
+
+
+def _norm(thread: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a raw GraphQL thread node the way the fetchers do."""
+    return gh._normalise_review_thread(thread)
+
+
+def test_human_unresolved_threads_keeps_human_drops_critic() -> None:
+    """The critic's ``**[sevN/...]**`` threads are filtered out; a human
+    request-changes thread (free prose) is kept (#230 AC3)."""
+    critic = _norm(_thread("c1", body="**[sev3/performance]** redundant I/O"))
+    human = _norm(_thread("h1", body="Please handle the error path here.", author="alice"))
+    resolved_human = _norm(_thread("h2", body="nit: rename this", author="alice", resolved=True))
+    out = gh.human_unresolved_threads([critic, human, resolved_human])
+    assert [t["id"] for t in out] == ["h1"]  # only the unresolved human thread
+
+
+def test_human_unresolved_threads_treats_empty_thread_as_human() -> None:
+    """Conservative direction: a thread we cannot prove is the critic's (no
+    comments / unknown signature) is treated as human so we never auto-merge
+    over it."""
+    empty = {"id": "e", "isResolved": False, "comments": []}
+    assert [t["id"] for t in gh.human_unresolved_threads([empty])] == ["e"]
+
+
+def test_is_approved_mergeable_false_with_unresolved_human_thread() -> None:
+    """AC3: a CLEAN PR with no block label is NOT terminal while a human
+    request-changes thread is open — even though merge state is CLEAN."""
+    pr = {"labels": [], "mergeStateStatus": "CLEAN"}
+    human = _norm(_thread("h", body="This needs a different approach.", author="bob"))
+    assert gh.is_approved_mergeable(pr, unresolved_threads=[human]) is False
+
+
+def test_is_approved_mergeable_true_with_only_critic_threads() -> None:
+    """A CLEAN PR whose only open threads are the critic's leftover sev3 notes
+    IS terminal (the leftover threads do not hold it back)."""
+    pr = {"labels": [], "mergeStateStatus": "CLEAN"}
+    critic = _norm(_thread("c", body="**[sev3/style]** rename field"))
+    assert gh.is_approved_mergeable(pr, unresolved_threads=[critic]) is True
+
+
+def test_prs_requiring_repair_selects_approved_clean_with_human_thread(monkeypatch) -> None:
+    """#230 AC3 through the REAL selector: an approved + CLEAN PR carrying an
+    unresolved *human* request-changes thread is STILL selected for repair (it
+    is not approved-mergeable), and is NOT surfaced as an approved skip."""
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return _completed(
+                [
+                    {
+                        "number": 9,
+                        "url": "https://github.com/o/r/pull/9",
+                        "headRefName": "loop/9-x",
+                        "labels": [],
+                        "updatedAt": "2026-01-01T00:00:00Z",
+                        "mergeStateStatus": "CLEAN",
+                    }
+                ]
+            )
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            human = _thread("h", body="Please rework this design.", author="alice")
+            return _completed(
+                {"data": {"repository": {"pr0": {"reviewThreads": {"nodes": [human]}}}}}
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(gh.subprocess, "run", fake_run)
+    skipped: list[dict[str, Any]] = []
+    prs = gh.prs_requiring_repair(5, repo="o/r", on_skip=skipped.append)
+
+    assert [p["number"] for p in prs] == [9]  # selected for repair
+    assert prs[0]["repairReasons"] == ["unresolved_review_threads"]
+    assert skipped == []  # NOT treated as approved-mergeable

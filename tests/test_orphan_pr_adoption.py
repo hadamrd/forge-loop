@@ -317,6 +317,27 @@ def _outcome(issue: int, *, status: str = "open", error: str | None = None) -> W
     )
 
 
+def _critic_thread(id_: str = "t-sev3") -> dict[str, Any]:
+    """A leftover CRITIC sev3 inline-comment thread (the ``**[sevN/...]**`` body
+    signature ``critic_actions`` emits). These must NOT hold an approved PR
+    back (#230)."""
+    return {
+        "id": id_,
+        "isResolved": False,
+        "comments": [{"author": {"login": "critic-bot"}, "body": "**[sev3/style]** nit"}],
+    }
+
+
+def _human_thread(id_: str = "t-human") -> dict[str, Any]:
+    """A human request-changes thread (free prose, not the critic signature).
+    AC3: this MUST hold a PR back even when CLEAN with no block label."""
+    return {
+        "id": id_,
+        "isResolved": False,
+        "comments": [{"author": {"login": "alice"}, "body": "Please rework this."}],
+    }
+
+
 def _patch_gh(monkeypatch, *, threads: list[Any] | None = None) -> list[str]:
     """Stub gh so adoption never touches the network; return the auto-merge log."""
     merged: list[str] = []
@@ -427,28 +448,46 @@ def test_adopted_automerge_merges_clean_despite_sev3_threads(tmp_path: Path, mon
     gate the merge (that gating caused the #229 multi-hour stall). The thread
     count is recorded on the enabled event for observability."""
     cfg = _cfg(tmp_path)
-    sev3 = [{"id": "t-sev3", "isResolved": False, "comments": []}]
+    sev3 = [_critic_thread()]
     merged = _patch_gh(monkeypatch, threads=sev3)
     o = _outcome(70)
     pr = {"number": 70, "url": o.pr_url, "mergeStateStatus": "CLEAN", "labels": []}
 
     _enable_automerge_for_adopted_prs(cfg, [(o, pr)], refused_issues=set(), emit=None)
 
-    assert merged == [o.pr_url]  # merged DESPITE the sev3 thread
+    assert merged == [o.pr_url]  # merged DESPITE the sev3 critic thread
     assert o.status == "merged"
     enabled = [e for e in _events(cfg) if e["kind"] == "orphan_pr_automerge_enabled"]
     assert len(enabled) == 1
-    assert enabled[0]["over_unresolved_sev3_threads"] == 1
-    # No skip emitted for unresolved threads anymore.
+    assert enabled[0]["over_unresolved_critic_threads"] == 1
+    # No skip emitted for leftover critic threads anymore.
     skips = [e for e in _events(cfg) if e["kind"] == "orphan_pr_skipped"]
     assert skips == []
+
+
+def test_adopted_automerge_skips_unresolved_human_thread(tmp_path: Path, monkeypatch) -> None:
+    """#230 AC3: an approved + CLEAN PR carrying an unresolved *human*
+    request-changes thread is NOT auto-merged — a human inline comment leaves
+    merge state CLEAN, so we must inspect authorship. It skips with
+    ``reason="human_review_unresolved"`` (not silently dropped)."""
+    cfg = _cfg(tmp_path)
+    merged = _patch_gh(monkeypatch, threads=[_human_thread(), _critic_thread()])
+    o = _outcome(74)
+    pr = {"number": 74, "url": o.pr_url, "mergeStateStatus": "CLEAN", "labels": []}
+
+    _enable_automerge_for_adopted_prs(cfg, [(o, pr)], refused_issues=set(), emit=None)
+
+    assert merged == []  # held back by the human thread
+    assert o.status == "open"
+    reasons = {(e["issue"], e["reason"]) for e in _events(cfg) if e["kind"] == "orphan_pr_skipped"}
+    assert (74, "human_review_unresolved") in reasons
 
 
 def test_adopted_automerge_idempotent_second_pass_is_noop(tmp_path: Path, monkeypatch) -> None:
     """AC4: re-running the adopted-automerge step on an already-merged outcome
     enables auto-merge AT MOST once (the second pass is a terminal no-op)."""
     cfg = _cfg(tmp_path)
-    sev3 = [{"id": "t-sev3", "isResolved": False, "comments": []}]
+    sev3 = [_critic_thread()]
     merged = _patch_gh(monkeypatch, threads=sev3)
     o = _outcome(71)
     pr = {"number": 71, "url": o.pr_url, "mergeStateStatus": "CLEAN", "labels": []}
@@ -478,13 +517,9 @@ def test_repaired_automerge_merges_despite_sev3_threads(tmp_path: Path, monkeypa
     monkeypatch.setattr(
         _ghmod, "enable_pr_auto_merge", lambda url, repo=None: merged.append(url) or True
     )
-    # unresolved_review_threads must NOT be consulted any more — make it explode
-    # if it ever is, to prove the gate is truly gone.
-    monkeypatch.setattr(
-        _ghmod,
-        "unresolved_review_threads",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("thread gate must be gone")),
-    )
+    # The leftover threads are the critic's OWN sev3 notes — they must NOT hold
+    # the PR back (that gating caused the #229 stall).
+    monkeypatch.setattr(_ghmod, "unresolved_review_threads", lambda *_a, **_k: [_critic_thread()])
     monkeypatch.setattr(
         "forge_loop.runner.merge_gate.apply_issue_closed_gate", lambda outcomes, **_k: []
     )
@@ -495,6 +530,34 @@ def test_repaired_automerge_merges_despite_sev3_threads(tmp_path: Path, monkeypa
     assert merged == [o.pr_url]
     assert o.status == "merged"
     assert "repair_automerge_enabled" in cfg.events_file.read_text()
+
+
+def test_repaired_automerge_skips_unresolved_human_thread(tmp_path: Path, monkeypatch) -> None:
+    """#230 AC3: a repaired PR the re-critic APPROVED but which still carries an
+    unresolved *human* request-changes thread is NOT auto-merged — it stays for
+    the repair loop with ``reason="human_review_unresolved"``."""
+    cfg = _cfg(tmp_path)
+    enable_automerge_for_repaired_prs = _import_repaired_automerge()
+    merged: list[str] = []
+    monkeypatch.setattr(
+        _ghmod, "enable_pr_auto_merge", lambda url, repo=None: merged.append(url) or True
+    )
+    monkeypatch.setattr(
+        _ghmod, "unresolved_review_threads", lambda *_a, **_k: [_human_thread(), _critic_thread()]
+    )
+    monkeypatch.setattr(
+        "forge_loop.runner.merge_gate.apply_issue_closed_gate", lambda outcomes, **_k: []
+    )
+    o = _outcome(75)  # approved (no error) but human thread open
+
+    enable_automerge_for_repaired_prs(cfg, [o], lambda *_a, **_k: None)
+
+    assert merged == []
+    assert o.status == "open"
+    reasons = {
+        (e["issue"], e["reason"]) for e in _events(cfg) if e["kind"] == "repair_automerge_skipped"
+    }
+    assert (75, "human_review_unresolved") in reasons
 
 
 def test_repaired_automerge_skips_when_critic_reblocked(tmp_path: Path, monkeypatch) -> None:
@@ -601,3 +664,94 @@ def test_blocking_pr_repairs_selects_blocked_but_skips_approved_in_same_batch(
     assert any(
         e["kind"] == "repair_pr_selected" and e.get("pr") == blocked_pr["url"] for e in events
     )
+
+
+# ---------------------------------------------------------------------------
+# #230 sev2/tests — drive the REAL prs_requiring_repair through the tick wiring
+# (no fake_selector substitution): prove the #229 5h stall cannot recur E2E.
+# ---------------------------------------------------------------------------
+
+
+def _open_pr(num: int, *, blocked: bool = False, state: str = "CLEAN") -> dict[str, Any]:
+    return {
+        "number": num,
+        "title": f"t{num}",
+        "body": f"fixes #{num}",
+        "headRefName": f"loop/{num}-{'blocked' if blocked else 'debt-fix'}",
+        "baseRefName": "trunk",
+        "url": f"https://github.com/o/r/pull/{num}",
+        "labels": [{"name": "critic:blocking"}] if blocked else [],
+        "updatedAt": f"2026-06-04T19:0{num % 10}:00Z",
+        "mergeStateStatus": state,
+    }
+
+
+def test_real_selector_excludes_approved_pr_across_n_ticks(tmp_path: Path, monkeypatch) -> None:
+    """E2E (#230 sev2/tests): the REAL ``prs_requiring_repair`` — not a fake
+    selector — excludes an approved + CLEAN PR whose only open threads are
+    leftover critic sev3 inline comments, across N consecutive ticks, so NO
+    repair worker is ever dispatched against it (the #229 ~5h stall cannot
+    recur). A sibling ``critic:blocking`` PR in the same batch IS selected each
+    tick, proving repair is not disabled wholesale."""
+    from forge_loop.runner.repairs import blocking_pr_repairs
+
+    cfg = _cfg(tmp_path)
+    open_list = [_open_pr(229), _open_pr(300, blocked=True)]
+    critic = _critic_thread()
+    monkeypatch.setattr(_ghmod, "_open_prs", lambda limit, repo: list(open_list))
+    monkeypatch.setattr(
+        _ghmod,
+        "review_threads_batch",
+        lambda numbers, repo=None: {229: [critic], 300: [critic]},
+    )
+
+    for _ in range(3):  # N consecutive ticks
+        repairs = blocking_pr_repairs(
+            cfg,
+            fetch_issue_fn=lambda num, repo=None: {"number": num, "title": "t", "labels": []},
+            pr_review_context_fn=lambda *_a, **_k: "ctx",
+        )
+        nums = [pr["number"] for _i, pr, _c in repairs]
+        assert 229 not in nums  # approved PR NEVER dispatched to a repair worker
+        assert nums == [300]  # blocked sibling IS selected
+
+    approved_skips = [
+        e
+        for e in _events(cfg)
+        if e["kind"] == "repair_pr_skipped" and e.get("reason") == "approved_mergeable"
+    ]
+    assert len(approved_skips) == 3  # surfaced every tick (no silent drop)
+    assert all(str(e.get("pr", "")).endswith("/229") for e in approved_skips)
+
+
+def test_tick_merges_approved_pr_and_dispatches_no_repair(tmp_path: Path, monkeypatch) -> None:
+    """Integration (#230 AC2 ordering): within a tick, an approved + CLEAN PR
+    with only critic sev3 threads is EXCLUDED by the REAL repair selector (no
+    repair worker) AND landed by the adoption enable-merge path. In ``_tick``
+    the selector runs first but excludes the PR (defence in depth), so merge
+    always wins over repair regardless of step order — the approved PR can never
+    be dispatched to a repair worker."""
+    from forge_loop.runner.repairs import blocking_pr_repairs
+
+    cfg = _cfg(tmp_path)
+    approved = _open_pr(229)
+    critic = _critic_thread()
+    monkeypatch.setattr(_ghmod, "_open_prs", lambda limit, repo: [approved])
+    monkeypatch.setattr(_ghmod, "review_threads_batch", lambda numbers, repo=None: {229: [critic]})
+
+    # Repair selector (real): the approved PR is NOT selected for repair.
+    repairs = blocking_pr_repairs(
+        cfg,
+        fetch_issue_fn=lambda num, repo=None: {"number": num, "title": "t", "labels": []},
+        pr_review_context_fn=lambda *_a, **_k: "ctx",
+    )
+    assert repairs == []  # zero repair workers dispatched
+
+    # Adoption enable-merge step: the same PR lands.
+    merged = _patch_gh(monkeypatch, threads=[critic])
+    o = _outcome(229)
+    _enable_automerge_for_adopted_prs(cfg, [(o, approved)], refused_issues=set(), emit=None)
+
+    assert merged == [o.pr_url]  # merge enabled exactly once
+    assert o.status == "merged"
+    assert any(e["kind"] == "orphan_pr_automerge_enabled" for e in _events(cfg))

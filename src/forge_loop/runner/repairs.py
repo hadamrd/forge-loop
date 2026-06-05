@@ -324,13 +324,12 @@ def enable_automerge_for_repaired_prs(
             continue
         # #230: the re-critic in this repair tick sets ``outcome.error`` when it
         # re-blocks the PR (re-applying critic:blocking/suspicious). THAT is the
-        # signal to hold a PR back — NOT the presence of unresolved review
-        # threads. The old thread gate also blocked APPROVED PRs whose only open
-        # threads were leftover sev3 critic inline comments, which (together
-        # with the selector bug) produced the #229 multi-hour stall. A
-        # critic-approved PR keeps its sev3 threads open forever, so gating on
-        # them never lets it land. GitHub's own branch protection still gates
-        # the actual merge once auto-merge is enabled.
+        # signal to hold a PR back — NOT the presence of leftover *critic* sev3
+        # inline-comment threads. The old gate blocked APPROVED PRs whose only
+        # open threads were the critic's own sev3 notes, which (together with
+        # the selector bug) produced the #229 multi-hour stall: a critic-approved
+        # PR keeps those threads open forever, so gating on them never lets it
+        # land.
         if outcome.error:
             append_event(
                 cfg.events_file,
@@ -338,6 +337,25 @@ def enable_automerge_for_repaired_prs(
                 issue=outcome.issue,
                 pr=outcome.pr_url,
                 reason="critic_blocked",
+            )
+            continue
+        # AC3: an unresolved *human* request-changes thread still holds the PR
+        # back. A human inline-comment thread leaves merge state CLEAN, so we
+        # inspect authorship explicitly (``human_unresolved_threads`` filters
+        # out the critic's own leftover sev3 findings) rather than dropping the
+        # signal wholesale. GitHub branch protection still gates the actual
+        # merge once auto-merge is enabled.
+        human_threads = _gh.human_unresolved_threads(
+            _gh.unresolved_review_threads(outcome.pr_url, repo=cfg.github_repo)
+        )
+        if human_threads:
+            append_event(
+                cfg.events_file,
+                "repair_automerge_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason="human_review_unresolved",
+                unresolved_human_threads=len(human_threads),
             )
             continue
         if _gh.enable_pr_auto_merge(outcome.pr_url, repo=cfg.github_repo):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -272,7 +273,55 @@ def _pr_label_names(pr: dict[str, Any]) -> set[str]:
     return {str(label.get("name") or "") for label in pr.get("labels") or []}
 
 
-def is_approved_mergeable(pr: dict[str, Any]) -> bool:
+#: The critic posts inline findings as ``**[sevN/category]** <message>`` (see
+#: ``critic_actions.post_critic_actions``). That machine signature on the
+#: *opening* comment of a thread — NOT the author login — is how we tell a
+#: leftover *critic* thread from a genuine *human* review thread. We cannot key
+#: off ``author{login}``: when the loop dogfoods itself the critic and human
+#: reviewers can share one GitHub identity, so the login does not discriminate.
+#: The critic's body format is stable code, so it does.
+_CRITIC_INLINE_RE = re.compile(r"^\s*\*\*\[sev[123]/")
+
+
+def _thread_is_critic(thread: dict[str, Any]) -> bool:
+    """Return ``True`` iff a review thread was opened by the critic.
+
+    Classification keys off the *opening* comment (the one that created the
+    thread): a human reply on a critic thread does not make it human, and a
+    critic reply on a human thread does not make it critic. A thread with no
+    comments — or whose opening comment does not match the critic's stable
+    ``**[sevN/...]**`` finding format — is treated as NOT-critic (i.e. human),
+    the conservative direction: we never auto-merge over a thread we cannot
+    prove is the critic's own leftover sev3 note (AC3).
+    """
+    comments = thread.get("comments") or []
+    if not comments:
+        return False
+    body = str((comments[0] or {}).get("body") or "")
+    return bool(_CRITIC_INLINE_RE.match(body))
+
+
+def human_unresolved_threads(
+    threads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the unresolved review threads NOT authored by the critic.
+
+    Issue #230 / AC3: leftover *critic* sev3 inline-comment threads on an
+    approved PR are informational and must NOT, on their own, keep the PR off
+    the merge conveyor (gating on them is exactly what caused the #229
+    multi-hour stall). But unresolved *human* review threads requesting changes
+    MUST still hold the PR back. A human inline-comment thread does not flip
+    ``mergeStateStatus`` off CLEAN, so merge state alone cannot encode this — we
+    filter the threads explicitly by their (non-critic) authorship signature.
+    """
+    return [t for t in threads if not bool(t.get("isResolved")) and not _thread_is_critic(t)]
+
+
+def is_approved_mergeable(
+    pr: dict[str, Any],
+    *,
+    unresolved_threads: list[dict[str, Any]] | None = None,
+) -> bool:
     """Return ``True`` iff a loop PR is critic-approved AND cleanly mergeable.
 
     Issue #230. "Approved" is represented operationally by the *absence* of a
@@ -284,14 +333,25 @@ def is_approved_mergeable(pr: dict[str, Any]) -> bool:
     Such a PR is *terminal* for the repair loop. The critic posts sev3 findings
     as inline comments, which remain unresolved review threads even after an
     APPROVE verdict — those leftover threads must NOT, on their own, re-enter
-    the PR into the repair set (the #229 multi-hour stall). A genuinely blocked
-    PR keeps a block label; a human "request changes" review drops
-    ``mergeStateStatus`` off CLEAN under branch protection — both fail this
-    predicate and remain eligible for repair (acceptance criterion 3).
+    the PR into the repair set (the #229 multi-hour stall).
+
+    AC3: a genuinely blocked PR keeps a block label, and a human "request
+    changes" review usually drops ``mergeStateStatus`` off CLEAN under branch
+    protection — both fail this predicate. But a human inline-comment thread
+    leaves merge state CLEAN, so when the caller has the PR's unresolved review
+    threads it passes them as ``unresolved_threads`` and we additionally exclude
+    any PR carrying an unresolved *human* thread (see
+    :func:`human_unresolved_threads`). When ``unresolved_threads`` is omitted,
+    the predicate falls back to label + CLEAN only.
     """
     if _pr_label_names(pr) & CRITIC_BLOCK_LABELS:
         return False
-    return str(pr.get("mergeStateStatus") or "").upper() == "CLEAN"
+    if str(pr.get("mergeStateStatus") or "").upper() != "CLEAN":
+        return False
+    # AC3: an unresolved *human* review thread keeps the PR off the merge
+    # conveyor even though merge state is CLEAN; leftover critic sev3 threads do
+    # not. ``human_unresolved_threads`` filters the latter out.
+    return not (unresolved_threads and human_unresolved_threads(unresolved_threads))
 
 
 def prs_requiring_repair(
@@ -342,12 +402,14 @@ def prs_requiring_repair(
         all_threads = threads_by_pr.get(int(pr["number"]), [])
         threads = [t for t in all_threads if not bool(t.get("isResolved"))]
 
-        # #230: leftover sev3 critic threads on an APPROVED + CLEAN PR are not,
-        # on their own, a repair trigger. They only count when the PR is
+        # #230: leftover sev3 *critic* threads on an APPROVED + CLEAN PR are
+        # not, on their own, a repair trigger. They only count when the PR is
         # otherwise blocked (block label / DIRTY / CONFLICTING — i.e. NOT
         # approved-mergeable), where a human review or merge conflict is the
-        # real driver.
-        approved_mergeable = is_approved_mergeable(pr)
+        # real driver. An unresolved *human* thread, however, keeps the PR out
+        # of the approved-mergeable set (AC3) — ``is_approved_mergeable`` is
+        # passed the threads so it can make that distinction.
+        approved_mergeable = is_approved_mergeable(pr, unresolved_threads=threads)
         if threads and not approved_mergeable:
             reasons.append("unresolved_review_threads")
 
