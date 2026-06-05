@@ -42,9 +42,16 @@ from forge_loop.worker_state import InvalidTransition, WorkerState
 
 
 class _StubGh:
-    def __init__(self, *, raise_on_label: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        raise_on_label: bool = False,
+        raise_on_remove: bool = False,
+    ) -> None:
         self.labels: list[tuple[str, list[str], str | None]] = []
+        self.removed: list[tuple[str, str, str | None]] = []
         self._raise_on_label = raise_on_label
+        self._raise_on_remove = raise_on_remove
 
     def add_pr_label(
         self,
@@ -55,6 +62,17 @@ class _StubGh:
         if self._raise_on_label:
             raise RuntimeError("simulated gh failure")
         self.labels.append((pr, list(labels), repo))
+        return True
+
+    def remove_pr_label(
+        self,
+        pr: str,
+        label: str,
+        repo: str | None = None,
+    ) -> bool:
+        if self._raise_on_remove:
+            raise RuntimeError("simulated gh remove failure")
+        self.removed.append((pr, label, repo))
         return True
 
 
@@ -328,7 +346,7 @@ def test_unknown_verdict_is_a_noop() -> None:
     result = handle_critic_verdict(
         store=store,
         session_id=sid,
-        report=_report("error"),
+        report=_report("banana"),  # genuinely unrecognised, not "error"
         pr_url=None,
         gh=_StubGh(),
         emit=emit,
@@ -337,6 +355,100 @@ def test_unknown_verdict_is_a_noop() -> None:
     # Session must remain in AWAITING_CRITIC so the next tick can retry.
     assert store.get(sid).state == WorkerState.AWAITING_CRITIC
     assert any(k == "critic_verdict_unknown" for k, _ in events)
+
+
+# ---------------------------------------------------------------------------
+# verdict=error -> errored (issue #245): a crashed re-review must NOT carry a
+# prior round's block label forward, and must surface LOUD via a typed event.
+# ---------------------------------------------------------------------------
+
+
+def test_error_verdict_clears_stale_block_labels_and_emits() -> None:
+    store = WorkerSessionStore(":memory:")
+    sid = _seed_awaiting(store)
+    gh = _StubGh()
+    events, emit = _events()
+
+    result = handle_critic_verdict(
+        store=store,
+        session_id=sid,
+        report=_report("error", raw="boom: parse failed"),
+        pr_url="https://github.com/o/r/pull/110",
+        gh=gh,
+        emit=emit,
+    )
+
+    assert result == "errored"
+    # Stale block labels are re-derived (removed), NOT carried forward.
+    removed_labels = {label for _, label, _ in gh.removed}
+    assert removed_labels == {"critic:blocking", "critic:suspicious"}
+    # Never merged, never abandoned — stays AWAITING_CRITIC for next-tick re-review.
+    assert store.get(sid).state == WorkerState.AWAITING_CRITIC
+    # Observable: a typed error event with the error tail.
+    errored = [kw for k, kw in events if k == "critic_review_errored"]
+    assert len(errored) == 1
+    assert errored[0]["pr"] == "https://github.com/o/r/pull/110"
+    assert "boom" in errored[0]["error"]
+    assert not any(k == "critic_verdict_unknown" for k, _ in events)
+
+
+def test_error_verdict_with_none_report_is_errored() -> None:
+    """A crashed review yields report=None — must NOT fall through to noop."""
+    store = WorkerSessionStore(":memory:")
+    sid = _seed_awaiting(store)
+    gh = _StubGh()
+    events, emit = _events()
+
+    result = handle_critic_verdict(
+        store=store,
+        session_id=sid,
+        report=None,
+        pr_url="https://github.com/o/r/pull/110",
+        gh=gh,
+        emit=emit,
+    )
+
+    assert result == "errored"
+    assert {label for _, label, _ in gh.removed} == {"critic:blocking", "critic:suspicious"}
+    assert store.get(sid).state == WorkerState.AWAITING_CRITIC
+    assert any(k == "critic_review_errored" for k, _ in events)
+
+
+def test_error_verdict_label_clear_failure_does_not_raise() -> None:
+    """A gh failure while clearing must not corrupt the FSM or raise."""
+    store = WorkerSessionStore(":memory:")
+    sid = _seed_awaiting(store)
+    gh = _StubGh(raise_on_remove=True)
+    events, emit = _events()
+
+    result = handle_critic_verdict(
+        store=store,
+        session_id=sid,
+        report=_report("error"),
+        pr_url="https://github.com/o/r/pull/110",
+        gh=gh,
+        emit=emit,
+    )
+
+    assert result == "errored"
+    assert store.get(sid).state == WorkerState.AWAITING_CRITIC
+    assert any(k == "critic_label_clear_failed" for k, _ in events)
+
+
+def test_error_verdict_without_pr_url_skips_label_call() -> None:
+    store = WorkerSessionStore(":memory:")
+    sid = _seed_awaiting(store)
+    gh = _StubGh()
+    result = handle_critic_verdict(
+        store=store,
+        session_id=sid,
+        report=_report("error"),
+        pr_url=None,
+        gh=gh,
+    )
+    assert result == "errored"
+    assert gh.removed == []
+    assert store.get(sid).state == WorkerState.AWAITING_CRITIC
 
 
 def test_wrong_starting_state_raises_invalid_transition() -> None:
