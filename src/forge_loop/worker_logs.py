@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from forge_loop.events import read_events
+
 # Per-row payload truncation (bytes/chars). Big tool_use inputs (e.g. a 5KB
 # file write) and tool_result content blow up the context window when a
 # debugger asks for ``tail=50`` — truncate inline so the tool stays usable.
@@ -94,20 +96,10 @@ def parse_worker_log(
     if not log_path.exists():
         return []
     rows: list[dict[str, Any]] = []
-    with open(log_path, "rb") as f:
-        for raw in f:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(ev, dict):
-                continue
-            if kind_filter is not None and ev.get("kind") != kind_filter:
-                continue
-            rows.append(_strip_large_payloads(ev))
+    for ev in read_events(log_path):
+        if kind_filter is not None and ev.get("kind") != kind_filter:
+            continue
+        rows.append(_strip_large_payloads(ev))
     if tail is not None and tail >= 0:
         rows = rows[-tail:]
     return rows

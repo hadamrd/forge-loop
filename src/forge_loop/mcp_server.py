@@ -267,13 +267,12 @@ def worker_logs(
 @mcp.tool()
 def loop_events(n: int = 30) -> list[dict[str, Any]]:
     """Tail the structured events log (last ``n`` entries)."""
-    import json
+    from forge_loop.events import read_events
 
     cfg = load_config()
     if not cfg.events_file.exists():
         return []
-    lines = cfg.events_file.read_text().splitlines()[-n:]
-    return [json.loads(line) for line in lines if line.strip()]
+    return list(read_events(cfg.events_file, tail=n))
 
 
 # ── Attempt history + critic tools ──────────────────────────────────────────

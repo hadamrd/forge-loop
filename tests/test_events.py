@@ -18,6 +18,7 @@ from forge_loop.events import (
     WorktreeReapedEvent,
     append_event_with_registry_check,
     emit,
+    read_events,
     register_event,
 )
 from forge_loop.state import append_event
@@ -160,3 +161,111 @@ def test_loose_path_preserves_extra_fields(tmp_path: Path) -> None:
         )
     rec = json.loads(events_file.read_text().strip())
     assert rec["unknown_extra_field"] == "kept"
+
+
+# ---------------------------------------------------------------------------
+# read_events — the ONE shared JSONL reader (issue #224). Covers the
+# malformed-line skip + tail-bound logic that used to be copy-pasted across
+# ~12 modules.
+# ---------------------------------------------------------------------------
+
+
+def _write_lines(path: Path, lines: list[str]) -> None:
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_read_events_happy_path_yields_dicts_in_order(tmp_path: Path) -> None:
+    p = tmp_path / "events.jsonl"
+    _write_lines(p, ['{"kind": "a", "n": 1}', '{"kind": "b", "n": 2}'])
+    out = list(read_events(p))
+    assert out == [{"kind": "a", "n": 1}, {"kind": "b", "n": 2}]
+
+
+def test_read_events_skips_malformed_and_blank_lines(tmp_path: Path) -> None:
+    p = tmp_path / "events.jsonl"
+    _write_lines(
+        p,
+        [
+            '{"kind": "ok1"}',
+            "",  # blank
+            "{not valid json",  # half-written / corrupt
+            "   ",  # whitespace-only
+            '{"kind": "ok2"}',
+        ],
+    )
+    out = list(read_events(p))
+    assert out == [{"kind": "ok1"}, {"kind": "ok2"}]
+
+
+def test_read_events_skips_non_dict_json(tmp_path: Path) -> None:
+    """A valid-JSON scalar/array is not an event record — the contract is
+    Iterator[dict], so non-objects are dropped."""
+    p = tmp_path / "events.jsonl"
+    _write_lines(p, ["123", '"a string"', "[1, 2, 3]", '{"kind": "real"}'])
+    assert list(read_events(p)) == [{"kind": "real"}]
+
+
+def test_read_events_tail_bounds_to_last_n_records(tmp_path: Path) -> None:
+    p = tmp_path / "events.jsonl"
+    _write_lines(p, [f'{{"n": {i}}}' for i in range(10)])
+    out = list(read_events(p, tail=3))
+    assert [e["n"] for e in out] == [7, 8, 9]
+
+
+def test_read_events_tail_counts_records_not_lines(tmp_path: Path) -> None:
+    """tail bounds *yielded records*, so malformed lines interleaved with
+    the tail window don't eat into the count."""
+    p = tmp_path / "events.jsonl"
+    _write_lines(
+        p,
+        ['{"n": 0}', "GARBAGE", '{"n": 1}', "", '{"n": 2}'],
+    )
+    out = list(read_events(p, tail=2))
+    assert [e["n"] for e in out] == [1, 2]
+
+
+def test_read_events_tail_zero_yields_nothing(tmp_path: Path) -> None:
+    p = tmp_path / "events.jsonl"
+    _write_lines(p, ['{"n": 1}', '{"n": 2}'])
+    assert list(read_events(p, tail=0)) == []
+
+
+def test_read_events_tail_larger_than_file_yields_all(tmp_path: Path) -> None:
+    p = tmp_path / "events.jsonl"
+    _write_lines(p, ['{"n": 1}', '{"n": 2}'])
+    assert [e["n"] for e in read_events(p, tail=999)] == [1, 2]
+
+
+def test_read_events_negative_tail_raises(tmp_path: Path) -> None:
+    """Adversarial: a negative tail is a programming error, not a silent
+    no-op — it must raise rather than guess."""
+    p = tmp_path / "events.jsonl"
+    _write_lines(p, ['{"n": 1}'])
+    with pytest.raises(ValueError, match="tail must be >= 0"):
+        list(read_events(p, tail=-1))
+
+
+def test_read_events_missing_file_raises_oserror(tmp_path: Path) -> None:
+    """Adversarial / T2: read_events does NOT swallow OSError — callers
+    keep their own exists()/try-except guard. A missing path must raise
+    when iterated, not silently yield nothing."""
+    missing = tmp_path / "nope.jsonl"
+    with pytest.raises(OSError):
+        list(read_events(missing))
+
+
+def test_read_events_tolerates_non_utf8_bytes(tmp_path: Path) -> None:
+    """A non-UTF-8 / half-flushed byte sequence must not crash the reader
+    (errors='replace'); valid records around it still come through."""
+    p = tmp_path / "events.jsonl"
+    p.write_bytes(b'{"kind": "before"}\n\xff\xfe not utf8\n{"kind": "after"}\n')
+    out = list(read_events(p))
+    assert out == [{"kind": "before"}, {"kind": "after"}]
+
+
+def test_read_events_returns_lazy_iterator_when_untailed(tmp_path: Path) -> None:
+    p = tmp_path / "events.jsonl"
+    _write_lines(p, ['{"n": 1}', '{"n": 2}'])
+    it = read_events(p)
+    assert iter(it) is iter(it)  # it's an iterator, not a re-iterable list
+    assert next(iter(it))["n"] == 1

@@ -12,6 +12,7 @@ from typing import Any
 import typer
 
 from forge_loop.control.status import collect_control_plane_status
+from forge_loop.events import read_events
 from forge_loop.state import tail_events
 
 
@@ -64,18 +65,12 @@ class StatusCommandsMixin:
             "worker_completed",
             "worker_merged",
         }
-        raw: list[str] = []
         if cfg.events_file.exists():
             try:
-                with open(cfg.events_file) as f:
-                    raw = f.readlines()
+                recent = list(read_events(cfg.events_file))
             except OSError:
-                raw = []
-            for line in raw[-500:]:
-                try:
-                    e = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                recent = []
+            for e in recent[-500:]:
                 ts = e.get("ts", "")
                 kind = e.get("kind", "")
                 try:
@@ -94,7 +89,7 @@ class StatusCommandsMixin:
                 issue = e.get("issue") or e.get("issue_number")
                 if not isinstance(issue, int):
                     try:
-                        issue = int(issue)
+                        issue = int(issue) if issue is not None else None
                     except (TypeError, ValueError):
                         issue = None
                 if isinstance(issue, int):
@@ -113,14 +108,10 @@ class StatusCommandsMixin:
                         active_workers_by_issue.pop(issue, None)
                     elif issue in active_workers_by_issue:
                         active_workers_by_issue[issue]["last_event_ts"] = ts
-            for line in raw[-5:]:
-                try:
-                    e = json.loads(line)
-                    last_5_events.append(
-                        {"ts": str(e.get("ts", "?")), "kind": str(e.get("kind", "?"))}
-                    )
-                except json.JSONDecodeError:
-                    pass
+            for e in recent[-5:]:
+                last_5_events.append(
+                    {"ts": str(e.get("ts", "?")), "kind": str(e.get("kind", "?"))}
+                )
         active_workers = list(active_workers_by_issue.values())
         runner_stale = state_blob.get("state") == "running" and not pid_alive and not active_workers
         if not active_workers and state_blob.get("state") == "running":

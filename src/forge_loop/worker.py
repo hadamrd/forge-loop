@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from forge_loop.events import read_events
 from forge_loop.sandbox import CapabilityPolicy
 from forge_loop.worker_brief import (
     brief_template_hash as _brief_template_hash,
@@ -76,17 +77,9 @@ def _branch_name(n: int, title: str) -> str:
 def _extract_outcome(log_path: Path) -> tuple[str | None, str]:
     """Parse the final `result` event from a claude stream-json log."""
     last_result_text = ""
-    with open(log_path, "rb") as f:
-        for raw in f:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if e.get("type") == "result":
-                last_result_text = e.get("result", "") or ""
+    for e in read_events(log_path):
+        if e.get("type") == "result":
+            last_result_text = e.get("result", "") or ""
 
     pr_url: str | None = None
     status = "no_pr"
@@ -829,13 +822,4 @@ def _read_subagent_events(worktree: Path) -> list[dict[str, Any]]:
     path = worktree / "sprint-events.jsonl"
     if not path.exists():
         return []
-    out: list[dict[str, Any]] = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
+    return list(read_events(path))

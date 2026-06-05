@@ -34,14 +34,13 @@ The sweep is conservative on purpose:
 
 from __future__ import annotations
 
-import json
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from forge_loop.events import EventBase, StuckSweepDemotedEvent, emit
+from forge_loop.events import EventBase, StuckSweepDemotedEvent, emit, read_events
 from forge_loop.log import get_logger
 
 # ---------------------------------------------------------------------------
@@ -132,25 +131,9 @@ def _read_tail(events_file: Path, tail: int) -> list[dict[str, Any]]:
     if not events_file.exists():
         return []
     try:
-        # We read the whole file because ``tail`` is small (default 100)
-        # and events.jsonl is bounded by the rotate setting. Seeking from
-        # the end would save IO on huge logs but adds complexity that
-        # isn't earning its keep here.
-        lines = events_file.read_text().splitlines()
+        return list(read_events(events_file, tail=tail))
     except OSError:
         return []
-    out: list[dict[str, Any]] = []
-    for line in lines[-tail:]:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(rec, dict):
-            out.append(rec)
-    return out
 
 
 # ---------------------------------------------------------------------------
