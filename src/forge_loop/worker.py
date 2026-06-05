@@ -187,6 +187,86 @@ def _emit_worker_event(
         emit(kind, payload)
 
 
+def _preflight_worker_env(
+    *,
+    repo: Path,
+    n: int,
+    title: str,
+    tick: int | None,
+    worktree: Path,
+    emit: Callable[[str, dict[str, Any]], None] | None,
+    env_path_prepend: tuple[str, ...],
+    env_vars: dict[str, str],
+    env_require: tuple[str, ...],
+) -> WorkerOutcome | None:
+    """Provision + preflight the worker's declared toolchain contract.
+
+    The 2026-06-05 silent-toolchain incident: a worker inherited the
+    orchestrator's ambient env (system python, no project ``.venv`` on PATH)
+    so ``pyright`` / ``pytest`` failed with ``command not found`` and the
+    worker burned ~20 min retrying variants with NO error surfaced. This makes
+    the toolchain an EXPLICIT, verified dependency:
+
+    * No env block declared at all → emit a ``worker_env_undeclared`` warning
+      (visible gap) and proceed.
+    * ``env_require`` non-empty and a tool is missing on the PROVISIONED PATH →
+      emit ``worker_toolchain_unavailable`` and return a failed WorkerOutcome
+      so the caller ABORTS before starting the doomed SDK session.
+
+    Returns ``None`` to proceed, or a terminal failed :class:`WorkerOutcome`.
+    """
+    if not (env_path_prepend or env_vars or env_require):
+        _emit_worker_event(
+            emit,
+            "worker_env_undeclared",
+            issue=n,
+            title=title,
+            tick=tick,
+            worktree=str(worktree),
+        )
+        return None
+
+    if not env_require:
+        return None
+
+    from forge_loop._worker_sdk import _clean_sdk_env
+    from forge_loop.worker_env import build_worker_env, missing_tools
+
+    preflight_env = build_worker_env(
+        _clean_sdk_env(),
+        repo=repo,
+        path_prepend=env_path_prepend,
+        vars=env_vars,
+    )
+    missing = missing_tools(preflight_env, env_require)
+    if not missing:
+        return None
+
+    _emit_worker_event(
+        emit,
+        "worker_toolchain_unavailable",
+        issue=n,
+        title=title,
+        tick=tick,
+        missing=missing,
+        path=preflight_env.get("PATH", ""),
+        venv=preflight_env.get("VIRTUAL_ENV", ""),
+        worktree=str(worktree),
+    )
+    return WorkerOutcome(
+        issue=n,
+        title=title,
+        pr_url=None,
+        status="failed",
+        duration_s=0.0,
+        stdout_tail=(
+            f"required worker toolchain missing: {', '.join(missing)} "
+            f"(PATH={preflight_env.get('PATH', '')})"
+        ),
+        error=f"worker_toolchain_unavailable: {', '.join(missing)}",
+    )
+
+
 def run_worker(
     issue: dict[str, Any],
     repo: Path,
@@ -214,6 +294,10 @@ def run_worker(
     events_file: Path | None = None,
     maestro_context: str = "",
     permissions: str = "full",
+    env_path_prepend: tuple[str, ...] = (),
+    env_vars: dict[str, str] | None = None,
+    env_require: tuple[str, ...] = (),
+    verify_commands: tuple[str, ...] = (),
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -267,6 +351,24 @@ def run_worker(
         log_path=str(log_path),
         branch=branch,
     )
+    # Worker environment contract — PREFLIGHT before driving a doomed session
+    # (the 2026-06-05 silent-toolchain incident). Abort loud if a required tool
+    # is missing on the provisioned PATH; warn if no env block was declared.
+    env_vars = env_vars or {}
+    aborted = _preflight_worker_env(
+        repo=repo,
+        n=n,
+        title=title,
+        tick=tick,
+        worktree=worktree,
+        emit=emit,
+        env_path_prepend=env_path_prepend,
+        env_vars=env_vars,
+        env_require=env_require,
+    )
+    if aborted is not None:
+        return aborted
+
     # Issue #132 — discover the active manifestos once at dispatch time.
     # The bundle threads into BOTH the brief renderer (prepends MANIFESTO
     # block) AND the outcome telemetry (``manifesto_sha`` audit field).
@@ -299,6 +401,7 @@ def run_worker(
             coauthor=coauthor,
             manifesto_bundle=manifesto_bundle,
             capability_policy=capability_policy,
+            verify_commands=verify_commands,
         )
 
     # Maestro advisory context (frontier + memory) rides on top of the brief.
@@ -353,6 +456,9 @@ def run_worker(
             mcp_servers=mcp_servers,
             permission_mode=_claude_opts["permission_mode"],
             sandbox=_claude_opts.get("sandbox"),
+            repo=repo,
+            env_path_prepend=env_path_prepend,
+            env_vars=env_vars,
         )
         outcome.manifesto_sha = manifesto_sha
         _emit_worker_event(
@@ -406,6 +512,10 @@ def run_repair_worker(
     capability_policy: CapabilityPolicy | None = None,
     events_file: Path | None = None,
     permissions: str = "full",
+    env_path_prepend: tuple[str, ...] = (),
+    env_vars: dict[str, str] | None = None,
+    env_require: tuple[str, ...] = (),
+    verify_commands: tuple[str, ...] = (),
 ) -> WorkerOutcome:
     """Repair an existing blocked PR by pushing to its head branch."""
     n = issue["number"]
@@ -440,6 +550,25 @@ def run_repair_worker(
             stdout_tail=err[-500:],
             error="repair-worktree-create-failed",
         )
+    # Same toolchain preflight as the fresh-worker path: a repair worker runs
+    # the same verify gates (pyright/pytest) and would silently degrade on a
+    # missing toolchain just the same (2026-06-05 incident).
+    env_vars = env_vars or {}
+    aborted = _preflight_worker_env(
+        repo=repo,
+        n=n,
+        title=title,
+        tick=tick,
+        worktree=worktree,
+        emit=emit,
+        env_path_prepend=env_path_prepend,
+        env_vars=env_vars,
+        env_require=env_require,
+    )
+    if aborted is not None:
+        aborted.pr_url = pr_url
+        return aborted
+
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"repair-{n}-{int(time.time())}.log"
     brief = make_repair_brief(
@@ -450,6 +579,7 @@ def run_repair_worker(
         lumen_top_k=lumen_top_k,
         lumen_test_pattern=lumen_test_pattern,
         coauthor=coauthor,
+        verify_commands=verify_commands,
     )
     from forge_loop.worker_permissions import claude_permission_options, codex_sandbox_args
 
@@ -480,6 +610,9 @@ def run_repair_worker(
         mcp_servers=mcp_servers,
         permission_mode=_claude_opts["permission_mode"],
         sandbox=_claude_opts.get("sandbox"),
+        repo=repo,
+        env_path_prepend=env_path_prepend,
+        env_vars=env_vars,
     )
 
 
@@ -565,6 +698,9 @@ def _run_worker_sdk(
     mcp_servers: dict[str, Any] | None = None,
     permission_mode: str = "bypassPermissions",
     sandbox: dict[str, Any] | None = None,
+    repo: Path | None = None,
+    env_path_prepend: tuple[str, ...] = (),
+    env_vars: dict[str, str] | None = None,
 ) -> WorkerOutcome:
     """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
 
@@ -591,6 +727,9 @@ def _run_worker_sdk(
                 brief,
                 cwd=worktree,
                 max_turns=120,
+                repo=repo,
+                env_path_prepend=env_path_prepend,
+                env_vars=env_vars or {},
                 add_dirs=[worktree],
                 permission_mode=permission_mode,
                 sandbox=sandbox,

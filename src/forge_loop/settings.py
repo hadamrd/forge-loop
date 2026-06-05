@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -247,6 +248,44 @@ class WorkerSettings(BaseSettings):
     # forge_loop.worker_permissions. 'full' = today's behaviour (full host
     # access, no sandbox); the others are opt-in confinement.
     permissions: str = "full"
+    # Worker environment contract (the 2026-06-05 silent-toolchain incident).
+    # Declared, per-project so the loop can PROVISION + PREFLIGHT the worker's
+    # toolchain instead of silently inheriting the orchestrator's ambient env.
+    # Nested under yaml ``worker.env`` / ``worker.verify``; see
+    # forge_loop.worker_env for the provisioning + preflight implementation.
+    env_path_prepend: tuple[str, ...] = ()
+    env_vars: dict[str, str] = Field(default_factory=dict)
+    env_require: tuple[str, ...] = ()
+    verify_commands: tuple[str, ...] = ()
+
+    @field_validator("env_path_prepend", "env_require", mode="before")
+    @classmethod
+    def _coerce_env_tuple(cls, v: Any) -> tuple[str, ...]:
+        return _coerce_str_tuple(v)
+
+    @field_validator("verify_commands", mode="before")
+    @classmethod
+    def _coerce_verify(cls, v: Any) -> tuple[str, ...]:
+        # Verify commands are full shell lines — split ONLY on list/tuple
+        # boundaries, never on commas (a command can contain commas), so a
+        # yaml list of command strings round-trips verbatim.
+        if v is None:
+            return ()
+        if isinstance(v, str):
+            v = v.strip()
+            return (v,) if v else ()
+        if isinstance(v, (list, tuple)):
+            return tuple(str(c) for c in v if str(c).strip())
+        return (str(v),)
+
+    @field_validator("env_vars", mode="before")
+    @classmethod
+    def _coerce_env_vars(cls, v: Any) -> dict[str, str]:
+        if v is None:
+            return {}
+        if isinstance(v, Mapping):
+            return {str(k): str(val) for k, val in v.items()}
+        raise ConfigError(f"worker.env.vars={v!r} — expected a mapping of name -> value")
 
     @field_validator("provider")
     @classmethod
@@ -463,6 +502,24 @@ class Settings(BaseSettings):
             "maintenance": {**(y.get("maintenance") or {})},
             "misc": {**(y.get("misc") or {})},
         }
+
+        # Flatten the nested ``worker.env`` / ``worker.verify`` yaml block onto
+        # the flat WorkerSettings fields. The contract is authored nested for
+        # operator readability (env-and-verify grouped under worker), but the
+        # settings model keeps the fields flat so the env-overlay + Config
+        # translation stay uniform. ``extra="ignore"`` would otherwise drop the
+        # nested keys silently — flatten BEFORE validation so they land.
+        worker_block = raw["worker"]
+        env_block = worker_block.pop("env", None) or {}
+        if isinstance(env_block, Mapping):
+            if "path_prepend" in env_block:
+                worker_block["env_path_prepend"] = env_block["path_prepend"]
+            if "vars" in env_block:
+                worker_block["env_vars"] = env_block["vars"]
+            if "require" in env_block:
+                worker_block["env_require"] = env_block["require"]
+        if "verify" in worker_block:
+            worker_block["verify_commands"] = worker_block.pop("verify")
 
         # ENV OVERLAY — each LOOP_* env var maps to one nested field. Done
         # explicitly (not via env_prefix auto-mapping) because the existing

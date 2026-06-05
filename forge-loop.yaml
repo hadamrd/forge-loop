@@ -32,6 +32,14 @@ worker:
   provider: codex
   model: ""
   thinking: medium
+  # Worker environment contract — DECLARE + PREFLIGHT the toolchain so a
+  # worker never silently inherits the orchestrator's ambient env (the
+  # 2026-06-05 silent-toolchain incident). See forge_loop.worker_env.
+  env:
+    path_prepend: [".venv/bin"]
+    vars: { VIRTUAL_ENV: ".venv" }
+    require: [python, ruff, pytest, pyright]
+  verify: ["ruff check src tests", "pyright src/forge_loop", "python -m pytest -q"]
 
 po:
   enabled: false

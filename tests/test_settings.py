@@ -300,3 +300,77 @@ def test_no_loop_env_reads_outside_settings() -> None:
         "Add the knob to Settings + ENV_MAP, or extend _ALLOWED_LEGACY_SITES "
         "with a comment justifying why it's dynamic."
     )
+
+
+# ---------------------------------------------------------------------------
+# Worker environment contract (2026-06-05 silent-toolchain incident) — the
+# nested ``worker.env`` / ``worker.verify`` yaml block flattens onto the
+# WorkerSettings fields and is exposed on the legacy Config dataclass.
+# ---------------------------------------------------------------------------
+
+
+def test_worker_env_block_parses_into_settings(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LOOP_GH_REPO", "owner/repo")
+    (fake_repo / "forge-loop.yaml").write_text(dedent("""
+        repo:
+          github: owner/repo
+        worker:
+          env:
+            path_prepend: [".venv/bin"]
+            vars: { VIRTUAL_ENV: ".venv" }
+            require: [python, ruff, pytest, pyright]
+          verify: ["ruff check src tests", "pyright src/forge_loop", "python -m pytest -q"]
+    """))
+    s = Settings.load()
+    assert s.worker.env_path_prepend == (".venv/bin",)
+    assert s.worker.env_vars == {"VIRTUAL_ENV": ".venv"}
+    assert s.worker.env_require == ("python", "ruff", "pytest", "pyright")
+    # Verify commands split ONLY on list boundaries — commands keep spaces.
+    assert s.worker.verify_commands == (
+        "ruff check src tests",
+        "pyright src/forge_loop",
+        "python -m pytest -q",
+    )
+
+
+def test_worker_env_absent_defaults_to_empty(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LOOP_GH_REPO", "owner/repo")
+    (fake_repo / "forge-loop.yaml").write_text(dedent("""
+        repo:
+          github: owner/repo
+        worker:
+          model: claude-sonnet-4-6
+    """))
+    s = Settings.load()
+    assert s.worker.env_path_prepend == ()
+    assert s.worker.env_vars == {}
+    assert s.worker.env_require == ()
+    assert s.worker.verify_commands == ()
+
+
+def test_worker_env_threads_onto_legacy_config(
+    fake_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge_loop import config as config_mod
+
+    monkeypatch.setattr("forge_loop.config._settings_mod._repo_root", lambda: fake_repo)
+    monkeypatch.setenv("LOOP_GH_REPO", "owner/repo")
+    (fake_repo / "forge-loop.yaml").write_text(dedent("""
+        repo:
+          github: owner/repo
+        worker:
+          env:
+            path_prepend: [".venv/bin"]
+            vars: { VIRTUAL_ENV: ".venv" }
+            require: [pytest]
+          verify: ["python -m pytest -q"]
+    """))
+    cfg = config_mod.load()
+    assert cfg.worker.env_path_prepend == (".venv/bin",)
+    assert cfg.worker.env_vars == {"VIRTUAL_ENV": ".venv"}
+    assert cfg.worker.env_require == ("pytest",)
+    assert cfg.worker.verify_commands == ("python -m pytest -q",)

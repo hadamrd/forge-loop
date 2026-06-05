@@ -551,6 +551,10 @@ def _run_worker_with_saga(
                 capability_policy=capability_policy,
                 events_file=cfg.events_file,
                 maestro_context=maestro_context,
+                env_path_prepend=getattr(cfg.worker, "env_path_prepend", ()),
+                env_vars=getattr(cfg.worker, "env_vars", {}),
+                env_require=getattr(cfg.worker, "env_require", ()),
+                verify_commands=getattr(cfg.worker, "verify_commands", ()),
             )
         except BaseException:
             _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
@@ -593,6 +597,10 @@ def _run_worker_with_saga(
             events_file=cfg.events_file,
             maestro_context=maestro_context,
             permissions=getattr(cfg.worker, "permissions", "full"),
+            env_path_prepend=getattr(cfg.worker, "env_path_prepend", ()),
+            env_vars=getattr(cfg.worker, "env_vars", {}),
+            env_require=getattr(cfg.worker, "env_require", ()),
+            verify_commands=getattr(cfg.worker, "verify_commands", ()),
         )
     except BaseException as ex_:
         # The subprocess crashed before producing a WorkerOutcome. We
@@ -805,6 +813,10 @@ def _run_repair_workers(
                     allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
                 ),
                 events_file=cfg.events_file,
+                env_path_prepend=getattr(cfg.worker, "env_path_prepend", ()),
+                env_vars=getattr(cfg.worker, "env_vars", {}),
+                env_require=getattr(cfg.worker, "env_require", ()),
+                verify_commands=getattr(cfg.worker, "verify_commands", ()),
             )
             for issue, pr, review_context in repairs
         ]
