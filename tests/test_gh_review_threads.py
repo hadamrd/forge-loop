@@ -17,6 +17,7 @@ import pytest
 
 from forge_loop import gh_issues
 from forge_loop.gh_client import GithubkitClient, MockGhClient, PullRequest
+from tests.conftest import make_critic_thread, make_human_thread
 
 
 @pytest.fixture(autouse=True)
@@ -263,39 +264,15 @@ def _gql_thread(id_: str, *, resolved: bool = False) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _comment_thread(
-    id_: str, *, body: str, author: str = "critic-bot", resolved: bool = False
-) -> dict[str, Any]:
-    """A normalised review-thread node (as ``review_threads_batch`` returns it:
-    ``comments`` is a flat list). The *opening* comment's ``body`` is what
-    classifies the thread as critic vs human (#230)."""
-    return {
-        "id": id_,
-        "isResolved": resolved,
-        "isOutdated": False,
-        "path": "src/app.py",
-        "line": 12,
-        "comments": [
-            {
-                "author": {"login": author},
-                "body": body,
-                "path": "src/app.py",
-                "line": 12,
-            }
-        ],
-    }
-
-
+# Centralised in conftest (#230 sev3/tests): ONE thread factory, critic body
+# derived from the real ``critic_format.finding_tag`` formatter so a producer
+# format drift breaks these tests instead of being silently masked.
 def _critic_thread(id_: str, *, sev: str = "sev3", resolved: bool = False) -> dict[str, Any]:
-    return _comment_thread(
-        id_, body=f"**[{sev}/correctness]** leftover critic finding", resolved=resolved
-    )
+    return make_critic_thread(id_, sev=sev, resolved=resolved)
 
 
 def _human_thread(id_: str, *, resolved: bool = False) -> dict[str, Any]:
-    return _comment_thread(
-        id_, body="Please rework this design.", author="alice", resolved=resolved
-    )
+    return make_human_thread(id_, resolved=resolved)
 
 
 # --- is_approved_mergeable (pure predicate) --------------------------------

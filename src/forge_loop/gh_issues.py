@@ -15,11 +15,11 @@ as gh``), so the ``gh.<fn>(...)`` call shape is preserved byte-for-byte.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any
 
+from forge_loop.critic_format import is_finding_body
 from forge_loop.gh_client import GhClient, GithubkitClient, Issue
 
 _GH_CLIENT: GhClient | None = None
@@ -237,13 +237,16 @@ def _pr_label_names(pr: dict[str, Any]) -> set[str]:
 
 
 #: The critic posts inline findings as ``**[sevN/category]** <message>`` (see
-#: ``critic_actions.post_critic_actions``). That machine signature on the
+#: ``critic_actions.apply_critic_report``). That machine signature on the
 #: *opening* comment of a thread — NOT the author login — is how we tell a
 #: leftover *critic* thread from a genuine *human* review thread. We cannot key
 #: off ``author{login}``: when the loop dogfoods itself the critic and human
 #: reviewers can share one GitHub identity, so the login does not discriminate.
-#: The critic's body format is stable code, so it does.
-_CRITIC_INLINE_RE = re.compile(r"^\s*\*\*\[sev[123]/")
+#: The critic's body format is stable code, so it does. The producer
+#: (``critic_actions``) and this classifier share ONE spelling of that format
+#: via ``critic_format`` — see :func:`critic_format.is_finding_body` — so a
+#: change to the tag on one side cannot silently desync the other (#230
+#: sev2/architecture).
 
 
 def _thread_is_critic(thread: dict[str, Any]) -> bool:
@@ -253,15 +256,22 @@ def _thread_is_critic(thread: dict[str, Any]) -> bool:
     thread): a human reply on a critic thread does not make it human, and a
     critic reply on a human thread does not make it critic. A thread with no
     comments — or whose opening comment does not match the critic's stable
-    ``**[sevN/...]**`` finding format — is treated as NOT-critic (i.e. human),
-    the conservative direction: we never auto-merge over a thread we cannot
-    prove is the critic's own leftover sev3 note (AC3).
+    ``**[<sev>/<category>]**`` finding format — is treated as NOT-critic (i.e.
+    human), the conservative direction: we never auto-merge over a thread we
+    cannot prove is the critic's own leftover sev3 note (AC3).
+
+    The match requires the *full* tag (known severity AND known category, with
+    the closing ``]**``), not just a ``**[sev`` prefix, so a human comment that
+    merely opens with two asterisks — or quotes/pastes an unknown
+    ``[sevN/...]`` token — is not mistaken for the critic's own finding (#230
+    sev3/correctness: silently merging past a human request-changes is the
+    exact AC3 violation the fix must prevent).
     """
     comments = thread.get("comments") or []
     if not comments:
         return False
     body = str((comments[0] or {}).get("body") or "")
-    return bool(_CRITIC_INLINE_RE.match(body))
+    return is_finding_body(body)
 
 
 def human_unresolved_threads(

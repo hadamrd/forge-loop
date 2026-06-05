@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from forge_loop.critic import CriticReport, Finding
+from forge_loop.critic_format import finding_tag
 
 MIN_SUSPICIOUS_APPROVE_LINES = 100
 
@@ -166,7 +167,7 @@ def apply_critic_report(
             "post_review_comment",
             gh.post_review_comment(
                 pr_url,
-                f"**[{f.severity}/{f.category}]** {f.message}",
+                f"{finding_tag(f.severity, f.category)} {f.message}",
                 file=f.file,
                 line=f.line,
                 repo=repo,
@@ -178,7 +179,7 @@ def apply_critic_report(
 
     if plan.summary_comments:
         summary = "\n".join(
-            f"- **[{f.severity}/{f.category}]** "
+            f"- {finding_tag(f.severity, f.category)} "
             f"{f.file or ''}{':' + str(f.line) if f.line else ''}"
             f"{' — ' if (f.file or f.line) else ''}{f.message}"
             for f in plan.summary_comments

@@ -24,7 +24,9 @@ from forge_loop.config import (
     LumenConfig,
     POConfig,
 )
+from forge_loop.gh_client import MockGhClient
 from forge_loop.runner.repairs import loop_issue_from_branch, orphaned_clean_pr_adoptions
+from tests.conftest import make_critic_thread, make_human_thread
 
 PR = "https://github.com/o/r/pull/205"
 
@@ -317,25 +319,14 @@ def _outcome(issue: int, *, status: str = "open", error: str | None = None) -> W
     )
 
 
+# Centralised in conftest (#230 sev3/tests): the critic body is derived from
+# the real ``critic_format.finding_tag`` so a producer drift breaks these tests.
 def _critic_thread(id_: str = "t-sev3") -> dict[str, Any]:
-    """A leftover CRITIC sev3 inline-comment thread (the ``**[sevN/...]**`` body
-    signature ``critic_actions`` emits). These must NOT hold an approved PR
-    back (#230)."""
-    return {
-        "id": id_,
-        "isResolved": False,
-        "comments": [{"author": {"login": "critic-bot"}, "body": "**[sev3/style]** nit"}],
-    }
+    return make_critic_thread(id_, sev="sev3", category="style")
 
 
 def _human_thread(id_: str = "t-human") -> dict[str, Any]:
-    """A human request-changes thread (free prose, not the critic signature).
-    AC3: this MUST hold a PR back even when CLEAN with no block label."""
-    return {
-        "id": id_,
-        "isResolved": False,
-        "comments": [{"author": {"login": "alice"}, "body": "Please rework this."}],
-    }
+    return make_human_thread(id_)
 
 
 def _patch_gh(monkeypatch, *, threads: list[Any] | None = None) -> list[str]:
@@ -765,3 +756,79 @@ def test_tick_merges_approved_pr_and_dispatches_no_repair(tmp_path: Path, monkey
     assert merged == [o.pr_url]  # merge enabled exactly once
     assert o.status == "merged"
     assert any(e["kind"] == "orphan_pr_automerge_enabled" for e in _events(cfg))
+
+
+class _StampingMockGh(MockGhClient):  # type: ignore[misc, valid-type]
+    """A ``MockGhClient`` whose ``add_pr_label`` also mutates the in-memory open
+    PR so a *subsequent* tick's selectors observe the stamped label — letting us
+    prove terminal idempotency (``loop:adopted``) through the REAL tick path."""
+
+    def add_pr_label(self, owner: str, repo: str, number: int, labels: list[str]) -> bool:
+        for pr in self.open_prs_response:
+            if pr.get("number") == number:
+                pr["labels"] = [*(pr.get("labels") or []), *({"name": lbl} for lbl in labels)]
+        return super().add_pr_label(owner, repo, number, labels)
+
+
+def test_pre_dispatch_repairs_merges_approved_pr_no_repair_worker_across_n_ticks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """E2E ordering (#230 sev2/tests): drive the REAL ``_run_pre_dispatch_repairs``
+    — the function that owns the within-tick ordering of the repair selector vs
+    the adoption enable-merge step — not the two helpers in isolation.
+
+    Across N consecutive ticks against an approved + CLEAN PR (#229) that still
+    carries leftover sev3 *critic* threads:
+      * the repair-worker dispatch (``_run_repair_workers``) is NEVER invoked —
+        the selector excludes the PR, so the #229 5-hour repair-stall cannot
+        recur;
+      * the adoption enable-merge path lands it, and auto-merge is enabled
+        EXACTLY ONCE (the ``loop:adopted`` stamp makes every later tick a
+        terminal no-op — AC4);
+      * a ``repair_pr_skipped reason=approved_mergeable`` event is surfaced
+        every tick (no silent drop — AC1/AC5).
+    """
+    from forge_loop.gh_client import Issue
+    from forge_loop.runner import tick as tickmod
+
+    cfg = _cfg(tmp_path)  # critic disabled → adoption skips re-critic
+    approved = _open_pr(229)
+    client = _StampingMockGh(
+        open_prs_response=[approved],
+        review_threads_by_pr={229: [_critic_thread()]},
+        issues={("o", "r", 229): Issue(number=229, title="t229", state="open")},
+    )
+    monkeypatch.setattr(_ghmod, "_GH_CLIENT", client)
+
+    # Spy: a repair worker must NEVER be dispatched against the approved PR.
+    repair_calls: list[Any] = []
+    monkeypatch.setattr(
+        tickmod, "_run_repair_workers", lambda *a, **k: repair_calls.append(a) or []
+    )
+    # Keep the stuck-issue sweep off the network in the test.
+    monkeypatch.setattr(tickmod, "_run_stuck_sweep", lambda *_a, **_k: None)
+
+    for _ in range(3):
+        tickmod._run_pre_dispatch_repairs(
+            cfg, 1, bus_emit=None, short_sleep=lambda *_a, **_k: None
+        )
+
+    assert repair_calls == []  # zero repair-worker dispatches, ever
+
+    enable_calls = [c for c in client.calls if c[0] == "enable_pr_auto_merge"]
+    assert len(enable_calls) == 1  # auto-merge enabled exactly once (idempotent)
+    assert enable_calls[0][1]["number"] == 229
+
+    skips = [
+        e
+        for e in _events(cfg)
+        if e["kind"] == "repair_pr_skipped" and e.get("reason") == "approved_mergeable"
+    ]
+    assert len(skips) == 3  # surfaced every tick — no silent drop
+    assert any(e["kind"] == "orphan_pr_automerge_enabled" for e in _events(cfg))
+    # Second/third ticks are terminal no-ops: the stamped PR is skipped as
+    # already-adopted rather than re-enabled.
+    assert any(
+        e["kind"] == "orphan_pr_skipped" and e.get("reason") == "already_adopted"
+        for e in _events(cfg)
+    )
