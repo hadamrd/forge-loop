@@ -120,6 +120,10 @@ class WorkerConfig:
     env_vars: dict[str, str] = field(default_factory=dict)
     env_require: tuple[str, ...] = ()
     verify_commands: tuple[str, ...] = ()
+    # Upfront scope-cap discipline (the #261 convergence failure). Soft
+    # NET-LOC ceiling cited in the worker brief so workers ship small,
+    # single-mechanism PRs by default. ``0`` keeps the prose without a number.
+    scope_soft_loc_cap: int = 150
 
 
 @dataclass(frozen=True)
@@ -309,6 +313,7 @@ def _from_settings(s: Settings) -> Config:
             env_vars=dict(s.worker.env_vars),
             env_require=s.worker.env_require,
             verify_commands=s.worker.verify_commands,
+            scope_soft_loc_cap=s.worker.scope_soft_loc_cap,
         ),
         attempts=AttemptsConfig(
             enabled=s.attempts.enabled,

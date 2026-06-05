@@ -30,6 +30,50 @@ def _render_verify_section(verify_commands: tuple[str, ...]) -> str:
     )
 
 
+def _render_scope_discipline(cap: int, *, repair: bool) -> str:
+    """Render the upfront SCOPE DISCIPLINE block (the #261 convergence fix).
+
+    A convergence experiment proved workers GROW a too-big PR
+    (+1013 -> +1033 -> +1128 over 3 rounds) instead of cutting scope. The
+    critic diagnosing the monolith after-the-fact wasn't enough — this block
+    sets the minimal-diff, single-mechanism expectation UPFRONT so the worker
+    ships small by default and proposes follow-up sub-tickets past the cap.
+
+    ``cap > 0`` cites a concrete "~N net LOC" soft ceiling; ``cap == 0`` keeps
+    the single-mechanism prose without a number. The ``repair`` variant ADDS a
+    CUT-do-not-grow directive — the exact #261 repair failure mode where each
+    repair round enlarged the diff.
+    """
+    cap_line = (
+        f"- SOFT NET-DIFF CAP ~{cap} LOC: if your change exceeds it, or needs "
+        "more than ONE mechanism, STOP. Implement only the core mechanism and "
+        "propose the rest as follow-up sub-tickets in the PR body."
+        if cap > 0
+        else "- If your change needs more than ONE mechanism, STOP. Implement only "
+        "the core mechanism and propose the rest as follow-up sub-tickets in the "
+        "PR body."
+    )
+    repair_line = (
+        "\n- THIS IS A REPAIR. CUT, do not grow. SHRINK the diff to the single "
+        "core mechanism; never ship a larger diff than you started with — "
+        "a repair that enlarges the PR is the failure mode this rule exists to "
+        "prevent."
+        if repair
+        else ""
+    )
+    return (
+        "\nSCOPE DISCIPLINE — ship the SMALLEST viable change:\n"
+        "- ONE mechanism: implement the acceptance criteria's PRIMARY ask, "
+        "nothing more. No alternative implementations \"to be safe\".\n"
+        "- Prefer EDITING or DELETING over ADDING. A large pure-addition diff "
+        "is a red flag, not progress.\n"
+        f"{cap_line}\n"
+        "- Dead code, unused exports, and speculative generality are DEFECTS, "
+        "not foresight.\n"
+        f"- A converging PR shrinks under review, it never grows.{repair_line}\n"
+    )
+
+
 def make_brief(
     issue: dict[str, Any],
     worktree: Path,
@@ -44,6 +88,7 @@ def make_brief(
     manifesto_bundle: Any | None = None,
     capability_policy: CapabilityPolicy | None = None,
     verify_commands: tuple[str, ...] = (),
+    scope_soft_loc_cap: int = 150,
 ) -> str:
     """Render the worker brief for an issue."""
     body = (issue.get("body") or "")[:6000]
@@ -100,6 +145,7 @@ def make_brief(
         "\n" + render_capability_policy(capability_policy) if capability_policy is not None else ""
     )
     verify_section = _render_verify_section(verify_commands)
+    scope_discipline_section = _render_scope_discipline(scope_soft_loc_cap, repair=False)
 
     from forge_loop.briefs import render_brief
 
@@ -118,6 +164,7 @@ def make_brief(
         final_status=final_status,
         capability_policy_section=capability_policy_section,
         verify_section=verify_section,
+        scope_discipline_section=scope_discipline_section,
     )
     if dry_run:
         from forge_loop.replay import apply_dry_run_to_brief
@@ -140,6 +187,7 @@ def make_repair_brief(
     lumen_test_pattern: str = "**/*Test.*",
     coauthor: str = "",
     verify_commands: tuple[str, ...] = (),
+    scope_soft_loc_cap: int = 150,
 ) -> str:
     """Render a worker brief for repairing an existing blocked PR."""
     body = (issue.get("body") or "")[:6000]
@@ -150,6 +198,7 @@ def make_repair_brief(
     final_status = f'{{"issue": {n}, "pr": "{pr_url}", "status": "open", "note": "repair pushed"}}'
     coauthor_line = f"Sign as: Co-Authored-By: {coauthor}" if coauthor else ""
     verify_section = _render_verify_section(verify_commands)
+    scope_discipline_section = _render_scope_discipline(scope_soft_loc_cap, repair=True)
     return f"""You are an autonomous repair worker in a sprint loop.
 
 WORKTREE (already created): {worktree}
@@ -168,7 +217,7 @@ REVIEW / CRITIC CONTEXT TO ADDRESS:
 ---
 {review_context[:12000]}
 ---
-
+{scope_discipline_section}
 CONTRACT:
 1. Repair the EXISTING PR branch. Do not create a new branch and do not open a new PR.
 2. Address every unresolved review thread and every sev1/blocking review point with production behavior and tests.

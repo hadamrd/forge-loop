@@ -298,6 +298,7 @@ def run_worker(
     env_vars: dict[str, str] | None = None,
     env_require: tuple[str, ...] = (),
     verify_commands: tuple[str, ...] = (),
+    scope_soft_loc_cap: int = 150,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -402,6 +403,7 @@ def run_worker(
             manifesto_bundle=manifesto_bundle,
             capability_policy=capability_policy,
             verify_commands=verify_commands,
+            scope_soft_loc_cap=scope_soft_loc_cap,
         )
 
     # Maestro advisory context (frontier + memory) rides on top of the brief.
@@ -516,6 +518,7 @@ def run_repair_worker(
     env_vars: dict[str, str] | None = None,
     env_require: tuple[str, ...] = (),
     verify_commands: tuple[str, ...] = (),
+    scope_soft_loc_cap: int = 150,
 ) -> WorkerOutcome:
     """Repair an existing blocked PR by pushing to its head branch."""
     n = issue["number"]
@@ -580,6 +583,7 @@ def run_repair_worker(
         lumen_test_pattern=lumen_test_pattern,
         coauthor=coauthor,
         verify_commands=verify_commands,
+        scope_soft_loc_cap=scope_soft_loc_cap,
     )
     from forge_loop.worker_permissions import claude_permission_options, codex_sandbox_args
 

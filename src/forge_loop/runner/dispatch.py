@@ -555,6 +555,7 @@ def _run_worker_with_saga(
                 env_vars=getattr(cfg.worker, "env_vars", {}),
                 env_require=getattr(cfg.worker, "env_require", ()),
                 verify_commands=getattr(cfg.worker, "verify_commands", ()),
+                scope_soft_loc_cap=getattr(cfg.worker, "scope_soft_loc_cap", 150),
             )
         except BaseException:
             _finalize_worker_saga(saga_store, task_id=task_id, status="failed")
@@ -601,6 +602,7 @@ def _run_worker_with_saga(
             env_vars=getattr(cfg.worker, "env_vars", {}),
             env_require=getattr(cfg.worker, "env_require", ()),
             verify_commands=getattr(cfg.worker, "verify_commands", ()),
+            scope_soft_loc_cap=getattr(cfg.worker, "scope_soft_loc_cap", 150),
         )
     except BaseException as ex_:
         # The subprocess crashed before producing a WorkerOutcome. We
@@ -817,6 +819,7 @@ def _run_repair_workers(
                 env_vars=getattr(cfg.worker, "env_vars", {}),
                 env_require=getattr(cfg.worker, "env_require", ()),
                 verify_commands=getattr(cfg.worker, "verify_commands", ()),
+                scope_soft_loc_cap=getattr(cfg.worker, "scope_soft_loc_cap", 150),
             )
             for issue, pr, review_context in repairs
         ]

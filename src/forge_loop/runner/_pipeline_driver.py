@@ -126,6 +126,7 @@ def _build_default_handlers(
             env_vars=getattr(cfg.worker, "env_vars", {}),
             env_require=getattr(cfg.worker, "env_require", ()),
             verify_commands=getattr(cfg.worker, "verify_commands", ()),
+            scope_soft_loc_cap=getattr(cfg.worker, "scope_soft_loc_cap", 150),
         )
         ok = out.status in {"merged", "open"}
         return StepOutcome(
