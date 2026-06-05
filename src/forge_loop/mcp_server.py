@@ -317,12 +317,23 @@ def critic_review_pr(pr_url: str, issue_number: int, timeout_s: int = 600) -> di
 def critic_findings(pr: str) -> list[dict[str, Any]]:
     """Return the OPEN critic findings for a PR from the durable ``.forge`` store.
 
-    This is the worker's first-class data path for what to repair — it reads
-    the SQLite control-plane projection, NOT re-fetched GitHub review comments
-    (which 422 and silently drop findings, #242). ``pr`` is the PR URL the
-    critic reviewed. Returns one dict per open finding with ``finding_id``,
-    ``severity``, ``category``, ``file``, ``line``, ``message``, ``status``,
-    ``note``. Returns ``[]`` when the PR has no open findings (drained).
+    Reads the SQLite control-plane projection, NOT re-fetched GitHub review
+    comments (which 422 and silently drop findings, #242).
+
+    NOTE ON REDUNDANCY (AC3 vs AC4): this is a *supplementary* read tool, NOT
+    the worker's sole or primary data path. The correctness baseline is the
+    deterministic, tool-free brief injection — ``repairs._compose_review_context``
+    renders these same open findings into the repair brief via
+    ``render_findings_block`` before the worker runs, so the worker has them
+    even if it never calls this tool. This tool exists for AC4: it lets a worker
+    re-query the live open-set on demand and pairs with
+    ``mark_finding_addressed`` to drive the reconcile/reopen loop. Treat it as a
+    convenience query over the same projection, not the source of truth.
+
+    ``pr`` is the PR URL the critic reviewed. Returns one dict per open finding
+    with ``finding_id``, ``severity``, ``category``, ``file``, ``line``,
+    ``message``, ``status``, ``note``. Returns ``[]`` when the PR has no open
+    findings (drained).
     """
     cfg = load_config()
     from forge_loop.critic_findings import open_critic_findings_store
