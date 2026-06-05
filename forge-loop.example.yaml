@@ -62,6 +62,29 @@ critic:
   model: claude-sonnet-4-6
   thinking: off
 
+# Fair repair scheduling (issue #248). When in-flight PR *repairs* monopolise
+# every worker slot, the ready backlog can starve indefinitely — a PR stuck on
+# critic:blocking is re-selected every tick with no backoff. Enable this to bound
+# that starvation. OFF by default: every field below preserves today's behaviour
+# until `enabled: true`.
+repair_fairness:
+  # Master switch. false = legacy terminal-repair behaviour (no backoff,
+  # no slot reservation, no round-robin yield).
+  enabled: false
+  # A PR re-blocked this many consecutive repair ticks enters a cooldown and is
+  # excluded from blocking-PR repair selection until it elapses, freeing its slot.
+  max_consecutive_blocks: 3
+  # Seconds a backed-off PR stays excluded before it is retried (mirrors
+  # attempts.cooldown_s / LOOP_RETRY_COOLDOWN_S semantics).
+  cooldown_s: 3600
+  # Worker slots held back for NEW dispatch whenever ready issues are waiting,
+  # so blocking repairs can never claim all `scheduling.parallel` slots.
+  reserve_dispatch_slots: 1
+  # After this many consecutive repair-only ticks with ready issues waiting, the
+  # next tick yields the repair phase to new dispatch. Bounds starvation to
+  # K = max_repair_streak + 1 ticks (default K=3).
+  max_repair_streak: 2
+
 # Optional: configure the Lumen test-discovery pattern. Match the test-file
 # glob for your stack: e.g. "**/*Test.java" for JUnit, "**/test_*.py" for pytest.
 lumen:

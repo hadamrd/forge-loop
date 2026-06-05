@@ -80,13 +80,45 @@ def _issue_number_from_pr(pr: dict[str, Any]) -> int | None:
     return issue_number_from_pr(pr)
 
 
-def _blocking_pr_repairs(cfg: Config) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+def _repair_backoff_file(cfg: Config) -> Path:
+    """Sidecar JSON holding per-PR repair-block counts + the round-robin streak.
+
+    Lives under the runner state dir (NOT the events log, which is truncated
+    each tick) so the fair scheduler's memory survives across ticks.
+    """
+    return cfg.state_dir / "loop-repair-backoff.json"
+
+
+def _blocking_pr_repairs(
+    cfg: Config,
+    *,
+    backoff_state: Any = None,
+    now: Any = None,
+) -> list[tuple[dict[str, Any], dict[str, Any], str]]:
+    rf = cfg.repair_fairness
     return _blocking_pr_repairs_impl(
         cfg,
         prs_requiring_repair_fn=prs_requiring_repair,
         fetch_issue_fn=fetch_issue,
         pr_review_context_fn=pr_review_context,
+        backoff_state=backoff_state,
+        max_consecutive_blocks=rf.max_consecutive_blocks if rf.enabled else 0,
+        cooldown_s=rf.cooldown_s,
+        now=now,
     )
+
+
+def _ready_issues_exist(cfg: Config) -> bool:
+    """Cheap peek: are there ready issues waiting that repairs could starve?
+
+    Failure-soft: a ``gh`` error reads as "no ready issues", so a transient
+    list failure never triggers a starvation yield (it just preserves the
+    legacy terminal-repair behaviour for that tick).
+    """
+    try:
+        return bool(top_issues(cfg.labels.ready, max(cfg.parallel, 1), repo=cfg.github_repo))
+    except Exception:  # noqa: BLE001 — best-effort existence probe
+        return False
 
 
 def _ready_issue_open_pr_repairs(
@@ -383,6 +415,7 @@ def _run_adoption_tick(
         {"state": "between-ticks", "tick": tick, "last_summary": summary},
     )
     short_sleep(cfg.tick_interval_s, cfg)
+    return outcomes
 
 
 def _should_run_worker_iterations(cfg: Any, outcomes: Sequence[object]) -> bool:
@@ -403,7 +436,13 @@ def _run_repair_tick(
     done_event: str,
     log_action: str,
     remove_ready: bool,
-) -> None:
+) -> list[WorkerOutcome]:
+    """Run repair workers for ``repairs`` and return their outcomes.
+
+    The return value is additive (issue #248): legacy callers invoke this for
+    its side effects and ignore it; the fair scheduler reads the outcomes to
+    update the per-PR repair-block backoff state.
+    """
     master_log_path = cfg.logs_dir / "master.log"
     issue_nums = [issue["number"] for issue, _, _ in repairs]
     write_state(
@@ -487,6 +526,140 @@ def _maybe_run_maintenance(cfg: Config, tick: int, *, short_sleep: Any) -> bool:
     return False
 
 
+def _run_blocking_pr_repairs_phase(
+    cfg: Config,
+    tick: int,
+    *,
+    bus_emit: Any,
+    short_sleep: Any,
+) -> bool:
+    """Select + run blocking-PR repairs. Returns True iff a repair tick ran.
+
+    With repair-fairness disabled this is the legacy terminal path: any blocking
+    PR ⇒ run the repair tick ⇒ return True (caller returns). With fairness on,
+    selection is filtered by per-PR backoff and bounded by the round-robin /
+    slot-reservation guard (issue #248), so it can return False — yielding the
+    tick to new dispatch — even when blocking PRs exist.
+    """
+    if not cfg.repair_fairness.enabled:
+        repairs = _blocking_pr_repairs(cfg)
+        if not repairs:
+            return False
+        _run_repair_tick(
+            cfg,
+            tick,
+            repairs,
+            bus_emit=bus_emit,
+            short_sleep=short_sleep,
+            start_event="repair_tick_start",
+            done_event="repair_tick_done",
+            log_action="repairing blocked PR(s)",
+            remove_ready=False,
+        )
+        return True
+    return _run_fair_blocking_repairs(cfg, tick, bus_emit=bus_emit, short_sleep=short_sleep)
+
+
+def _run_fair_blocking_repairs(
+    cfg: Config,
+    tick: int,
+    *,
+    bus_emit: Any,
+    short_sleep: Any,
+) -> bool:
+    """Fair blocking-PR repair selection + slot reservation (issue #248).
+
+    Returns True iff a (possibly slot-capped) repair tick ran. Returns False —
+    falling through to new dispatch — when there are no selectable repairs OR
+    when the round-robin / reservation guard yields this tick so the ready
+    backlog cannot be starved.
+    """
+    from datetime import UTC, datetime
+
+    from forge_loop.runner import repair_backoff as _rb
+
+    rf = cfg.repair_fairness
+    state_path = _repair_backoff_file(cfg)
+    state = _rb.load_state(state_path)
+    now = datetime.now(UTC)
+
+    repairs = _blocking_pr_repairs(cfg, backoff_state=state, now=now)
+    if not repairs:
+        # Nothing selectable (none blocking, or all in backoff) → dispatch will
+        # run this tick. Reset the consecutive-repair streak.
+        if state.streak:
+            state.streak = 0
+            _rb.save_state(state_path, state)
+        return False
+
+    ready_exist = _ready_issues_exist(cfg)
+    selected = _rb.reserve_repair_slots(
+        repairs,
+        parallel=cfg.parallel,
+        reserve=rf.reserve_dispatch_slots,
+        ready_issues_exist=ready_exist,
+    )
+    # Forward-progress guarantee: after ``max_repair_streak`` consecutive
+    # repair-only ticks with ready work waiting — OR when reservation leaves no
+    # repair slots at all — yield this tick to dispatch (AC1, bounded K).
+    streak_exhausted = ready_exist and state.streak >= rf.max_repair_streak
+    if ready_exist and (streak_exhausted or not selected):
+        append_event(
+            cfg.events_file,
+            "repair_slot_reserved",
+            tick=tick,
+            reserved=rf.reserve_dispatch_slots,
+            consecutive_repair_ticks=state.streak,
+            deferred_prs=[pr.get("url") for _, pr, _ in repairs],
+        )
+        state.streak = 0
+        _rb.save_state(state_path, state)
+        return False
+
+    state.streak += 1
+    _rb.save_state(state_path, state)
+    outcomes = _run_repair_tick(
+        cfg,
+        tick,
+        selected,
+        bus_emit=bus_emit,
+        short_sleep=short_sleep,
+        start_event="repair_tick_start",
+        done_event="repair_tick_done",
+        log_action="repairing blocked PR(s)",
+        remove_ready=False,
+    )
+    _record_repair_block_outcomes(cfg, state_path, outcomes)
+    return True
+
+
+def _record_repair_block_outcomes(
+    cfg: Config,
+    state_path: Path,
+    outcomes: list[WorkerOutcome],
+) -> None:
+    """Update per-PR repair-block backoff state from a repair tick's outcomes.
+
+    A re-blocked PR (``outcome.error`` set by the critic) increments its
+    consecutive-block counter; a cleared/merged PR resets it. Reloads the
+    sidecar so the streak persisted just before the repair ran is preserved.
+    """
+    from forge_loop.runner import repair_backoff as _rb
+    from forge_loop.state import now_iso
+
+    state = _rb.load_state(state_path)
+    stamp = now_iso()
+    for o in outcomes:
+        url = o.pr_url
+        if not url:
+            continue
+        if o.error:
+            _rb.record_block(state, url, now_iso=stamp)
+        elif o.status in {"open", "merged"}:
+            _rb.clear_pr(state, url)
+    _rb.save_state(state_path, state)
+
+
 def _run_pre_dispatch_repairs(
     cfg: Config,
     tick: int,
@@ -503,19 +676,7 @@ def _run_pre_dispatch_repairs(
     """
     _run_stuck_sweep(cfg, tick)
 
-    repairs = _blocking_pr_repairs(cfg)
-    if repairs:
-        _run_repair_tick(
-            cfg,
-            tick,
-            repairs,
-            bus_emit=bus_emit,
-            short_sleep=short_sleep,
-            start_event="repair_tick_start",
-            done_event="repair_tick_done",
-            log_action="repairing blocked PR(s)",
-            remove_ready=False,
-        )
+    if _run_blocking_pr_repairs_phase(cfg, tick, bus_emit=bus_emit, short_sleep=short_sleep):
         return True
 
     # Issue #213 — adopt orphaned clean PRs. A worker can open its PR and then
