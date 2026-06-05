@@ -9,7 +9,6 @@ mirrors every emit() to the log stream at the right level.
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest

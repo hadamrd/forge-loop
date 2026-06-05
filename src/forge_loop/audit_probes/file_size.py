@@ -31,12 +31,11 @@ crosses N× its soft cap — the cli.py case fires P1, not P2.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 from forge_loop.codebase_audit import Violation, walk_source_files
-
 
 DEFAULT_THRESHOLDS: dict[str, int] = {
     ".py": 500,

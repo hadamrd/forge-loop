@@ -617,7 +617,7 @@ class ProductCommandsMixin:
         owner = ""
         repo_name = ""
         extra_labels: tuple[str, ...] = ()
-        cfg: Any | None = None
+        cfg: Any = None
         try:
             cfg = self.load()
             repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path

@@ -47,7 +47,7 @@ def _coerce_issue(merged: object) -> tuple[int, str, str | None] | None:
         title = getattr(merged, "title", "")
         pr_url = getattr(merged, "pr_url", None)
 
-    if number is None:
+    if not isinstance(number, (int, float, str)):
         return None
     try:
         n = int(number)

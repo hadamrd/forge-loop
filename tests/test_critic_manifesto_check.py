@@ -16,8 +16,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from forge_loop._critic_sdk import load_manifestos_text
 from forge_loop.briefs import load_template
 from forge_loop.critic import (
@@ -26,7 +24,6 @@ from forge_loop.critic import (
     parse_report_from_text,
 )
 from forge_loop.critic_actions import plan_actions
-
 
 # ---------------------------------------------------------------------------
 # Manifesto loading + prompt rendering
