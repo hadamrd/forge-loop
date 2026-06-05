@@ -8,6 +8,7 @@ no behaviour change, no signature change.
 
 from __future__ import annotations
 
+import functools
 import subprocess
 from collections.abc import Sequence
 from dataclasses import asdict
@@ -429,27 +430,48 @@ def _run_repair_tick(
     short_sleep(cfg.tick_interval_s, cfg)
 
 
-def _tick(cfg: Config, tick: int) -> None:
-    # Imported lazily to avoid an import cycle (boot.py imports tick.py).
-    from forge_loop.runner.boot import _short_sleep
+# --------------------------------------------------------------------------- #
+# Issue #225 — ``_tick`` decomposition.
+#
+# ``_tick`` was a ~580-line god-function (the program's central control flow).
+# It is now a readable orchestrator that calls named, individually-testable
+# phase helpers below. Each helper owns one phase of the tick and is small
+# enough to unit-test in isolation. Behaviour, ordering and emitted events are
+# byte-for-byte unchanged from the pre-#225 inline body — this was a pure
+# mechanical extraction, no semantics moved.
+# --------------------------------------------------------------------------- #
 
-    # Codebase-state audit (issue #156) — same cadence as maintenance.
-    # Runs *before* the maintenance branch so it fires even when the
-    # maintenance subagent is the body of the tick.
+
+def _maybe_run_maintenance(cfg: Config, tick: int, *, short_sleep: Any) -> bool:
+    """Codebase audit (#156) + maintenance sub-tick on the maintenance cadence.
+
+    The audit runs *before* the maintenance branch so it fires even when the
+    maintenance subagent is the body of the tick. Returns True when the
+    maintenance sub-tick ran and the caller must return immediately.
+    """
     if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
         _run_codebase_audit(cfg, tick)
-
     if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
         _run_maintenance_tick(cfg, tick)
-        _short_sleep(cfg.tick_interval_s, cfg)
-        return
+        short_sleep(cfg.tick_interval_s, cfg)
+        return True
+    return False
 
-    def _bus_emit(kind: str, payload: dict[str, Any]) -> None:
-        append_event(cfg.events_file, kind, **payload)
 
-    # Stuck-issue sweep (issue #129) — fires before the next dispatch
-    # so any issue the iteration loop gave up on but failed to demote
-    # gets caught here, not re-picked by top_issues below.
+def _run_pre_dispatch_repairs(
+    cfg: Config,
+    tick: int,
+    *,
+    bus_emit: Any,
+    short_sleep: Any,
+) -> bool:
+    """Stuck-issue sweep (#129) + blocking-PR repair + orphaned-clean-PR adoption.
+
+    Each repair/adoption path is a terminal tick body: when one runs, the caller
+    must return immediately. Returns True if any of them ran. The stuck sweep
+    fires first so an issue the iteration loop gave up on gets caught here, not
+    re-picked by ``top_issues`` later in the tick.
+    """
     _run_stuck_sweep(cfg, tick)
 
     repairs = _blocking_pr_repairs(cfg)
@@ -458,47 +480,44 @@ def _tick(cfg: Config, tick: int) -> None:
             cfg,
             tick,
             repairs,
-            bus_emit=_bus_emit,
-            short_sleep=_short_sleep,
+            bus_emit=bus_emit,
+            short_sleep=short_sleep,
             start_event="repair_tick_start",
             done_event="repair_tick_done",
             log_action="repairing blocked PR(s)",
             remove_ready=False,
         )
-        return
+        return True
 
     # Issue #213 — adopt orphaned clean PRs. A worker can open its PR and then
     # trip ``worker_timeout_s`` before the post-critic merge step runs, leaving
     # a CLEAN / never-critic'd PR open forever (it matches neither the blocking
     # nor the ready-issue repair selectors). Re-critic + merge-gate it here.
-    # This runs BEFORE top_issues so it fires even on otherwise-idle ticks
-    # where the source issue no longer carries ``loop:ready``.
     adoptions = _orphaned_clean_pr_adoptions(cfg)
     if adoptions:
         _run_adoption_tick(
             cfg,
             tick,
             adoptions,
-            bus_emit=_bus_emit,
-            short_sleep=_short_sleep,
+            bus_emit=bus_emit,
+            short_sleep=short_sleep,
         )
-        return
+        return True
+    return False
 
-    # Issue #126 — axis-aware dispatch filter. When ``LOOP_AXIS_FILTER``
-    # is set (via ``forge-loop run --axis ...``), the dispatcher pulls a
-    # wider window of ready issues than ``cfg.parallel`` so the filter
-    # has something to chew on, then trims back to ``cfg.parallel`` from
-    # the matched subset. When the env var is empty, behaviour is
-    # byte-identical to today (same call, same limit).
-    from forge_loop.axis import filter_issues_by_axes, parse_filter_env
+
+def _resolve_axis_filter(cfg: Config, tick: int) -> list[str]:
+    """Resolve the active axis filter (issue #126).
+
+    ``LOOP_AXIS_FILTER`` (set via ``forge-loop run --axis ...``) wins. Otherwise,
+    when ``.forge/axes.yaml`` exists, default to filtering by ANY known axis
+    label so the legacy maintenance LLM (or stray ops) can't smuggle
+    non-axis-aligned issues onto the dispatch path. No axes.yaml ⇒ empty filter
+    ⇒ byte-identical legacy behaviour.
+    """
+    from forge_loop.axis import parse_filter_env
 
     axis_filter = parse_filter_env()
-    # When .forge/axes.yaml exists, default to filtering by ANY known
-    # axis label so the legacy maintenance LLM (or stray ops) can't
-    # smuggle non-axis-aligned issues onto the dispatch path. Dogfood-
-    # caught: maintenance daemon re-labeled 4 cosmetic tickets as
-    # loop:ready after the brainstormer had explicitly omitted them.
-    # Explicit env override (LOOP_AXIS_FILTER) still wins.
     if not axis_filter:
         try:
             from forge_loop.product_vision import discover as _discover_vision
@@ -513,14 +532,34 @@ def _tick(cfg: Config, tick: int) -> None:
             )
         except Exception:  # noqa: BLE001 — no axes.yaml or unreadable; preserve legacy
             axis_filter = []
+    return axis_filter
+
+
+def _select_candidates(
+    cfg: Config,
+    tick: int,
+    *,
+    short_sleep: Any,
+) -> list[dict[str, Any]] | None:
+    """Resolve the axis filter, fetch ready issues, apply the filter.
+
+    Returns the candidate issue list, or ``None`` when the tick should end now:
+    a ``gh`` list failure (emits ``gh_list_failed``) or no candidates after
+    filtering (emits ``tick_idle``). When a filter is active the fetch window is
+    widened to ``max(parallel, 50)`` so the filter has something to chew on,
+    then trimmed back to ``cfg.parallel``.
+    """
+    from forge_loop.axis import filter_issues_by_axes
+
+    axis_filter = _resolve_axis_filter(cfg, tick)
     fetch_limit = max(cfg.parallel, 50) if axis_filter else cfg.parallel
     try:
         issues = top_issues(cfg.labels.ready, fetch_limit, repo=cfg.github_repo)
     except subprocess.CalledProcessError as e:
         append_event(cfg.events_file, "gh_list_failed", err=(e.stderr or "")[:200])
         write_state(cfg.state_file, {"state": "gh_error", "tick": tick})
-        _short_sleep(60, cfg)
-        return
+        short_sleep(60, cfg)
+        return None
 
     if axis_filter:
         append_event(
@@ -532,12 +571,7 @@ def _tick(cfg: Config, tick: int) -> None:
         )
         issues = filter_issues_by_axes(issues, axis_filter)[: cfg.parallel]
         if not issues:
-            append_event(
-                cfg.events_file,
-                "axis_filter_empty",
-                tick=tick,
-                axes=axis_filter,
-            )
+            append_event(cfg.events_file, "axis_filter_empty", tick=tick, axes=axis_filter)
 
     if not issues:
         append_event(cfg.events_file, "tick_idle", tick=tick)
@@ -545,85 +579,101 @@ def _tick(cfg: Config, tick: int) -> None:
             cfg.state_file,
             {"state": "idle", "tick": tick, "next_check_s": cfg.tick_interval_s},
         )
-        _short_sleep(cfg.tick_interval_s, cfg)
-        return
+        short_sleep(cfg.tick_interval_s, cfg)
+        return None
+    return issues
 
-    # PO spec-expansion pass (gap: workers ship janitor PRs when issue bodies
-    # are thin; the PO subagent rewrites bodies to feature-grade specs before
-    # dispatch). Idempotent — issues already expanded carry the marker.
-    if cfg.po.enabled:
-        write_state(cfg.state_file, {"state": "po_expanding", "tick": tick})
-        append_event(cfg.events_file, "po_start", tick=tick, issues=[i["number"] for i in issues])
-        po_outcomes = _po_expand(
-            issues,
-            cfg.repo,
-            cfg.logs_dir,
-            github_repo=cfg.github_repo or "",
-            timeout_s=cfg.po.timeout_s,
-            max_to_expand=cfg.po.max_to_expand_per_tick,
-            model=cfg.po.model,
-            provider=getattr(cfg.po, "provider", "claude"),
-        )
-        expanded_nums = [o.issue for o in po_outcomes if not o.skipped]
-        append_event(
-            cfg.events_file,
-            "po_done",
-            tick=tick,
-            expanded=expanded_nums,
-            skipped=[o.issue for o in po_outcomes if o.skipped],
-            outcomes=[
-                {
-                    "issue": o.issue,
-                    "skipped": o.skipped,
-                    "reason": o.reason,
-                    "sections_added": o.sections_added,
-                    "duration_s": round(o.duration_s, 1),
-                    "error": o.error,
-                }
-                for o in po_outcomes
-            ],
-        )
-        # Re-fetch any issues whose bodies were just rewritten so the workers
-        # see the new spec, not the stale snapshot we captured at tick start.
-        if expanded_nums:
-            refreshed = []
-            for issue in issues:
-                if issue["number"] in expanded_nums:
-                    fresh = fetch_issue(issue["number"], repo=cfg.github_repo)
-                    refreshed.append(fresh or issue)
-                else:
-                    refreshed.append(issue)
-            issues = refreshed
 
+def _expand_specs(cfg: Config, tick: int, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """PO spec-expansion pass (rewrites thin issue bodies to feature-grade specs).
+
+    Idempotent — issues already expanded carry the marker. Returns ``issues``,
+    with any rewritten bodies re-fetched so workers see the new spec, not the
+    stale snapshot captured at tick start. No-op when ``cfg.po`` is disabled.
+    """
+    if not cfg.po.enabled:
+        return issues
+    write_state(cfg.state_file, {"state": "po_expanding", "tick": tick})
+    append_event(cfg.events_file, "po_start", tick=tick, issues=[i["number"] for i in issues])
+    po_outcomes = _po_expand(
+        issues,
+        cfg.repo,
+        cfg.logs_dir,
+        github_repo=cfg.github_repo or "",
+        timeout_s=cfg.po.timeout_s,
+        max_to_expand=cfg.po.max_to_expand_per_tick,
+        model=cfg.po.model,
+        provider=getattr(cfg.po, "provider", "claude"),
+    )
+    expanded_nums = [o.issue for o in po_outcomes if not o.skipped]
+    append_event(
+        cfg.events_file,
+        "po_done",
+        tick=tick,
+        expanded=expanded_nums,
+        skipped=[o.issue for o in po_outcomes if o.skipped],
+        outcomes=[
+            {
+                "issue": o.issue,
+                "skipped": o.skipped,
+                "reason": o.reason,
+                "sections_added": o.sections_added,
+                "duration_s": round(o.duration_s, 1),
+                "error": o.error,
+            }
+            for o in po_outcomes
+        ],
+    )
+    if expanded_nums:
+        refreshed = []
+        for issue in issues:
+            if issue["number"] in expanded_nums:
+                fresh = fetch_issue(issue["number"], repo=cfg.github_repo)
+                refreshed.append(fresh or issue)
+            else:
+                refreshed.append(issue)
+        issues = refreshed
+    return issues
+
+
+def _run_ready_issue_repairs(
+    cfg: Config,
+    tick: int,
+    issues: list[dict[str, Any]],
+    *,
+    bus_emit: Any,
+    short_sleep: Any,
+) -> bool:
+    """Repair open PRs attached to ready issues; terminal tick body if any run."""
     open_pr_repairs = _ready_issue_open_pr_repairs(cfg, issues)
     if open_pr_repairs:
         _run_repair_tick(
             cfg,
             tick,
             open_pr_repairs,
-            bus_emit=_bus_emit,
-            short_sleep=_short_sleep,
+            bus_emit=bus_emit,
+            short_sleep=short_sleep,
             start_event="ready_issue_open_pr_repair_tick_start",
             done_event="ready_issue_open_pr_repair_tick_done",
             log_action="repairing open PR(s)",
             remove_ready=True,
         )
-        return
+        return True
+    return False
 
-    write_state(
-        cfg.state_file,
-        {
-            "state": "running",
-            "tick": tick,
-            "dispatched": [{"issue": i["number"], "title": i["title"]} for i in issues],
-        },
-    )
-    append_event(cfg.events_file, "tick_start", tick=tick, issues=[i["number"] for i in issues])
 
-    # Maestro step (additive, best-effort): let the durable frontier + curated
-    # memory inform dispatch — reorder candidates (aligned first, rejected last)
-    # and hand each worker an advisory context block. A control-plane read
-    # failure leaves `issues` untouched and dispatch byte-identical to legacy.
+def _apply_maestro_plan(
+    cfg: Config,
+    tick: int,
+    issues: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    """Maestro step (additive, best-effort): reorder candidates + build a brief.
+
+    Lets the durable frontier + curated memory inform dispatch (aligned first,
+    rejected last) and hand each worker an advisory context block. A control-
+    plane read failure leaves ``issues`` untouched and dispatch byte-identical
+    to legacy. Returns ``(issues, maestro_context)``.
+    """
     maestro_context = ""
     try:
         from forge_loop.runner.maestro import build_maestro_plan, load_maestro_inputs
@@ -638,224 +688,259 @@ def _tick(cfg: Config, tick: int) -> None:
     except Exception as ex_:  # noqa: BLE001 — the maestro step must never break the tick
         append_event(cfg.events_file, "maestro_plan_failed", tick=tick, err=str(ex_)[:200])
         maestro_context = ""
+    return issues, maestro_context
 
-    # Per-issue: detect risk-gate + fetch past attempt history (if enabled).
-    # Also apply the fingerprint-based skip guards (in-flight / cooldown) so
-    # a half-finished prior dispatch doesn't get re-done and dupe a PR.
-    risk_gate_label = cfg.labels.risk_gate
-    workers_meta: list[dict[str, Any]] = []
+
+def _classify_issue_for_dispatch(
+    cfg: Config,
+    i: dict[str, Any],
+    *,
+    force_set: set[int],
+    cooldown_s: float,
+    brief_hash: str,
+    risk_gate_label: str,
+) -> dict[str, Any] | None:
+    """Build the ``workers_meta`` entry for one candidate, or ``None`` to skip it.
+
+    Detects the risk gate, fetches past attempt history + blocking comments
+    (one ``gh issue view --comments`` round-trip), computes the brief
+    fingerprint, then applies the fingerprint-based skip guards. Returns a meta
+    dict to dispatch the issue, or ``None`` to skip it this tick — emitting
+    ``worker_skip_in_flight`` (and dropping the ready label) or
+    ``worker_skip_cooldown`` exactly as the inline loop did. ``forced`` issues
+    bypass the skip guards.
+    """
+    labels = [lab.get("name", "") for lab in (i.get("labels") or [])]
+    gated = bool(risk_gate_label) and risk_gate_label in labels
+    past: list[dict[str, Any]] = []
+    blocking_comments: list[str] = []
+    corrupt = 0
+    if cfg.attempts.enabled:
+        attempts_view = _attempts.fetch_issue_attempts(i["number"], repo=cfg.github_repo)
+        past, corrupt = attempts_view.history, attempts_view.corrupt
+        blocking_comments = attempts_view.blocking_comments
+        if corrupt:
+            append_event(cfg.events_file, "attempts_corrupt", issue=i["number"], rows=corrupt)
+    fingerprint_body = i.get("body") or ""
+    if blocking_comments:
+        fingerprint_body = fingerprint_body + "\n\n" + "\n\n".join(blocking_comments)
+    fp = _attempts.compute_fingerprint(i["number"], fingerprint_body, brief_hash)
+    forced = i["number"] in force_set
+    if cfg.attempts.enabled and not forced:
+        decision = _attempts.classify_skip(past, fp, cooldown_s=cooldown_s)
+        if decision.kind == "in_flight":
+            append_event(
+                cfg.events_file,
+                "worker_skip_in_flight",
+                issue=i["number"],
+                pr_url=decision.pr_url,
+                fingerprint=fp[:12],
+                matched_ts=decision.matched_ts,
+            )
+            _remove_ready_label(cfg, i["number"], status="in_flight", pr_url=decision.pr_url)
+            return None
+        if decision.kind == "cooldown":
+            append_event(
+                cfg.events_file,
+                "worker_skip_cooldown",
+                issue=i["number"],
+                fingerprint=fp[:12],
+                cooldown_remaining_s=decision.cooldown_remaining_s,
+                matched_ts=decision.matched_ts,
+            )
+            return None
+    trimmed = past[-cfg.attempts.max_history_in_brief :] if past else []
+    return {
+        "risk_gated": gated,
+        "past_attempts": trimmed,
+        "blocking_comments": blocking_comments,
+        "brief_fingerprint": fp,
+        "forced": forced,
+    }
+
+
+def _select_dispatch_set(
+    cfg: Config,
+    issues: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Filter candidates through the per-issue skip guards.
+
+    Returns ``(issues_to_dispatch, workers_meta)``, aligned index-for-index:
+    ``workers_meta[k]`` is the dispatch meta for ``issues_to_dispatch[k]``.
+    Issues skipped by ``_classify_issue_for_dispatch`` are dropped from both.
+    """
     force_set = _consume_force_set(cfg)
     cooldown_s = _attempts.cooldown_from_env()
     brief_hash = _worker.brief_template_hash()
+    risk_gate_label = cfg.labels.risk_gate
     issues_to_dispatch: list[dict[str, Any]] = []
+    workers_meta: list[dict[str, Any]] = []
     for i in issues:
-        labels = [lab.get("name", "") for lab in (i.get("labels") or [])]
-        gated = bool(risk_gate_label) and risk_gate_label in labels
-        past: list[dict[str, Any]] = []
-        blocking_comments: list[str] = []
-        corrupt = 0
-        if cfg.attempts.enabled:
-            # One ``gh issue view --comments`` round-trip per issue per tick:
-            # the comment payload is fetched once and parsed for both attempt
-            # history and blocking comments (issue #226 — this used to be two
-            # identical subprocess fetches of the same payload).
-            attempts_view = _attempts.fetch_issue_attempts(
-                i["number"],
-                repo=cfg.github_repo,
-            )
-            past, corrupt = attempts_view.history, attempts_view.corrupt
-            blocking_comments = attempts_view.blocking_comments
-            if corrupt:
-                append_event(
-                    cfg.events_file,
-                    "attempts_corrupt",
-                    issue=i["number"],
-                    rows=corrupt,
-                )
-        fingerprint_body = i.get("body") or ""
-        if blocking_comments:
-            fingerprint_body = fingerprint_body + "\n\n" + "\n\n".join(blocking_comments)
-        fp = _attempts.compute_fingerprint(i["number"], fingerprint_body, brief_hash)
-        forced = i["number"] in force_set
-        if cfg.attempts.enabled and not forced:
-            decision = _attempts.classify_skip(
-                past,
-                fp,
-                cooldown_s=cooldown_s,
-            )
-            if decision.kind == "in_flight":
-                append_event(
-                    cfg.events_file,
-                    "worker_skip_in_flight",
-                    issue=i["number"],
-                    pr_url=decision.pr_url,
-                    fingerprint=fp[:12],
-                    matched_ts=decision.matched_ts,
-                )
-                _remove_ready_label(
-                    cfg,
-                    i["number"],
-                    status="in_flight",
-                    pr_url=decision.pr_url,
-                )
-                continue
-            if decision.kind == "cooldown":
-                append_event(
-                    cfg.events_file,
-                    "worker_skip_cooldown",
-                    issue=i["number"],
-                    fingerprint=fp[:12],
-                    cooldown_remaining_s=decision.cooldown_remaining_s,
-                    matched_ts=decision.matched_ts,
-                )
-                continue
-        trimmed = past[-cfg.attempts.max_history_in_brief :] if past else []
-        workers_meta.append(
-            {
-                "risk_gated": gated,
-                "past_attempts": trimmed,
-                "blocking_comments": blocking_comments,
-                "brief_fingerprint": fp,
-                "forced": forced,
-            }
+        meta = _classify_issue_for_dispatch(
+            cfg,
+            i,
+            force_set=force_set,
+            cooldown_s=cooldown_s,
+            brief_hash=brief_hash,
+            risk_gate_label=risk_gate_label,
         )
+        if meta is None:
+            continue
+        workers_meta.append(meta)
         issues_to_dispatch.append(i)
-    issues = issues_to_dispatch
+    return issues_to_dispatch, workers_meta
 
-    if not issues:
-        # All candidates were skipped (in-flight or cooldown). Idle the tick.
-        append_event(cfg.events_file, "tick_all_skipped", tick=tick)
-        write_state(
-            cfg.state_file,
-            {"state": "idle", "tick": tick, "next_check_s": cfg.tick_interval_s},
-        )
-        _short_sleep(cfg.tick_interval_s, cfg)
-        return
 
-    risk_gated_issues = {
-        issue["number"]
-        for issue, meta in zip(issues, workers_meta, strict=True)
-        if meta.get("risk_gated")
-    }
+def _dispatch_follow_up_worker(
+    _issue: dict[str, Any],
+    brief: str,
+    *,
+    cfg: Config,
+    tick: int,
+    bus_emit: Any,
+) -> WorkerOutcome:
+    """Dispatch one follow-up worker session reusing the worktree.
 
-    master_log_path = cfg.logs_dir / "master.log"
-    _mlog.info(
-        master_log_path,
-        f"tick {tick} dispatching {len(issues)} worker(s): {[i['number'] for i in issues]}",
+    Module-level (issue #225): this was a closure defined *inside* the dispatch
+    ``for`` loop, which re-created the function object per outcome and captured
+    the loop variables implicitly. It now captures nothing implicitly — the
+    caller binds ``cfg``/``tick``/``bus_emit`` explicitly via
+    ``functools.partial``, yielding the ``(issue, brief) -> WorkerOutcome``
+    callable ``run_iteration_loop`` expects.
+    """
+    from forge_loop.worker import run_worker
+
+    return run_worker(
+        _issue,
+        cfg.repo,
+        cfg.logs_dir,
+        cfg.worker_timeout_s,
+        risk_gated=False,
+        past_attempts=[],
+        emit=bus_emit,
+        lumen_top_k=cfg.lumen.top_k,
+        lumen_test_pattern=cfg.lumen_test_pattern,
+        coauthor=cfg.coauthor,
+        tick=tick,
+        model=cfg.worker.model,
+        thinking=cfg.worker.thinking,
+        provider=getattr(cfg.worker, "provider", "claude"),
+        allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
+        load_timeout_ms=cfg.worker.load_timeout_ms,
+        strict_mcp_config=cfg.worker.strict_mcp_config,
+        mcp_servers=cfg.worker.mcp_servers,
+        base_branch=cfg.base_branch,
+        brief_override=brief,
+        permissions=getattr(cfg.worker, "permissions", "full"),
     )
 
-    # forge-loop assumes Claude Code subscription-mode billing (flat). The
-    # per-tick token-cost gate was removed in issue #38: it only made sense
-    # under per-token billing, and the implementation was buggy under the
-    # subscription operator persona we actually support.
-    outcomes: list[WorkerOutcome]
-    outcomes, _used_pipeline = _run_workers(
+
+def _run_worker_iterations(
+    cfg: Config,
+    tick: int,
+    issues: list[dict[str, Any]],
+    outcomes: list[WorkerOutcome],
+    *,
+    bus_emit: Any,
+) -> None:
+    """Worker iteration loop (issue #78). Mutates ``outcomes`` in place.
+
+    For each outcome that didn't reach ``merged`` (and hasn't already opened a
+    PR), probe the worker state and dispatch a focused follow-up session — up to
+    ``cfg.worker_max_iterations`` attempts. A worker that already opened a PR has
+    met the dispatch contract; leave it for the normal critic / merge-gate path.
+    Iteration-loop bugs emit ``worker_iteration_failed`` and never fail the tick.
+    """
+    if not _should_run_worker_iterations(cfg, outcomes):
+        return
+    from forge_loop.runner.iteration import run_iteration_loop
+    from forge_loop.worker_worktree import worktree_path
+
+    issue_by_n = {i["number"]: i for i in issues}
+    dispatch = functools.partial(_dispatch_follow_up_worker, cfg=cfg, tick=tick, bus_emit=bus_emit)
+    for idx, o in enumerate(list(outcomes)):
+        if o.status == "merged":
+            continue
+        if o.status == "open" and o.pr_url:
+            continue
+        issue_for_iteration = issue_by_n.get(o.issue)
+        if issue_for_iteration is None:
+            continue
+        wt = worktree_path(cfg.repo, o.issue)
+        try:
+            new_outcome = run_iteration_loop(
+                o,
+                issue_for_iteration,
+                repo=cfg.github_repo or "",
+                base_branch=cfg.base_branch,
+                worktree=wt,
+                max_iterations=cfg.worker_max_iterations,
+                dispatch_worker=dispatch,
+                emit=bus_emit,
+                coauthor=cfg.coauthor,
+            )
+            outcomes[idx] = new_outcome
+        except Exception as ex_:  # noqa: BLE001 — never fail the tick on iteration loop bugs
+            append_event(
+                cfg.events_file,
+                "worker_iteration_failed",
+                issue=o.issue,
+                err=str(ex_)[:200],
+            )
+
+
+def _dispatch_and_iterate(
+    cfg: Config,
+    tick: int,
+    issues: list[dict[str, Any]],
+    workers_meta: list[dict[str, Any]],
+    *,
+    bus_emit: Any,
+    maestro_context: str,
+    master_log_path: Path,
+) -> tuple[list[WorkerOutcome], bool]:
+    """Dispatch the worker fleet, then run the follow-up iteration loop.
+
+    Returns ``(outcomes, used_pipeline)``. ``used_pipeline`` tells the merge gate
+    whether the critic already ran as a chain step (pipeline-driven mode).
+    """
+    outcomes, used_pipeline = _run_workers(
         cfg,
         issues,
         workers_meta,
         tick,
         master_log_path=master_log_path,
-        bus_emit=_bus_emit,
+        bus_emit=bus_emit,
         maestro_context=maestro_context,
     )
+    _run_worker_iterations(cfg, tick, issues, outcomes, bus_emit=bus_emit)
+    return outcomes, used_pipeline
 
-    # Issue #78 — worker iteration loop. For each outcome that didn't reach
-    # ``merged`` on attempt 1, probe the worker state (DIRTY_NO_COMMIT,
-    # COMMITTED_NOT_PUSHED, PUSHED_NO_PR, PR_OPEN_BLOCKED, PR_OPEN_CI_FAILED,
-    # PR_OPEN_CONFLICT, PR_OPEN_HEALTHY, CLEAN_NOTHING) and dispatch a
-    # focused follow-up worker session — up to ``cfg.worker_max_iterations``
-    # attempts. After N attempts without merge, the issue gets labeled
-    # ``loop:needs-human``.
-    if _should_run_worker_iterations(cfg, outcomes):
-        from forge_loop.runner.iteration import run_iteration_loop
 
-        issue_by_n = {i["number"]: i for i in issues}
-        for idx, o in enumerate(list(outcomes)):
-            if o.status == "merged":
-                continue
-            # A worker that already opened a PR has completed the dispatch
-            # contract. Let the normal critic / ready-label / merge-gate path
-            # handle it instead of probing the worktree and accidentally
-            # converting a good PR into a follow-up failure.
-            if o.status == "open" and o.pr_url:
-                continue
-            issue_for_iteration = issue_by_n.get(o.issue)
-            if issue_for_iteration is None:
-                continue
-            from forge_loop.worker_worktree import worktree_path
+def _run_merge_gate(
+    cfg: Config,
+    outcomes: list[WorkerOutcome],
+    *,
+    risk_gated_issues: set[int],
+    used_pipeline: bool,
+    bus_emit: Any,
+    master_log_path: Path,
+) -> None:
+    """Critic → ready-label cleanup → issue-closed gate → enable auto-merge.
 
-            wt = worktree_path(cfg.repo, o.issue)
-
-            def _dispatch_follow_up(_issue: dict[str, Any], brief: str) -> WorkerOutcome:
-                """Dispatch one follow-up worker session reusing the worktree."""
-                from forge_loop.worker import run_worker
-
-                return run_worker(
-                    _issue,
-                    cfg.repo,
-                    cfg.logs_dir,
-                    cfg.worker_timeout_s,
-                    risk_gated=False,
-                    past_attempts=[],
-                    emit=_bus_emit,
-                    lumen_top_k=cfg.lumen.top_k,
-                    lumen_test_pattern=cfg.lumen_test_pattern,
-                    coauthor=cfg.coauthor,
-                    tick=tick,
-                    model=cfg.worker.model,
-                    thinking=cfg.worker.thinking,
-                    provider=getattr(cfg.worker, "provider", "claude"),
-                    allowed_mcp_servers=cfg.worker.allowed_mcp_tools,
-                    load_timeout_ms=cfg.worker.load_timeout_ms,
-                    strict_mcp_config=cfg.worker.strict_mcp_config,
-                    mcp_servers=cfg.worker.mcp_servers,
-                    base_branch=cfg.base_branch,
-                    brief_override=brief,
-                    permissions=getattr(cfg.worker, "permissions", "full"),
-                )
-
-            try:
-                new_outcome = run_iteration_loop(
-                    o,
-                    issue_for_iteration,
-                    repo=cfg.github_repo or "",
-                    base_branch=cfg.base_branch,
-                    worktree=wt,
-                    max_iterations=cfg.worker_max_iterations,
-                    dispatch_worker=_dispatch_follow_up,
-                    emit=_bus_emit,
-                    coauthor=cfg.coauthor,
-                )
-                outcomes[idx] = new_outcome
-            except Exception as ex_:  # never fail the tick on iteration loop bugs
-                append_event(
-                    cfg.events_file,
-                    "worker_iteration_failed",
-                    issue=o.issue,
-                    err=str(ex_)[:200],
-                )
-
-    fingerprint_by_issue = {
-        i["number"]: meta.get("brief_fingerprint", "")
-        for i, meta in zip(issues, workers_meta, strict=True)
-    }
-
-    # Critic agent: review PRs the workers opened, before auto-merge fires.
-    # In pipeline-driven mode the critic ran as a chain step already.
-    if cfg.critic.enabled and not _used_pipeline:
-        _run_critic_for_outcomes(cfg, outcomes, _bus_emit)
+    Issue #65: the pre-merge issue-closed gate runs AFTER the critic has had its
+    say but BEFORE any outcome is declared ``merged`` — an operator who closed
+    the issue mid-flight (dup / not-planned / scope-change) wants the loop to
+    STOP, and the gate is conservative on ``gh`` failure (refuse rather than
+    land work on a closed ticket).
+    """
+    if cfg.critic.enabled and not used_pipeline:
+        _run_critic_for_outcomes(cfg, outcomes, bus_emit)
 
     for o in outcomes:
         if o.status in {"open", "merged"} and o.pr_url:
             _remove_ready_label(cfg, o.issue, status=o.status, pr_url=o.pr_url)
 
-    # Issue #65 — pre-merge gate. AFTER the critic has had its say but
-    # BEFORE we declare any outcome "merged", re-check that the source
-    # issue is still OPEN. An operator who closed it mid-flight
-    # (close-as-dup / not-planned / scope-change) wants the loop to STOP,
-    # even if the worker raced to the finish. Conservative on gh failure:
-    # refuse rather than risk landing a 1300-LOC refactor on a closed
-    # ticket.
     from forge_loop import gh as _gh
     from forge_loop.runner.merge_gate import apply_issue_closed_gate
 
@@ -864,7 +949,7 @@ def _tick(cfg: Config, tick: int) -> None:
         gh=_gh,
         repo=cfg.github_repo,
         events_file=cfg.events_file,
-        emit=_bus_emit,
+        emit=bus_emit,
     )
     _enable_automerge_for_reviewed_outcomes(
         cfg,
@@ -878,33 +963,107 @@ def _tick(cfg: Config, tick: int) -> None:
             f"merge gate refused {len(refused)} PR(s) — closed issues: {refused}",
         )
 
-    # Persist this attempt as a GH issue comment after critic + merge gates so
-    # the ledger reflects the real post-review state, not the worker's
-    # optimistic pre-critic status.
-    if cfg.attempts.enabled:
-        for o in outcomes:
-            try:
-                _attempts.record(
-                    o.issue,
-                    status=o.status,
-                    pr_url=o.pr_url,
-                    duration_s=o.duration_s,
-                    note=(o.error or "")[:200],
-                    event_count=len(o.events or []),
-                    repo=cfg.github_repo,
-                    brief_fingerprint=fingerprint_by_issue.get(o.issue, ""),
-                )
-            except Exception as ex_:  # don't fail tick on history-write error
+
+def _record_attempts(
+    cfg: Config,
+    outcomes: list[WorkerOutcome],
+    *,
+    fingerprint_by_issue: dict[int, str],
+) -> None:
+    """Persist each attempt as a GH issue comment, post critic + merge gates.
+
+    Done after review so the ledger reflects the real post-review state, not the
+    worker's optimistic pre-critic status. A history-write error never fails the
+    tick — it emits ``attempt_record_failed`` instead.
+    """
+    if not cfg.attempts.enabled:
+        return
+    for o in outcomes:
+        try:
+            _attempts.record(
+                o.issue,
+                status=o.status,
+                pr_url=o.pr_url,
+                duration_s=o.duration_s,
+                note=(o.error or "")[:200],
+                event_count=len(o.events or []),
+                repo=cfg.github_repo,
+                brief_fingerprint=fingerprint_by_issue.get(o.issue, ""),
+            )
+        except Exception as ex_:  # noqa: BLE001 — don't fail tick on history-write error
+            append_event(
+                cfg.events_file, "attempt_record_failed", issue=o.issue, err=str(ex_)[:200]
+            )
+
+
+def _rescue_and_reap(cfg: Config, outcomes: list[WorkerOutcome]) -> None:
+    """Auto-rescue uncommitted work, then reap (or preserve) each worktree.
+
+    Real failure mode observed in dogfooding: workers write real implementation
+    + tests over 50-90 turns then exit cleanly without ever running
+    ``git commit`` — ``final_result.result == ""`` and no PR. BEFORE reaping any
+    non-merged worktree, check for uncommitted changes; if present, auto-commit
+    + push + open a draft PR labelled ``loop:needs-review`` and treat as
+    ``open`` so the reap proceeds. Worktrees that decline rescue (no dirty
+    changes / push failed) are preserved for operator inspection.
+    """
+    reapable = frozenset({"merged", "open"})
+    for o in outcomes:
+        if o.status not in reapable:
+            rescued = _rescue_uncommitted_work(o, cfg)
+            if rescued is not None:
+                o.status = "open"
+                o.pr_url = rescued
                 append_event(
-                    cfg.events_file, "attempt_record_failed", issue=o.issue, err=str(ex_)[:200]
+                    cfg.events_file,
+                    "worker_work_rescued",
+                    issue=o.issue,
+                    pr=rescued,
+                    hint="Worker exited dirty; loop auto-committed + opened draft PR. Review for completeness.",
                 )
+
+        if o.status in reapable:
+            _reap_worktree(cfg.repo, o.issue)
+            append_event(cfg.events_file, "worktree_reaped", issue=o.issue, status=o.status)
+        else:
+            from forge_loop.worker_worktree import worktree_path
+
+            wt_path = str(worktree_path(cfg.repo, o.issue))
+            append_event(
+                cfg.events_file,
+                "worktree_preserved",
+                issue=o.issue,
+                status=o.status,
+                path=wt_path,
+                hint=(
+                    f"Worker exited with status={o.status!r} and auto-rescue "
+                    "either found no dirty changes or couldn't push. Inspect "
+                    f"{wt_path} manually. Reaped at next loop boot unless "
+                    "you `git worktree remove --force` it sooner."
+                ),
+            )
+
+
+def _finalize_tick(
+    cfg: Config,
+    tick: int,
+    outcomes: list[WorkerOutcome],
+    *,
+    fingerprint_by_issue: dict[int, str],
+    short_sleep: Any,
+) -> None:
+    """Record attempts → promote memory → reap → redeploy → drift → consolidate.
+
+    The terminal phase of a dispatching tick. If the drift detector halts the
+    loop (3 identical failures in a row) the consolidation/sleep tail is skipped
+    via an early return, exactly as the inline body did.
+    """
+    _record_attempts(cfg, outcomes, fingerprint_by_issue=fingerprint_by_issue)
 
     merged_nums = [o.issue for o in outcomes if o.status == "merged"]
 
-    # Close the cognition feedback loop: write durable episodic memory from
-    # the real merged outcomes so future ticks/boots know what shipped. This
-    # is strictly best-effort — a memory write failing must NEVER break the
-    # tick, so the whole step is wrapped and only emits an event either way.
+    # Close the cognition feedback loop: durable episodic memory from real
+    # merged outcomes. Strictly best-effort — never breaks the tick.
     _record_merged_memory(cfg, [o for o in outcomes if o.status == "merged"])
 
     append_event(
@@ -923,65 +1082,7 @@ def _tick(cfg: Config, tick: int) -> None:
         },
     )
 
-    # Post-tick: auto-rescue uncommitted work, then reap.
-    #
-    # Real failure mode observed in dogfooding:
-    # workers consume 50-90 turns writing + editing real implementation +
-    # tests, then exit cleanly without ever running ``git commit``.
-    # ``final_result.result == ""`` and there's no PR. With the old reap
-    # policy the worktree was nuked and the work was lost ($16+ wasted in
-    # one night across 3 issues).
-    #
-    # Fix: BEFORE reaping any non-merged worktree, check if it has
-    # uncommitted changes. If yes, the loop AUTO-COMMITS + pushes + opens
-    # a draft PR labelled ``loop:needs-review`` so the operator can pick
-    # up the work. The outcome's pr_url + status get updated to reflect
-    # the rescue. After rescue, the worktree gets reaped normally (the
-    # work is on origin).
-    _REAPABLE_STATUSES = frozenset({"merged", "open"})
-    for o in outcomes:
-        if o.status not in _REAPABLE_STATUSES:
-            rescued = _rescue_uncommitted_work(o, cfg)
-            if rescued is not None:
-                # Rescue succeeded — outcome was mutated in place.
-                # Treat as "open" so the reap proceeds normally.
-                o.status = "open"
-                o.pr_url = rescued
-                append_event(
-                    cfg.events_file,
-                    "worker_work_rescued",
-                    issue=o.issue,
-                    pr=rescued,
-                    hint="Worker exited dirty; loop auto-committed + opened draft PR. Review for completeness.",
-                )
-
-        if o.status in _REAPABLE_STATUSES:
-            _reap_worktree(cfg.repo, o.issue)
-            append_event(
-                cfg.events_file,
-                "worktree_reaped",
-                issue=o.issue,
-                status=o.status,
-            )
-        else:
-            # Preserve for operator inspection (rescue declined the work —
-            # e.g. no uncommitted changes, or push failed).
-            from forge_loop.worker_worktree import worktree_path
-
-            wt_path = str(worktree_path(cfg.repo, o.issue))
-            append_event(
-                cfg.events_file,
-                "worktree_preserved",
-                issue=o.issue,
-                status=o.status,
-                path=wt_path,
-                hint=(
-                    f"Worker exited with status={o.status!r} and auto-rescue "
-                    "either found no dirty changes or couldn't push. Inspect "
-                    f"{wt_path} manually. Reaped at next loop boot unless "
-                    "you `git worktree remove --force` it sooner."
-                ),
-            )
+    _rescue_and_reap(cfg, outcomes)
 
     if merged_nums and cfg.deploy_task:
         ok, log = redeploy(cfg.repo, cfg.deploy_task)
@@ -1011,6 +1112,100 @@ def _tick(cfg: Config, tick: int) -> None:
         [asdict(o) for o in outcomes],
     )
     append_event(cfg.events_file, "sprint_consolidated", **summary)
-
     write_state(cfg.state_file, {"state": "between-ticks", "tick": tick, "last_summary": summary})
-    _short_sleep(cfg.tick_interval_s, cfg)
+    short_sleep(cfg.tick_interval_s, cfg)
+
+
+def _tick(cfg: Config, tick: int) -> None:
+    """Orchestrate one loop tick.
+
+    Reads as a sequence of named phases (issue #225 decomposition). Each phase
+    helper owns one slice of the tick and is unit-testable in isolation; this
+    body only wires them together and handles the early-return control flow.
+    """
+    # Imported lazily to avoid an import cycle (boot.py imports tick.py).
+    from forge_loop.runner.boot import _short_sleep
+
+    def _bus_emit(kind: str, payload: dict[str, Any]) -> None:
+        append_event(cfg.events_file, kind, **payload)
+
+    if _maybe_run_maintenance(cfg, tick, short_sleep=_short_sleep):
+        return
+
+    if _run_pre_dispatch_repairs(cfg, tick, bus_emit=_bus_emit, short_sleep=_short_sleep):
+        return
+
+    issues = _select_candidates(cfg, tick, short_sleep=_short_sleep)
+    if issues is None:
+        return
+
+    issues = _expand_specs(cfg, tick, issues)
+
+    if _run_ready_issue_repairs(cfg, tick, issues, bus_emit=_bus_emit, short_sleep=_short_sleep):
+        return
+
+    write_state(
+        cfg.state_file,
+        {
+            "state": "running",
+            "tick": tick,
+            "dispatched": [{"issue": i["number"], "title": i["title"]} for i in issues],
+        },
+    )
+    append_event(cfg.events_file, "tick_start", tick=tick, issues=[i["number"] for i in issues])
+
+    issues, maestro_context = _apply_maestro_plan(cfg, tick, issues)
+
+    issues, workers_meta = _select_dispatch_set(cfg, issues)
+    if not issues:
+        # All candidates were skipped (in-flight or cooldown). Idle the tick.
+        append_event(cfg.events_file, "tick_all_skipped", tick=tick)
+        write_state(
+            cfg.state_file,
+            {"state": "idle", "tick": tick, "next_check_s": cfg.tick_interval_s},
+        )
+        _short_sleep(cfg.tick_interval_s, cfg)
+        return
+
+    risk_gated_issues = {
+        issue["number"]
+        for issue, meta in zip(issues, workers_meta, strict=True)
+        if meta.get("risk_gated")
+    }
+    fingerprint_by_issue = {
+        i["number"]: meta.get("brief_fingerprint", "")
+        for i, meta in zip(issues, workers_meta, strict=True)
+    }
+
+    master_log_path = cfg.logs_dir / "master.log"
+    _mlog.info(
+        master_log_path,
+        f"tick {tick} dispatching {len(issues)} worker(s): {[i['number'] for i in issues]}",
+    )
+
+    outcomes, used_pipeline = _dispatch_and_iterate(
+        cfg,
+        tick,
+        issues,
+        workers_meta,
+        bus_emit=_bus_emit,
+        maestro_context=maestro_context,
+        master_log_path=master_log_path,
+    )
+
+    _run_merge_gate(
+        cfg,
+        outcomes,
+        risk_gated_issues=risk_gated_issues,
+        used_pipeline=used_pipeline,
+        bus_emit=_bus_emit,
+        master_log_path=master_log_path,
+    )
+
+    _finalize_tick(
+        cfg,
+        tick,
+        outcomes,
+        fingerprint_by_issue=fingerprint_by_issue,
+        short_sleep=_short_sleep,
+    )
