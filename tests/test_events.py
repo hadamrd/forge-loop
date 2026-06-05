@@ -7,6 +7,7 @@ import warnings
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from forge_loop.events import (
     EVENT_REGISTRY,
@@ -20,7 +21,6 @@ from forge_loop.events import (
     register_event,
 )
 from forge_loop.state import append_event
-
 
 # ---------------------------------------------------------------------------
 # Schema validation at construction — typed events refuse bad payloads
@@ -41,12 +41,12 @@ def test_redeploy_event_requires_ok() -> None:
 
 
 def test_tick_start_event_rejects_zero_tick() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         TickStartEvent(tick=0)
 
 
 def test_worktree_reaped_rejects_zero_issue() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         WorktreeReapedEvent(issue=0)
 
 
