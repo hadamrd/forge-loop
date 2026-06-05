@@ -338,6 +338,31 @@ class AttemptsSettings(BaseSettings):
     cooldown_s: int = 3600
 
 
+class RepairSettings(BaseSettings):
+    """Fair-scheduling knobs for blocking-PR repair selection (issue #248).
+
+    Disabled by default so the field defaults preserve today's behaviour
+    byte-for-byte: ``enabled=False`` ⇒ no slot reservation, no per-PR
+    backoff, repair selection is identical to the legacy path.
+
+    When enabled:
+      * ``max_consecutive_blocks`` (N) — a PR re-blocked N consecutive
+        repair ticks enters a cooldown and is excluded from
+        ``blocking_pr_repairs`` until ``cooldown_s`` elapses, freeing its
+        slot. Mirrors ``attempts.cooldown_s`` semantics.
+      * ``reserve_dispatch_after_ticks`` (K-1) — after this many
+        consecutive repair-terminal ticks while ready issues are waiting,
+        the repair phase yields the tick to new dispatch, guaranteeing
+        forward progress within ``reserve_dispatch_after_ticks + 1`` ticks.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+    enabled: bool = False
+    max_consecutive_blocks: int = 3
+    cooldown_s: int = 3600
+    reserve_dispatch_after_ticks: int = 2
+
+
 class LumenSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
     top_k: int = 3
@@ -458,6 +483,7 @@ class Settings(BaseSettings):
     po: POSettings = Field(default_factory=POSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     attempts: AttemptsSettings = Field(default_factory=AttemptsSettings)
+    repair: RepairSettings = Field(default_factory=RepairSettings)
     lumen: LumenSettings = Field(default_factory=LumenSettings)
     operator: OperatorSettings = Field(default_factory=OperatorSettings)
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
@@ -495,6 +521,7 @@ class Settings(BaseSettings):
             "po": {**(y.get("po") or {})},
             "worker": {**(y.get("worker") or {})},
             "attempts": {**(y.get("attempts") or {})},
+            "repair": {**(y.get("repair") or {})},
             "lumen": {**(y.get("lumen") or {})},
             "operator": {**(y.get("operator") or {})},
             "dashboard": {**(y.get("dashboard") or {})},
@@ -618,6 +645,11 @@ ENV_MAP: tuple[tuple[str, str, Any], ...] = (
     ("LOOP_LUMEN_TOP_K", "lumen.top_k", int),
     # Attempts
     ("LOOP_RETRY_COOLDOWN_S", "attempts.cooldown_s", int),
+    # Repair fair-scheduling (issue #248)
+    ("LOOP_REPAIR_FAIRNESS", "repair.enabled", _coerce_bool),
+    ("LOOP_REPAIR_MAX_CONSECUTIVE_BLOCKS", "repair.max_consecutive_blocks", int),
+    ("LOOP_REPAIR_COOLDOWN_S", "repair.cooldown_s", int),
+    ("LOOP_REPAIR_RESERVE_AFTER_TICKS", "repair.reserve_dispatch_after_ticks", int),
     # Iteration
     ("LOOP_WORKER_MAX_ITERATIONS", "iteration.max_iterations", int),
     ("LOOP_PIPELINE_DRIVEN", "iteration.pipeline_driven", _coerce_bool),

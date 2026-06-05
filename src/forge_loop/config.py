@@ -124,6 +124,26 @@ class AttemptsConfig:
 
 
 @dataclass(frozen=True)
+class RepairConfig:
+    """Fair-scheduling knobs for blocking-PR repair selection (issue #248).
+
+    Defaults preserve today's behaviour: ``enabled=False`` ⇒ no slot
+    reservation and no per-PR backoff, so repair selection is byte-identical
+    to the legacy path.
+    """
+
+    enabled: bool = False
+    # N — a PR re-blocked this many consecutive repair ticks enters cooldown.
+    max_consecutive_blocks: int = 3
+    # Backoff window (seconds) before a backed-off PR is selectable again.
+    cooldown_s: int = 3600
+    # K-1 — yield the tick to new dispatch after this many consecutive
+    # repair-terminal ticks while ready issues wait (forward progress in
+    # at most this+1 ticks).
+    reserve_dispatch_after_ticks: int = 2
+
+
+@dataclass(frozen=True)
 class LumenConfig:
     top_k: int = 3
 
@@ -157,6 +177,7 @@ class Config:
     po: POConfig = field(default_factory=POConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     attempts: AttemptsConfig = field(default_factory=AttemptsConfig)
+    repair: RepairConfig = field(default_factory=RepairConfig)
     lumen: LumenConfig = field(default_factory=LumenConfig)
 
     worker_max_iterations: int = 3
@@ -308,6 +329,12 @@ def _from_settings(s: Settings) -> Config:
             enabled=s.attempts.enabled,
             max_history_in_brief=s.attempts.max_history_in_brief,
         ),
+        repair=RepairConfig(
+            enabled=s.repair.enabled,
+            max_consecutive_blocks=s.repair.max_consecutive_blocks,
+            cooldown_s=s.repair.cooldown_s,
+            reserve_dispatch_after_ticks=s.repair.reserve_dispatch_after_ticks,
+        ),
         lumen=LumenConfig(top_k=s.lumen.top_k),
         worker_max_iterations=s.iteration.max_iterations,
         stuck_threshold_attempts=s.maintenance.stuck_threshold_attempts,
@@ -334,6 +361,7 @@ __all__ = [
     "LumenConfig",
     "ModelConfigError",
     "POConfig",
+    "RepairConfig",
     "WorkerConfig",
     "load",
 ]

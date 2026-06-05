@@ -62,6 +62,25 @@ critic:
   model: claude-sonnet-4-6
   thinking: off
 
+# Fair scheduling for blocking-PR repairs (issue #248). DISABLED by default:
+# with `enabled: false` the loop's repair selection is byte-identical to the
+# legacy path (in-flight repairs can pin every worker slot). Turn this on to
+# stop in-flight repairs from starving the ready backlog.
+repair:
+  # Master switch. false = legacy behaviour (no reservation, no backoff).
+  enabled: false
+  # N — a PR re-blocked this many consecutive repair ticks enters a cooldown
+  # and is excluded from repair selection until `cooldown_s` elapses, freeing
+  # its worker slot for the ready backlog.
+  max_consecutive_blocks: 3
+  # Backoff window (seconds) before a backed-off PR is offered for repair
+  # again. Mirrors `attempts.cooldown_s` semantics.
+  cooldown_s: 3600
+  # K-1 — after this many consecutive repair-only ticks while ready issues are
+  # waiting, the repair phase yields the tick to new dispatch. Guarantees a
+  # ready issue is dispatched within `reserve_dispatch_after_ticks + 1` ticks.
+  reserve_dispatch_after_ticks: 2
+
 # Optional: configure the Lumen test-discovery pattern. Match the test-file
 # glob for your stack: e.g. "**/*Test.java" for JUnit, "**/test_*.py" for pytest.
 lumen:
