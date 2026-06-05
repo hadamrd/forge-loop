@@ -1,8 +1,8 @@
-[← System Architecture](./07-system-architecture.md) · [Index](./README.md) · [Next: Conclusion →](./09-conclusion.md)
+[← Agent Enablement](./08-agent-enablement.md) · [Index](./README.md) · [Next: Conclusion →](./10-conclusion.md)
 
 ---
 
-# 8. Limitations & Threats to Validity
+# 9. Limitations & Threats to Validity
 
 A position paper that only argues its own strengths is advertising. This
 section is the honest ledger: where the *thesis* may be wrong, and where the
@@ -101,4 +101,4 @@ read as one.
 
 ---
 
-[← System Architecture](./07-system-architecture.md) · [Index](./README.md) · [Next: Conclusion →](./09-conclusion.md)
+[← Agent Enablement](./08-agent-enablement.md) · [Index](./README.md) · [Next: Conclusion →](./10-conclusion.md)

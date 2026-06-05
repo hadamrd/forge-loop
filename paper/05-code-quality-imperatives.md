@@ -124,7 +124,7 @@ preach against — a 567-line orchestration function, dead scaffolding,
 duplicated config systems. That the artifact does not fully live up to its
 own imperatives is not a refutation of the imperatives; if anything it is
 evidence *for* them, demonstrating that without relentless enforcement even
-a quality-conscious author drifts. Section 8 treats this honestly rather
+a quality-conscious author drifts. Section 9 treats this honestly rather
 than hiding it.
 
 ## References

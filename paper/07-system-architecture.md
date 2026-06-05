@@ -1,4 +1,4 @@
-[← The Slop Daemon](./06-hunting-sloppy-patterns.md) · [Index](./README.md) · [Next: Limitations →](./08-limitations.md)
+[← The Slop Daemon](./06-hunting-sloppy-patterns.md) · [Index](./README.md) · [Next: Agent Enablement →](./08-agent-enablement.md)
 
 ---
 
@@ -191,4 +191,4 @@ DOIs, author-hosted PDFs, or the publisher of record — before being cited.)*
 
 ---
 
-[← The Slop Daemon](./06-hunting-sloppy-patterns.md) · [Index](./README.md) · [Next: Limitations →](./08-limitations.md)
+[← The Slop Daemon](./06-hunting-sloppy-patterns.md) · [Index](./README.md) · [Next: Agent Enablement →](./08-agent-enablement.md)
