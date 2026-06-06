@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from forge_loop.control.boot import BootSources, assemble_boot_context
+from forge_loop.control.boot import (
+    BootContext,
+    BootContextError,
+    BootSources,
+    assemble_boot_context,
+)
 from forge_loop.eventlog import EventEnvelope, EventKind, ProjectionCursor, SqliteEventLog
 from forge_loop.eventlog.projections import ProjectionReplayError, replay_projection
 from forge_loop.frontier import FrontierCursor, FrontierStore
@@ -441,3 +446,131 @@ class TestCompactionBootEquivalence:
         assert boot_after.active_memory_ids == ("mem-keep",)  # type: ignore[attr-defined]
         # Frontier/memory boot lines are byte-identical pre/post.
         assert summary_before.splitlines()[0] == summary_after.splitlines()[0]
+
+
+@dataclass
+class _RejectingProjection:
+    """Projection that rejects an out-of-order/unexpected event mid-tail.
+
+    Mirrors a real projection guard: when it is handed an event it cannot
+    safely apply it raises ``ProjectionReplayError`` BEFORE advancing, so the
+    stored cursor must never move past the last cleanly-applied event.
+    """
+
+    cursor: ProjectionCursor
+    reject_on_sequence: int
+    applied_sequences: tuple[int, ...] = ()
+
+    def apply(self, event: EventEnvelope) -> None:
+        if event.sequence == self.reject_on_sequence:
+            raise ProjectionReplayError(f"rejected event {event.sequence} out of order")
+        self.cursor = ProjectionCursor(sequence=event.sequence)
+        self.applied_sequences = (*self.applied_sequences, event.sequence)
+
+
+def _comparable(ctx: BootContext) -> tuple[object, ...]:
+    """The byte-for-byte-equivalence surface of a reconstructed boot context."""
+    return (
+        ctx.frontier,
+        ctx.active_memory_ids,
+        ctx.rejected_path_memory_ids,
+        ctx.in_flight_task_ids,
+        ctx.in_flight_saga_ids,
+        ctx.stale_saga_ids,
+        ctx.latest_event_sequence,
+        dict(ctx.projection_cursors),
+    )
+
+
+class TestBootDrivesProjectionsToTail:
+    """Boot itself closes projection lag — no manual pre-boot replay needed."""
+
+    def _control_projection(self, tmp_path: Path, tag: str) -> _ControlProjection:
+        return _ControlProjection(
+            FrontierStore(tmp_path / f"{tag}-frontier.yaml"),
+            SqliteMemoryStore(tmp_path / f"{tag}-memory.db"),
+            SqliteTaskSagaStore(tmp_path / f"{tag}-tasks.db"),
+        )
+
+    def _boot(
+        self,
+        event_path: Path,
+        projection: _ControlProjection,
+    ) -> BootContext:
+        return assemble_boot_context(
+            BootSources(
+                frontier_store=projection.frontier_store,
+                event_log=SqliteEventLog(event_path),
+                memory_store=projection.memory_store,
+                task_store=projection.task_store,
+                projections={"control-boot": projection},
+            )
+        )
+
+    def test_partial_cursor_then_boot_equals_clean_full_replay(self, tmp_path: Path) -> None:
+        # --- Scenario A: a projection crashed partway, leaving a lagging cursor.
+        partial_path = tmp_path / "partial-events.db"
+        appended = _append_interleaved_control_events(SqliteEventLog(partial_path))
+        latest = appended[-1].sequence
+
+        partial = self._control_projection(tmp_path, "a")
+        events = list(SqliteEventLog(partial_path).since(0))
+        for event in events[:3]:  # cleanly apply only sequences 1..3 to the stores
+            partial.apply(event)
+        SqliteEventLog(partial_path).advance_projection_cursor(
+            "control-boot", ProjectionCursor(sequence=partial.cursor.sequence)
+        )
+        assert partial.cursor.sequence == 3 < latest
+
+        # Hard-reopen: a FRESH projection over the SAME (state-at-3) stores.
+        booted = self._boot(partial_path, self._control_projection(tmp_path, "a"))
+
+        # --- Scenario B: a clean full replay from sequence 0 on separate stores.
+        clean_path = tmp_path / "clean-events.db"
+        _append_interleaved_control_events(SqliteEventLog(clean_path))
+        clean = self._boot(clean_path, self._control_projection(tmp_path, "b"))
+
+        # Boot drove the lagging cursor to the tail: zero lag, head reached.
+        assert booted.projection_cursors["control-boot"].lag == 0
+        assert booted.projection_cursors["control-boot"].sequence == latest
+        # And the reconstructed context is byte-for-byte equal to a clean replay.
+        assert _comparable(booted) == _comparable(clean)
+
+    def test_projection_that_cannot_reach_tail_is_a_hard_boot_fault(self, tmp_path: Path) -> None:
+        frontier_path = tmp_path / "frontier.yaml"
+        FrontierStore(frontier_path).save(_frontier())
+        event_path = tmp_path / "events.db"
+        appended = _append_interleaved_control_events(SqliteEventLog(event_path))
+        latest = appended[-1].sequence
+        SqliteEventLog(event_path).advance_projection_cursor(
+            "control-boot", ProjectionCursor(sequence=3)
+        )
+
+        rejecting = _RejectingProjection(
+            cursor=ProjectionCursor(sequence=0),  # boot re-seeds this from the saved cursor
+            reject_on_sequence=5,  # 4 applies cleanly, 5 is rejected mid-tail
+        )
+
+        with pytest.raises(BootContextError, match="could not be replayed"):
+            assemble_boot_context(
+                BootSources(
+                    frontier_store=FrontierStore(frontier_path),
+                    event_log=SqliteEventLog(event_path),
+                    projections={"control-boot": rejecting},
+                )
+            )
+
+        # All-or-nothing: the stored cursor never moved past its pre-boot value,
+        # and boot raised rather than returning a context with residual lag.
+        assert SqliteEventLog(event_path).get_projection_cursor("control-boot").sequence == 3
+        assert latest == appended[-1].sequence
+
+
+def _frontier() -> FrontierCursor:
+    return FrontierCursor(
+        product_goal="make restart replay trustworthy",
+        current_problem="boot must drive lagging cursors to the tail",
+        next_expansion="hard-fault when a projection cannot reach the head",
+        why_now="stale projection state must never boot silently",
+        active_decisions=("replay-to-tail is synchronous and all-or-nothing",),
+    )
