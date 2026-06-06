@@ -583,17 +583,17 @@ class TestMemoryStoreContract:
 
 
 # ===========================================================================
-# Event-log contract (issue #292)
+# Event-log contract (issues #292, #293)
 # ===========================================================================
 #
 # The fast ``InMemoryEventLog`` (fake) and durable ``SqliteEventLog`` (real) are
 # written and maintained separately, so the fake can silently drift from the
-# real adapter — a future change to ``since()`` ordering or ``sequence``
-# numbering on one side only would leave every fast unit test green. This
-# parametrized class asserts the append→since round-trip is identical across
-# both adapters. It compares only ``(kind, dict(payload), sequence)`` — never
-# ``occurred_at``, which the Sqlite adapter stamps with wall-clock
-# ``datetime.now(UTC)``.
+# real adapter — a future change to ``since()`` ordering, ``sequence``
+# numbering, or ``idempotency_key`` dedup on one side only would leave every
+# fast unit test green. This parametrized class asserts the append→since
+# round-trip AND idempotency-key dedup are identical across both adapters. It
+# compares only ``(kind, dict(payload), sequence)`` — never ``occurred_at``,
+# which the Sqlite adapter stamps with wall-clock ``datetime.now(UTC)``.
 
 EventLogFactory = Callable[[Path], EventLog]
 
@@ -677,3 +677,47 @@ class TestEventLogContract:
             (EventKind.DECISION_MADE, 2),
             (EventKind.FRONTIER_ADVANCED, 3),
         ]
+
+    # --- Idempotency-key dedup parity (issue #293) ------------------------
+
+    # Primary acceptance criterion: appending twice with the same non-None
+    # idempotency_key returns the SAME envelope and leaves exactly one event.
+    def test_duplicate_idempotency_key_dedups(self, event_log: EventLog) -> None:
+        first = event_log.append(
+            EventKind.TASK_DISPATCHED,
+            {"task": "ship-m1"},
+            task_id="task-1",
+            saga_id="saga-1",
+            idempotency_key="dispatch:task-1",
+        )
+        duplicate = event_log.append(
+            EventKind.TASK_DISPATCHED,
+            # Different payload/ids: the existing envelope must win regardless.
+            {"task": "ship-m1-again"},
+            task_id="task-2",
+            saga_id="saga-2",
+            idempotency_key="dispatch:task-1",
+        )
+
+        assert duplicate == first
+        assert [event.sequence for event in event_log.since(0)] == [1]
+        assert event_log.latest_sequence() == 1
+
+    # Adversarial T2: a None idempotency_key must NOT dedup — two appends with
+    # no key are two distinct events on both adapters.
+    def test_none_idempotency_key_does_not_dedup(self, event_log: EventLog) -> None:
+        first = event_log.append(EventKind.TASK_DISPATCHED, {"n": 1})
+        second = event_log.append(EventKind.TASK_DISPATCHED, {"n": 2})
+
+        assert first != second
+        assert [event.sequence for event in event_log.since(0)] == [1, 2]
+        assert event_log.latest_sequence() == 2
+
+    # Adversarial: distinct non-None keys are distinct events (dedup is keyed,
+    # not a blanket "second append is dropped").
+    def test_distinct_idempotency_keys_are_distinct_events(self, event_log: EventLog) -> None:
+        event_log.append(EventKind.TASK_DISPATCHED, {"n": 1}, idempotency_key="k-1")
+        event_log.append(EventKind.TASK_DISPATCHED, {"n": 2}, idempotency_key="k-2")
+
+        assert [event.sequence for event in event_log.since(0)] == [1, 2]
+        assert event_log.latest_sequence() == 2
