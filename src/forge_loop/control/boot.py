@@ -274,6 +274,12 @@ def build_boot_sources(repo: Path | str) -> BootSources:
     # missing store is not silently materialised on open.
     tasks_path = canonical_task_saga_path(repo)
     task_store = SqliteTaskSagaStore(tasks_path) if tasks_path.exists() else None
+    # ``projections`` is intentionally left empty here: no concrete production
+    # ``Projection`` exists in the repo yet, so there is nothing for the
+    # CLI/maestro boot path to reconcile. This is the single seam where future
+    # production projections register — once one lands, add it to this mapping
+    # and ``assemble_boot_context`` drives it to the log tail automatically. The
+    # replay-to-tail mechanism itself is fully exercised by the boot tests.
     return BootSources(
         frontier_store=FrontierStore(frontier_path),
         event_log=SqliteEventLog(forge_dir / "events.db"),
