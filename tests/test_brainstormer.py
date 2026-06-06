@@ -390,6 +390,25 @@ def test_integration_renders_vision_axes_and_rubric_into_prompt() -> None:
     assert "(none)" in prompt
 
 
+def test_brief_enforces_small_single_mechanism_and_decomposition() -> None:
+    """The brainstormer brief must instruct: single-mechanism, ≤~150 LOC,
+    one falsifiable AC, and epic-decomposition for large ideas."""
+    vision = discover(FIXTURES / "valid_full")
+    fn = _stub_sdk({"proposed_epics": [], "proposed_tickets": []})
+    b = Brainstormer(sdk_fn=fn)
+    b.run(vision)
+    prompt = fn.captured["prompt"]  # type: ignore[attr-defined]
+    # Single-mechanism + size directive
+    assert "single-mechanism" in prompt.lower() or "ONE mechanism" in prompt
+    assert "150" in prompt  # the net-LOC ceiling is cited explicitly
+    # One falsifiable acceptance criterion
+    assert "falsifiable acceptance criterion" in prompt.lower()
+    # Epic-decomposition instruction with dispatchable sub-tickets
+    assert "Decomposing large" in prompt
+    assert "proposed_epics" in prompt and "sub-tickets" in prompt
+    assert "epic" in prompt.lower() and "loop:ready" in prompt
+
+
 # ---------------------------------------------------------------------------
 # Backlog helper (gh_client wrapper)
 # ---------------------------------------------------------------------------

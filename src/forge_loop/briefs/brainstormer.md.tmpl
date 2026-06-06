@@ -27,6 +27,51 @@ Do not propose anything that is the same idea as a rejected path above, even
 reworded. If you believe a rejected path should be revisited, that is an
 operator decision via supersession — not yours to re-file.
 
+# Sizing & single-mechanism (HARD requirement — verification-easy regime)
+
+The loop only CONVERGES on tickets a worker can land in ONE small PR. Large,
+multi-mechanism tickets do not converge: the worker can't land the diff, the
+critic correctly blocks it, and the slot is wasted. So every *ticket* you file
+(items in `proposed_tickets`) MUST be sized for the verification-easy regime:
+
+  * **ONE mechanism.** A single, named change — one code path, one feature
+    flag, one command, one endpoint, one guard. If you find yourself writing
+    "and" between two distinct behaviours in the title, it is two tickets.
+  * **ONE primary falsifiable acceptance criterion.** State it as a single
+    sentence a test can prove true/false. Secondary criteria are fine only if
+    they are facets of that one mechanism (not separate features).
+  * **≤ ~150 net LOC.** Estimate implementation + tests at no more than ~150
+    net lines of code (this mirrors the worker's `scope_soft_loc_cap = 150`).
+    If your honest estimate exceeds that, the idea is an EPIC — decompose it
+    (see below). Do NOT file an oversized idea as a single ticket.
+  * **Implementable + testable in one small PR** by a single worker session.
+
+When in doubt, file the SMALLER thing. A narrow ticket that lands beats a
+broad ticket that never converges.
+
+# Decomposing large / multi-mechanism ideas into an epic + sub-tickets
+
+If an idea is inherently large or spans more than one mechanism (e.g. "auto-
+sweep stale branches" = sweep-on-merge AND a periodic sweep command AND a
+dry-run report), DO NOT file it as one ticket. Instead file it as:
+
+  1. ONE entry in `proposed_epics` — the umbrella idea. It carries the axis +
+     customer_story but is NOT itself dispatchable (it is filed with the
+     `epic` label, never `loop:ready`).
+  2. 2–4 entries in `proposed_tickets`, EACH a single-mechanism, ≤ ~150-LOC,
+     verification-easy slice of that epic. Each sub-ticket's body MUST name
+     the parent epic by its title (write `Part of epic: "<epic title>"` on the
+     first line of the body) and stand on its own as one shippable PR.
+
+Example decomposition — "auto-sweep stale branches":
+  * epic:    "Auto-sweep stale branches"
+  * ticket:  "Delete the source branch when its PR merges" (one mechanism)
+  * ticket:  "Add `forge-loop sweep-branches` periodic command" (one mechanism)
+  * ticket:  "Dry-run flag for sweep-branches that lists, never deletes" (one)
+
+Only the small sub-tickets are dispatchable; the epic groups them. Never file
+an epic WITHOUT at least 2 sub-tickets — a bare epic moves nothing.
+
 # Hard-refusal rubric
 
 A proposal is REJECTED if any of the following are true:
@@ -37,6 +82,8 @@ A proposal is REJECTED if any of the following are true:
    (exact, case-sensitive).
 4. Its title or body contains (case-insensitive substring) any phrase
    listed under that axis's `rejected_as_cosmetic`.
+5. A `proposed_tickets` item is multi-mechanism or estimated to exceed
+   ~150 net LOC — it must be decomposed into an epic + sub-tickets instead.
 
 These are not stylistic preferences — proposals failing the rubric are
 dropped post-hoc by the operator. Do not propose:
@@ -70,3 +117,6 @@ no prose after it:
 
 Empty lists are valid. Better to propose nothing than to propose
 cosmetic work.
+
+Remember: every `proposed_tickets` item is single-mechanism and ≤ ~150 net
+LOC. Anything bigger goes into `proposed_epics` PLUS its 2–4 small sub-tickets.
