@@ -72,10 +72,14 @@ def classify_critic_error_text(text: str | None) -> CriticErrorClass:
     t = (text or "").lower()
     if "event loop is closed" in t:
         return CriticErrorClass.EVENT_LOOP_CLOSED
-    if "timeout" in t or "timed out" in t:
-        return CriticErrorClass.TIMEOUT
+    # Transport markers (incl. "read timed out") FIRST: a read-timeout is a
+    # transient transport blip and must classify as SDK_TRANSPORT (retryable),
+    # not the terminal TIMEOUT. Only a bare timeout with no transport marker is
+    # TIMEOUT. (Fixes the sev2: the "read timed out" marker was unreachable.)
     if any(marker in t for marker in _TRANSPORT_MARKERS):
         return CriticErrorClass.SDK_TRANSPORT
+    if "timeout" in t or "timed out" in t:
+        return CriticErrorClass.TIMEOUT
     return CriticErrorClass.UNKNOWN
 
 

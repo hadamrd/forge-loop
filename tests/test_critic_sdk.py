@@ -449,6 +449,14 @@ def test_classify_transport_and_unknown_from_text() -> None:
         classify_critic_error_text("httpx.ConnectError: connection refused")
         is CriticErrorClass.SDK_TRANSPORT
     )
+    # Regression (#274 sev2): "read timed out" is a transient transport blip
+    # (retryable SDK_TRANSPORT), NOT the terminal TIMEOUT — transport markers
+    # must be checked before the generic timeout branch.
+    assert (
+        classify_critic_error_text("httpx.ReadTimeout: read timed out")
+        is CriticErrorClass.SDK_TRANSPORT
+    )
+    assert classify_critic_error_text("critic session timed out after 600s") is CriticErrorClass.TIMEOUT
     assert classify_critic_error_text("totally novel boom") is CriticErrorClass.UNKNOWN
 
 
