@@ -2,20 +2,43 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import combinations
 from pathlib import Path
 from typing import Protocol
 
 from forge_loop.eventlog import ProjectionCursor, SqliteEventLog
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import MemoryItem, MemoryKind, SqliteMemoryStore
+from forge_loop.memory.models import axis_from_tags, contradicts, is_load_bearing
 from forge_loop.tasks import SqliteTaskSagaStore, TaskSaga
 
 
 class BootContextError(RuntimeError):
     """Raised when required durable boot state cannot be loaded."""
+
+
+def assert_no_active_contradictions(items: Sequence[MemoryItem]) -> None:
+    """Raise :class:`BootContextError` if any two active load-bearing items contradict.
+
+    A maestro resuming from ``list_active`` assumes the loaded decisions are
+    mutually consistent. This invariant makes that assumption *checked*: if two
+    contradictory load-bearing decisions were ever both admitted (e.g. via a
+    direct ``put`` that bypassed the curator's transition gate), boot fails
+    loudly naming the offending ``memory_id``s instead of silently acting on a
+    contradictory frontier. It only detects and refuses — it never auto-heals.
+    """
+    load_bearing = [item for item in items if is_load_bearing(item)]
+    for left, right in combinations(load_bearing, 2):
+        if contradicts(left, right):
+            raise BootContextError(
+                "active load-bearing memory contains a live contradiction: "
+                f"{left.memory_id!r} vs {right.memory_id!r} on axis "
+                f"{axis_from_tags(left.tags)!r}; resolve via an explicit "
+                "reopen/amend/retire transition before booting"
+            )
 
 
 class BootFrontierStore(Protocol):
@@ -158,7 +181,9 @@ def assemble_boot_context(sources: BootSources, *, now: datetime | None = None) 
     active_memory_ids: tuple[str, ...] = ()
     rejected_path_memory_ids: tuple[str, ...] = ()
     if sources.memory_store is not None:
-        active_memory_ids = tuple(item.memory_id for item in sources.memory_store.list_active())
+        active_items = sources.memory_store.list_active()
+        assert_no_active_contradictions(active_items)
+        active_memory_ids = tuple(item.memory_id for item in active_items)
         rejected_path_memory_ids = tuple(
             item.memory_id for item in sources.memory_store.list_rejected_paths()
         )

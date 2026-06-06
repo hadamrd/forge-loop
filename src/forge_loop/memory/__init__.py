@@ -4,15 +4,30 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from forge_loop.memory.curator import (
+    ContradictionError,
+    ContradictionResolution,
+    MemoryCurator,
+    PromotionCandidate,
+)
 from forge_loop.memory.models import (
     AXIS_TAG_PREFIX,
+    LOAD_BEARING_TAG,
     REJECTED_PATH_TAG,
+    STANCE_TAG_PREFIX,
+    SUBJECT_TAG_PREFIX,
     MemoryItem,
     MemoryKind,
     MemoryProvenance,
     axis_from_tags,
     axis_tag,
+    contradicts,
     derive_memory_id,
+    is_load_bearing,
+    stance_from_tags,
+    stance_tag,
+    subject_from_tags,
+    subject_tag,
 )
 from forge_loop.memory.store import MemoryStore, SqliteMemoryStore
 
@@ -38,15 +53,28 @@ def open_memory_store(repo_path: str | Path) -> SqliteMemoryStore:
 
 __all__ = [
     "AXIS_TAG_PREFIX",
+    "LOAD_BEARING_TAG",
     "REJECTED_PATH_TAG",
+    "STANCE_TAG_PREFIX",
+    "SUBJECT_TAG_PREFIX",
+    "ContradictionError",
+    "ContradictionResolution",
+    "MemoryCurator",
     "MemoryItem",
     "MemoryKind",
     "MemoryProvenance",
     "MemoryStore",
+    "PromotionCandidate",
     "SqliteMemoryStore",
     "axis_from_tags",
     "axis_tag",
+    "contradicts",
     "derive_memory_id",
+    "is_load_bearing",
     "memory_db_path",
     "open_memory_store",
+    "stance_from_tags",
+    "stance_tag",
+    "subject_from_tags",
+    "subject_tag",
 ]
