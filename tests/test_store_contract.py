@@ -45,11 +45,18 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from forge_loop._testing.memory_store import FakeMemoryStore
 from forge_loop._testing.task_saga_store import FakeTaskSagaStore
+from forge_loop.eventlog import (
+    EventKind,
+    EventLog,
+    InMemoryEventLog,
+    SqliteEventLog,
+)
 from forge_loop.memory.models import (
     REJECTED_PATH_TAG,
     MemoryItem,
@@ -573,3 +580,100 @@ class TestMemoryStoreContract:
         unchanged = memory_store.get("mem-old")
         assert unchanged is not None
         assert unchanged.is_active
+
+
+# ===========================================================================
+# Event-log contract (issue #292)
+# ===========================================================================
+#
+# The fast ``InMemoryEventLog`` (fake) and durable ``SqliteEventLog`` (real) are
+# written and maintained separately, so the fake can silently drift from the
+# real adapter — a future change to ``since()`` ordering or ``sequence``
+# numbering on one side only would leave every fast unit test green. This
+# parametrized class asserts the append→since round-trip is identical across
+# both adapters. It compares only ``(kind, dict(payload), sequence)`` — never
+# ``occurred_at``, which the Sqlite adapter stamps with wall-clock
+# ``datetime.now(UTC)``.
+
+EventLogFactory = Callable[[Path], EventLog]
+
+
+def _build_fake_event_log(_tmp_path: Path) -> EventLog:
+    return InMemoryEventLog()
+
+
+def _build_sqlite_event_log(tmp_path: Path) -> EventLog:
+    return SqliteEventLog(tmp_path / "events.db")
+
+
+@pytest.fixture(
+    params=[_build_fake_event_log, _build_sqlite_event_log],
+    ids=["fake", "sqlite"],
+)
+def event_log(request: pytest.FixtureRequest, tmp_path: Path) -> EventLog:
+    """An event log, parametrized over the fake and the real adapter."""
+    factory: EventLogFactory = request.param
+    return factory(tmp_path)
+
+
+#: A fixed sequence of ≥3 envelopes with DISTINCT kind, payload, and task_id.
+#: Order matters: the round-trip asserts ``since(0)`` preserves append order
+#: and 1-based contiguous sequencing on both adapters.
+_SEED_EVENTS: tuple[tuple[EventKind, dict[str, Any], str], ...] = (
+    (EventKind.TASK_PLANNED, {"task_id": "task-292", "issue": 292}, "task-292"),
+    (EventKind.DECISION_MADE, {"decision": "ship", "rationale": "contract"}, "task-293"),
+    (EventKind.FRONTIER_ADVANCED, {"frontier": "eventlog", "delta": 3}, "task-294"),
+)
+
+
+def _seed_events(log: EventLog) -> None:
+    """Append the fixed seed sequence via the public ``append`` API."""
+    for kind, payload, task_id in _SEED_EVENTS:
+        log.append(kind, payload, task_id=task_id)
+
+
+class TestEventLogContract:
+    """Identical behavioral assertions for fake and real event logs."""
+
+    # (a) append→since(0) round-trip yields the same ordered tuples on both.
+    def test_append_then_since_round_trip(self, event_log: EventLog) -> None:
+        _seed_events(event_log)
+
+        observed = [(env.kind, dict(env.payload), env.sequence) for env in event_log.since(0)]
+        expected = [
+            (kind, payload, index)
+            for index, (kind, payload, _task_id) in enumerate(_SEED_EVENTS, start=1)
+        ]
+        assert observed == expected
+
+    # Sequences are 1-based and contiguous (fake: len+1, sqlite: AUTOINCREMENT).
+    def test_sequences_are_one_based_and_contiguous(self, event_log: EventLog) -> None:
+        _seed_events(event_log)
+        sequences = [env.sequence for env in event_log.since(0)]
+        assert sequences == [1, 2, 3]
+
+    # since(0) returns a fresh iterable each call — does not exhaust to empty.
+    def test_since_returns_fresh_iterable_each_call(self, event_log: EventLog) -> None:
+        _seed_events(event_log)
+        first = list(event_log.since(0))
+        second = list(event_log.since(0))
+        assert len(first) == len(_SEED_EVENTS)
+        assert second == first
+
+    # --- Adversarial / sad-path -------------------------------------------
+
+    def test_since_high_watermark_returns_empty(self, event_log: EventLog) -> None:
+        # T2 / off-by-one: since(N) after N appends is strictly > N → [].
+        _seed_events(event_log)
+        n = len(_SEED_EVENTS)
+        assert list(event_log.since(n)) == []
+
+    def test_since_midpoint_returns_tail(self, event_log: EventLog) -> None:
+        # The since() boundary is EXCLUSIVE and identical across adapters:
+        # since(1) yields only events with sequence > 1.
+        _seed_events(event_log)
+        tail = [(env.kind, env.sequence) for env in event_log.since(1)]
+        assert tail == [
+            (EventKind.DECISION_MADE, 2),
+            (EventKind.FRONTIER_ADVANCED, 3),
+        ]
