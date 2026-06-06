@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from forge_loop.control.boot import BootContextError, BootSources, assemble_boot_context
-from forge_loop.eventlog import EventKind, ProjectionCursor, SqliteEventLog
+from forge_loop.eventlog import EventEnvelope, EventKind, ProjectionCursor, SqliteEventLog
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import (
     REJECTED_PATH_TAG,
@@ -41,6 +42,99 @@ def _memory(memory_id: str, *, tags: tuple[str, ...] = ()) -> MemoryItem:
             confidence=0.9,
         ),
     )
+
+
+@dataclass
+class _RecordingProjection:
+    """Minimal projection that records the tail it replays (cursor-only)."""
+
+    cursor: ProjectionCursor = ProjectionCursor()
+    applied_sequences: tuple[int, ...] = ()
+
+    def apply(self, event: EventEnvelope) -> None:
+        self.cursor = ProjectionCursor(sequence=event.sequence)
+        self.applied_sequences = (*self.applied_sequences, event.sequence)
+
+
+@dataclass
+class _ExplodingProjection:
+    """Projection that fails if replay is ever attempted against it."""
+
+    cursor: ProjectionCursor = ProjectionCursor()
+
+    def apply(self, event: EventEnvelope) -> None:
+        raise AssertionError(f"replay must not run; got event {event.sequence}")
+
+
+def _seed_events(eventlog: SqliteEventLog, count: int) -> int:
+    last = 0
+    for _ in range(count):
+        last = eventlog.append(EventKind.FRONTIER_ADVANCED, {"cursor": "seed"}).sequence
+    return last
+
+
+def test_boot_drives_lagging_projection_cursor_to_tail(tmp_path: Path) -> None:
+    frontier_path = tmp_path / "frontier.yaml"
+    eventlog_path = tmp_path / "events.db"
+    FrontierStore(frontier_path).save(_frontier())
+
+    eventlog = SqliteEventLog(eventlog_path)
+    latest = _seed_events(eventlog, 10)
+    eventlog.set_projection_cursor("control", ProjectionCursor(sequence=4))
+
+    projection = _RecordingProjection()
+    context = assemble_boot_context(
+        BootSources(
+            frontier_store=FrontierStore(frontier_path),
+            event_log=SqliteEventLog(eventlog_path),
+            projections={"control": projection},
+        )
+    )
+
+    assert context.projection_cursors["control"].sequence == latest
+    assert context.projection_cursors["control"].lag == 0
+    # Only the lagging tail (5..10) is replayed — events 1..4 are NOT re-applied.
+    assert projection.applied_sequences == (5, 6, 7, 8, 9, 10)
+    assert "projections: control@10 lag=0" in context.summary()
+
+
+def test_boot_projection_already_at_tail_is_a_noop(tmp_path: Path) -> None:
+    frontier_path = tmp_path / "frontier.yaml"
+    eventlog_path = tmp_path / "events.db"
+    FrontierStore(frontier_path).save(_frontier())
+
+    eventlog = SqliteEventLog(eventlog_path)
+    latest = _seed_events(eventlog, 6)
+    eventlog.set_projection_cursor("control", ProjectionCursor(sequence=latest))
+
+    projection = _RecordingProjection()
+    context = assemble_boot_context(
+        BootSources(
+            frontier_store=FrontierStore(frontier_path),
+            event_log=SqliteEventLog(eventlog_path),
+            projections={"control": projection},
+        )
+    )
+
+    assert projection.applied_sequences == ()
+    assert context.projection_cursors["control"].sequence == latest
+    assert context.projection_cursors["control"].lag == 0
+
+
+def test_boot_empty_event_log_succeeds_without_replay(tmp_path: Path) -> None:
+    frontier_path = tmp_path / "frontier.yaml"
+    FrontierStore(frontier_path).save(_frontier())
+
+    context = assemble_boot_context(
+        BootSources(
+            frontier_store=FrontierStore(frontier_path),
+            event_log=SqliteEventLog(tmp_path / "events.db"),
+            projections={"control": _ExplodingProjection()},
+        )
+    )
+
+    assert context.latest_event_sequence == 0
+    assert context.projection_cursors == {}
 
 
 def test_boot_context_assembles_from_reopened_durable_stores(tmp_path: Path) -> None:
