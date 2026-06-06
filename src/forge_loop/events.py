@@ -386,11 +386,17 @@ class WorkerPolicyEnforcedEvent(EventBase):
     ``policy_hash`` is the stable sha256 over the canonical policy JSON
     (``forge_loop.sandbox.policy_hash``). Boot/replay reads this to confirm
     each worker ran within exactly the grant it was leased.
+
+    ``withheld_secrets`` (issue #283) records the NAMES (never values) of the
+    operator's secret-shaped env keys that the lease did NOT grant and were
+    therefore withheld from the worker child env. Empty when every secret-shaped
+    key was leased (or when no secret-shaped keys were present).
     """
 
     KIND: ClassVar[str] = "worker_policy_enforced"
     worktree_path: str = ""
     policy_hash: str = ""
+    withheld_secrets: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

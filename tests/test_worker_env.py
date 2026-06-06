@@ -20,7 +20,8 @@ from typing import Any
 import pytest
 
 from forge_loop import worker as worker_mod
-from forge_loop.worker_env import build_worker_env, missing_tools
+from forge_loop.sandbox.policy import CapabilityPolicy
+from forge_loop.worker_env import build_worker_env, missing_tools, scope_secrets
 
 # ---------------------------------------------------------------------------
 # build_worker_env — provisioning
@@ -74,6 +75,104 @@ def test_build_worker_env_path_dedup_and_precedence(tmp_path: Path) -> None:
 def test_build_worker_env_accepts_vars_as_pairs(tmp_path: Path) -> None:
     env = build_worker_env({}, repo=tmp_path, vars=[("FOO", "bar")])
     assert env["FOO"] == "bar"
+
+
+# ---------------------------------------------------------------------------
+# scope_secrets — secret-lease enforcement at spawn (issue #283)
+# ---------------------------------------------------------------------------
+
+
+def test_scope_secrets_keeps_leased_drops_unleased_passes_plain() -> None:
+    base = {
+        "GITHUB_TOKEN": "gh-secret",
+        "ANTHROPIC_API_KEY": "sk-secret",
+        "PATH": "/usr/bin",
+        "HOME": "/home/x",
+        "VIRTUAL_ENV": "/opt/venv",
+    }
+    policy = CapabilityPolicy(secret_names=("GITHUB_TOKEN",))
+    env, withheld = scope_secrets(base, policy)
+
+    # Leased secret survives.
+    assert env["GITHUB_TOKEN"] == "gh-secret"
+    # Unleased secret-shaped key is removed (and reported by name).
+    assert "ANTHROPIC_API_KEY" not in env
+    assert withheld == ["ANTHROPIC_API_KEY"]
+    # Non-secret keys pass through untouched.
+    assert env["PATH"] == "/usr/bin"
+    assert env["HOME"] == "/home/x"
+    assert env["VIRTUAL_ENV"] == "/opt/venv"
+
+
+def test_scope_secrets_none_policy_withholds_all() -> None:
+    base = {
+        "GITHUB_TOKEN": "a",
+        "ANTHROPIC_API_KEY": "b",
+        "DB_PASSWORD": "c",
+        "PATH": "/usr/bin",
+    }
+    env, withheld = scope_secrets(base, None)
+
+    # Fail safe: every secret-shaped key withheld when there is no lease.
+    assert "GITHUB_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "DB_PASSWORD" not in env
+    assert env["PATH"] == "/usr/bin"
+    # Withheld names are sorted/stable and exactly the secret-shaped keys.
+    assert withheld == ["ANTHROPIC_API_KEY", "DB_PASSWORD", "GITHUB_TOKEN"]
+
+
+def test_scope_secrets_empty_policy_withholds_all() -> None:
+    # An empty CapabilityPolicy() behaves identically to None — closed default.
+    base = {"GITHUB_TOKEN": "a", "PATH": "/usr/bin"}
+    env, withheld = scope_secrets(base, CapabilityPolicy())
+    assert "GITHUB_TOKEN" not in env
+    assert withheld == ["GITHUB_TOKEN"]
+
+
+def test_scope_secrets_does_not_mutate_input() -> None:
+    base = {"GITHUB_TOKEN": "a", "PATH": "/usr/bin"}
+    snapshot = dict(base)
+    env, _ = scope_secrets(base, CapabilityPolicy(secret_names=("GITHUB_TOKEN",)))
+    # The input mapping is untouched; a brand-new dict is returned.
+    assert base == snapshot
+    assert env is not base
+
+
+def test_scope_secrets_leased_name_absent_from_base_is_noop() -> None:
+    # Leasing a name that isn't in base must not error or invent a key.
+    base = {"PATH": "/usr/bin"}
+    env, withheld = scope_secrets(base, CapabilityPolicy(secret_names=("GITHUB_TOKEN",)))
+    assert "GITHUB_TOKEN" not in env
+    assert withheld == []
+    assert env == {"PATH": "/usr/bin"}
+
+
+def test_scope_secrets_pattern_coverage() -> None:
+    base = {
+        "ANTHROPIC_API_KEY": "1",
+        "GITHUB_TOKEN": "2",
+        "AWS_SECRET_ACCESS_KEY": "3",
+        "DB_PASSWORD": "4",
+        "MY_PASSWD": "5",
+        "SOME_CREDENTIAL": "6",
+        # Non-secret-shaped — must NOT be flagged.
+        "PATH": "/usr/bin",
+        "LANG": "en_US.UTF-8",
+        "EDITOR": "vim",
+    }
+    _, withheld = scope_secrets(base, None)
+    assert set(withheld) == {
+        "ANTHROPIC_API_KEY",
+        "GITHUB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "DB_PASSWORD",
+        "MY_PASSWD",
+        "SOME_CREDENTIAL",
+    }
+    # PATH/LANG/EDITOR explicitly not flagged.
+    for plain in ("PATH", "LANG", "EDITOR"):
+        assert plain not in withheld
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +386,95 @@ def test_run_sdk_session_provisions_env_into_base_kwargs(tmp_path: Path) -> None
     venv_bin = str((tmp_path / ".venv" / "bin").resolve())
     assert env["PATH"].split(os.pathsep)[0] == venv_bin
     assert env["VIRTUAL_ENV"] == str((tmp_path / ".venv").resolve())
+
+
+def _run_session_capture_env(
+    tmp_path: Path, *, base_env: dict[str, str], **session_kw: Any
+) -> dict[str, str]:
+    """Drive run_sdk_session with a fake SDK and return the env it built."""
+    import anyio
+
+    from forge_loop import _worker_sdk
+
+    captured: dict[str, Any] = {}
+
+    class FakeOptions:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    async def fake_query(**_kw: Any) -> Any:
+        if False:
+            yield None
+        return
+
+    async def _run() -> Any:
+        return await _worker_sdk.run_sdk_session(
+            "brief",
+            cwd=tmp_path,
+            env=dict(base_env),
+            query_fn=fake_query,
+            options_cls=FakeOptions,
+            **session_kw,
+        )
+
+    anyio.run(_run)
+    return captured["env"]
+
+
+def test_run_sdk_session_scopes_secrets_to_lease(tmp_path: Path) -> None:
+    """Integration: only the leased secret survives into ClaudeAgentOptions(env).
+
+    The acceptance customer story — a lease naming only GITHUB_TOKEN keeps it,
+    drops ANTHROPIC_API_KEY, and leaves PATH/VIRTUAL_ENV (toolchain) intact.
+    """
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    base_env = {
+        "GITHUB_TOKEN": "gh",
+        "ANTHROPIC_API_KEY": "sk",
+        "PATH": "/usr/bin",
+        "VIRTUAL_ENV": "/opt/venv",
+    }
+    env = _run_session_capture_env(
+        tmp_path,
+        base_env=base_env,
+        repo=tmp_path,
+        env_path_prepend=[".venv/bin"],
+        secret_names=("GITHUB_TOKEN",),
+    )
+
+    assert env["GITHUB_TOKEN"] == "gh"
+    assert "ANTHROPIC_API_KEY" not in env
+    # Toolchain provisioning survives secret scoping.
+    assert env["VIRTUAL_ENV"] == "/opt/venv"
+    venv_bin = str((tmp_path / ".venv" / "bin").resolve())
+    assert env["PATH"].split(os.pathsep)[0] == venv_bin
+
+
+def test_run_sdk_session_secret_acceptance_gate(tmp_path: Path) -> None:
+    """Adversarial acceptance gate from the customer story (issue #283).
+
+    A worker whose lease omits both tokens CANNOT read either from its env;
+    a worker whose lease names them CAN.
+    """
+    base_env = {"ANTHROPIC_API_KEY": "sk", "GITHUB_TOKEN": "gh", "PATH": "/usr/bin"}
+
+    # Lease omits both → both withheld.
+    denied = _run_session_capture_env(tmp_path, base_env=base_env, secret_names=())
+    assert "ANTHROPIC_API_KEY" not in denied
+    assert "GITHUB_TOKEN" not in denied
+    assert denied["PATH"] == "/usr/bin"
+
+    # Lease names both → both present.
+    granted = _run_session_capture_env(
+        tmp_path, base_env=base_env, secret_names=("ANTHROPIC_API_KEY", "GITHUB_TOKEN")
+    )
+    assert granted["ANTHROPIC_API_KEY"] == "sk"
+    assert granted["GITHUB_TOKEN"] == "gh"
+
+
+def test_run_sdk_session_default_closes_secrets(tmp_path: Path) -> None:
+    """No secret_names kwarg → closed default: every secret-shaped key withheld."""
+    base_env = {"GITHUB_TOKEN": "gh", "PATH": "/usr/bin"}
+    env = _run_session_capture_env(tmp_path, base_env=base_env)
+    assert "GITHUB_TOKEN" not in env
+    assert env["PATH"] == "/usr/bin"

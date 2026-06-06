@@ -185,12 +185,20 @@ def _emit_worker_policy_event(
     if events_file is None:
         return
     from forge_loop.events import WorkerPolicyEnforcedEvent, emit
+    from forge_loop.worker_env import scope_secrets
+
+    # Record (names only, never values) which operator secret-shaped env keys
+    # the lease withheld from the worker child env (issue #283). Computed
+    # against the operator's current process env — the same base the worker
+    # would otherwise have inherited.
+    _, withheld = scope_secrets(os.environ, policy)
 
     emit(
         events_file,
         WorkerPolicyEnforcedEvent(
             worktree_path=str(worktree),
             policy_hash=policy_hash(policy),
+            withheld_secrets=withheld,
         ),
     )
 
