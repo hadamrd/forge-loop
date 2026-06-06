@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from typing import Any
 
 from forge_loop.config import Config
 from forge_loop.maintenance import run_maintenance
@@ -49,6 +50,69 @@ def run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
             demoted=[d.issue for d in report.demotions if d.ok],
             failed=list(report.errors),
             scanned=report.scanned,
+        )
+    return report
+
+
+def run_branch_sweep(cfg: Config, tick: int) -> Any:
+    """Delete stale remote + local branches and emit ``branch_sweep_done``.
+
+    Shared by the per-tick cadence (``branch_sweep_every_n_ticks``) and the
+    manual ``forge-loop sweep branches`` command, so the deletion policy lives
+    in exactly one place. Returns the :class:`BranchSweepReport` (or ``None``
+    when the repo isn't configured / the gh client can't init) so the CLI can
+    print a summary. Never raises — gh failures are recorded in the report.
+    """
+    from forge_loop.branch_sweep import (
+        BranchSweepReport,
+        sweep_branches,
+        sweep_local_branches,
+    )
+    from forge_loop.events import BranchSweepDoneEvent, emit
+
+    if cfg.github_repo is None or "/" not in cfg.github_repo:
+        return None
+    owner, repo = cfg.github_repo.split("/", 1)
+    try:
+        from forge_loop.gh_client import GithubkitClient
+
+        client = GithubkitClient()
+    except Exception as ex:  # noqa: BLE001
+        append_event(
+            cfg.events_file,
+            "branch_sweep_skipped",
+            tick=tick,
+            reason=f"gh_client_init: {ex}"[:200],
+        )
+        return None
+
+    report: BranchSweepReport = sweep_branches(
+        client,
+        owner=owner,
+        repo=repo,
+        base_branch=cfg.base_branch,
+        min_age_days=cfg.branch_min_age_days,
+    )
+    try:
+        report.local_deleted = sweep_local_branches(
+            cfg.repo,
+            base_branch=cfg.base_branch,
+            min_age_days=cfg.branch_local_min_age_days,
+        )
+    except Exception as ex:  # noqa: BLE001 — local prune is best-effort
+        append_event(cfg.events_file, "branch_sweep_local_crashed", tick=tick, err=str(ex)[:200])
+
+    with contextlib.suppress(Exception):
+        emit(
+            cfg.events_file,
+            BranchSweepDoneEvent(
+                deleted=len(report.deleted),
+                skipped=len(report.skipped),
+                errors=len(report.errors),
+                local_deleted=len(report.local_deleted),
+                scanned=report.scanned,
+                rate_limited=report.rate_limited,
+            ),
         )
     return report
 

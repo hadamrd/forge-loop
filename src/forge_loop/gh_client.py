@@ -264,6 +264,8 @@ class GhClient(Protocol):
 
     def delete_branch(self, owner: str, repo: str, branch: str) -> bool: ...
 
+    def list_branches(self, owner: str, repo: str, *, limit: int = ...) -> list[str]: ...
+
     # -- auth ----------------------------------------------------------------
     def check_auth(self) -> None: ...
 
@@ -891,7 +893,9 @@ class GithubkitClient:
 
         Used by the iteration probe (#78): it must see MERGED / CLOSED PRs too,
         not just open ones. Returns a dict with the keys the probe reads
-        (``url, number, state, mergeable, mergeStateStatus, isDraft``) or None.
+        (``url, number, state, mergeable, mergeStateStatus, isDraft``) plus the
+        ``updatedAt`` / ``closedAt`` / ``mergedAt`` timestamps the branch sweep
+        (#146) needs to age out merged/closed branches, or None.
         GraphQL so we get ``mergeStateStatus`` + ``mergeable`` in one call.
         """
         query = (
@@ -899,7 +903,8 @@ class GithubkitClient:
             "  repository(owner: $owner, name: $name) {\n"
             "    pullRequests(headRefName: $head, first: 1, "
             "orderBy: {field: UPDATED_AT, direction: DESC}) {\n"
-            "      nodes { number url state isDraft mergeable mergeStateStatus }\n"
+            "      nodes { number url state isDraft mergeable mergeStateStatus "
+            "updatedAt closedAt mergedAt }\n"
             "    }\n"
             "  }\n"
             "}\n"
@@ -922,6 +927,9 @@ class GithubkitClient:
             "mergeable": str(node.get("mergeable") or "").upper(),
             "mergeStateStatus": str(node.get("mergeStateStatus") or "").upper(),
             "isDraft": bool(node.get("isDraft")),
+            "updatedAt": node.get("updatedAt") or "",
+            "closedAt": node.get("closedAt") or "",
+            "mergedAt": node.get("mergedAt") or "",
         }
 
     def latest_critic_report(self, owner: str, repo: str, number: int) -> str:
@@ -1153,6 +1161,33 @@ class GithubkitClient:
             return False
         return True
 
+    def list_branches(self, owner: str, repo: str, *, limit: int = 200) -> list[str]:
+        """Return up to ``limit`` branch names for the repo (#146).
+
+        Paginates githubkit's ``repos.list_branches`` (100/page) so the
+        branch sweep sees the full accumulation, not just the first page.
+        Raises :class:`GhError` on a non-2xx so the caller can distinguish a
+        rate-limit (status 403/429) from an empty repo.
+        """
+        out: list[str] = []
+        page = 1
+        while len(out) < limit:
+            resp = self._gh.rest.repos.list_branches(
+                owner=owner, repo=repo, per_page=100, page=page
+            )
+            self._raise_if_error(f"list_branches(page={page})", resp)
+            items = cast(list[Any], resp.parsed_data or [])
+            if not items:
+                break
+            for item in items:
+                name = getattr(item, "name", None)
+                if isinstance(name, str) and name:
+                    out.append(name)
+            if len(items) < 100:
+                break
+            page += 1
+        return out[:limit]
+
     def disable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool:
         """Disable auto-merge on a PR (GraphQL). Best-effort: False on failure.
 
@@ -1293,6 +1328,8 @@ class MockGhClient:
     merge_fail_reason: str | None = None
     #: When True, ``delete_branch`` reports failure (still non-fatal).
     delete_branch_fails: bool = False
+    #: Branch names returned by ``list_branches`` (the branch sweep, #146).
+    branches_response: list[str] = field(default_factory=list)
 
     def _record(self, method: str, **kwargs: Any) -> None:
         self.calls.append((method, kwargs))
@@ -1541,6 +1578,10 @@ class MockGhClient:
     def delete_branch(self, owner: str, repo: str, branch: str) -> bool:
         self._record("delete_branch", owner=owner, repo=repo, branch=branch)
         return not self.delete_branch_fails
+
+    def list_branches(self, owner: str, repo: str, *, limit: int = 200) -> list[str]:
+        self._record("list_branches", owner=owner, repo=repo, limit=limit)
+        return list(self.branches_response[:limit])
 
     def _next_number(self) -> int:
         existing = [n for (_, _, n) in self.issues]

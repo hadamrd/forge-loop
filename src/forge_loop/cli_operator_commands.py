@@ -277,6 +277,61 @@ class OperatorCommandsMixin:
         console.print(table)
         return 1 if red else 0
 
+    def _cmd_sweep_branches(self, args: SimpleNamespace) -> int:
+        """`forge-loop sweep branches` — manually run the stale-branch sweep (#146).
+
+        Delegates to the same ``run_branch_sweep`` the per-tick cadence uses, so
+        the deletion policy lives in exactly one place. Prints a summary and
+        exits 0 unless the repo isn't configured (exit 1). ``--json`` emits the
+        counts for scripting.
+        """
+        from forge_loop.runner.tick_checks import run_branch_sweep
+
+        try:
+            cfg = self.load()
+        except Exception as ex:  # noqa: BLE001
+            typer.echo(f"sweep branches: config error: {ex}", err=True)
+            return 1
+
+        report = run_branch_sweep(cfg, 0)
+        if report is None:
+            typer.echo(
+                "sweep branches: github_repo not configured (set LOOP_GH_REPO or "
+                "repo.github = owner/repo)",
+                err=True,
+            )
+            return 1
+
+        if getattr(args, "json", False):
+            typer.echo(
+                json.dumps(
+                    {
+                        "deleted": report.deleted,
+                        "skipped": len(report.skipped),
+                        "errors": report.errors,
+                        "local_deleted": report.local_deleted,
+                        "scanned": report.scanned,
+                        "rate_limited": report.rate_limited,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            typer.echo(
+                f"sweep branches: deleted={len(report.deleted)} "
+                f"skipped={len(report.skipped)} errors={len(report.errors)} "
+                f"local_deleted={len(report.local_deleted)} "
+                f"scanned={report.scanned} rate_limited={report.rate_limited}"
+            )
+            for b in report.deleted:
+                typer.echo(f"  - deleted remote {b}")
+            for b in report.local_deleted:
+                typer.echo(f"  - deleted local  {b}")
+            for b, err in report.errors.items():
+                typer.echo(f"  ! {b}: {err}", err=True)
+        return 0
+
     def _cmd_pause(self, _args: SimpleNamespace) -> int:
         cfg, _config_error = self.operator_cfg()
         cfg.state_dir.mkdir(parents=True, exist_ok=True)

@@ -130,6 +130,7 @@ replay_app = typer.Typer(
 )
 roles_app = typer.Typer(help="Pluggable roles.", no_args_is_help=True)
 cluster_app = typer.Typer(help="Cluster-mode commands.", no_args_is_help=True)
+sweep_app = typer.Typer(help="Maintenance sweeps (stale branches, ...).", no_args_is_help=True)
 manifesto_app = typer.Typer(
     help="Manifesto feedback loop: turn fixed bugs into permanent house rules.",
     no_args_is_help=True,
@@ -142,6 +143,7 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(replay_app, name="replay")
 app.add_typer(roles_app, name="roles")
 app.add_typer(cluster_app, name="cluster")
+app.add_typer(sweep_app, name="sweep")
 app.add_typer(manifesto_app, name="manifesto")
 
 
@@ -291,6 +293,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _cmd_config,
     _cmd_config_models,
     _cmd_roles_list,
+    _cmd_sweep_branches,
 ) = (
     _make_cmd("run"),
     _make_cmd("cluster_status"),
@@ -320,6 +323,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _make_cmd("config"),
     _make_cmd("config_models"),
     _make_cmd("roles_list"),
+    _make_cmd("sweep_branches"),
 )
 
 # ---------------------------------------------------------------------------
@@ -603,6 +607,16 @@ def cmd_pipeline_show(
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
     _exit(_cmd_pipeline_show(SimpleNamespace(config=config, json=json_)))
+
+
+# ---- sweep --------------------------------------------------------------
+
+
+@sweep_app.command("branches", help="Delete stale remote + local branches (#146).")
+def cmd_sweep_branches(
+    json_: bool = typer.Option(False, "--json", help="Emit the counts as JSON."),
+) -> None:
+    _exit(_cmd_sweep_branches(SimpleNamespace(json=json_)))
 
 
 # ---- repos --------------------------------------------------------------

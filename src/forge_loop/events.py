@@ -342,6 +342,28 @@ class StuckSweepDemotedEvent(EventBase):
 
 
 @register_event
+class BranchSweepDoneEvent(EventBase):
+    """Summary of one branch-sweep run (issue #146).
+
+    Emitted by ``forge_loop.branch_sweep.sweep_branches`` (per-tick on the
+    ``branch_sweep_every_n_ticks`` cadence, and on the manual
+    ``forge-loop sweep branches`` command). Carries the counts the operator
+    cares about — how many stale remote branches were deleted, how many were
+    skipped (open PR / orphan / too-recent), how many gh calls errored, and
+    how many local branches were pruned. ``rate_limited`` flags an early bail
+    when GitHub started rate-limiting mid-sweep (we back off, never hammer).
+    """
+
+    KIND: ClassVar[str] = "branch_sweep_done"
+    deleted: int = Field(ge=0, default=0)
+    skipped: int = Field(ge=0, default=0)
+    errors: int = Field(ge=0, default=0)
+    local_deleted: int = Field(ge=0, default=0)
+    scanned: int = Field(ge=0, default=0)
+    rate_limited: bool = False
+
+
+@register_event
 class WorkerPreCommitInstalledEvent(EventBase):
     """Pre-commit hook propagation result for one worker worktree."""
 
@@ -533,6 +555,7 @@ __all__ = [
     "LoopStartEvent",
     "LoopStopEvent",
     "RedeployEvent",
+    "BranchSweepDoneEvent",
     "StuckSweepDemotedEvent",
     "TickStartEvent",
     "WorkerSessionRecoveredEvent",

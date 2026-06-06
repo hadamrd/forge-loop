@@ -177,6 +177,12 @@ class Config:
     stuck_threshold_attempts: int = 2
     stuck_tail_events: int = 100
 
+    # Stale-branch sweep (issue #146). Cadence + age thresholds, sourced from
+    # settings.maintenance.branch_*.
+    branch_sweep_every_n_ticks: int = 20
+    branch_min_age_days: int = 7
+    branch_local_min_age_days: int = 30
+
     @property
     def state_dir(self) -> Path:
         return self.repo / "docs" / "ops"
@@ -323,6 +329,9 @@ def _from_settings(s: Settings) -> Config:
         worker_max_iterations=s.iteration.max_iterations,
         stuck_threshold_attempts=s.maintenance.stuck_threshold_attempts,
         stuck_tail_events=s.maintenance.stuck_tail_events,
+        branch_sweep_every_n_ticks=s.maintenance.branch_sweep_every_n_ticks,
+        branch_min_age_days=s.maintenance.branch_min_age_days,
+        branch_local_min_age_days=s.maintenance.branch_local_min_age_days,
     )
 
 

@@ -61,6 +61,7 @@ from forge_loop.runner.repairs import (
 )
 from forge_loop.runner.rescue import rescue_uncommitted_work as _rescue_uncommitted_work
 from forge_loop.runner.tick_checks import run_codebase_audit as _run_codebase_audit
+from forge_loop.runner.tick_checks import run_branch_sweep as _run_branch_sweep
 from forge_loop.runner.tick_checks import run_maintenance_tick as _run_maintenance_tick
 from forge_loop.runner.tick_checks import run_stuck_sweep as _run_stuck_sweep
 from forge_loop.state import append_event, consolidate_sprint, write_state
@@ -571,6 +572,15 @@ def _run_pre_dispatch_repairs(
     on gets caught here, not re-picked by ``top_issues`` later in the tick.
     """
     _run_stuck_sweep(cfg, tick)
+
+    # Stale-branch sweep (#146) on its own (slower) cadence — every Nth tick
+    # delete remote branches whose PR merged/closed long ago + prune dead local
+    # branches, so the operator's branch list stays clean without manual loops.
+    if (
+        cfg.branch_sweep_every_n_ticks > 0
+        and tick % cfg.branch_sweep_every_n_ticks == 0
+    ):
+        _run_branch_sweep(cfg, tick)
 
     repairs = _blocking_pr_repairs(cfg)
     if repairs:

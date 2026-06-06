@@ -446,6 +446,13 @@ class MaintenanceSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
     stuck_threshold_attempts: int = 2
     stuck_tail_events: int = 100
+    # Stale-branch sweep (issue #146). Every Nth tick the loop deletes remote
+    # branches whose PR merged/closed ≥ ``branch_min_age_days`` ago, and prunes
+    # local branches with no upstream + a commit older than
+    # ``branch_local_min_age_days``. ``0`` disables the periodic remote sweep.
+    branch_sweep_every_n_ticks: int = 20
+    branch_min_age_days: int = 7
+    branch_local_min_age_days: int = 30
 
 
 class MiscSettings(BaseSettings):
@@ -648,6 +655,10 @@ ENV_MAP: tuple[tuple[str, str, Any], ...] = (
     ("LOOP_LUMEN_TOP_K", "lumen.top_k", int),
     # Attempts
     ("LOOP_RETRY_COOLDOWN_S", "attempts.cooldown_s", int),
+    # Maintenance — stale-branch sweep (#146)
+    ("LOOP_BRANCH_SWEEP_EVERY_N", "maintenance.branch_sweep_every_n_ticks", int),
+    ("LOOP_BRANCH_MIN_AGE_DAYS", "maintenance.branch_min_age_days", int),
+    ("LOOP_BRANCH_LOCAL_MIN_AGE_DAYS", "maintenance.branch_local_min_age_days", int),
     # Iteration
     ("LOOP_WORKER_MAX_ITERATIONS", "iteration.max_iterations", int),
     ("LOOP_PIPELINE_DRIVEN", "iteration.pipeline_driven", _coerce_bool),
