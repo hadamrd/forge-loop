@@ -50,6 +50,12 @@ import pytest
 
 from forge_loop._testing.memory_store import FakeMemoryStore
 from forge_loop._testing.task_saga_store import FakeTaskSagaStore
+from forge_loop.eventlog import (
+    EventKind,
+    EventLog,
+    InMemoryEventLog,
+    SqliteEventLog,
+)
 from forge_loop.memory.models import (
     REJECTED_PATH_TAG,
     MemoryItem,
@@ -573,3 +579,72 @@ class TestMemoryStoreContract:
         unchanged = memory_store.get("mem-old")
         assert unchanged is not None
         assert unchanged.is_active
+
+
+# ===========================================================================
+# Event-log contract (issue #293 — idempotency-key dedup parity)
+# ===========================================================================
+
+EventLogFactory = Callable[[Path], EventLog]
+
+
+def _build_fake_event_log(_tmp_path: Path) -> EventLog:
+    return InMemoryEventLog()
+
+
+def _build_sqlite_event_log(tmp_path: Path) -> EventLog:
+    return SqliteEventLog(tmp_path / "events.db")
+
+
+@pytest.fixture(
+    params=[_build_fake_event_log, _build_sqlite_event_log],
+    ids=["fake", "sqlite"],
+)
+def event_log(request: pytest.FixtureRequest, tmp_path: Path) -> EventLog:
+    """An event log, parametrized over the fake and the real adapter."""
+    factory: EventLogFactory = request.param
+    return factory(tmp_path)
+
+
+class TestEventLogContract:
+    """Identical idempotency-dedup assertions for the fake and real event log."""
+
+    # Primary acceptance criterion: appending twice with the same non-None
+    # idempotency_key returns the SAME envelope and leaves exactly one event.
+    def test_duplicate_idempotency_key_dedups(self, event_log: EventLog) -> None:
+        first = event_log.append(
+            EventKind.TASK_DISPATCHED,
+            {"task": "ship-m1"},
+            task_id="task-1",
+            saga_id="saga-1",
+            idempotency_key="dispatch:task-1",
+        )
+        duplicate = event_log.append(
+            EventKind.TASK_DISPATCHED,
+            # Different payload/ids: the existing envelope must win regardless.
+            {"task": "ship-m1-again"},
+            task_id="task-2",
+            saga_id="saga-2",
+            idempotency_key="dispatch:task-1",
+        )
+
+        assert duplicate == first
+        assert [event.sequence for event in event_log.since(0)] == [1]
+        assert event_log.latest_sequence() == 1
+
+    # Adversarial T2: a None idempotency_key must NOT dedup — two appends with
+    # no key are two distinct events on both adapters.
+    def test_none_idempotency_key_does_not_dedup(self, event_log: EventLog) -> None:
+        first = event_log.append(EventKind.TASK_DISPATCHED, {"n": 1})
+        second = event_log.append(EventKind.TASK_DISPATCHED, {"n": 2})
+
+        assert first != second
+        assert [event.sequence for event in event_log.since(0)] == [1, 2]
+
+    # Adversarial: distinct non-None keys are distinct events (dedup is keyed,
+    # not a blanket "second append is dropped").
+    def test_distinct_idempotency_keys_are_distinct_events(self, event_log: EventLog) -> None:
+        event_log.append(EventKind.TASK_DISPATCHED, {"n": 1}, idempotency_key="k-1")
+        event_log.append(EventKind.TASK_DISPATCHED, {"n": 2}, idempotency_key="k-2")
+
+        assert [event.sequence for event in event_log.since(0)] == [1, 2]

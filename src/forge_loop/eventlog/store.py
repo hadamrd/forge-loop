@@ -84,6 +84,10 @@ class InMemoryEventLog:
         saga_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> EventEnvelope:
+        if idempotency_key is not None:
+            existing = self._find_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                return existing
         event = EventEnvelope(
             event_id=EventId(uuid.uuid4().hex),
             sequence=len(self._events) + 1,
@@ -95,6 +99,13 @@ class InMemoryEventLog:
         )
         self._events.append(event)
         return event
+
+    def _find_by_idempotency_key(self, idempotency_key: str) -> EventEnvelope | None:
+        """Return the first event already stored under ``idempotency_key``."""
+        for event in self._events:
+            if event.idempotency_key == idempotency_key:
+                return event
+        return None
 
     def since(self, sequence: int = 0) -> Iterable[EventEnvelope]:
         return (event for event in self._events if event.sequence > sequence)
