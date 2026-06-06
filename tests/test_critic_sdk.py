@@ -612,3 +612,47 @@ def test_timeout_is_classified_and_not_retried(
     assert calls["n"] == 1  # NOT retried
     assert outcome.verdict == "error"
     assert outcome.error_class is CriticErrorClass.TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# Secret-lease regression (#283 / PR #289 review): the TRUSTED critic must
+# keep its secrets despite run_sdk_session's closed fail-safe default.
+# ---------------------------------------------------------------------------
+
+
+def test_critic_sdk_retains_required_secret_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The critic threads a "keep all my secrets" lease into run_sdk_session.
+
+    Regression: the worker's least-privilege closed default must NOT strip the
+    trusted reviewer's SDK auth secret / GITHUB_TOKEN from its effective env.
+    """
+    from forge_loop._critic_sdk import run_critic_sdk
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-critic")
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-critic")
+
+    captured: dict[str, object] = {}
+
+    class FakeOptions:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    async def fake_query(**_kw: object):  # type: ignore[no-untyped-def]
+        if False:
+            yield None
+        return
+
+    run_critic_sdk(
+        "review this",
+        cwd=tmp_path,
+        timeout_s=30,
+        query_fn=fake_query,
+        options_cls=FakeOptions,
+    )
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env.get("ANTHROPIC_API_KEY") == "sk-critic"
+    assert env.get("GITHUB_TOKEN") == "gh-critic"

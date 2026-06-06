@@ -33,7 +33,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from forge_loop.sandbox.policy import CapabilityPolicy
 
-__all__ = ["build_worker_env", "missing_tools", "scope_secrets"]
+__all__ = [
+    "build_worker_env",
+    "missing_tools",
+    "scope_secrets",
+    "secret_shaped_keys",
+]
 
 # Case-insensitive substrings that mark an env key as carrying a secret value
 # (issue #283). A key matching ANY of these is withheld from the worker child
@@ -57,6 +62,18 @@ def _is_secret_shaped(name: str) -> bool:
     """
     upper = name.upper()
     return any(pattern in upper for pattern in _SECRET_KEY_PATTERNS)
+
+
+def secret_shaped_keys(base: Mapping[str, str]) -> tuple[str, ...]:
+    """Every secret-shaped key present in ``base`` (sorted, stable).
+
+    The "keep all my secrets" lease for a TRUSTED caller (e.g. the critic
+    reviewer, not a sandboxed worker): pass the result as ``secret_names`` so
+    :func:`scope_secrets`'s closed fail-safe default does not strip the
+    credentials the trusted process was launched with (issue #283 / PR #289
+    review). Returns key NAMES only — never values.
+    """
+    return tuple(sorted(k for k in base if _is_secret_shaped(k)))
 
 
 def scope_secrets(

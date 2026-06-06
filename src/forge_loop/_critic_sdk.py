@@ -219,6 +219,16 @@ def run_critic_sdk(
                 if msg:
                     last_text = msg
 
+        # The critic is the TRUSTED reviewer, not a sandboxed worker (#283 /
+        # PR #289 review). ``run_sdk_session``'s secret lease defaults CLOSED
+        # (fail-safe for least-privilege workers), which would strip every
+        # secret-shaped key — including the SDK auth secret and GITHUB_TOKEN —
+        # from the reviewer's env. Thread an explicit "keep all my secrets"
+        # lease enumerating the secret-shaped keys the operator launched us
+        # with so the reviewer retains the credentials it needs.
+        from forge_loop.worker_env import secret_shaped_keys
+
+        critic_secret_lease = secret_shaped_keys(os.environ)
         try:
             result = await asyncio.wait_for(
                 run_sdk_session(
@@ -234,6 +244,7 @@ def run_critic_sdk(
                     load_timeout_ms=load_timeout_ms,
                     strict_mcp_config=strict_mcp_config,
                     mcp_servers=mcp_servers,
+                    secret_names=critic_secret_lease,
                 ),
                 timeout=float(timeout_s),
             )
