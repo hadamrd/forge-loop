@@ -1,16 +1,33 @@
 product_goal: 'Make forge-loop a resumable, self-improving autonomous loop: it ships
   PRs from well-specified issues, recovers from crashes, and gets measurably better
   from its own outcomes.'
-current_problem: "Cognition is half-closed: the loop writes episodic memory and reads\
-  \ rejected paths, but outcomes (critic findings, repeat failures) don't yet become\
-  \ durable rules it consumes \u2014 and nothing measures whether quality is improving."
-next_expansion: "Close the learning loop \u2014 turn critic findings and repeated\
-  \ failures into procedural / rejected-path memory the maestro and worker briefs\
-  \ enforce \u2014 and instrument the event log to measure first-pass critic acceptance,\
-  \ rework rate, and $/merged-PR."
-why_now: The durable control plane, resumable recovery, maestro planning, and a write
-  path to memory all landed; the missing pieces are consumption + measurement, which
-  make the recursive-improvement claim falsifiable.
+current_problem: >-
+  The outer PDCA loop is open: Check and Act-on-direction are scaffolded but
+  switched off. The durable event log has 267+ rows of merge/critic/task outcomes
+  and grows every tick via LegacyEventMirror, but projection_cursors is empty —
+  nothing measures whether the loop's own output is improving, so the
+  self-improvement claim is currently unfalsifiable. Plan-intent (axes/vision)
+  and Act-on-quality (the manifesto ratchet) exist; the return arcs do not.
+next_expansion: >-
+  Register the Scorecard projection on the existing replay framework (the single
+  reserved seam in build_boot_sources) to derive first-pass critic acceptance,
+  repair-rounds-to-converge, sev2-regeneration, lead time and abandonment as a
+  TREND; then gate a reversible frontier-advance policy (emitting the reserved
+  frontier.advanced event) and value-ranked brainstorming on that curve. This is
+  activation/wiring of dormant scaffolding, not greenfield.
+why_now: >-
+  The durable log, the Projection protocol, replay_projection, the writable
+  FrontierStore, the reserved FRONTIER_ADVANCED kind, and the manifesto ratchet
+  all already landed and are verified present but unwired. The data to measure
+  from already exists; measurement-first because every downstream arc is
+  unfalsifiable noise until the trend curve exists to gate it.
+objective: Make recursive self-improvement falsifiable, then act on it.
+key_result: >-
+  mean repair-rounds-to-converge trends down across a rolling 20-merge window
+  AND sev2-regeneration rate stays flat-or-down, both derived by the Scorecard
+  projection — checked before any frontier.advance fires. (Typed objective/
+  key_result fields land with the value-ranking ticket; until then these are
+  documented intent the loader ignores.)
 active_decisions:
 - Context windows are working memory, not durable state; externalise cognition to
   .forge.
@@ -19,6 +36,10 @@ active_decisions:
   belongs to long-lived worker sessions, not the maestro.
 - Durable cognition is committed as text; runtime journal (events.db) and transient
   sagas (tasks.db) stay local.
+- Close the outer loop by ACTIVATING dormant scaffolding, never rebuilding it
+  (anti-reinvention); measurement (Check) precedes prescription (Act).
+- Act-on-direction must be evidence-gated and reversible — no frontier.advance
+  unless the KR is met across the window; the prior cursor stays recoverable.
 rejected_paths:
 - idea: commit binary sqlite stores (memory.db / events.db) to git
   reason: no diffs, merge conflicts, repo bloat; events.db rotates at 10MB
@@ -31,25 +52,38 @@ rejected_paths:
 - idea: shorten the worker lease TTL without heartbeats
   reason: a live worker would be reaped as stale; heartbeats are the prerequisite
   revisit_if: ''
+- idea: build a bespoke "strategist agent" to pick the frontier
+  reason: reinvents proven human structure (PDCA / OKR / retro) AND duplicates
+    dormant in-repo scaffolding; the retro is a wiring job, not a new agent
+  revisit_if: the wired evidence-gated frontier-advance proves insufficient in practice
 hot_files:
-- ref: src/forge_loop/runner/maestro.py
-  why_hot: the planning brain; smarter matching + future frontier-advance live here
-- ref: src/forge_loop/runner/learning.py
-  why_hot: write path to memory; the consume path attaches here
+- ref: src/forge_loop/eventlog/projections.py
+  why_hot: the Projection/replay framework the Scorecard plugs into (no concrete
+    metric projection registered yet)
 - ref: src/forge_loop/control/boot.py
-  why_hot: reset-recovery context assembly; the maestro boots from it
-- ref: src/forge_loop/runner/dispatch.py
-  why_hot: saga lifecycle + heartbeats; a context-checkpoint hook would attach here
+  why_hot: build_boot_sources holds the single reserved seam to register the
+    Scorecard projection; drives projections to tail
+- ref: src/forge_loop/frontier/store.py
+  why_hot: writable cursor (load/save) + the OKR round-trip for value-ranking and
+    the frontier-advance policy
+- ref: src/forge_loop/manifesto_suggest.py
+  why_hot: the bug->rule ratchet to EXTEND to recurring critic-finding patterns
+    (reuse build_prompt/parse_suggestion/build_pr_plan; never rebuild)
+- ref: src/forge_loop/brainstormer.py
+  why_hot: add value/effort ranking + emit OKR scoring inputs (the one genuine build)
 hot_tests:
 - ref: tests/test_maestro_plan.py
   why_hot: planner behaviour + matching
 - ref: tests/test_recovery.py
   why_hot: resumability / dead-worker reconciliation invariants
 open_questions:
-- Should the maestro advance frontier.yaml from outcomes, or stay read-only?
+- '$/merged-PR has no cost signal in event payloads — what records per-task cost,
+  and where does it attach? (parked; ship the other five metrics first)'
+- Which KR balancing-pair best resists Goodhart (repair-rounds + sev2-regen vs
+  acceptance-alone)?
 - 'Memory persistence: committed text export vs single-maintainer binary memory.db?'
-- Wire a context-pressure checkpoint (PreCompact hook) into worker sessions?
 external_sources:
 - docs/design/context-awareness.md
 - docs/design/long-running-agent-architecture.md
-version: 1
+- paper/10-the-outer-loop.md
+version: 2
