@@ -950,6 +950,11 @@ def _run_critic_for_outcomes(
                     duration_s=round(critic_outcome.duration_s, 1),
                     sev_counts=_sev_counts(critic_outcome),
                     parse_retries=critic_outcome.parse_retries,
+                    error_class=(
+                        critic_outcome.error_class.value
+                        if critic_outcome.error_class is not None
+                        else None
+                    ),
                 )
                 if critic_outcome.report is not None:
                     try:

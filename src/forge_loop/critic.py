@@ -36,8 +36,23 @@ from pathlib import Path
 from typing import Any
 
 from forge_loop import critic_format
+from forge_loop._critic_sdk import (
+    CriticErrorClass,
+    is_transient_critic_error,
+)
 from forge_loop.events import read_events
 from forge_loop.worker import ensure_subagent_trusted
+
+# Short backoff (seconds) inserted between attempts when a transient SDK
+# error (event-loop / transport class) is retried (#270). Module-level so
+# tests can monkeypatch it to 0.0 and keep the suite fast. Deliberately
+# small — we cap at the existing 2-attempt budget, never an aggressive
+# retry storm, and genuine timeouts are NOT retried into a longer hang.
+_TRANSIENT_BACKOFF_S = 2.0
+
+# Total attempt budget for the SDK critic path: one initial + one retry.
+# Shared by parse-failure retries and transient-SDK-error retries.
+_CRITIC_ATTEMPTS = 2
 
 VALID_OVERALL = {"approve", "request_changes", "block"}
 # The severity / category vocabulary lives in ``critic_format`` (the single
@@ -161,6 +176,66 @@ class CriticOutcome:
     report: CriticReport | None = None
     error: str | None = None
     parse_retries: int = 0
+    # Machine-readable cause category for verdict="error" runs (#270), so
+    # error verdicts can be tallied by cause instead of grepped by hand.
+    error_class: CriticErrorClass | None = None
+    # Path to the per-critic error log holding the full class name + a
+    # >= 2000-char excerpt (the event field stays truncated for back-compat).
+    error_log: str | None = None
+
+
+def _write_critic_error_log(
+    logs_dir: Path,
+    issue_number: int,
+    *,
+    error_class: CriticErrorClass,
+    detail: str,
+) -> str | None:
+    """Persist the FULL critic failure cause to a per-critic error log (#270).
+
+    The legacy paths truncated the cause to 200/300/500 chars before anyone
+    could read it; this writes the class name plus the full excerpt to
+    ``logs/critic-{issue}-{ts}-error.log`` alongside the per-attempt logs.
+    Returns the path as a string (for the event pointer), or ``None`` if the
+    write failed — error logging must never crash the review itself.
+    """
+    path = logs_dir / f"critic-{issue_number}-{int(time.time())}-error.log"
+    body = f"error_class={error_class.value}\n\n{detail}"
+    try:
+        path.write_text(body, encoding="utf-8")
+    except OSError:
+        return None
+    return str(path)
+
+
+def _emit_critic_error(
+    emit: Callable[[str, dict[str, Any]], None] | None,
+    *,
+    issue_number: int,
+    pr_url: str,
+    err: str,
+    error_class: CriticErrorClass,
+    error_log: str | None,
+    retries: int,
+) -> None:
+    """Emit ``critic_parse_failed`` with the machine-readable cause + log pointer.
+
+    The ``err`` field stays truncated to 200 chars for back-compat; the rich
+    detail lives in ``error_log`` on disk (#270 observability AC).
+    """
+    if emit is None:
+        return
+    emit(
+        "critic_parse_failed",
+        {
+            "issue": issue_number,
+            "pr": pr_url,
+            "err": err[:200],
+            "retries": retries,
+            "error_class": error_class.value,
+            "error_log": error_log,
+        },
+    )
 
 
 def detect_precommit_bypass(commit_text: str, *, pr_body: str) -> CriticReport:
@@ -587,32 +662,57 @@ def review_pr(
             add_dirs=[repo],
         )
         if result.timed_out:
+            error_log = _write_critic_error_log(
+                logs_dir,
+                issue_number,
+                error_class=CriticErrorClass.TIMEOUT,
+                detail=result.error or f"critic exceeded {timeout_s}s",
+            )
+            _emit_critic_error(
+                emit,
+                issue_number=issue_number,
+                pr_url=pr_url,
+                err=result.error or f"critic exceeded {timeout_s}s",
+                error_class=CriticErrorClass.TIMEOUT,
+                error_log=error_log,
+                retries=0,
+            )
             return CriticOutcome(
                 verdict="error",
                 reasons=[],
                 duration_s=result.duration_s,
                 stdout_tail="(timeout)",
                 error=result.error,
+                error_class=CriticErrorClass.TIMEOUT,
+                error_log=error_log,
             )
         report, parse_error = parse_report_from_text(result.last_message)
         tail = _tail(log_path, 500)
         if report is None:
-            if emit is not None:
-                emit(
-                    "critic_parse_failed",
-                    {
-                        "issue": issue_number,
-                        "pr": pr_url,
-                        "err": (parse_error or result.error or "no_json_found")[:200],
-                        "retries": 0,
-                    },
-                )
+            error_detail = parse_error or result.error or "no_json_found"
+            error_log = _write_critic_error_log(
+                logs_dir,
+                issue_number,
+                error_class=CriticErrorClass.PARSE_FAILURE,
+                detail=error_detail,
+            )
+            _emit_critic_error(
+                emit,
+                issue_number=issue_number,
+                pr_url=pr_url,
+                err=error_detail,
+                error_class=CriticErrorClass.PARSE_FAILURE,
+                error_log=error_log,
+                retries=0,
+            )
             return CriticOutcome(
                 verdict="error",
                 reasons=[],
                 duration_s=result.duration_s,
                 stdout_tail=tail,
                 error=parse_error or result.error or "critic_parse_failed",
+                error_class=CriticErrorClass.PARSE_FAILURE,
+                error_log=error_log,
             )
         report = _finalize_report(
             report,
@@ -641,7 +741,7 @@ def review_pr(
     # auth itself.
     from forge_loop._critic_sdk import run_critic_sdk
 
-    for attempt in range(2):  # initial + 1 retry
+    for attempt in range(_CRITIC_ATTEMPTS):  # initial + 1 retry
         log_path = logs_dir / f"critic-{issue_number}-{int(time.time())}-{attempt}.log"
         last_log_path = log_path
         sdk_result = run_critic_sdk(
@@ -656,7 +756,25 @@ def review_pr(
         # operators can grep critic-*.log as before.
         with suppress(OSError):
             log_path.write_text(sdk_result.last_message or "")
+
         if sdk_result.timed_out:
+            # A genuine timeout on a too-large PR is NOT retried into a
+            # longer hang (#270 out-of-scope) — classify, log, and bail.
+            error_log = _write_critic_error_log(
+                logs_dir,
+                issue_number,
+                error_class=CriticErrorClass.TIMEOUT,
+                detail=sdk_result.error_detail or f"critic exceeded {timeout_s}s",
+            )
+            _emit_critic_error(
+                emit,
+                issue_number=issue_number,
+                pr_url=pr_url,
+                err=f"critic exceeded {timeout_s}s",
+                error_class=CriticErrorClass.TIMEOUT,
+                error_log=error_log,
+                retries=retries,
+            )
             return CriticOutcome(
                 verdict="error",
                 reasons=[],
@@ -664,10 +782,38 @@ def review_pr(
                 stdout_tail="(timeout)",
                 error=f"critic exceeded {timeout_s}s",
                 parse_retries=retries,
+                error_class=CriticErrorClass.TIMEOUT,
+                error_log=error_log,
             )
+
         if sdk_result.error:
-            # An SDK-side failure (auth, transport) — surface as error
-            # verdict so the runner doesn't auto-approve.
+            # An SDK-side failure (auth, transport, event-loop teardown).
+            # A TRANSIENT cause (event-loop / transport class) is a blip a
+            # second call may clear — retry within the attempt budget with a
+            # short backoff before falling back to verdict="error" (#270).
+            err_class = sdk_result.error_class or CriticErrorClass.UNKNOWN
+            if is_transient_critic_error(err_class) and attempt + 1 < _CRITIC_ATTEMPTS:
+                retries = attempt + 1
+                if _TRANSIENT_BACKOFF_S > 0:
+                    time.sleep(_TRANSIENT_BACKOFF_S * (attempt + 1))
+                continue
+            # Exhausted budget or non-transient → surface as error verdict so
+            # the runner never auto-approves (preserves #264/#269 safety).
+            error_log = _write_critic_error_log(
+                logs_dir,
+                issue_number,
+                error_class=err_class,
+                detail=sdk_result.error_detail or sdk_result.error,
+            )
+            _emit_critic_error(
+                emit,
+                issue_number=issue_number,
+                pr_url=pr_url,
+                err=sdk_result.error,
+                error_class=err_class,
+                error_log=error_log,
+                retries=retries,
+            )
             return CriticOutcome(
                 verdict="error",
                 reasons=[],
@@ -675,6 +821,8 @@ def review_pr(
                 stdout_tail=sdk_result.error[:500],
                 error=sdk_result.error,
                 parse_retries=retries,
+                error_class=err_class,
+                error_log=error_log,
             )
 
         report, parse_error = parse_report_from_text(sdk_result.last_message)
@@ -686,16 +834,21 @@ def review_pr(
     tail = _tail(last_log_path, 500) if last_log_path else ""
 
     if report is None:
-        if emit is not None:
-            emit(
-                "critic_parse_failed",
-                {
-                    "issue": issue_number,
-                    "pr": pr_url,
-                    "err": (parse_error or "no_json_found")[:200],
-                    "retries": retries,
-                },
-            )
+        error_log = _write_critic_error_log(
+            logs_dir,
+            issue_number,
+            error_class=CriticErrorClass.PARSE_FAILURE,
+            detail=parse_error or "no_json_found",
+        )
+        _emit_critic_error(
+            emit,
+            issue_number=issue_number,
+            pr_url=pr_url,
+            err=parse_error or "no_json_found",
+            error_class=CriticErrorClass.PARSE_FAILURE,
+            error_log=error_log,
+            retries=retries,
+        )
         return CriticOutcome(
             verdict="error",
             reasons=[],
@@ -703,6 +856,8 @@ def review_pr(
             stdout_tail=tail,
             error=parse_error or "critic_parse_failed",
             parse_retries=retries,
+            error_class=CriticErrorClass.PARSE_FAILURE,
+            error_log=error_log,
         )
 
     report = _finalize_report(
