@@ -425,7 +425,7 @@ def run_worker(
             brief=brief,
             timeout_s=timeout_s,
             model=model,
-            sandbox_args=codex_sandbox_args(permissions),
+            sandbox_args=codex_sandbox_args(permissions, capability_policy),
         )
         outcome.manifesto_sha = manifesto_sha
         _emit_worker_event(
@@ -443,7 +443,7 @@ def run_worker(
         )
         return outcome
 
-    _claude_opts = claude_permission_options(permissions)
+    _claude_opts = claude_permission_options(permissions, capability_policy)
     try:
         outcome = _run_worker_sdk(
             issue=issue,
@@ -599,9 +599,9 @@ def run_repair_worker(
             brief=brief,
             timeout_s=timeout_s,
             model=model,
-            sandbox_args=codex_sandbox_args(permissions),
+            sandbox_args=codex_sandbox_args(permissions, capability_policy),
         )
-    _claude_opts = claude_permission_options(permissions)
+    _claude_opts = claude_permission_options(permissions, capability_policy)
     return _run_worker_sdk(
         issue=issue,
         worktree=worktree,

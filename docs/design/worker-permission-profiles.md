@@ -27,7 +27,7 @@ tiny and correct.
 | Profile | Claude SDK | Codex CLI |
 |---|---|---|
 | `full` *(default)* | `permission_mode=bypassPermissions`, no sandbox | `-s danger-full-access --dangerously-bypass-approvals-and-sandbox` |
-| `standard` | `permission_mode=bypassPermissions` + `sandbox={enabled, autoAllowBashIfSandboxed}` | `-s workspace-write` |
+| `standard` | `permission_mode=bypassPermissions` + `sandbox={enabled, autoAllowBashIfSandboxed, network.allowedDomains=lease}` | `-s workspace-write` (+ `network_access`/`allowed_domains` from the lease) |
 | `readonly` | `permission_mode=plan` | `-s read-only` |
 
 `forge_loop.worker_permissions` is the single source of truth
@@ -54,16 +54,28 @@ tests assert the option *mapping*, not that a sandboxed worker can actually
 finish a task. Treat them as **experimental** until a real sandboxed run is
 tuned and green.
 
-Known gap: the current `standard` profile sets `sandbox.enabled` +
-`autoAllowBashIfSandboxed` but **no `network` allow-list**. The default egress
-policy will very likely block `git push` / `gh pr create` (and any dependency
-fetch the build needs), so a `standard` worker may complete its edits and then
-fail to ship a PR. Making `standard` genuinely usable requires, at minimum:
+Network egress binding (issue #282, RESOLVED): the `standard` profile now binds
+a leased `NetworkPolicy.allow_domains` onto the backend's **native** egress
+allow-list — `sandbox.network.allowedDomains` for the Claude SDK and the
+`sandbox_workspace_write` network config for Codex. `claude_permission_options`
+and `codex_sandbox_args` take the leased `CapabilityPolicy` and render it:
 
-- `sandbox.network.allowedDomains` covering `github.com`, `api.github.com`,
-  `*.githubusercontent.com`, **plus the project's package registries**
-  (pypi/npm/crates/goproxy/apt…). This set is inherently per-project — a single
-  global `standard` cannot be both tight and universally working.
+- A lease that grants domains opens exactly those (`allowedDomains=[...]` /
+  Codex `network_access=true` + `allowed_domains=[...]`).
+- **Fail-safe closed:** `deny_by_default=True` with an empty `allow_domains`
+  renders an empty allow-list (Claude) / no extra flags (Codex
+  workspace-write denies egress by default) — never open-by-default or
+  wildcarded, mirroring the "empty policy → empty allow" rule (#200).
+- `full` ignores the policy and stays byte-identical (no sandbox ⇒ nothing to
+  bind). A `network` knob an old SDK rejects is stripped via `_OPTIONAL_KNOBS`.
+
+The allow-list is inherently per-project — `github.com`, `api.github.com`,
+`*.githubusercontent.com`, **plus the project's package registries**
+(pypi/npm/crates/goproxy/apt…). A single global `standard` cannot be both tight
+and universally working; the lease (not a global default) carries the set.
+
+Remaining `standard` work (its own follow-up):
+
 - writable roots covering the worktree (`/tmp/forge-<repo>/wt-loop-*`), git's
   config, and `/tmp`.
 

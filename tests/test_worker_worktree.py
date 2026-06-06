@@ -248,6 +248,33 @@ def test_policy_hash_stable_and_sensitive() -> None:
     assert policy_hash(a) != policy_hash(b)
 
 
+def test_policy_hash_covers_network_dimension() -> None:
+    """AC5 (#282): the attestation hash already covers ``network``.
+
+    ``CapabilityPolicy.to_json_obj`` serialises the network dimension, so
+    ``policy_hash`` flips when ``allow_domains`` changes and is stable when it
+    does not — no second hash is fabricated.
+    """
+    base = CapabilityPolicy(network=NetworkPolicy(allow_domains=("github.com",)))
+    same = CapabilityPolicy(network=NetworkPolicy(allow_domains=("github.com",)))
+    widened = CapabilityPolicy(
+        network=NetworkPolicy(allow_domains=("github.com", "evil.example.com"))
+    )
+
+    # network IS serialised into the canonical JSON that the hash covers.
+    assert base.to_json_obj()["network"]["allow_domains"] == ["github.com"]
+
+    assert policy_hash(base) == policy_hash(same)
+    assert policy_hash(base) != policy_hash(widened)
+
+
+def test_policy_hash_flips_on_deny_by_default_flag() -> None:
+    """The deny_by_default flag is load-bearing and must move the digest."""
+    closed = CapabilityPolicy(network=NetworkPolicy(allow_domains=(), deny_by_default=True))
+    open_default = CapabilityPolicy(network=NetworkPolicy(allow_domains=(), deny_by_default=False))
+    assert policy_hash(closed) != policy_hash(open_default)
+
+
 def test_plant_worker_settings_is_read_only(tmp_path: Path) -> None:
     """Planted file is mode ``0o444`` and its ``.claude`` dir ``0o555``."""
     wt = tmp_path / "wt"

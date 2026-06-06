@@ -80,7 +80,7 @@ def build_maestro_plan(
     to starve the loop). The reorder is a stable permutation: it never adds or
     removes issues, so the caller's ``issues``/``workers_meta`` lockstep holds.
     """
-    hot_files = ()
+    hot_files: tuple[str, ...] = ()
     rejected_ideas: tuple[str, ...] = tuple(t for t in rejected_path_titles if t.strip())
     goal = next_expansion = ""
     keywords: set[str] = set()
@@ -97,8 +97,8 @@ def build_maestro_plan(
         for ref in hot_files:
             keywords.update(_hot_file_tokens(ref))
 
-    rejected_matchers = tuple(_rejected_matcher(idea) for idea in rejected_ideas)
-    rejected_matchers = tuple(m for m in rejected_matchers if m is not None)
+    _candidate_matchers = tuple(_rejected_matcher(idea) for idea in rejected_ideas)
+    rejected_matchers = tuple(m for m in _candidate_matchers if m is not None)
 
     def _bucket(issue: dict[str, Any]) -> int:
         text = _issue_text(issue)
