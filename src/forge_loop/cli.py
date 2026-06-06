@@ -134,6 +134,10 @@ manifesto_app = typer.Typer(
     help="Manifesto feedback loop: turn fixed bugs into permanent house rules.",
     no_args_is_help=True,
 )
+research_app = typer.Typer(
+    help="Durable research-note channel: surface cited external state-of-art into brainstorm inputs.",
+    no_args_is_help=True,
+)
 
 app.add_typer(config_app, name="config", invoke_without_command=True)
 app.add_typer(pipeline_app, name="pipeline")
@@ -143,6 +147,7 @@ app.add_typer(replay_app, name="replay")
 app.add_typer(roles_app, name="roles")
 app.add_typer(cluster_app, name="cluster")
 app.add_typer(manifesto_app, name="manifesto")
+app.add_typer(research_app, name="research")
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +283,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _cmd_init,
     _cmd_brainstorm,
     _cmd_audit,
+    _cmd_research_add,
     _cmd_manifesto_suggest,
     _cmd_record_session,
     _cmd_retry,
@@ -307,6 +313,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _make_cmd("init"),
     _make_cmd("brainstorm"),
     _make_cmd("audit"),
+    _make_cmd("research_add"),
     _make_cmd("manifesto_suggest"),
     _make_cmd("record_session"),
     _make_cmd("retry"),
@@ -346,6 +353,14 @@ _STATUS_AXIS_OPTION = typer.Option(
     [],
     "--axis",
     help="Narrow the axis-grouped view to these slugs (repeatable).",
+)
+
+# List-typed Typer options are hoisted to module-level singletons so the call
+# is not a function-call-in-default (ruff B008), mirroring ``_RUN_AXIS_OPTION``.
+_RESEARCH_REF_OPTION = typer.Option(
+    ...,
+    "--ref",
+    help="A citation (URL / paper / tool). Repeatable; at least one required.",
 )
 
 
@@ -518,6 +533,23 @@ def cmd_manifesto_suggest(
     ),
 ) -> None:
     _exit(_cmd_manifesto_suggest(SimpleNamespace(from_pr=from_pr, apply=apply)))
+
+
+@research_app.command(
+    "add",
+    help=(
+        "Persist a cited research note into the durable research channel so the "
+        "next brainstorm surfaces it. At least one --ref is required."
+    ),
+)
+def cmd_research_add(
+    title: str = typer.Option(..., "--title", help="The research note headline."),
+    ref: list[str] = _RESEARCH_REF_OPTION,
+    note: str | None = typer.Option(
+        None, "--note", help="Operator rationale: why this matters to the frontier."
+    ),
+) -> None:
+    _exit(_cmd_research_add(SimpleNamespace(title=title, ref=ref, note=note)))
 
 
 @app.command("record-session", help="Record a real SDK session to a JSONL fixture.")

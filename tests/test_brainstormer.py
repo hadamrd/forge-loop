@@ -10,6 +10,7 @@ import pytest
 
 from forge_loop._testing.memory_store import FakeMemoryStore
 from forge_loop.brainstormer import (
+    RESEARCH_NOTE_CAP,
     Brainstormer,
     BrainstormReport,
     ProposedEpic,
@@ -18,10 +19,12 @@ from forge_loop.brainstormer import (
     _render_axes_block,
     _render_backlog_block,
     _render_rejected_paths_block,
+    _render_research_block,
 )
 from forge_loop.gh_client import Issue, MockGhClient, OpenBacklog, list_open_backlog
 from forge_loop.memory.models import (
     REJECTED_PATH_TAG,
+    RESEARCH_TAG,
     MemoryItem,
     MemoryKind,
     MemoryProvenance,
@@ -715,4 +718,147 @@ def test_no_store_renders_none_rejected_block() -> None:
     prompt = fn.captured["prompt"]  # type: ignore[attr-defined]
     assert "Previously rejected paths" in prompt
     # The block degrades to "(none)" with no store wired.
+    assert "(none)" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Research-note channel (issue #278)
+# ---------------------------------------------------------------------------
+
+
+def _research_item(
+    *,
+    title: str,
+    refs: tuple[str, ...],
+    rationale: str = "promising external technique",
+    memory_id: str | None = None,
+) -> MemoryItem:
+    return MemoryItem(
+        memory_id=memory_id or f"research-{abs(hash((title, refs)))}",
+        kind=MemoryKind.SEMANTIC,
+        title=title,
+        body=rationale,
+        tags=(RESEARCH_TAG,),
+        provenance=MemoryProvenance(
+            source_event=None,
+            authored_by="research-add",
+            source_task_ref="research-add",
+            evidence_refs=refs,
+        ),
+    )
+
+
+def test_research_block_empty_renders_none() -> None:
+    assert _render_research_block(()) == "  (none)"
+    assert _render_research_block(None) == "  (none)"
+
+
+def test_research_block_renders_title_refs_and_rationale() -> None:
+    block = _render_research_block(
+        [
+            _research_item(
+                title="Speculative-decoding critic",
+                refs=("https://arxiv.org/abs/1234.5678", "tool:vllm"),
+                rationale="cuts critic latency ~2x",
+            )
+        ]
+    )
+    assert "Speculative-decoding critic" in block
+    assert "https://arxiv.org/abs/1234.5678" in block
+    assert "tool:vllm" in block
+    assert "cuts critic latency ~2x" in block
+
+
+def test_run_surfaces_research_notes_into_prompt() -> None:
+    store = FakeMemoryStore()
+    store.put(
+        _research_item(
+            title="Speculative-decoding critic",
+            refs=("https://arxiv.org/abs/1234.5678",),
+            rationale="cuts critic latency",
+        )
+    )
+    store.put(
+        _research_item(
+            title="Retrieval-augmented brainstorming",
+            refs=("paper:RAG-2020",),
+            rationale="ground proposals in prior art",
+        )
+    )
+    fn = _stub_sdk({"proposed_epics": [], "proposed_tickets": []})
+    Brainstormer(sdk_fn=fn, memory_store=store).run(_vision())
+    prompt = fn.captured["prompt"]  # type: ignore[attr-defined]
+    assert "External research inputs" in prompt
+    assert "Speculative-decoding critic" in prompt
+    assert "https://arxiv.org/abs/1234.5678" in prompt
+    assert "Retrieval-augmented brainstorming" in prompt
+    assert "paper:RAG-2020" in prompt
+
+
+def test_no_store_renders_none_research_block() -> None:
+    fn = _stub_sdk({"proposed_epics": [], "proposed_tickets": []})
+    Brainstormer(sdk_fn=fn, memory_store=None).run(_vision())
+    prompt = fn.captured["prompt"]  # type: ignore[attr-defined]
+    assert "External research inputs" in prompt
+    assert "(none)" in prompt
+
+
+def test_research_notes_capped_at_most_recent_n() -> None:
+    store = FakeMemoryStore()
+    # Insert more than the cap; most-recent-first so the freshest survive.
+    for i in range(RESEARCH_NOTE_CAP + 5):
+        store.put(
+            _research_item(
+                title=f"note-{i}",
+                refs=(f"url:{i}",),
+                memory_id=f"research-{i}",
+            )
+        )
+    b = Brainstormer(memory_store=store)
+    notes = b._load_research_notes()
+    assert len(notes) == RESEARCH_NOTE_CAP
+    # Most-recent-first: the last inserted note is first.
+    assert notes[0].title == f"note-{RESEARCH_NOTE_CAP + 4}"
+
+
+def test_superseded_research_note_excluded_from_prompt() -> None:
+    store = FakeMemoryStore()
+    store.put(
+        _research_item(
+            title="Stale technique",
+            refs=("url:old",),
+            memory_id="research-old",
+        )
+    )
+    store.put(
+        _research_item(
+            title="Fresh technique",
+            refs=("url:new",),
+            memory_id="research-new",
+        )
+    )
+    store.supersede("research-old", by_memory_id="research-new")
+    fn = _stub_sdk({"proposed_epics": [], "proposed_tickets": []})
+    Brainstormer(sdk_fn=fn, memory_store=store).run(_vision())
+    prompt = fn.captured["prompt"]  # type: ignore[attr-defined]
+    assert "Fresh technique" in prompt
+    assert "Stale technique" not in prompt
+
+
+def test_run_degrades_to_none_when_research_store_raises() -> None:
+    """Adversarial: a store raising on read must degrade to ``(none)`` and the
+    session still runs (mirrors ``_load_rejected_paths``)."""
+
+    class _BoomStore:
+        def list_rejected_paths(self):
+            return ()
+
+        def list_research_notes(self):
+            raise RuntimeError("sqlite is on fire")
+
+    fn = _stub_sdk({"proposed_epics": [], "proposed_tickets": []})
+    report = Brainstormer(sdk_fn=fn, memory_store=_BoomStore()).run(_vision())
+    assert isinstance(report, BrainstormReport)
+    prompt = fn.captured["prompt"]  # type: ignore[attr-defined]
+    assert "External research inputs" in prompt
     assert "(none)" in prompt

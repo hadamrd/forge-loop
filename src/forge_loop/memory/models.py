@@ -20,6 +20,13 @@ class MemoryKind(StrEnum):
 
 REJECTED_PATH_TAG = "rejected-path"
 
+#: Tag marking a durable *research note* — cited external state-of-art surfaced
+#: into the brainstormer's frontier-generation inputs (issue #278). Mirrors
+#: ``REJECTED_PATH_TAG``: a plain tag on a ``SEMANTIC`` :class:`MemoryItem`, no
+#: new persistence layer. Distinct from ``rejected-path`` (filters inputs) — a
+#: research note *adds* a new input source.
+RESEARCH_TAG = "research"
+
 #: Tag prefix used to carry the axis a memory item is filed under, so the
 #: brainstormer can re-derive ``normalize_candidate_key(title, axis)`` from a
 #: stored rejected-path item without a second normalisation scheme.

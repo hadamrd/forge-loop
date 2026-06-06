@@ -594,6 +594,93 @@ class ProductCommandsMixin:
             return 1
         return 0
 
+    def _cmd_research_add(self, args: SimpleNamespace) -> int:
+        """`forge-loop research add` — persist a cited research note (issue #278).
+
+        Adds a durable ``research``-tagged ``SEMANTIC`` :class:`MemoryItem` via
+        the existing ``memory_store_factory`` (``.forge/memory.db`` — no new
+        persistence layer). The note surfaces cited external state-of-art into
+        the brainstormer's frontier-generation inputs.
+
+        Contract:
+          * ``--title`` is required (the note's headline).
+          * At least one ``--ref`` (URL / paper / tool citation) is REQUIRED —
+            this validation is research-channel-specific (the write/CLI seam),
+            NOT a global ``MemoryProvenance`` change. A note with no ref is
+            rejected with exit 2 and nothing is persisted.
+          * ``--note`` carries the operator's rationale (optional).
+        """
+        from forge_loop.memory.models import (
+            RESEARCH_TAG,
+            MemoryItem,
+            MemoryKind,
+            MemoryProvenance,
+            derive_memory_id,
+        )
+        from forge_loop.settings import ConfigError
+
+        title = (getattr(args, "title", None) or "").strip()
+        if not title:
+            typer.echo("research add: --title is required", err=True)
+            return 2
+
+        refs = tuple(
+            ref.strip() for ref in (getattr(args, "ref", None) or []) if ref and ref.strip()
+        )
+        if not refs:
+            # Research-channel-specific guard: a research note with no evidence
+            # ref is uncitable, so it is rejected at the write seam BEFORE the
+            # store is touched — nothing is persisted.
+            typer.echo(
+                "research add: at least one --ref (URL / paper / tool citation) is required",
+                err=True,
+            )
+            return 2
+
+        body = (getattr(args, "note", None) or "").strip()
+
+        repo_path = Path.cwd()
+        try:
+            cfg = self.load()
+            repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path
+        except ConfigError as exc:
+            _log.warning(
+                "research_add: config load failed; using cwd",
+                repo_path=str(repo_path),
+                error=str(exc),
+            )
+
+        try:
+            store = self.memory_store_factory(repo_path)
+        except Exception as exc:  # noqa: BLE001 — clear operator-facing failure
+            typer.echo(f"research add: memory store unavailable: {exc}", err=True)
+            return 1
+
+        provenance = MemoryProvenance(
+            source_event=None,
+            authored_by="research-add",
+            source_task_ref="research-add",
+            confidence=1.0,
+            evidence_refs=refs,
+        )
+        item = MemoryItem(
+            memory_id=derive_memory_id(f"research:{title}:{refs[0]}", prefix="research"),
+            kind=MemoryKind.SEMANTIC,
+            title=title,
+            body=body or "(no rationale recorded)",
+            tags=(RESEARCH_TAG,),
+            provenance=provenance,
+        )
+        try:
+            store.put(item)
+        except Exception as exc:  # noqa: BLE001 — clear operator-facing failure
+            typer.echo(f"research add: failed to persist note: {exc}", err=True)
+            return 1
+
+        typer.echo(f"research add: stored {item.memory_id}: {title}")
+        typer.echo(f"  refs: {', '.join(refs)}")
+        return 0
+
     def _cmd_audit(self, args: SimpleNamespace) -> int:
         """`forge-loop audit` — codebase-state audit (issue #156).
 
