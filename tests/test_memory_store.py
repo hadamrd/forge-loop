@@ -9,6 +9,7 @@ from forge_loop.eventlog.models import EventId, EventRef
 from forge_loop.memory.curator import MemoryCurator, PromotionCandidate
 from forge_loop.memory.models import (
     REJECTED_PATH_TAG,
+    RESEARCH_TAG,
     MemoryItem,
     MemoryKind,
     MemoryProvenance,
@@ -334,3 +335,39 @@ def test_fake_memory_store_matches_real_shape(tmp_path: Path) -> None:
     )
     assert real.get("mem-rejected") == fake.get("mem-rejected")
     assert real.list_rejected_paths() == fake.list_rejected_paths()
+
+
+@pytest.mark.parametrize("make_store", ["real", "fake"])
+def test_list_research_notes_returns_active_research_items_most_recent_first(
+    make_store: str, tmp_path: Path
+) -> None:
+    """Research-channel query (issue #278): active ``research``-tagged items only,
+    most-recent-first, on BOTH the real and fake stores."""
+    store: object = (
+        SqliteMemoryStore(tmp_path / "memory.db") if make_store == "real" else FakeMemoryStore()
+    )
+
+    store.put(_item("mem-r1", MemoryKind.SEMANTIC, tags=(RESEARCH_TAG,)))  # type: ignore[attr-defined]
+    store.put(_item("mem-other", MemoryKind.SEMANTIC, tags=("boot-context",)))  # type: ignore[attr-defined]
+    store.put(_item("mem-r2", MemoryKind.SEMANTIC, tags=(RESEARCH_TAG,)))  # type: ignore[attr-defined]
+    store.put(_item("mem-rejected", MemoryKind.SEMANTIC, tags=(REJECTED_PATH_TAG,)))  # type: ignore[attr-defined]
+
+    notes = store.list_research_notes()  # type: ignore[attr-defined]
+    # Only research-tagged items, most-recent-first (mem-r2 inserted after mem-r1).
+    assert [item.memory_id for item in notes] == ["mem-r2", "mem-r1"]
+
+
+@pytest.mark.parametrize("make_store", ["real", "fake"])
+def test_superseded_research_note_excluded_from_list(make_store: str, tmp_path: Path) -> None:
+    """Adversarial: a research note superseded via ``supersede`` must drop out of
+    ``list_research_notes`` on BOTH stores."""
+    store: object = (
+        SqliteMemoryStore(tmp_path / "memory.db") if make_store == "real" else FakeMemoryStore()
+    )
+
+    store.put(_item("mem-old", MemoryKind.SEMANTIC, tags=(RESEARCH_TAG,)))  # type: ignore[attr-defined]
+    store.put(_item("mem-new", MemoryKind.SEMANTIC, tags=(RESEARCH_TAG,)))  # type: ignore[attr-defined]
+    store.supersede("mem-old", by_memory_id="mem-new")  # type: ignore[attr-defined]
+
+    notes = store.list_research_notes()  # type: ignore[attr-defined]
+    assert [item.memory_id for item in notes] == ["mem-new"]

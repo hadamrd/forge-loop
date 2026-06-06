@@ -12,6 +12,7 @@ from typing import Protocol
 from forge_loop.eventlog.models import EventId, EventRef
 from forge_loop.memory.models import (
     REJECTED_PATH_TAG,
+    RESEARCH_TAG,
     MemoryItem,
     MemoryKind,
     MemoryProvenance,
@@ -54,6 +55,10 @@ class MemoryStore(Protocol):
 
     def list_rejected_paths(self) -> tuple[MemoryItem, ...]:
         """Return active memory items tagged as rejected paths."""
+        ...
+
+    def list_research_notes(self) -> tuple[MemoryItem, ...]:
+        """Return active ``research``-tagged items, most-recent-first."""
         ...
 
     def supersede(self, memory_id: str, *, by_memory_id: str) -> MemoryItem:
@@ -162,6 +167,13 @@ class SqliteMemoryStore:
 
     def list_rejected_paths(self) -> tuple[MemoryItem, ...]:
         return tuple(item for item in self.list_active() if REJECTED_PATH_TAG in item.tags)
+
+    def list_research_notes(self) -> tuple[MemoryItem, ...]:
+        # ``list_active`` returns rowid-ASC (insertion order); reverse for
+        # most-recent-first. Superseded notes are already excluded by
+        # ``list_active``'s ``superseded_by IS NULL`` filter.
+        active = [item for item in self.list_active() if RESEARCH_TAG in item.tags]
+        return tuple(reversed(active))
 
     def supersede(self, memory_id: str, *, by_memory_id: str) -> MemoryItem:
         if self.get(by_memory_id) is None:

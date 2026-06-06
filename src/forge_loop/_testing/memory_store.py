@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from forge_loop.memory.models import REJECTED_PATH_TAG, MemoryItem, MemoryKind
+from forge_loop.memory.models import (
+    REJECTED_PATH_TAG,
+    RESEARCH_TAG,
+    MemoryItem,
+    MemoryKind,
+)
 
 
 @dataclass
@@ -27,6 +32,11 @@ class FakeMemoryStore:
 
     def list_rejected_paths(self) -> tuple[MemoryItem, ...]:
         return tuple(item for item in self.list_active() if REJECTED_PATH_TAG in item.tags)
+
+    def list_research_notes(self) -> tuple[MemoryItem, ...]:
+        # ``items`` preserves insertion order; reverse for most-recent-first.
+        active = [item for item in self.list_active() if RESEARCH_TAG in item.tags]
+        return tuple(reversed(active))
 
     def supersede(self, memory_id: str, *, by_memory_id: str) -> MemoryItem:
         if by_memory_id not in self.items:

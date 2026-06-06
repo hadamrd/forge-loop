@@ -36,10 +36,16 @@ __all__ = [
     "ProposedEpic",
     "ProposedTicket",
     "_render_rejected_paths_block",
+    "_render_research_block",
     "filter_report_for_vision",
 ]
 
 _log = get_logger("forge_loop.brainstormer")
+
+#: Cap on the number of research notes surfaced into the prompt — bounded so a
+#: large research channel can't blow the prompt budget. Most-recent-first, so
+#: the freshest external state-of-art wins the slots.
+RESEARCH_NOTE_CAP = 10
 
 
 class _ProposedBase(BaseModel):
@@ -133,6 +139,28 @@ def _render_rejected_paths_block(items: Any) -> str:
         rationale = (getattr(item, "body", "") or "").strip() or "(no rationale recorded)"
         axis_part = f"[{axis}] " if axis else ""
         lines.append(f"  - {axis_part}{title} — {rationale}")
+    return "\n".join(lines) if lines else "  (none)"
+
+
+def _render_research_block(items: Any) -> str:
+    """Render durable research notes as a prompt-friendly, cited block.
+
+    Each entry shows the note title, its ``evidence_refs`` (the operator-supplied
+    URL / paper / tool citations carried on ``provenance``), and the rationale
+    (the memory body) so the session can fold cited external state-of-art into
+    frontier generation. An empty or missing store renders ``(none)`` — identical
+    to the rejected-path block's degrade behaviour.
+    """
+    lines: list[str] = []
+    for item in items or []:
+        title = getattr(item, "title", "") or ""
+        provenance = getattr(item, "provenance", None)
+        refs = (
+            tuple(getattr(provenance, "evidence_refs", ()) or ()) if provenance is not None else ()
+        )
+        rationale = (getattr(item, "body", "") or "").strip() or "(no rationale recorded)"
+        refs_part = f" [refs: {', '.join(refs)}]" if refs else ""
+        lines.append(f"  - {title}{refs_part} — {rationale}")
     return "\n".join(lines) if lines else "  (none)"
 
 
@@ -308,7 +336,8 @@ class Brainstormer:
         # 1. Build the prompt.
         backlog = self._scan_backlog()
         rejected_paths = self._load_rejected_paths()
-        prompt = self._render_prompt(vision, backlog, rejected_paths)
+        research_notes = self._load_research_notes()
+        prompt = self._render_prompt(vision, backlog, rejected_paths, research_notes)
 
         # 2. Drive the SDK session.
         sdk_fn = self.sdk_fn or self._default_sdk_fn()
@@ -353,6 +382,24 @@ class Brainstormer:
         except Exception:  # noqa: BLE001 — boundary; degrade gracefully
             _log.warning("brainstormer_rejected_paths_unavailable")
             return ()
+
+    def _load_research_notes(self) -> tuple[Any, ...]:
+        """Return active research-note memory items, bounded + degrading to ``()``.
+
+        Capped at the most-recent :data:`RESEARCH_NOTE_CAP` notes. When no store
+        is wired, or the store raises (corrupt db, transient sqlite error), the
+        brainstormer behaves as it did before the research channel existed: no
+        block — mirroring ``_load_rejected_paths`` / ``_scan_backlog``.
+        """
+        store = self.memory_store
+        if store is None:
+            return ()
+        try:
+            notes = tuple(store.list_research_notes())
+        except Exception:  # noqa: BLE001 — boundary; degrade gracefully
+            _log.warning("brainstormer_research_notes_unavailable")
+            return ()
+        return notes[:RESEARCH_NOTE_CAP]
 
     def _filter_rejected_paths(
         self, report: BrainstormReport, rejected_paths: tuple[Any, ...]
@@ -423,7 +470,11 @@ class Brainstormer:
             return OpenBacklog()
 
     def _render_prompt(
-        self, vision: ProductVision, backlog: Any, rejected_paths: tuple[Any, ...] = ()
+        self,
+        vision: ProductVision,
+        backlog: Any,
+        rejected_paths: tuple[Any, ...] = (),
+        research_notes: tuple[Any, ...] = (),
     ) -> str:
         from forge_loop.briefs import render_brief
 
@@ -433,6 +484,7 @@ class Brainstormer:
             axes_block=_render_axes_block(vision),
             backlog_block=_render_backlog_block(backlog),
             rejected_paths_block=_render_rejected_paths_block(rejected_paths),
+            research_block=_render_research_block(research_notes),
         )
 
     def _default_sdk_fn(self) -> Callable[..., Any]:

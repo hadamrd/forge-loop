@@ -7,6 +7,7 @@ from pathlib import Path
 from forge_loop.memory.models import (
     AXIS_TAG_PREFIX,
     REJECTED_PATH_TAG,
+    RESEARCH_TAG,
     MemoryItem,
     MemoryKind,
     MemoryProvenance,
@@ -39,6 +40,7 @@ def open_memory_store(repo_path: str | Path) -> SqliteMemoryStore:
 __all__ = [
     "AXIS_TAG_PREFIX",
     "REJECTED_PATH_TAG",
+    "RESEARCH_TAG",
     "MemoryItem",
     "MemoryKind",
     "MemoryProvenance",
