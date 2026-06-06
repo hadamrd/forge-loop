@@ -464,6 +464,7 @@ def run_worker(
             repo=repo,
             env_path_prepend=env_path_prepend,
             env_vars=env_vars,
+            secret_names=capability_policy.secret_names if capability_policy else (),
         )
         outcome.manifesto_sha = manifesto_sha
         _emit_worker_event(
@@ -620,6 +621,7 @@ def run_repair_worker(
         repo=repo,
         env_path_prepend=env_path_prepend,
         env_vars=env_vars,
+        secret_names=capability_policy.secret_names if capability_policy else (),
     )
 
 
@@ -708,6 +710,7 @@ def _run_worker_sdk(
     repo: Path | None = None,
     env_path_prepend: tuple[str, ...] = (),
     env_vars: dict[str, str] | None = None,
+    secret_names: tuple[str, ...] = (),
 ) -> WorkerOutcome:
     """Drive the SDK session, emit typed WorkerEvents, build a WorkerOutcome.
 
@@ -747,6 +750,7 @@ def _run_worker_sdk(
                 load_timeout_ms=load_timeout_ms,
                 strict_mcp_config=strict_mcp_config,
                 mcp_servers=mcp_servers,
+                secret_names=secret_names,
             )
 
         timed_out = False

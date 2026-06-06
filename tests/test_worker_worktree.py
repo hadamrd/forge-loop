@@ -305,3 +305,69 @@ def test_plant_worker_settings_no_events_file_is_silent(tmp_path: Path) -> None:
     assert (wt / ".claude" / "settings.json").exists()
     # no events file was created anywhere under the worktree
     assert not list(tmp_path.glob("*.jsonl"))
+
+
+def test_policy_hash_sensitive_to_secret_names() -> None:
+    """``policy_hash`` already differs when ``secret_names`` differs (#283).
+
+    The secret dimension is in ``to_json_obj``; the hash must reflect it so a
+    re-leased secret set flips the attestation. Do NOT re-derive the hash —
+    just assert the existing canonicalisation covers the dimension.
+    """
+    a = CapabilityPolicy(secret_names=("GITHUB_TOKEN",))
+    a2 = CapabilityPolicy(secret_names=("GITHUB_TOKEN",))
+    b = CapabilityPolicy(secret_names=("GITHUB_TOKEN", "ANTHROPIC_API_KEY"))
+    none = CapabilityPolicy()
+
+    assert policy_hash(a) == policy_hash(a2)
+    assert policy_hash(a) != policy_hash(b)
+    assert policy_hash(a) != policy_hash(none)
+    # Round-trip preserves the dimension and thus the hash.
+    assert policy_hash(CapabilityPolicy.from_json_obj(a.to_json_obj())) == policy_hash(a)
+
+
+def test_plant_worker_settings_records_withheld_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The attestation carries the withheld secret NAMES (never values) (#283)."""
+    monkeypatch.setattr(
+        "forge_loop.worker_worktree.os.environ",
+        {
+            "GITHUB_TOKEN": "gh",
+            "ANTHROPIC_API_KEY": "sk",
+            "PATH": "/usr/bin",
+        },
+    )
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    events_file = tmp_path / "events.jsonl"
+    policy = CapabilityPolicy(secret_names=("GITHUB_TOKEN",))
+
+    plant_worker_settings(wt, policy, events_file=events_file)
+
+    lines = [json.loads(line) for line in events_file.read_text().splitlines() if line.strip()]
+    enforced = [rec for rec in lines if rec.get("kind") == "worker_policy_enforced"]
+    assert len(enforced) == 1
+    # Only the UNLEASED secret-shaped key is recorded — by name, never value.
+    assert enforced[0]["withheld_secrets"] == ["ANTHROPIC_API_KEY"]
+    assert "sk" not in json.dumps(enforced[0])
+    assert enforced[0]["policy_hash"] == policy_hash(policy)
+
+
+def test_plant_worker_settings_none_policy_withholds_all_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adversarial: a ``None`` lease withholds (and records) ALL secret keys."""
+    monkeypatch.setattr(
+        "forge_loop.worker_worktree.os.environ",
+        {"GITHUB_TOKEN": "gh", "DB_PASSWORD": "p", "PATH": "/usr/bin"},
+    )
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    events_file = tmp_path / "events.jsonl"
+
+    plant_worker_settings(wt, None, events_file=events_file)
+
+    lines = [json.loads(line) for line in events_file.read_text().splitlines() if line.strip()]
+    enforced = [rec for rec in lines if rec.get("kind") == "worker_policy_enforced"]
+    assert enforced[0]["withheld_secrets"] == ["DB_PASSWORD", "GITHUB_TOKEN"]

@@ -339,6 +339,7 @@ async def run_sdk_session(
     strict_mcp_config: bool = False,
     mcp_servers: dict[str, Any] | None = None,
     resume: str | None = None,
+    secret_names: Iterable[str] | None = None,
 ) -> SDKRunResult:
     """Drive one Claude Agent SDK session and stream typed WorkerEvents.
 
@@ -432,6 +433,18 @@ async def run_sdk_session(
             path_prepend=env_path_prepend,
             vars=env_vars,
         )
+    # Enforce the secret lease at spawn (issue #283). AFTER build_worker_env so
+    # toolchain provisioning (PATH/VIRTUAL_ENV) is unaffected: only secret-shaped
+    # keys are gated, and only those named in the lease survive. A None/empty
+    # lease withholds ALL secret-shaped keys (closed default, fail safe). The
+    # withheld NAMES are recorded in the policy attestation, not here — no value
+    # is ever logged or emitted.
+    from forge_loop.sandbox.policy import CapabilityPolicy
+    from forge_loop.worker_env import scope_secrets
+
+    effective_env, _ = scope_secrets(
+        effective_env, CapabilityPolicy(secret_names=tuple(secret_names or ()))
+    )
     base_kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "max_turns": max_turns,
