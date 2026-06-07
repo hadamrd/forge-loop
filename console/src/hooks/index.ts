@@ -41,6 +41,9 @@ export function useEvents(query: EventQuery = { limit: 400 }, cap = 600) {
     const unsub = api.streamEvents(since, (e: EventEnvelope) => {
       qc.setQueryData(qk.events(query), (prev: any) => {
         if (!prev) return { events: [e], cursor: null, has_more: false };
+        // Idempotent ingest: a redelivered event (StrictMode double-subscribe, SSE
+        // backfill, reconnect) must not duplicate — key by event_id.
+        if (prev.events.some((x: EventEnvelope) => x.event_id === e.event_id)) return prev;
         const events = prev.events.concat(e).slice(-cap);
         return { ...prev, events };
       });
