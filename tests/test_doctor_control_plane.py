@@ -192,6 +192,7 @@ class TestControlPlaneDoctorShape:
             "stale_leases",
             "memory_integrity",
             "replay_determinism",
+            "eventlog_integrity",
         }
         for result in checks.values():
             assert set(result) == {"status", "detail", "remediation"}
@@ -353,6 +354,116 @@ class TestReplayDeterminism:
         assert replay["remediation"] is not None
 
 
+def _tamper_payload(events_db: Path, *, sequence: int) -> None:
+    """Hand-edit one row's ``payload_json`` (operator corruption / partial write)."""
+    import sqlite3
+
+    connection = sqlite3.connect(events_db)
+    try:
+        connection.execute(
+            "UPDATE events SET payload_json = ? WHERE sequence = ?",
+            ('{"tampered":true}', sequence),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _null_chain_hash(events_db: Path, *, sequence: int) -> None:
+    """Simulate a pre-migration row whose chain hash is NULL (unverifiable)."""
+    import sqlite3
+
+    connection = sqlite3.connect(events_db)
+    try:
+        connection.execute(
+            "UPDATE events SET chain_hash = NULL WHERE sequence = ?",
+            (sequence,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+class TestEventlogIntegrity:
+    def test_clean_log_passes_referencing_head(self, tmp_path: Path) -> None:
+        repo = _seeded_repo(tmp_path, cursor_sequence=2)
+        checks = collect_control_plane_doctor(repo, _FIXED_NOW, state_dir=tmp_path / "docs" / "ops")
+
+        integrity = checks["eventlog_integrity"]
+        assert integrity["status"] == PASS
+        assert "ok" in integrity["detail"]
+        assert "2" in integrity["detail"]  # head sequence referenced
+        assert integrity["remediation"] is None
+
+    def test_tampered_payload_fails_naming_first_sequence(self, tmp_path: Path) -> None:
+        forge_dir = tmp_path / ".forge"
+        _seed_event_log(forge_dir, cursor_sequence=2)  # events at seq 1 and 2
+        _seed_sessions(tmp_path / "docs" / "ops", lease_expires_at=datetime.now(UTC) + timedelta(hours=1))
+        events_db = forge_dir / "events.db"
+        _checkpoint_and_close(events_db)
+        _tamper_payload(events_db, sequence=2)
+        _checkpoint_and_close(events_db)  # fold the tamper into the main db file
+
+        checks = collect_control_plane_doctor(
+            tmp_path, _FIXED_NOW, state_dir=tmp_path / "docs" / "ops"
+        )
+        integrity = checks["eventlog_integrity"]
+        assert integrity["status"] == FAIL
+        assert "sequence 2" in integrity["detail"]
+        assert integrity["remediation"]
+
+    def test_absent_event_log_warns(self, tmp_path: Path) -> None:
+        # No .forge directory → probe degrades to WARN, never crashes.
+        checks = collect_control_plane_doctor(
+            tmp_path, _FIXED_NOW, state_dir=tmp_path / "docs" / "ops"
+        )
+        assert checks["eventlog_integrity"]["status"] == WARN
+
+    def test_null_chain_hash_row_is_unverifiable_warn_not_fail(self, tmp_path: Path) -> None:
+        # A row predating the chain-hash column (NULL) must WARN, not FAIL.
+        forge_dir = tmp_path / ".forge"
+        _seed_event_log(forge_dir, cursor_sequence=2)
+        _seed_sessions(tmp_path / "docs" / "ops", lease_expires_at=datetime.now(UTC) + timedelta(hours=1))
+        events_db = forge_dir / "events.db"
+        _checkpoint_and_close(events_db)
+        _null_chain_hash(events_db, sequence=1)
+        _checkpoint_and_close(events_db)  # fold the NULL update into the main db file
+
+        checks = collect_control_plane_doctor(
+            tmp_path, _FIXED_NOW, state_dir=tmp_path / "docs" / "ops"
+        )
+        integrity = checks["eventlog_integrity"]
+        assert integrity["status"] == WARN
+        assert integrity["remediation"] is None
+
+    def test_first_break_named_on_multi_event_log_and_probe_is_byte_stable(
+        self, tmp_path: Path
+    ) -> None:
+        # Adversarial / sad path: a 3-event log with the FIRST event tampered.
+        # The probe must name sequence 1 as the first break AND must not rewrite
+        # the DB while reading it (mirrors the must-not-mutate invariant).
+        forge_dir = tmp_path / ".forge"
+        event_log = _seed_event_log(forge_dir, cursor_sequence=2)
+        event_log.append(EventKind.PR_OPENED, {"pr": 3})  # third event, seq 3
+        del event_log
+        _seed_sessions(tmp_path / "docs" / "ops", lease_expires_at=datetime.now(UTC) + timedelta(hours=1))
+        events_db = forge_dir / "events.db"
+        _checkpoint_and_close(events_db)
+        _tamper_payload(events_db, sequence=1)
+        _checkpoint_and_close(events_db)  # fold the tamper into the main db file
+
+        before_hash = hashlib.sha256(events_db.read_bytes()).hexdigest()
+        checks = collect_control_plane_doctor(
+            tmp_path, _FIXED_NOW, state_dir=tmp_path / "docs" / "ops"
+        )
+        after_hash = hashlib.sha256(events_db.read_bytes()).hexdigest()
+
+        integrity = checks["eventlog_integrity"]
+        assert integrity["status"] == FAIL
+        assert "sequence 1" in integrity["detail"]
+        assert after_hash == before_hash  # read-only probe did not rewrite the DB
+
+
 class TestMissingForgeStores:
     def test_all_checks_degrade_to_warn_when_forge_absent(self, tmp_path: Path) -> None:
         # No .forge directory at all — every probe must warn, never crash.
@@ -407,6 +518,7 @@ class TestDoctorJsonIntegration:
             "stale_leases",
             "memory_integrity",
             "replay_determinism",
+            "eventlog_integrity",
         }
         for result in control.values():
             assert result["status"] != FAIL

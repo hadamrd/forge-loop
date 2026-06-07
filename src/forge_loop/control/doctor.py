@@ -32,6 +32,11 @@ from forge_loop.eventlog.projections import (
     ProjectionReplayError,
     replay_projection,
 )
+from forge_loop.eventlog.sqlite import (
+    GENESIS_CHAIN_HASH,
+    canonical_event_fields,
+    compute_chain_hash,
+)
 
 if TYPE_CHECKING:
     from forge_loop.eventlog.projections import Projection, ProjectionEventLog
@@ -52,13 +57,18 @@ RECOVER_REMEDIATION = (
 REPROJECT_REMEDIATION = (
     "forge-loop boot   # re-project durable control-plane state from the event log"
 )
+EVENTLOG_INTEGRITY_REMEDIATION = (
+    "inspect .forge/events.db at the named sequence and restore it from a known-good "
+    "backup BEFORE booting (boot/replay hard-aborts on a broken hash chain)"
+)
 
-# The four control-plane check names, in display order.
+# The control-plane check names, in display order.
 CHECK_NAMES = (
     "projection_lag",
     "stale_leases",
     "memory_integrity",
     "replay_determinism",
+    "eventlog_integrity",
 )
 
 
@@ -92,6 +102,7 @@ def collect_control_plane_doctor(
         "stale_leases": _stale_leases_check(status),
         "memory_integrity": _memory_integrity_check(status, memory_path),
         "replay_determinism": _replay_determinism_check(status, event_log_path),
+        "eventlog_integrity": _eventlog_integrity_check(status, event_log_path),
     }
 
 
@@ -368,6 +379,123 @@ def _replay_determinism_check(
         ),
         None,
     )
+
+
+def _eventlog_integrity_check(
+    status: dict[str, Any],
+    event_log_path: Path,
+) -> dict[str, Any]:
+    """Walk the event-log hash chain and report the FIRST break (#339).
+
+    Recomputes ``chain_hash_n = sha256(prev_chain_hash + canonical(fields))``
+    for every row from a ``mode=ro`` connection and compares it against the
+    stored hash. The probe is strictly read-only and never raises: any
+    ``sqlite3.Error``/``OSError``/decode error converts to a verdict so
+    ``doctor`` runs to completion.
+
+    - clean chain → ``PASS`` referencing the head sequence;
+    - a mutated/corrupt row → ``FAIL`` naming the first offending sequence;
+    - rows predating the chain-hash column (NULL) → ``WARN`` (unverifiable);
+    - event log absent → ``WARN`` (not applicable).
+    """
+
+    event_log = status["event_log"]
+    if not event_log["available"]:
+        return _check(WARN, "event log absent; integrity not applicable", None)
+
+    try:
+        if not _has_chain_hash_column(event_log_path):
+            return _check(
+                WARN,
+                "eventlog_integrity: event log predates the chain-hash column; "
+                "integrity unverifiable",
+                None,
+            )
+        rows = _read_event_chain_rows(event_log_path)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return _check(
+            FAIL,
+            f"eventlog_integrity: event log could not be read: {exc}",
+            EVENTLOG_INTEGRITY_REMEDIATION,
+        )
+
+    prev = GENESIS_CHAIN_HASH
+    head_sequence = 0
+    for row in rows:
+        sequence = int(row["sequence"])
+        head_sequence = sequence
+        stored = row["chain_hash"]
+        if stored is None:
+            return _check(
+                WARN,
+                f"eventlog_integrity: event at sequence {sequence} predates the "
+                "chain-hash column (NULL); integrity unverifiable",
+                None,
+            )
+        try:
+            expected = compute_chain_hash(
+                prev,
+                canonical_event_fields(
+                    event_id=row["event_id"],
+                    kind=row["kind"],
+                    payload_json=row["payload_json"],
+                    schema_version=int(row["schema_version"]),
+                    occurred_at=row["occurred_at"],
+                    task_id=row["task_id"],
+                    saga_id=row["saga_id"],
+                    idempotency_key=row["idempotency_key"],
+                ),
+            )
+        except (ValueError, TypeError) as exc:
+            return _check(
+                FAIL,
+                f"eventlog_integrity: could not recompute chain at sequence {sequence}: {exc}",
+                EVENTLOG_INTEGRITY_REMEDIATION,
+            )
+        if expected != stored:
+            return _check(
+                FAIL,
+                f"eventlog_integrity: chain-hash mismatch first at sequence {sequence} "
+                "(payload tampered or corrupted)",
+                EVENTLOG_INTEGRITY_REMEDIATION,
+            )
+        # Continue from the STORED hash so a single tampered row flags only
+        # itself as the first break, not every following row.
+        prev = str(stored)
+
+    return _check(
+        PASS,
+        f"eventlog_integrity=ok (verified chain through head sequence {head_sequence})",
+        None,
+    )
+
+
+def _has_chain_hash_column(event_log_path: Path) -> bool:
+    """Return whether the read-only ``events`` table carries ``chain_hash``."""
+
+    uri = f"file:{event_log_path}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(events)")}
+    finally:
+        connection.close()
+    return "chain_hash" in columns
+
+
+def _read_event_chain_rows(event_log_path: Path) -> list[sqlite3.Row]:
+    """Read the hash-chain columns of every event via a read-only connection."""
+
+    uri = f"file:{event_log_path}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        return connection.execute(
+            "SELECT sequence, chain_hash, event_id, kind, payload_json, "
+            "schema_version, occurred_at, task_id, saga_id, idempotency_key "
+            "FROM events ORDER BY sequence ASC"
+        ).fetchall()
+    finally:
+        connection.close()
 
 
 def _live_projection_cursors(event_log_path: Path) -> dict[str, int]:

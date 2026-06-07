@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS events (
     saga_id TEXT,
     causal_event_id TEXT,
     causal_sequence INTEGER,
-    idempotency_key TEXT UNIQUE
+    idempotency_key TEXT UNIQUE,
+    chain_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS projection_cursors (
@@ -52,6 +54,53 @@ CREATE TABLE IF NOT EXISTS projection_cursors (
     sequence INTEGER NOT NULL
 );
 """
+
+#: Fixed empty/zero seed the genesis event chains from (#339). 64 hex zeros so
+#: it is the same shape as a SHA-256 digest.
+GENESIS_CHAIN_HASH = "0" * 64
+
+
+def canonical_event_fields(
+    *,
+    event_id: str,
+    kind: str,
+    payload_json: str,
+    schema_version: int,
+    occurred_at: str,
+    task_id: str | None,
+    saga_id: str | None,
+    idempotency_key: str | None,
+) -> str:
+    """Canonical JSON over the tamper-evident fields of one event (#339).
+
+    Reuses the canonical-JSON convention (``sort_keys=True,
+    separators=(",", ":")``) shared by :meth:`SqliteEventLog.append`'s
+    ``payload_json`` and :func:`forge_loop.sandbox.policy.canonical_policy_json`,
+    rather than inventing a new canonicaliser. ``payload_json`` is folded in as
+    the already-canonical stored string so the probe can recompute the digest
+    from the raw stored row without re-canonicalising the parsed payload.
+    """
+
+    return json.dumps(
+        {
+            "event_id": event_id,
+            "idempotency_key": idempotency_key,
+            "kind": kind,
+            "occurred_at": occurred_at,
+            "payload_json": payload_json,
+            "saga_id": saga_id,
+            "schema_version": schema_version,
+            "task_id": task_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def compute_chain_hash(prev_chain_hash: str, canonical_fields: str) -> str:
+    """``chain_hash_n = sha256(prev_chain_hash + canonical(event fields))`` (#339)."""
+
+    return hashlib.sha256((prev_chain_hash + canonical_fields).encode("utf-8")).hexdigest()
 
 
 class SqliteEventLog:
@@ -65,6 +114,31 @@ class SqliteEventLog:
         if str(path) != ":memory:":
             self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.executescript(_SCHEMA)
+        self._ensure_chain_hash_column()
+
+    def _ensure_chain_hash_column(self) -> None:
+        """Idempotent migration: add ``chain_hash`` to a pre-existing table (#339).
+
+        ``_SCHEMA`` only adds the column on a *fresh* ``CREATE TABLE``; a DB that
+        already exists on disk without it skips the create entirely, so back-fill
+        the column here. Rows written before this migration keep ``NULL``
+        chain_hash and are reported as unverifiable by the doctor probe.
+        """
+
+        columns = {row[1] for row in self._connection.execute("PRAGMA table_info(events)")}
+        if "chain_hash" not in columns:
+            with self._connection:
+                self._connection.execute("ALTER TABLE events ADD COLUMN chain_hash TEXT")
+
+    def _latest_chain_hash(self) -> str:
+        """Return the chain hash of the current head event, or the genesis seed."""
+
+        row = self._connection.execute(
+            "SELECT chain_hash FROM events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if row is None or row["chain_hash"] is None:
+            return GENESIS_CHAIN_HASH
+        return str(row["chain_hash"])
 
     def append(
         self,
@@ -85,6 +159,23 @@ class SqliteEventLog:
         payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         event_id = EventId(uuid.uuid4().hex)
         occurred_at = datetime.now(UTC).isoformat()
+        schema_version = 1
+
+        # Tamper-evident chain hash (#339): each event links to its predecessor
+        # so the doctor probe can recompute the chain and detect a mutated row.
+        chain_hash = compute_chain_hash(
+            self._latest_chain_hash(),
+            canonical_event_fields(
+                event_id=str(event_id),
+                kind=kind.value,
+                payload_json=payload_json,
+                schema_version=schema_version,
+                occurred_at=occurred_at,
+                task_id=task_id,
+                saga_id=saga_id,
+                idempotency_key=idempotency_key,
+            ),
+        )
 
         try:
             with self._connection:
@@ -98,19 +189,21 @@ class SqliteEventLog:
                         occurred_at,
                         task_id,
                         saga_id,
-                        idempotency_key
+                        idempotency_key,
+                        chain_hash
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(event_id),
                         kind.value,
                         payload_json,
-                        1,
+                        schema_version,
                         occurred_at,
                         task_id,
                         saga_id,
                         idempotency_key,
+                        chain_hash,
                     ),
                 )
         except sqlite3.IntegrityError:
