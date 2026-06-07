@@ -16,6 +16,9 @@ from forge_loop.memory.models import (
     axis_from_tags,
     axis_tag,
     derive_memory_id,
+    derive_skill_key,
+    skill_from_tags,
+    skill_tag,
 )
 from forge_loop.memory.store import SqliteMemoryStore
 
@@ -312,6 +315,36 @@ def test_axis_tag_round_trips_and_missing_axis_is_empty() -> None:
     # No axis tag present → empty string (degrade, no crash).
     assert axis_from_tags((REJECTED_PATH_TAG,)) == ""
     assert axis_from_tags(()) == ""
+
+
+def test_derive_skill_key_deterministic_and_collision_distinct() -> None:
+    # Same signature → same key (deterministic, pure).
+    assert derive_skill_key("ImportError: X", "src/foo/bar.py") == derive_skill_key(
+        "ImportError: X", "src/foo/bar.py"
+    )
+    # Whitespace is stripped, so incidental spacing does not fork the key.
+    assert derive_skill_key(" ImportError: X ", " src/foo/bar.py ") == derive_skill_key(
+        "ImportError: X", "src/foo/bar.py"
+    )
+    # Different failing-signal → different key.
+    assert derive_skill_key("ImportError: X", "src/foo/bar.py") != derive_skill_key(
+        "ImportError: Y", "src/foo/bar.py"
+    )
+    # Different target → different key.
+    assert derive_skill_key("ImportError: X", "src/foo/bar.py") != derive_skill_key(
+        "ImportError: X", "src/foo/baz.py"
+    )
+    # NUL separator keeps the boundary unambiguous: ("ab","c") != ("a","bc").
+    assert derive_skill_key("ab", "c") != derive_skill_key("a", "bc")
+
+
+def test_skill_tag_round_trips_and_missing_skill_is_empty() -> None:
+    key = derive_skill_key("ImportError: X", "src/foo/bar.py")
+    assert skill_from_tags((skill_tag(key),)) == key
+    assert skill_tag(" abc123 ") == "skill:abc123"
+    # No skill tag present → empty string (degrade, no crash).
+    assert skill_from_tags((REJECTED_PATH_TAG,)) == ""
+    assert skill_from_tags(()) == ""
 
 
 def test_fake_memory_store_matches_real_shape(tmp_path: Path) -> None:

@@ -6,12 +6,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from forge_loop.memory.models import MemoryItem, MemoryKind, MemoryProvenance
+from forge_loop.memory.models import (
+    MemoryItem,
+    MemoryKind,
+    MemoryProvenance,
+    derive_skill_key,
+    skill_tag,
+)
 from forge_loop.memory.store import SqliteMemoryStore
 from forge_loop.runner.learning import (
     _MAX_REASON_LEN,
     record_failed_outcomes,
     record_merged_outcomes,
+    record_procedural_skill,
 )
 
 _NOW = datetime(2026, 6, 3, 12, 0, 0, tzinfo=UTC)
@@ -396,3 +403,150 @@ def test_merge_when_failure_already_superseded_by_other(tmp_path: Path) -> None:
     shipped = store.get("episodic-shipped-99")
     assert shipped is not None
     assert shipped.is_active is True
+
+
+# --- Procedural skill-key supersession (issue #359) ---------------------------
+
+_SIGNAL = "ImportError: cannot import name X"
+_TARGET = "src/foo/bar.py"
+
+
+def _write_skill(store: SqliteMemoryStore, *, source_key: str, body: str) -> str:
+    """Write one procedural skill for the shared (_SIGNAL, _TARGET) signature."""
+    return record_procedural_skill(
+        store,
+        failing_signal=_SIGNAL,
+        target=_TARGET,
+        title="repair ImportError in bar.py",
+        body=body,
+        source_key=source_key,
+        source_task_ref="issue:#359",
+        now=_NOW,
+    )
+
+
+def test_same_skill_key_leaves_one_active_one_superseded(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    old_id = _write_skill(store, source_key="repair:monday", body="monday recipe")
+    new_id = _write_skill(store, source_key="repair:thursday", body="thursday recipe")
+
+    assert old_id != new_id
+
+    active = store.list_active(kind=MemoryKind.PROCEDURAL)
+    assert len(active) == 1
+    assert active[0].memory_id == new_id
+
+    # The superseded item is still retrievable with its lineage intact.
+    old = store.get(old_id)
+    assert old is not None
+    assert old.is_active is False
+    assert old.superseded_by == new_id
+
+    # Provenance lineage preserved on the new item.
+    new = store.get(new_id)
+    assert new is not None
+    assert old_id in new.provenance.supersedes
+
+
+def test_different_skill_keys_keep_both_active(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    first = record_procedural_skill(
+        store,
+        failing_signal=_SIGNAL,
+        target=_TARGET,
+        title="repair bar.py",
+        body="recipe a",
+        source_key="repair:a",
+        source_task_ref="issue:#359",
+        now=_NOW,
+    )
+    second = record_procedural_skill(
+        store,
+        failing_signal="TypeError: bad arg",
+        target="src/foo/qux.py",
+        title="repair qux.py",
+        body="recipe b",
+        source_key="repair:b",
+        source_task_ref="issue:#359",
+        now=_NOW,
+    )
+
+    active = store.list_active(kind=MemoryKind.PROCEDURAL)
+    assert {item.memory_id for item in active} == {first, second}
+    assert store.get(first).superseded_by is None  # type: ignore[union-attr]
+    assert store.get(second).superseded_by is None  # type: ignore[union-attr]
+
+
+def test_third_write_supersedes_only_currently_active(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    first = _write_skill(store, source_key="repair:1", body="r1")
+    second = _write_skill(store, source_key="repair:2", body="r2")
+    third = _write_skill(store, source_key="repair:3", body="r3")
+
+    # Chain stays linear: first -> second -> third, no double-supersede.
+    assert store.get(first).superseded_by == second  # type: ignore[union-attr]
+    assert store.get(second).superseded_by == third  # type: ignore[union-attr]
+    third_item = store.get(third)
+    assert third_item is not None
+    assert third_item.is_active is True
+
+    # Third supersedes ONLY the currently-active (second), never re-points first.
+    assert third_item.provenance.supersedes == (second,)
+
+    active = store.list_active(kind=MemoryKind.PROCEDURAL)
+    assert len(active) == 1
+    assert active[0].memory_id == third
+
+
+def test_idempotent_rerun_same_source_key_does_not_self_supersede(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    first = _write_skill(store, source_key="repair:same", body="recipe")
+    again = _write_skill(store, source_key="repair:same", body="recipe v2")
+
+    assert first == again
+    active = store.list_active(kind=MemoryKind.PROCEDURAL)
+    assert len(active) == 1
+    item = store.get(first)
+    assert item is not None
+    assert item.is_active is True
+    assert item.provenance.supersedes == ()  # never superseded itself
+
+
+def test_skill_key_collision_on_other_kind_is_ignored(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    # A SEMANTIC item that coincidentally bears the same skill-key tag.
+    skill_key = derive_skill_key(_SIGNAL, _TARGET)
+    semantic_id = "semantic-coincidence"
+    store.put(
+        MemoryItem(
+            memory_id=semantic_id,
+            kind=MemoryKind.SEMANTIC,
+            title="unrelated semantic note",
+            body="a fact that happens to share the tag",
+            provenance=MemoryProvenance(
+                source_event=None,
+                authored_by="maestro",
+                source_task_ref="issue:#359",
+                confidence=1.0,
+                created_at=_NOW,
+            ),
+            tags=(skill_tag(skill_key),),
+        )
+    )
+
+    new_id = _write_skill(store, source_key="repair:proc", body="recipe")
+
+    # The non-procedural item is untouched (kind-scoped lookup).
+    semantic = store.get(semantic_id)
+    assert semantic is not None
+    assert semantic.is_active is True
+    assert semantic.superseded_by is None
+    # The procedural item supersedes nothing.
+    new = store.get(new_id)
+    assert new is not None
+    assert new.provenance.supersedes == ()

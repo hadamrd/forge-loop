@@ -27,10 +27,22 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 
-from forge_loop.memory.models import MemoryItem, MemoryKind, MemoryProvenance
+from forge_loop.eventlog.models import EventRef
+from forge_loop.memory.models import (
+    MemoryItem,
+    MemoryKind,
+    MemoryProvenance,
+    derive_memory_id,
+    derive_skill_key,
+    skill_tag,
+)
 from forge_loop.memory.store import MemoryStore
 
-__all__ = ["record_failed_outcomes", "record_merged_outcomes"]
+__all__ = [
+    "record_failed_outcomes",
+    "record_merged_outcomes",
+    "record_procedural_skill",
+]
 
 #: Upper bound on how many characters of a failure reason are persisted as the
 #: lesson body. Mirrors the 2000-char cap used by ``runner/_helpers.py`` when it
@@ -96,6 +108,97 @@ def _coerce_failure(record: object) -> tuple[int, str, str, str] | None:
     status_str = str(status or "").strip()
     reason_str = str(reason or "").strip()[:_MAX_REASON_LEN]
     return n, title, status_str, reason_str
+
+
+def record_procedural_skill(
+    memory_store: MemoryStore,
+    *,
+    failing_signal: str,
+    target: str,
+    title: str,
+    body: str,
+    source_key: str,
+    authored_by: str = "maestro",
+    source_task_ref: str | None = None,
+    source_event: EventRef | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Record a validated repair as a PROCEDURAL skill, superseding any prior.
+
+    Procedural memory is a *bounded set of current skills*, not an append-only
+    log: a repair of the same ``failing_signal`` on the same ``target`` should
+    replace the prior recipe, not pile up beside it. Each repair *instance*
+    gets its own fresh ``memory_id`` (derived from ``source_key``); the repair
+    *signature* is carried as a stable ``skill:<digest>`` tag. We deliberately
+    do NOT use the skill-key as the ``memory_id`` — that would collide and let
+    ``put``'s ``ON CONFLICT`` overwrite the prior row in place, destroying
+    provenance. Instead we look up the active procedural item bearing the same
+    skill-key tag and supersede it explicitly, preserving lineage.
+
+    The new item is upserted BEFORE the supersede call, matching the ordering in
+    :func:`record_merged_outcomes`: ``MemoryStore.supersede`` raises
+    ``KeyError`` if ``by_memory_id`` is absent, so the replacement must exist
+    first.
+
+    The lookup is scoped to *active* items of the *same kind*
+    (``list_active(kind=PROCEDURAL)``), so an already-superseded skill is left
+    untouched (the chain stays linear) and a coincidentally-matching tag on a
+    SEMANTIC/EPISODIC item is ignored.
+
+    Args:
+        memory_store: The durable memory store to write to.
+        failing_signal: The failure signature being repaired (e.g. an error
+            message class).
+        target: The target identifier the repair applies to (e.g. a file path).
+        title: Human-readable skill title.
+        body: The reusable recipe body.
+        source_key: A key unique to *this* repair instance, used to derive the
+            fresh ``memory_id``. Re-running with the same ``source_key`` upserts
+            in place (idempotent) rather than self-superseding.
+        authored_by: Provenance author; defaults to ``"maestro"``.
+        source_task_ref: Optional provenance task reference.
+        source_event: Optional provenance event reference.
+        now: Optional fixed timestamp for deterministic provenance.
+
+    Returns:
+        The ``memory_id`` of the newly-active procedural item.
+    """
+    created_at = now if now is not None else datetime.now(UTC)
+    skill_key = derive_skill_key(failing_signal, target)
+    tag = skill_tag(skill_key)
+    memory_id = derive_memory_id(source_key, prefix="procedural")
+
+    # The currently-active procedural skill(s) for this exact signature. By the
+    # supersession invariant there is at most one, but we iterate defensively.
+    # ``memory_id != ...`` guards the idempotent re-run case (same source_key)
+    # so the new row never supersedes itself.
+    prior = tuple(
+        item
+        for item in memory_store.list_active(kind=MemoryKind.PROCEDURAL)
+        if tag in item.tags and item.memory_id != memory_id
+    )
+
+    item = MemoryItem(
+        memory_id=memory_id,
+        kind=MemoryKind.PROCEDURAL,
+        title=title,
+        body=body,
+        provenance=MemoryProvenance(
+            source_event=source_event,
+            authored_by=authored_by,
+            source_task_ref=source_task_ref,
+            confidence=1.0,
+            created_at=created_at,
+            supersedes=tuple(old.memory_id for old in prior),
+        ),
+        tags=(tag,),
+    )
+    # Persist the replacement first, THEN supersede — see docstring.
+    memory_store.put(item)
+    for old in prior:
+        memory_store.supersede(old.memory_id, by_memory_id=memory_id)
+
+    return memory_id
 
 
 def record_failed_outcomes(
