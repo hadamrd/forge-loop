@@ -14,6 +14,12 @@ Idempotency is structural: each merged issue maps to a deterministic
 ``memory_id`` (``episodic-shipped-{n}``), and the store's :meth:`put` performs
 an idempotent upsert, so re-recording the same merged issue never creates a
 duplicate row.
+
+When a ticket that previously failed (an active ``episodic-failed-{n}`` written
+by the failure-episode track, parent #346) later merges, recording its merged
+outcome also supersedes that failure episode with the shipped item, so a
+maestro rebuilding its working set from ``list_active`` never sees a stale
+"this ticket failed" lesson for a ticket that has since shipped.
 """
 
 from __future__ import annotations
@@ -119,7 +125,22 @@ def record_merged_outcomes(
             ),
             tags=("shipped",),
         )
+        # The shipped item MUST be upserted before the supersede call below:
+        # ``MemoryStore.supersede`` raises ``KeyError`` if ``by_memory_id`` is
+        # absent, so the superseding row has to exist first.
         memory_store.put(item)
         promoted.append(memory_id)
+
+        # Supersede the failure episode (parent #346) for this ticket if one is
+        # still active: when #N first fails and later merges, the stale
+        # "this ticket failed" lesson must not survive into the working set.
+        # We reuse the supersession path (not delete) so provenance stays
+        # intact. An already-superseded failure item is left untouched — we
+        # only re-point a failure episode that is still active, so we never
+        # clobber an existing supersession.
+        failure_id = f"episodic-failed-{n}"
+        failure_item = memory_store.get(failure_id)
+        if failure_item is not None and failure_item.is_active:
+            memory_store.supersede(failure_id, by_memory_id=memory_id)
 
     return tuple(promoted)
