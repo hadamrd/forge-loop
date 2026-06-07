@@ -212,6 +212,30 @@ class CriticSettings(BaseSettings):
         return self
 
 
+class MutationGateSettings(BaseSettings):
+    """Oracle-strength merge gate (issue #381).
+
+    Consumes the scoped mutation-check result (#379) for ONE configured
+    high-risk module and refuses frontier-advance / merge when the surviving
+    mutant count exceeds ``survivor_threshold``. ``enabled=False`` makes the
+    gate a no-op, preserving pre-#381 behaviour.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+    enabled: bool = True
+    # The single high-risk module whose oracle strength is gated. Defaults to
+    # the event-log hash-chain integrity module (the durable-cognition root).
+    module: str = "forge_loop/eventlog/chain.py"
+    survivor_threshold: int = 0
+
+    @field_validator("survivor_threshold")
+    @classmethod
+    def _threshold_nonneg(cls, v: int) -> int:
+        if v < 0:
+            raise ConfigError(f"mutation_gate.survivor_threshold={v!r} — must be >= 0")
+        return int(v)
+
+
 class POSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
     enabled: bool = True
@@ -486,6 +510,7 @@ class Settings(BaseSettings):
     labels: LabelsSettings = Field(default_factory=LabelsSettings)
     briefs: BriefsSettings = Field(default_factory=BriefsSettings)
     critic: CriticSettings = Field(default_factory=CriticSettings)
+    mutation_gate: MutationGateSettings = Field(default_factory=MutationGateSettings)
     po: POSettings = Field(default_factory=POSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     attempts: AttemptsSettings = Field(default_factory=AttemptsSettings)
@@ -523,6 +548,7 @@ class Settings(BaseSettings):
             "labels": {**(y.get("labels") or {})},
             "briefs": {**(y.get("briefs") or {})},
             "critic": {**(y.get("critic") or {})},
+            "mutation_gate": {**(y.get("mutation_gate") or {})},
             "po": {**(y.get("po") or {})},
             "worker": {**(y.get("worker") or {})},
             "attempts": {**(y.get("attempts") or {})},
@@ -713,6 +739,7 @@ __all__ = [
     "LabelsSettings",
     "BriefsSettings",
     "CriticSettings",
+    "MutationGateSettings",
     "POSettings",
     "WorkerSettings",
     "AttemptsSettings",
