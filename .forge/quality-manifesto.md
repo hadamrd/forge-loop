@@ -113,7 +113,7 @@ discriminator into an enum + updating both call sites in the same PR.
 
 **Rule.** A manifesto rule that can only be checked by looking at codebase **state** (file size, module count, deprecated-pattern count, test coverage, dead-code count) MUST register a probe in the codebase auditor (#156). Per-PR critic catches **deltas**; the auditor catches **accumulation**.
 
-**Rationale.** `src/forge_loop/cli.py` is 1705 LOC. The Python soft-cap is 500. The critic never flagged it because cli.py grew 50-100 LOC per PR over many merges. Each individual increment was a reasonable diff; the cumulative state-violation slipped past every per-PR review. Classic boiling-frog.
+**Rationale.** `src/forge_loop/cli.py` once grew to several times the Python soft-cap of 500 LOC. The critic never flagged it because cli.py grew 50-100 LOC per PR over many merges. Each individual increment was a reasonable diff; the cumulative state-violation slipped past every per-PR review. Classic boiling-frog. The `FileSizeProbe` state-gate now re-measures it on every audit pass, so the rule references the live probe rather than a frozen snapshot LOC.
 
 **How to apply.** When you add a rule like "no module > N LOC" or "no Any-typed param" or "no `subprocess.run(['gh', ...])` in production code": the same PR that adds the rule MUST add an audit probe under ``src/forge_loop/audit_probes/``. Rule and gate ship together; otherwise the rule is decoration.
 
@@ -136,9 +136,9 @@ the same capability is **sev1**. "I needed `X`, the model didn't surface the
 existing `X`, so it wrote a new `X`" is the single most common slop pattern, and
 it is invisible to the type checker — both copies type-check fine.
 
-**Rationale.** This repo has **three** GitHub-issue-creation surfaces:
-`gh.py::create_issue`, `gh_issues.py::create_issue`, and `gh_client.py` with
-**three** `create_issue` methods across its classes. A worker that needed "open
+**Rationale.** This repo has multiple GitHub-issue-creation surfaces:
+`gh_issues.py::create_issue` and `gh_client.py` with several `create_issue`
+methods across its classes. A worker that needed "open
 an issue" reinvented it instead of importing the existing `GhClient`. None of
 the duplications was individually flagged because each looked like a reasonable
 new helper in its own diff — the same boiling-frog shape as cli.py's LOC.
@@ -157,13 +157,15 @@ known offender to burn down).
 
 A single function/method longer than **80 logical lines** (or whose cyclomatic
 complexity exceeds ~15) is **sev2**. A PR that grows an already-over-cap
-function is **sev2** even if the net diff is small — that is how they get to 582
-lines. Decompose into named helpers that can each be unit-tested.
+function is **sev2** even if the net diff is small — that is how they get to many
+times the cap. Decompose into named helpers that can each be unit-tested.
 
-**Rationale.** `runner/tick.py::_tick()` is **582 lines** (432–1014). The #156
-auditor caps *module* size (cli.py at 1705 LOC) but never *function* size, so the
-single most important function in the system — the orchestration tick — grew
-unreviewable and has no unit tests of its branches, only end-to-end coverage.
+**Rationale.** `runner/tick.py::_tick()` once ballooned to many times the 80-LOC
+cap before it was decomposed. The #156 auditor caps *module* size but never
+*function* size, so the single most important function in the system — the
+orchestration tick — grew unreviewable and had no unit tests of its branches,
+only end-to-end coverage. A `function_size` probe re-measures this on every pass
+so the rule references the live gate rather than a frozen line range.
 Module caps without function caps just relocate the boiling frog one scope down.
 
 **How to apply.** The per-PR critic flags any function in the diff that ends
@@ -185,7 +187,7 @@ loops over the work-list or the event log are **sev2**.
 
 **Rationale.** Honesty per the meta-rule: this audit did **not** find a confirmed
 perf *incident* — but it did find that loop-bodies issuing external calls cluster
-in `gh.py`, `critic.py`, and `_worker_sdk.py`, exactly where an N+1 would hide,
+in `gh_issues.py`, `critic.py`, and `_worker_sdk.py`, exactly where an N+1 would hide,
 and the rubric has *zero* perf coverage, so nothing measures it. Per the
 boiling-frog meta-rule, perf needs an auditor probe before it accretes the way
 LOC did — the rule and that probe ship together; until the probe exists this

@@ -218,8 +218,9 @@ def default_probes() -> list[Probe]:
     doesn't drag in every probe — and so tests can monkey-patch.
     """
     from forge_loop.audit_probes.file_size import FileSizeProbe
+    from forge_loop.audit_probes.function_size import FunctionSizeProbe
 
-    return [FileSizeProbe()]
+    return [FileSizeProbe(), FunctionSizeProbe()]
 
 
 def audit(repo: Path, probes: list[Probe] | None = None) -> AuditReport:
