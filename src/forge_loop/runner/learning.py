@@ -27,10 +27,15 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 
+from forge_loop.eventlog.models import EventId, EventRef
 from forge_loop.memory.models import MemoryItem, MemoryKind, MemoryProvenance
 from forge_loop.memory.store import MemoryStore
 
-__all__ = ["record_failed_outcomes", "record_merged_outcomes"]
+__all__ = [
+    "record_failed_outcomes",
+    "record_merged_outcomes",
+    "record_repair_recipe",
+]
 
 #: Upper bound on how many characters of a failure reason are persisted as the
 #: lesson body. Mirrors the 2000-char cap used by ``runner/_helpers.py`` when it
@@ -167,6 +172,146 @@ def record_failed_outcomes(
         promoted.append(memory_id)
 
     return tuple(promoted)
+
+
+def _coerce_touched(touched: object) -> str:
+    """Render the file(s)/test(s) a repair touched into a compact string.
+
+    Accepts a single path string or an iterable of paths. The result is capped
+    at :data:`_MAX_REASON_LEN` so a sprawling change list never bloats the row.
+    """
+    if touched is None:
+        return ""
+    if isinstance(touched, str):
+        return touched.strip()[:_MAX_REASON_LEN]
+    if isinstance(touched, (list, tuple)):
+        joined = ", ".join(str(part).strip() for part in touched if str(part).strip())
+        return joined[:_MAX_REASON_LEN]
+    return str(touched).strip()[:_MAX_REASON_LEN]
+
+
+def _coerce_repair(
+    record: object,
+) -> tuple[int, str, str, str, str, EventRef] | None:
+    """Normalise one repair record into a structured recipe tuple.
+
+    Returns ``(issue_number, title, failing_signal, fix, touched, event_ref)`` or
+    ``None`` when the record lacks a usable issue number OR an originating event
+    reference. Both are required: the recipe's ``memory_id`` is keyed on the
+    issue, and the acceptance contract demands the provenance point at the
+    repair tick's event, so a record without an ``event_id``/``sequence`` pair
+    cannot satisfy it and is skipped rather than written with empty provenance.
+
+    Reuses :func:`_coerce_issue` for the issue-number/title extraction so the
+    repair path shares the one normalisation scheme used by the other producers.
+    """
+    coerced = _coerce_issue(record)
+    if coerced is None:
+        return None
+    n, title, _pr = coerced
+
+    signal: object
+    fix: object
+    touched: object
+    event_id: object
+    sequence: object
+    if isinstance(record, Mapping):
+        signal = record.get("failing_signal", record.get("signal"))
+        fix = record.get("fix")
+        touched = record.get("touched")
+        event_id = record.get("event_id")
+        sequence = record.get("event_sequence", record.get("sequence"))
+    else:
+        signal = getattr(record, "failing_signal", getattr(record, "signal", None))
+        fix = getattr(record, "fix", None)
+        touched = getattr(record, "touched", None)
+        event_id = getattr(record, "event_id", None)
+        sequence = getattr(record, "event_sequence", getattr(record, "sequence", None))
+
+    if not event_id or not isinstance(sequence, (int, float, str)):
+        return None
+    try:
+        seq = int(sequence)
+    except (TypeError, ValueError):
+        return None
+    event_ref = EventRef(event_id=EventId(str(event_id)), sequence=seq)
+
+    signal_str = str(signal or "").strip()[:_MAX_REASON_LEN]
+    fix_str = str(fix or "").strip()[:_MAX_REASON_LEN]
+    touched_str = _coerce_touched(touched)
+    return n, title, signal_str, fix_str, touched_str, event_ref
+
+
+def record_repair_recipe(
+    memory_store: MemoryStore,
+    repair: object,
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    """Record one PROCEDURAL repair-recipe memory item for a validated repair.
+
+    Sibling of :func:`record_merged_outcomes` for the *repair* path (epic #355):
+    when a repair tick lands a passing critic (an approved / merged PR produced
+    by the repair loop), this upserts ONE PROCEDURAL :class:`MemoryItem`
+    capturing a compact, reusable repair recipe — the failing signal that
+    triggered the repair, the named fix that was applied, and the file/test it
+    touched. It is a *recipe*, NOT a transcript.
+
+    The item's :class:`MemoryProvenance` points at the ORIGINATING event id (the
+    repair tick's event) via ``source_event``, so a maestro rebuilding its
+    working set after a context loss can trace the recipe back to the concrete
+    validated outcome instead of re-deriving a fix that already worked.
+
+    The ``memory_id`` is the deterministic ``procedural-repair-{N}`` so re-runs
+    upsert in place rather than duplicating; cross-fix dedup is a separate slice.
+
+    Args:
+        memory_store: The durable memory store to write to.
+        repair: A repair record — a mapping or object exposing an issue number
+            (``issue``/``number``), the ``failing_signal`` (or ``signal``), the
+            ``fix`` applied, the ``touched`` file/test (str or iterable), and the
+            originating ``event_id`` plus ``event_sequence`` (or ``sequence``).
+        now: Optional fixed timestamp for deterministic provenance; defaults to
+            the current UTC time.
+
+    Returns:
+        The promoted ``memory_id``, or ``None`` when ``repair`` lacks a usable
+        issue number or originating event reference.
+    """
+    created_at = now if now is not None else datetime.now(UTC)
+
+    coerced = _coerce_repair(repair)
+    if coerced is None:
+        return None
+    n, title, signal, fix, touched, event_ref = coerced
+
+    memory_id = f"procedural-repair-{n}"
+    recipe_title = f"repair #{n}: {title}" if title else f"repair #{n}"
+    body_lines = [recipe_title]
+    if signal:
+        body_lines.append(f"failing signal: {signal}")
+    if fix:
+        body_lines.append(f"fix: {fix}")
+    if touched:
+        body_lines.append(f"touched: {touched}")
+    body = "\n".join(body_lines)
+
+    item = MemoryItem(
+        memory_id=memory_id,
+        kind=MemoryKind.PROCEDURAL,
+        title=recipe_title,
+        body=body,
+        provenance=MemoryProvenance(
+            source_event=event_ref,
+            authored_by="maestro",
+            source_task_ref=f"issue:#{n}",
+            confidence=1.0,
+            created_at=created_at,
+        ),
+        tags=("repair",),
+    )
+    memory_store.put(item)
+    return memory_id
 
 
 def record_merged_outcomes(

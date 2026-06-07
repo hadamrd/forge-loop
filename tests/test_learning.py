@@ -12,6 +12,7 @@ from forge_loop.runner.learning import (
     _MAX_REASON_LEN,
     record_failed_outcomes,
     record_merged_outcomes,
+    record_repair_recipe,
 )
 
 _NOW = datetime(2026, 6, 3, 12, 0, 0, tzinfo=UTC)
@@ -30,6 +31,17 @@ class _FakeFailure:
     title: str
     status: str = "abandoned"
     reason: str | None = None
+
+
+@dataclass
+class _FakeRepair:
+    issue: int
+    title: str
+    failing_signal: str
+    fix: str
+    touched: object
+    event_id: str
+    event_sequence: int
 
 
 def _seed_failure_episode(store: SqliteMemoryStore, issue: int) -> str:
@@ -396,3 +408,179 @@ def test_merge_when_failure_already_superseded_by_other(tmp_path: Path) -> None:
     shipped = store.get("episodic-shipped-99")
     assert shipped is not None
     assert shipped.is_active is True
+
+
+# --- procedural repair recipe: record_repair_recipe (#358) -------------------
+
+
+def _repair(issue: int = 42, **overrides: object) -> _FakeRepair:
+    base: dict[str, object] = {
+        "issue": issue,
+        "title": "fix flaky retry",
+        "failing_signal": "critic sev2: N+1 gh call in repair loop",
+        "fix": "hoist GhClient.list_prs out of the per-issue loop",
+        "touched": "src/forge_loop/runner/repairs.py",
+        "event_id": "evt-repair-001",
+        "event_sequence": 7,
+    }
+    base.update(overrides)
+    return _FakeRepair(**base)  # type: ignore[arg-type]
+
+
+def test_repair_recipe_writes_one_procedural_item(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    memory_id = record_repair_recipe(store, _repair(issue=42), now=_NOW)
+
+    assert memory_id == "procedural-repair-42"
+    item = store.get("procedural-repair-42")
+    assert item is not None
+    assert item.kind is MemoryKind.PROCEDURAL
+    assert item.title == "repair #42: fix flaky retry"
+    # Compact recipe carries failing signal, the named fix, and the file touched.
+    assert "critic sev2: N+1 gh call in repair loop" in item.body
+    assert "hoist GhClient.list_prs out of the per-issue loop" in item.body
+    assert "src/forge_loop/runner/repairs.py" in item.body
+    assert item.tags == ("repair",)
+
+
+def test_repair_recipe_provenance_references_originating_event(tmp_path: Path) -> None:
+    # The falsifiable acceptance criterion: after a repair tick lands a passing
+    # critic, list_active(kind=PROCEDURAL) returns exactly one new item whose
+    # provenance references that tick's event.
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    record_repair_recipe(store, _repair(issue=5, event_id="evt-tick-9", event_sequence=12), now=_NOW)
+
+    procedural = store.list_active(kind=MemoryKind.PROCEDURAL)
+    assert len(procedural) == 1
+    item = procedural[0]
+    assert item.provenance.source_event is not None
+    assert item.provenance.source_event.event_id == "evt-tick-9"
+    assert item.provenance.source_event.sequence == 12
+    assert item.provenance.source_task_ref == "issue:#5"
+    assert item.provenance.authored_by == "maestro"
+
+
+def test_repair_recipe_is_idempotent_on_rerun(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    repair = _repair(issue=7)
+
+    first = record_repair_recipe(store, repair, now=_NOW)
+    second = record_repair_recipe(store, repair, now=_NOW)
+
+    assert first == second == "procedural-repair-7"
+    assert len(store.list_active(kind=MemoryKind.PROCEDURAL)) == 1
+
+
+def test_repair_recipe_accepts_mapping_records(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    memory_id = record_repair_recipe(
+        store,
+        {
+            "issue": 9,
+            "title": "from dict",
+            "failing_signal": "pyright: missing return",
+            "fix": "add explicit None return",
+            "touched": "src/forge_loop/foo.py",
+            "event_id": "evt-dict-1",
+            "sequence": 3,
+        },
+        now=_NOW,
+    )
+
+    assert memory_id == "procedural-repair-9"
+    item = store.get("procedural-repair-9")
+    assert item is not None
+    assert item.title == "repair #9: from dict"
+    assert item.provenance.source_event is not None
+    assert item.provenance.source_event.sequence == 3
+
+
+def test_repair_recipe_touched_accepts_iterable(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    record_repair_recipe(
+        store,
+        _repair(issue=4, touched=["src/forge_loop/a.py", "tests/test_a.py"]),
+        now=_NOW,
+    )
+
+    item = store.get("procedural-repair-4")
+    assert item is not None
+    assert "src/forge_loop/a.py" in item.body
+    assert "tests/test_a.py" in item.body
+
+
+def test_repair_recipe_skips_record_without_issue_number(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    memory_id = record_repair_recipe(
+        store,
+        {
+            "title": "no issue",
+            "failing_signal": "x",
+            "fix": "y",
+            "event_id": "evt-1",
+            "sequence": 1,
+        },
+        now=_NOW,
+    )
+
+    assert memory_id is None
+    assert store.list_active(kind=MemoryKind.PROCEDURAL) == ()
+
+
+def test_repair_recipe_skips_record_without_event_reference(tmp_path: Path) -> None:
+    # Adversarial: provenance MUST reference the originating event. A record with
+    # no event_id cannot satisfy the contract, so it is skipped rather than
+    # written with empty provenance.
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    memory_id = record_repair_recipe(
+        store,
+        {"issue": 11, "title": "no event", "failing_signal": "x", "fix": "y"},
+        now=_NOW,
+    )
+
+    assert memory_id is None
+    assert store.list_active(kind=MemoryKind.PROCEDURAL) == ()
+
+
+def test_repair_recipe_skips_non_numeric_event_sequence(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    memory_id = record_repair_recipe(
+        store,
+        {"issue": 12, "event_id": "evt-1", "sequence": "not-a-number"},
+        now=_NOW,
+    )
+
+    assert memory_id is None
+    assert store.list_active(kind=MemoryKind.PROCEDURAL) == ()
+
+
+def test_repair_recipe_truncates_long_fields(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    long_fix = "z" * 5000
+
+    record_repair_recipe(store, _repair(issue=3, fix=long_fix), now=_NOW)
+
+    item = store.get("procedural-repair-3")
+    assert item is not None
+    # The fix is truncated to exactly _MAX_REASON_LEN chars, pinning the cap.
+    assert item.body.count("z") == _MAX_REASON_LEN
+    assert "z" * (_MAX_REASON_LEN + 1) not in item.body
+
+
+def test_repair_recipe_does_not_collide_with_episodic_kinds(tmp_path: Path) -> None:
+    # The procedural recipe is a distinct kind; recording one alongside a shipped
+    # episode leaves exactly one active item of each kind.
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+
+    record_merged_outcomes(store, [_FakeOutcome(issue=21, title="shipped it")], now=_NOW)
+    record_repair_recipe(store, _repair(issue=21), now=_NOW)
+
+    assert len(store.list_active(kind=MemoryKind.EPISODIC)) == 1
+    assert len(store.list_active(kind=MemoryKind.PROCEDURAL)) == 1
