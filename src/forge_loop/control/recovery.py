@@ -21,11 +21,21 @@ from forge_loop.tasks import CompensationKind, TaskSagaStore
 # Reap a worker's worktree, keyed by issue number (best-effort, idempotent).
 ReapWorktree = Callable[[int], None]
 
-# Compensation kinds this engine knows how to run during a recovery sweep. A
-# stale saga carrying any kind NOT in this set (e.g. the close-pr / delete-branch
-# kinds #272 adds) cannot be honestly driven to COMPENSATED here, so it is left
-# non-terminal for the next sweep (or that kind's handler) to finish.
-_HANDLED_COMPENSATION_KINDS: frozenset[str] = frozenset({CompensationKind.REMOVE_WORKTREE})
+# Compensation kinds this engine knows how to run during a recovery sweep. This
+# keyset is the load-bearing exhaustiveness guard: an exhaustiveness contract
+# test asserts it equals ``set(CompensationKind)``, so adding a new enum member
+# without registering it here turns that test red (see ``test_recovery``).
+#
+# A stale saga carrying any kind NOT in this set (e.g. the close-pr /
+# delete-branch kinds #272 adds) cannot be honestly driven to COMPENSATED here —
+# doing so would assert a side effect was undone when no handler ran. Instead
+# such a saga is driven to the terminal QUARANTINED state ("parked for a human,
+# could not auto-compensate"): that ends the saga (liveness — it drains from the
+# in-flight view and is never swept again) without lying about the side effect
+# (integrity). See ``reconcile_stale_sagas``.
+_HANDLED_COMPENSATION_KINDS: frozenset[CompensationKind] = frozenset(
+    {CompensationKind.REMOVE_WORKTREE}
+)
 
 
 @dataclass(frozen=True)
@@ -79,11 +89,14 @@ def reconcile_stale_sagas(
     snag.
 
     A saga carrying a compensation kind this engine has no handler for is NOT
-    marked COMPENSATED: driving it terminal would assert a side effect was
+    marked COMPENSATED: driving it COMPENSATED would assert a side effect was
     undone when it never ran (a wrong-but-green integrity hole). Instead the
-    saga is left non-terminal and an entry naming its id + the unhandled
-    kind(s) is appended to ``RecoveryReport.errors`` so the next sweep (or that
-    kind's future handler) can finish it.
+    saga is driven to the terminal QUARANTINED state ("parked for a human") so
+    it stops being immortal — it drains from the in-flight view and is never
+    re-swept — without claiming the side effect was undone. No handled
+    compensation is run for such a saga (we refuse to half-compensate it), and
+    an entry naming its id + the unhandled kind(s) is appended to
+    ``RecoveryReport.errors`` so an operator knows a saga was parked and why.
     """
     moment = now or datetime.now(UTC)
     recovered: list[RecoveredSaga] = []
@@ -95,9 +108,17 @@ def reconcile_stale_sagas(
                 {c.kind for c in saga.compensations if c.kind not in _HANDLED_COMPENSATION_KINDS}
             )
             if unhandled:
+                kinds = ", ".join(unhandled)
+                saga_store.mark_quarantined(
+                    saga.task_id,
+                    reason=(
+                        "recovered: parked for human, no recovery handler for "
+                        f"compensation kind(s): {kinds}"
+                    ),
+                )
                 errors.append(
-                    f"{saga.saga_id}: left non-terminal, "
-                    f"unhandled compensation kind(s): {', '.join(unhandled)}"
+                    f"{saga.saga_id}: quarantined, "
+                    f"unhandled compensation kind(s): {kinds}"
                 )
                 continue
             reaped: list[str] = []
