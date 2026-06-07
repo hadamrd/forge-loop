@@ -39,6 +39,7 @@ from forge_loop._sdk_events import (
     WorkerMcpFilterNoMatchEvent,
     event_to_record,
 )
+from forge_loop.sandbox.policy import CapabilityPolicy, mcp_allow_patterns
 
 # NOTE: do NOT import `subprocess` here. The new SDK worker path must be
 # subprocess-free (issue #2 acceptance criterion); a unit test enforces it.
@@ -340,6 +341,7 @@ async def run_sdk_session(
     mcp_servers: dict[str, Any] | None = None,
     resume: str | None = None,
     secret_names: Iterable[str] | None = None,
+    capability_policy: CapabilityPolicy | None = None,
 ) -> SDKRunResult:
     """Drive one Claude Agent SDK session and stream typed WorkerEvents.
 
@@ -439,7 +441,6 @@ async def run_sdk_session(
     # lease withholds ALL secret-shaped keys (closed default, fail safe). The
     # withheld NAMES are recorded in the policy attestation, not here — no value
     # is ever logged or emitted.
-    from forge_loop.sandbox.policy import CapabilityPolicy
     from forge_loop.worker_env import scope_secrets
 
     effective_env, _ = scope_secrets(
@@ -458,18 +459,31 @@ async def run_sdk_session(
     # no-sandbox path. Degraded via _OPTIONAL_KNOBS on SDKs too old to accept it.
     if sandbox is not None:
         base_kwargs["sandbox"] = sandbox
-    # MCP server allow-list (issue #60). The default bundled allow-list
-    # lives in :mod:`forge_loop.config`; if the caller passes ``None`` we
-    # still apply the bundled default so a forgetful caller doesn't
-    # accidentally ship the 250-tool firehose.
-    allow_servers: tuple[str, ...] = tuple(
-        s for s in (allowed_mcp_servers or _BUNDLED_DEFAULT_ALLOWED) if s
-    )
-    if allow_servers:
-        # Prefer the SDK kwarg name (``allowed_tools``). If the installed
-        # SDK doesn't accept it we transparently degrade — the spec lists
-        # ``disallowed_tools`` as the fallback path.
-        base_kwargs["allowed_tools"] = build_allowed_tools_patterns(allow_servers)
+    # MCP server allow-list. When a leased CapabilityPolicy is supplied it is
+    # the SINGLE SOURCE OF TRUTH for MCP enforcement (#326): the SDK
+    # ``allowed_tools`` patterns are derived from ``policy.mcp`` (deny-by-
+    # default) — NOT the operator-global ``allowed_mcp_servers`` config. A
+    # worker leased without a grant for server X therefore has X's tools
+    # excluded from ``allowed_tools`` and is physically unable to invoke them;
+    # the brief's printed grant is no longer merely advisory. When NO policy
+    # is leased (critic / brainstormer / legacy callers) we fall back to the
+    # operator-config path (issue #60): the bundled default keeps a forgetful
+    # caller from shipping the 250-tool firehose.
+    mcp_filter_default: tuple[str, ...] = _BUNDLED_DEFAULT_ALLOWED
+    if capability_policy is not None:
+        # Deny-by-default: only servers named in the lease are kept, and an
+        # empty grant means an EMPTY allow-list (no bundled fallback), so a
+        # no-MCP lease genuinely yields zero MCP tools.
+        allow_servers = tuple(g.server for g in capability_policy.mcp if g.server)
+        mcp_filter_default = ()
+        base_kwargs["allowed_tools"] = mcp_allow_patterns(capability_policy)
+    else:
+        allow_servers = tuple(s for s in (allowed_mcp_servers or _BUNDLED_DEFAULT_ALLOWED) if s)
+        if allow_servers:
+            # Prefer the SDK kwarg name (``allowed_tools``). If the installed
+            # SDK doesn't accept it we transparently degrade — the spec lists
+            # ``disallowed_tools`` as the fallback path.
+            base_kwargs["allowed_tools"] = build_allowed_tools_patterns(allow_servers)
     if model:
         base_kwargs["model"] = model
     # SDK init knobs (issue: an early dogfood run hit "Control request timeout:
@@ -566,6 +580,7 @@ async def run_sdk_session(
                         actual_servers=actual_names,
                         allow_list=allow_servers,
                         emit=emit_record,
+                        default=mcp_filter_default,
                     )
                 else:
                     # Non-init system messages (compaction notices, mid-session

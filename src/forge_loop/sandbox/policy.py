@@ -90,6 +90,44 @@ class CapabilityPolicy:
         )
 
 
+def mcp_allow_patterns(policy: CapabilityPolicy) -> list[str]:
+    """SDK/settings ``allowed_tools`` MCP patterns derived from ``policy.mcp``.
+
+    Single source of truth (#326) for turning a leased
+    :class:`CapabilityPolicy` MCP grant into the ``mcp__<server>__*`` /
+    ``mcp__<server>__<tool>`` glob patterns the Claude Agent SDK's
+    ``allowed_tools`` whitelist (and the worktree ``.claude/settings.json``
+    allow-list) understand. Both the SDK enforcement path
+    (:func:`forge_loop._worker_sdk.run_sdk_session`) and the worktree
+    settings renderer (:mod:`forge_loop.worker_worktree`) call this so the two
+    can never disagree on what a grant maps to.
+
+    Deny-by-default: a server NOT named in ``policy.mcp`` produces NO entry,
+    never a blanket ``mcp__*``. A grant with no tools (or an explicit ``*``)
+    yields ``mcp__<server>__*``; a tool allow-list yields one
+    ``mcp__<server>__<tool>`` per tool. Order-preserving, de-duplicated.
+    """
+    seen: set[str] = set()
+    entries: list[str] = []
+
+    def _add(pattern: str) -> None:
+        if pattern not in seen:
+            seen.add(pattern)
+            entries.append(pattern)
+
+    for grant in policy.mcp:
+        server = grant.server
+        if not server:
+            continue
+        tools = tuple(tool for tool in grant.tools if tool)
+        if not tools or "*" in tools:
+            _add(f"mcp__{server}__*")
+            continue
+        for tool in tools:
+            _add(f"mcp__{server}__{tool}")
+    return entries
+
+
 def canonical_policy_json(policy: CapabilityPolicy) -> str:
     """Stable, sorted-keys JSON serialisation of a policy.
 

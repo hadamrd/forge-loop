@@ -17,7 +17,7 @@ from forge_loop.precommit import (
     PreCommitRunner,
     ensure_worker_precommit_hook,
 )
-from forge_loop.sandbox import CapabilityPolicy, policy_hash
+from forge_loop.sandbox import CapabilityPolicy, mcp_allow_patterns, policy_hash
 
 # Operator-trusted contexts (critic/PO subagents running against the operator's
 # OWN checkout via ``ensure_subagent_trusted``) keep the historical permissive
@@ -48,22 +48,12 @@ _WRITE_TOOLS: tuple[str, ...] = ("Write", "Edit")
 def _mcp_allow_entries(policy: CapabilityPolicy) -> list[str]:
     """Allow-list entries for the granted MCP servers/tools.
 
-    A grant with no tools (or an explicit ``*``) yields ``mcp__<server>__*``;
-    a tool allowlist yields one ``mcp__<server>__<tool>`` per tool. A server
-    that is not in ``policy.mcp`` produces NO entry — never a blanket
-    ``mcp__*``.
+    Thin alias over :func:`forge_loop.sandbox.mcp_allow_patterns` — the single
+    source of truth that the SDK enforcement path (#326) and this settings
+    renderer share, so the worktree allow-list and the SDK ``allowed_tools``
+    whitelist can never disagree on what a grant maps to.
     """
-    entries: list[str] = []
-    for grant in policy.mcp:
-        server = grant.server
-        if not server:
-            continue
-        tools = tuple(tool for tool in grant.tools if tool)
-        if not tools or "*" in tools:
-            entries.append(f"mcp__{server}__*")
-            continue
-        entries.extend(f"mcp__{server}__{tool}" for tool in tools)
-    return entries
+    return mcp_allow_patterns(policy)
 
 
 def _fs_allow_entries(policy: CapabilityPolicy) -> list[str]:
