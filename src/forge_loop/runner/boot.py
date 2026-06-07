@@ -146,6 +146,31 @@ def _run_boot_recovery(cfg: Config) -> Any:
     return _lease_reconcile_sweep(cfg, event_prefix="boot_recovery")
 
 
+def _run_tick_recovery(cfg: Config, *, now: Any = None) -> Any:
+    """Reconcile dead-worker sagas at the TOP of every loop tick (issue #340).
+
+    Boot recovery (:func:`_run_boot_recovery`) runs exactly once, before the
+    tick loop. In a long single session that never reboots, a worker that dies
+    mid-run keeps its saga ``RUNNING`` and its dispatch slot held until the next
+    process restart — recovery latency is bounded by reboot frequency, not by
+    the lease TTL. This wrapper invokes the SAME sweep at the start of each tick
+    so a saga whose lease has truly expired is compensated within ~one tick
+    interval of the TTL lapsing, with no restart.
+
+    A saga still being heart-beated by a live worker is never reaped: the
+    existing ``list_stale(now=...)`` predicate enforces the expired-lease
+    filter, so this only changes *when* reconciliation runs, not *what* it
+    reaps. Thin wrapper over :func:`_lease_reconcile_sweep` fixing the event
+    prefix to ``tick_recovery`` (so ``tick_recovery`` / ``tick_recovery_failed``
+    name the mid-session reaps). Best-effort and store-missing-safe per that
+    helper: an empty sweep emits nothing (no per-tick log spam), any exception
+    is recorded as ``tick_recovery_failed`` and swallowed so a recovery hiccup
+    never aborts or blocks the tick, and a missing canonical store is a silent
+    no-op returning ``None``.
+    """
+    return _lease_reconcile_sweep(cfg, event_prefix="tick_recovery", now=now)
+
+
 def _install_signal_handlers(cfg: Config, state: RunnerState | None = None) -> None:
     """Install SIGTERM/SIGINT/SIGUSR1 handlers bound to ``state``.
 
@@ -642,6 +667,13 @@ def run_async(cfg: Config) -> int:
     async def _one_tick() -> None:
         nonlocal tick
         tick += 1
+        # Issue #340 — reconcile stale (expired-lease) sagas at the TOP of the
+        # tick, before candidate selection / dispatch, so a worker that died
+        # mid-session frees its dispatch slot within ~one tick of the TTL
+        # lapsing, with no restart. Best-effort: the helper swallows every
+        # failure into a ``tick_recovery_failed`` event so a recovery hiccup
+        # never aborts the tick.
+        await asyncio.to_thread(_run_tick_recovery, cfg)
         try:
             issues = await asyncio.to_thread(
                 top_issues,

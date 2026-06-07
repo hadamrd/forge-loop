@@ -1263,10 +1263,20 @@ def _tick(cfg: Config, tick: int) -> None:
     returning early, so a perpetually-stuck repair can't starve the backlog.
     """
     # Imported lazily to avoid an import cycle (boot.py imports tick.py).
-    from forge_loop.runner.boot import _short_sleep
+    from forge_loop.runner.boot import _run_tick_recovery, _short_sleep
 
     def _bus_emit(kind: str, payload: dict[str, Any]) -> None:
         append_event(cfg.events_file, kind, **payload)
+
+    # Issue #340 — reconcile stale (expired-lease) sagas at the TOP of every
+    # tick, before any candidate selection / dispatch. In a long single session
+    # that never reboots, a worker hard-killed mid-run would otherwise hold its
+    # saga RUNNING (and its dispatch slot) until the next restart; running the
+    # same boot sweep here compensates it within ~one tick of the lease TTL
+    # lapsing. Best-effort and store-missing-safe: the helper swallows every
+    # failure into a ``tick_recovery_failed`` event so a recovery hiccup never
+    # aborts or blocks the tick.
+    _run_tick_recovery(cfg)
 
     if _maybe_run_maintenance(cfg, tick, short_sleep=_short_sleep):
         return
