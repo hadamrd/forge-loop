@@ -10,8 +10,14 @@ combined ``worktree_sweep_done`` event), plus the maintenance-cadence guard.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from forge_loop.config import Briefs, Config, Labels
 from forge_loop.runner import tick_checks as tc
@@ -84,6 +90,28 @@ def test_agent_live_paths_keeps_all_but_prunable_unlocked(monkeypatch: Any) -> N
     assert "/home/u/forge-loop/.claude/worktrees/wt-dead" not in live  # reapable
 
 
+def test_agent_live_paths_reaps_intact_but_stale_dir(tmp_path: Path, monkeypatch: Any) -> None:
+    """Positive reap path (#405 sev1): git NEVER marks an intact crashed worktree dir
+    ``prunable``, so liveness falls back to a conservative age floor — a stale intact
+    dir is dropped from the live set (reapable); a fresh one is kept."""
+    agent_root = tmp_path / ".claude" / "worktrees"
+    stale, fresh = agent_root / "wt-stale", agent_root / "wt-fresh"
+    stale.mkdir(parents=True)
+    fresh.mkdir(parents=True)
+    now = time.time()
+    os.utime(stale, (now - 48 * 3600, now - 48 * 3600))  # idle 48h → past the floor
+    os.utime(fresh, (now, now))
+    porcelain = (
+        f"worktree {tmp_path}\nHEAD a\n\n"
+        f"worktree {stale}\nbranch refs/heads/x\n\n"
+        f"worktree {fresh}\nbranch refs/heads/y\n"
+    )
+    monkeypatch.setattr(tc, "_worktree_porcelain", lambda _repo: porcelain)
+    live = tc._agent_live_paths(tmp_path, min_age_s=24 * 3600, now=now)
+    assert str(fresh) in live  # too young → kept (fail-safe)
+    assert str(stale) not in live  # intact but stale → reapable
+
+
 # --------------------------------------------------------------------------- #
 # run_worktree_sweep — orchestrator feeds BOTH roots
 # --------------------------------------------------------------------------- #
@@ -131,3 +159,48 @@ def test_run_worktree_sweep_off_cadence_short_circuits_both_roots(tmp_path: Path
     assert report is None
     assert removed == []
     assert _read_events(cfg) == []
+
+
+# --------------------------------------------------------------------------- #
+# E2E — real git: an intact-but-stale agent worktree is reaped, checkout intact
+# --------------------------------------------------------------------------- #
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True, text=True)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_e2e_reaps_intact_stale_agent_worktree(tmp_path: Path) -> None:
+    """Real git (#405 sev1): an intact ``.claude/worktrees/*`` left by a crashed run is
+    NOT prunable, yet the age floor reaps it while the main checkout + ``.git`` survive."""
+    repo = (tmp_path / "repo").resolve()
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("x\n")
+    _git(repo, "add", "f.txt")
+    _git(repo, "commit", "-qm", "init")
+
+    wt = repo / ".claude" / "worktrees" / "wt-orphan"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt))
+    assert wt.is_dir()
+    old = time.time() - 48 * 3600  # past the 24h floor
+    os.utime(wt, (old, old))
+
+    cfg = Config(
+        repo=repo,
+        github_repo="o/r",
+        labels=Labels(),
+        briefs=Briefs(),
+        worktree_root=tmp_path / "forge-x",  # disjoint from the checkout
+        maintenance_every_n_ticks=5,
+    )
+    report = tc.run_worktree_sweep(cfg, tick=5)  # default live derivation (no leases)
+
+    assert report is not None
+    assert str(wt) in report.reaped
+    assert not wt.exists()  # orphan gone
+    assert (repo / ".git").exists()  # checkout intact
+    assert (repo / "f.txt").read_text() == "x\n"

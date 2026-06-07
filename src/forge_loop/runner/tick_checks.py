@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -230,18 +232,50 @@ def _agent_root(repo: Path) -> Path:
     return repo / ".claude" / "worktrees"
 
 
-def _agent_live_paths(repo: Path) -> set[str]:
-    """Live ``.claude/worktrees/*`` agent worktrees per git's porcelain markers (#405).
+# Conservative age floor (#405): an intact, unlocked agent worktree is only reaped
+# once it has been idle on disk longer than this. Git marks a worktree ``prunable``
+# ONLY when its working dir is already gone — a crashed run that leaves an intact
+# ``.claude/worktrees/wt-*`` dir behind is never prunable, so without this floor it
+# would accrete forever. Anything younger (or whose mtime can't be read) is kept.
+_AGENT_WORKTREE_MIN_AGE_S = 24 * 3600
 
-    The task-saga store knows nothing about agent worktrees, so liveness here comes
-    from git itself: a worktree is LIVE (preserved) unless git marks it ``prunable``
-    and not ``locked``. Non-prunable / locked / unknown ⇒ kept (fail-safe on unknown).
-    Only an explicitly prunable, unlocked agent worktree is eligible for reaping."""
+
+def _path_age_s(path: str, now: float) -> float | None:
+    """Seconds since ``path`` was last modified; ``None`` if its mtime can't be read
+    (fail-safe on unknown — an unreadable age must never make a worktree reapable)."""
+    try:
+        return now - os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _agent_live_paths(
+    repo: Path, *, min_age_s: float = _AGENT_WORKTREE_MIN_AGE_S, now: float | None = None
+) -> set[str]:
+    """Live ``.claude/worktrees/*`` agent worktrees (#405).
+
+    The task-saga store knows nothing about agent worktrees, so liveness comes from
+    git's own porcelain markers plus a conservative age floor:
+      * ``locked`` ⇒ always LIVE (in use).
+      * ``prunable`` and not locked ⇒ git-confirmed dead ⇒ reapable.
+      * intact (no marker), unlocked ⇒ reapable ONLY once idle longer than
+        ``min_age_s``; younger, or mtime unreadable ⇒ kept (fail-safe on unknown).
+    This adds the positive reap path for intact-but-stale crashed agent worktrees,
+    which git never marks prunable."""
     agent_root = str(_agent_root(repo))
+    clock = time.time() if now is None else now
     live: set[str] = set()
     for path, locked, prunable in _parse_worktree_records(_worktree_porcelain(repo)):
-        if _under_root(path, agent_root) and not (prunable and not locked):
+        if not _under_root(path, agent_root):
+            continue
+        if locked:
             live.add(path)
+            continue
+        if prunable:
+            continue  # git-confirmed dead → reapable
+        age = _path_age_s(path, clock)
+        if age is None or age < min_age_s:
+            live.add(path)  # too young / unknown age → keep (fail-safe)
     return live
 
 
