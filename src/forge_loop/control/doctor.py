@@ -52,6 +52,15 @@ RECOVER_REMEDIATION = (
 REPROJECT_REMEDIATION = (
     "forge-loop boot   # re-project durable control-plane state from the event log"
 )
+MUTATION_REMEDIATION = (
+    "forge-loop mutation-check   # plant faults on the high-risk module and "
+    "strengthen the tests that let survivors through"
+)
+
+# The single high-risk control-plane module the scoped mutation-check targets by
+# default (epic #378): the event-log hash-chain integrity module. Kept as a
+# named constant so the discriminator is declared once, not as a bare literal.
+DEFAULT_MUTATION_MODULE = "forge_loop.eventlog.sqlite"
 
 # The four control-plane check names, in display order.
 CHECK_NAMES = (
@@ -368,6 +377,96 @@ def _replay_determinism_check(
         ),
         None,
     )
+
+
+@dataclass(frozen=True)
+class MutationCheckResult:
+    """Outcome of one scoped mutation-check run over a single module.
+
+    ``survivors`` is the number of planted faults the test oracle FAILED to
+    kill on ``module``. ``0`` means the suite is strong enough to catch every
+    planted fault (healthy); ``>0`` means the oracle is too weak to trust an
+    autonomous patch on that module (oracle rot — see epic #378).
+    """
+
+    module: str
+    survivors: int
+
+
+class MutationChecker(Protocol):
+    """Typed boundary over the scoped mutation-check (#379).
+
+    Per the manifesto's external-I/O rule (Q2) the mutation-check — which
+    plants faults and re-runs the suite, a subprocess/test boundary — is
+    reached through this Protocol with a companion ``FakeMutationChecker`` in
+    ``forge_loop/_testing/``. ``doctor`` injects the real checker once #379
+    wires it; until then it passes ``None`` and the probe degrades to ``warn``.
+    """
+
+    def check(self) -> MutationCheckResult: ...
+
+
+def mutation_survivors_check(
+    checker: MutationChecker | None,
+    *,
+    module: str = DEFAULT_MUTATION_MODULE,
+) -> dict[str, Any]:
+    """Surviving-mutant count for the configured high-risk module (issue #380).
+
+    Invokes the scoped mutation-check (#379) and reports the module name plus
+    the surviving-mutant count. Healthy (``PASS``) is exactly ``0`` survivors;
+    any ``>0`` is ``FAIL`` (the oracle let a planted fault through). When no
+    checker is wired — or the check cannot run — the probe degrades to ``WARN``
+    with ``count=None`` rather than crashing ``doctor`` (declared degrade per
+    Q11), so ``doctor`` keeps reporting the other checks.
+
+    The returned dict always carries an integer (or ``None``) ``count`` and the
+    ``module`` it names, alongside the standard ``status``/``detail``/
+    ``remediation`` keys the doctor renderer consumes.
+    """
+
+    if checker is None:
+        return {
+            "status": WARN,
+            "module": module,
+            "count": None,
+            "detail": (
+                f"scoped mutation-check unavailable; surviving-mutant count for "
+                f"{module} not measured (wire the #379 mutation-check command)"
+            ),
+            "remediation": MUTATION_REMEDIATION,
+        }
+
+    try:
+        result = checker.check()
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        return {
+            "status": WARN,
+            "module": module,
+            "count": None,
+            "detail": f"mutation-check over {module} could not run: {exc}",
+            "remediation": MUTATION_REMEDIATION,
+        }
+
+    if result.survivors > 0:
+        return {
+            "status": FAIL,
+            "module": result.module,
+            "count": result.survivors,
+            "detail": (
+                f"{result.survivors} planted fault(s) survive the test oracle on "
+                f"{result.module}: the suite is too weak to trust an autonomous patch"
+            ),
+            "remediation": MUTATION_REMEDIATION,
+        }
+
+    return {
+        "status": PASS,
+        "module": result.module,
+        "count": 0,
+        "detail": f"no surviving mutants on {result.module}; the oracle kills every planted fault",
+        "remediation": None,
+    }
 
 
 def _live_projection_cursors(event_log_path: Path) -> dict[str, int]:
