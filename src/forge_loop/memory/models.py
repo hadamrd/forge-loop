@@ -46,6 +46,41 @@ def axis_from_tags(tags: tuple[str, ...]) -> str:
     return ""
 
 
+#: Tag prefix carrying a procedural item's stable *skill-key* — the digest of
+#: its repair signature (failing-signal + target). Procedural memory is a
+#: bounded set of *current* skills, not an append-only log, so the producer uses
+#: this tag (not the ``memory_id``) to find the active skill for a given repair
+#: signature and supersede it, preserving lineage instead of overwriting in
+#: place. Mirrors ``AXIS_TAG_PREFIX`` / ``axis_tag`` / ``axis_from_tags``.
+SKILL_TAG_PREFIX = "skill:"
+
+
+def derive_skill_key(failing_signal: str, target: str) -> str:
+    """Derive a deterministic skill-key from a repair signature.
+
+    The skill-key is the ``sha256`` digest of the ``(failing-signal, target)``
+    pair — same signature → same key, different signature → different key —
+    reusing the digest pattern from :func:`derive_memory_id`. A NUL separator
+    keeps ``("ab", "c")`` distinct from ``("a", "bc")``. Inputs are stripped so
+    incidental whitespace does not fork the key.
+    """
+    source = f"{failing_signal.strip()}\x00{target.strip()}"
+    return sha256(source.encode("utf-8")).hexdigest()[:16]
+
+
+def skill_tag(skill_key: str) -> str:
+    """Render a ``skill:<digest>`` tag for ``skill_key`` (stripped)."""
+    return f"{SKILL_TAG_PREFIX}{skill_key.strip()}"
+
+
+def skill_from_tags(tags: tuple[str, ...]) -> str:
+    """Extract the skill-key from a ``skill:<digest>`` tag, or ``""`` if absent."""
+    for tag in tags:
+        if tag.startswith(SKILL_TAG_PREFIX):
+            return tag[len(SKILL_TAG_PREFIX) :]
+    return ""
+
+
 def derive_memory_id(source_key: str, *, prefix: str) -> str:
     """Derive a stable ``memory_id`` from a source key.
 
