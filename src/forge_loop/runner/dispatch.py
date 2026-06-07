@@ -20,6 +20,7 @@ from forge_loop import master_log as _mlog
 from forge_loop.config import Config
 from forge_loop.control.boot import canonical_task_saga_path
 from forge_loop.critic import review_pr as _critic_review
+from forge_loop.critic import serialize_findings as _serialize_findings
 from forge_loop.critic_actions import apply_critic_report
 from forge_loop.events import CriticReviewErroredEvent
 from forge_loop.events import emit as _emit_typed
@@ -947,6 +948,12 @@ def _run_critic_for_outcomes(
                 # branch below — so a crashed review can never fall through the
                 # gate's allow-list and auto-merge an unreviewed PR.
                 o.critic_verdict = critic_outcome.verdict
+                # Issue #404: persist the per-finding detail + the ordered
+                # minimal_path_to_green ON the durable payload, sourced from the
+                # report already in hand (no critic re-run). The legacy mirror
+                # passes these fields straight through to ``critique.issued`` so
+                # the console can render them on replay.
+                _report = critic_outcome.report
                 append_event(
                     cfg.events_file,
                     "critic_done",
@@ -961,6 +968,12 @@ def _run_critic_for_outcomes(
                         critic_outcome.error_class.value
                         if critic_outcome.error_class is not None
                         else None
+                    ),
+                    findings=(
+                        _serialize_findings(_report.findings) if _report is not None else []
+                    ),
+                    minimal_path_to_green=(
+                        list(_report.minimal_path_to_green) if _report is not None else []
                     ),
                 )
                 if critic_outcome.report is not None:

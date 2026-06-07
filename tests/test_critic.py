@@ -11,8 +11,10 @@ from forge_loop.critic import (
     CriticReport,
     Finding,
     _extract_verdict,
+    deserialize_findings,
     parse_report_from_log,
     parse_report_from_text,
+    serialize_findings,
 )
 
 
@@ -233,6 +235,62 @@ def test_parse_report_keeps_performance_and_architecture_findings() -> None:
     assert report is not None
     cats = sorted(f.category for f in report.findings)
     assert cats == ["architecture", "performance"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #404: durable serialization of critic findings.
+# ---------------------------------------------------------------------------
+def test_serialize_findings_round_trip_fidelity() -> None:
+    findings = [
+        Finding("sev2", "correctness", "src/a.py", 10, "off-by-one"),
+        Finding("sev1", "security", None, None, "no file/line on this one"),
+        Finding("sev3", "style", "src/b.py", 0, "line zero is a real int"),
+    ]
+    payload = serialize_findings(findings)
+    # Plain-JSON shape: str/int/None only, exactly the Finding fields.
+    assert payload[0] == {
+        "severity": "sev2",
+        "category": "correctness",
+        "file": "src/a.py",
+        "line": 10,
+        "message": "off-by-one",
+    }
+    assert payload[1]["file"] is None and payload[1]["line"] is None
+    # Round-trip must reconstruct identical Finding objects.
+    assert deserialize_findings(payload) == findings
+
+
+def test_serialize_findings_empty_list_round_trips() -> None:
+    assert serialize_findings([]) == []
+    assert deserialize_findings([]) == []
+
+
+def test_deserialize_findings_back_compat_missing_or_bad_payload() -> None:
+    # Legacy events have no findings field at all → degrade to [].
+    assert deserialize_findings(None) == []
+    assert deserialize_findings("not a list") == []
+    assert deserialize_findings({"severity": "sev1"}) == []
+
+
+def test_deserialize_findings_skips_malformed_rows() -> None:
+    rows = [
+        {"severity": "sev2", "category": "correctness", "file": "a.py", "line": 1, "message": "ok"},
+        "garbage-not-a-dict",
+        {"severity": "sev1"},  # missing message → skip
+        {"message": "no severity"},  # missing severity → skip
+        {"severity": "sev3", "message": "minimal but valid"},
+    ]
+    out = deserialize_findings(rows)
+    assert len(out) == 2
+    assert out[0].message == "ok"
+    # Missing optional fields normalize: category="", file/line None.
+    assert out[1] == Finding("sev3", "", None, None, "minimal but valid")
+
+
+def test_deserialize_findings_coerces_bad_optional_types() -> None:
+    rows = [{"severity": "sev2", "category": 5, "file": 7, "line": "x", "message": "m"}]
+    out = deserialize_findings(rows)
+    assert out == [Finding("sev2", "", None, None, "m")]
 
 
 if __name__ == "__main__":
