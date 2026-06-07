@@ -138,6 +138,10 @@ research_app = typer.Typer(
     help="Durable research-note channel: surface cited external state-of-art into brainstorm inputs.",
     no_args_is_help=True,
 )
+memory_app = typer.Typer(
+    help="Inspect curated project memory: active decisions, rejected paths, and episodes.",
+    no_args_is_help=True,
+)
 
 app.add_typer(config_app, name="config", invoke_without_command=True)
 app.add_typer(pipeline_app, name="pipeline")
@@ -148,6 +152,7 @@ app.add_typer(roles_app, name="roles")
 app.add_typer(cluster_app, name="cluster")
 app.add_typer(manifesto_app, name="manifesto")
 app.add_typer(research_app, name="research")
+app.add_typer(memory_app, name="memory")
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +289,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _cmd_brainstorm,
     _cmd_audit,
     _cmd_research_add,
+    _cmd_memory_list,
     _cmd_manifesto_suggest,
     _cmd_record_session,
     _cmd_retry,
@@ -314,6 +320,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _make_cmd("brainstorm"),
     _make_cmd("audit"),
     _make_cmd("research_add"),
+    _make_cmd("memory_list"),
     _make_cmd("manifesto_suggest"),
     _make_cmd("record_session"),
     _make_cmd("retry"),
@@ -550,6 +557,28 @@ def cmd_research_add(
     ),
 ) -> None:
     _exit(_cmd_research_add(SimpleNamespace(title=title, ref=ref, note=note)))
+
+
+@memory_app.command(
+    "list",
+    help=(
+        "Read-only: print active curated memory (decisions, rejected paths, "
+        "episodes) grouped by kind, with provenance. Excludes superseded items."
+    ),
+)
+def cmd_memory_list(
+    kind: str | None = typer.Option(
+        None,
+        "--kind",
+        help="Filter to one bucket: semantic | episodic | procedural.",
+    ),
+    tag: str | None = typer.Option(
+        None,
+        "--tag",
+        help="Filter to active items carrying this tag (e.g. rejected-path).",
+    ),
+) -> None:
+    _exit(_cmd_memory_list(SimpleNamespace(kind=kind, tag=tag)))
 
 
 @app.command("record-session", help="Record a real SDK session to a JSONL fixture.")

@@ -19,6 +19,21 @@ from forge_loop.state import tail_events
 _log = get_logger("forge_loop.cli_product_commands")
 
 
+def _format_memory_source(prov: Any) -> str:
+    """Render a memory item's source reference for ``memory list`` (#328).
+
+    Prefers the durable ``source_event`` (id @ sequence) when present; otherwise
+    falls back to the ``source_task_ref``. Returns ``"(none)"`` only if neither
+    is set — which :class:`MemoryProvenance` forbids, but we degrade rather than
+    raise in a read-only inspection command.
+    """
+    if prov.source_event is not None:
+        return f"event:{prov.source_event.event_id}@{prov.source_event.sequence}"
+    if prov.source_task_ref:
+        return f"task:{prov.source_task_ref}"
+    return "(none)"
+
+
 class ProductCommandsMixin:
     load: Any
     brainstormer_factory: Any
@@ -680,6 +695,100 @@ class ProductCommandsMixin:
         typer.echo(f"research add: stored {item.memory_id}: {title}")
         typer.echo(f"  refs: {', '.join(refs)}")
         return 0
+
+    def _cmd_memory_list(self, args: SimpleNamespace) -> int:
+        """`forge-loop memory list` — read-only inspection of curated memory (#328).
+
+        Surfaces the durable :class:`SqliteMemoryStore` so an operator can, after
+        a context reset, see *which* active decisions / rejected paths / episodes
+        survived and *where they came from* — without opening the SQLite file by
+        hand. ``forge-loop status`` only reports counts; this renders the items.
+
+        Contract (strictly read-only — calls only ``list_active`` and filters its
+        result; performs ZERO writes):
+          * Prints every **active** item grouped by :class:`MemoryKind`, excluding
+            superseded items (``list_active`` already filters ``superseded_by``).
+          * Each item renders title, tags, and provenance (``authored_by``,
+            ``confidence``, and a source reference — the ``source_event`` when
+            present, else ``source_task_ref``).
+          * ``--kind`` filters to one bucket; an invalid value is a usage error
+            (exit 2, stderr message, nothing on stdout).
+          * ``--tag`` filters active items carrying that tag.
+          * Store absent / unreadable → fail soft (exit 1, clear message, no
+            traceback), mirroring ``research add``.
+          * Empty / no-match → friendly line, exit 0 (an empty store is not an
+            error).
+        """
+        from forge_loop.memory.models import MemoryKind
+        from forge_loop.settings import ConfigError
+
+        # Validate --kind BEFORE touching the store so an invalid value is a pure
+        # usage error (exit 2) that prints nothing on stdout.
+        kind_filter: MemoryKind | None = None
+        raw_kind = (getattr(args, "kind", None) or "").strip()
+        if raw_kind:
+            try:
+                kind_filter = MemoryKind(raw_kind)
+            except ValueError:
+                valid = ", ".join(k.value for k in MemoryKind)
+                typer.echo(
+                    f"memory list: invalid --kind {raw_kind!r}; choose one of: {valid}",
+                    err=True,
+                )
+                return 2
+
+        tag_filter = (getattr(args, "tag", None) or "").strip() or None
+
+        repo_path = Path.cwd()
+        try:
+            cfg = self.load()
+            repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path
+        except ConfigError as exc:
+            _log.warning(
+                "memory_list: config load failed; using cwd",
+                repo_path=str(repo_path),
+                error=str(exc),
+            )
+
+        try:
+            store = self.memory_store_factory(repo_path)
+            items = store.list_active(kind=kind_filter)
+        except Exception as exc:  # noqa: BLE001 — clear operator-facing failure, no traceback
+            typer.echo(f"memory list: memory store unavailable: {exc}", err=True)
+            return 1
+
+        if tag_filter is not None:
+            items = tuple(item for item in items if tag_filter in item.tags)
+
+        if not items:
+            typer.echo("memory list: no active memory items")
+            return 0
+
+        buckets: dict[MemoryKind, list[Any]] = {kind: [] for kind in MemoryKind}
+        for item in items:
+            buckets[item.kind].append(item)
+
+        for kind in MemoryKind:
+            bucket = buckets[kind]
+            if not bucket:
+                continue
+            typer.echo(f"{kind.value} ({len(bucket)}):")
+            for item in bucket:
+                self._echo_memory_item(item)
+        return 0
+
+    def _echo_memory_item(self, item: Any) -> None:
+        """Render one active memory item: title, tags, and provenance."""
+        prov = item.provenance
+        typer.echo(f"  - {item.title}")
+        if item.tags:
+            typer.echo(f"    tags: {', '.join(item.tags)}")
+        typer.echo(
+            "    provenance: "
+            f"authored_by={prov.authored_by} "
+            f"confidence={prov.confidence} "
+            f"source={_format_memory_source(prov)}"
+        )
 
     def _cmd_audit(self, args: SimpleNamespace) -> int:
         """`forge-loop audit` — codebase-state audit (issue #156).
