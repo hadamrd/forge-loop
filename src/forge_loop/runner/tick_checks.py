@@ -16,8 +16,8 @@ from forge_loop.maintenance import run_maintenance
 from forge_loop.state import append_event, write_state
 from forge_loop.stuck_sweep import SweepReport
 from forge_loop.stuck_sweep import sweep as _stuck_sweep
-from forge_loop.worktree_sweep import WorktreeSweepReport
-from forge_loop.worktree_sweep import sweep as _worktree_sweep
+from forge_loop.worktree_sweep import WorktreeSweepReport, _under_root
+from forge_loop.worktree_sweep import sweep_roots as _worktree_sweep
 
 
 def run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
@@ -183,11 +183,10 @@ def run_branch_sweep(
     return report
 
 
-def _list_worktrees(repo: Path) -> list[str]:
-    """Paths of every git worktree of THIS repo (`git worktree list --porcelain`).
-    Scoped to forge-loop's own worktrees by git; [] on failure."""
+def _worktree_porcelain(repo: Path) -> str:
+    """Raw ``git worktree list --porcelain`` for THIS repo; "" on any failure."""
     try:
-        out = subprocess.run(
+        return subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
             cwd=str(repo),
             capture_output=True,
@@ -196,12 +195,54 @@ def _list_worktrees(repo: Path) -> list[str]:
             check=True,
         ).stdout
     except (subprocess.SubprocessError, OSError):
-        return []
-    return [
-        line[len("worktree ") :].strip()
-        for line in out.splitlines()
-        if line.startswith("worktree ")
-    ]
+        return ""
+
+
+def _parse_worktree_records(porcelain: str) -> list[tuple[str, bool, bool]]:
+    """Parse porcelain into ``(path, locked, prunable)`` per worktree block. Git emits
+    one block per worktree, fields one-per-line, blocks separated by a blank line; the
+    optional ``locked`` / ``prunable`` markers are git's own liveness signal (#405)."""
+    records: list[tuple[str, bool, bool]] = []
+    path: str | None = None
+    locked = prunable = False
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            if path is not None:
+                records.append((path, locked, prunable))
+            path, locked, prunable = line[len("worktree ") :].strip(), False, False
+        elif line == "locked" or line.startswith("locked "):
+            locked = True
+        elif line == "prunable" or line.startswith("prunable "):
+            prunable = True
+    if path is not None:
+        records.append((path, locked, prunable))
+    return records
+
+
+def _list_worktrees(repo: Path) -> list[str]:
+    """Paths of every git worktree of THIS repo (`git worktree list --porcelain`).
+    Scoped to forge-loop's own worktrees by git; [] on failure."""
+    return [path for path, _locked, _prunable in _parse_worktree_records(_worktree_porcelain(repo))]
+
+
+def _agent_root(repo: Path) -> Path:
+    """Second GC root (#405): the harness's agent worktrees under the checkout."""
+    return repo / ".claude" / "worktrees"
+
+
+def _agent_live_paths(repo: Path) -> set[str]:
+    """Live ``.claude/worktrees/*`` agent worktrees per git's porcelain markers (#405).
+
+    The task-saga store knows nothing about agent worktrees, so liveness here comes
+    from git itself: a worktree is LIVE (preserved) unless git marks it ``prunable``
+    and not ``locked``. Non-prunable / locked / unknown ⇒ kept (fail-safe on unknown).
+    Only an explicitly prunable, unlocked agent worktree is eligible for reaping."""
+    agent_root = str(_agent_root(repo))
+    live: set[str] = set()
+    for path, locked, prunable in _parse_worktree_records(_worktree_porcelain(repo)):
+        if _under_root(path, agent_root) and not (prunable and not locked):
+            live.add(path)
+    return live
 
 
 def _remove_worktree(repo: Path, path: str) -> bool:
@@ -247,11 +288,15 @@ def run_worktree_sweep(
     live_paths: set[str] | None = None,
     remove: Callable[[str], bool] | None = None,
 ) -> WorktreeSweepReport | None:
-    """Reap orphaned task worktrees under ``worktree_root`` (operational-convergence).
+    """Reap orphaned worktrees across BOTH GC roots (operational-convergence, #405).
 
-    Maintenance-cadence only; deterministic, no LLM. Removes worktrees under the loop's
-    worktree_root that no live in-flight lease owns — never the main checkout, never a
-    leased worktree. Args injectable for tests.
+    Maintenance-cadence only; deterministic, no LLM. Reconciles two disjoint roots in
+    one pass: the loop's ``worktree_root`` (task worktrees, liveness = in-flight lease)
+    and ``<repo>/.claude/worktrees`` (agent worktrees, liveness = git porcelain
+    locked/prunable markers). Removes any worktree under either root that no live
+    owner claims — never the main checkout, never a leased/locked worktree, fail-safe
+    on unknown. Args injectable for tests; ``live_paths`` overrides BOTH liveness
+    sources with a single combined set.
     """
     if cfg.maintenance_every_n_ticks <= 0 or tick % cfg.maintenance_every_n_ticks != 0:
         return None
@@ -259,11 +304,16 @@ def run_worktree_sweep(
     if not root:
         return None
     wts = worktrees if worktrees is not None else _list_worktrees(cfg.repo)
-    live = live_paths if live_paths is not None else _inflight_worktrees(cfg)
+    live = (
+        live_paths
+        if live_paths is not None
+        else (_inflight_worktrees(cfg) | _agent_live_paths(cfg.repo))
+    )
     rm = remove if remove is not None else (lambda p: _remove_worktree(cfg.repo, p))
     protected = {str(cfg.repo)}
+    roots = [str(root), str(_agent_root(cfg.repo))]
     try:
-        report = _worktree_sweep(rm, wts, live_paths=live, root=str(root), protected=protected)
+        report = _worktree_sweep(rm, wts, roots=roots, live_paths=live, protected=protected)
     except Exception as ex:  # noqa: BLE001 — the sweep never raises; belt-and-braces
         append_event(cfg.events_file, "worktree_sweep_crashed", tick=tick, err=str(ex)[:200])
         return None
