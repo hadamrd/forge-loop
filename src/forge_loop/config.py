@@ -156,6 +156,13 @@ class Config:
     # yaml > default) from LOOP_WORKER_HEARTBEAT_INTERVAL_S /
     # ``scheduling.worker_heartbeat_interval_s``.
     worker_heartbeat_interval_s: float = 60.0
+    # Interval (seconds) at which the run loop's stale-lease watchdog
+    # (issue #325) re-runs the boot reconcile sweep so a worker that silently
+    # stops heart-beating mid-run has its lease compensated without a reboot or
+    # a manual ``forge-loop recover``. Defaults to the heartbeat interval so a
+    # lapsed lease is caught within ~one heartbeat of its TTL expiring; set to
+    # 0 to disable the watchdog.
+    lease_watchdog_interval_s: float = 60.0
     maintenance_every_n_ticks: int = 0
 
     deploy_task: str = ""
@@ -269,6 +276,10 @@ def _from_settings(s: Settings) -> Config:
         max_ticks=s.scheduling.max_ticks,
         worker_timeout_s=s.scheduling.worker_timeout_s,
         worker_heartbeat_interval_s=_resolve_heartbeat_interval_s(),
+        # The watchdog sweeps on the same cadence as the heartbeat: that is the
+        # finest granularity at which lease freshness changes, so re-checking
+        # more often would just burn cycles. Single knob, no new env var (Q3).
+        lease_watchdog_interval_s=_resolve_heartbeat_interval_s(),
         maintenance_every_n_ticks=s.scheduling.maintenance_every_n_ticks,
         deploy_task=s.deploy.task,
         labels=Labels(

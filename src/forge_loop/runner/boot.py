@@ -83,14 +83,29 @@ def _check_environment_poison(cfg: Config) -> Any:
         return PoisonResult(poisoned=False)
 
 
-def _run_boot_recovery(cfg: Config) -> Any:
-    """Reconcile dead-worker sagas at boot so the loop resumes cleanly.
+def _lease_reconcile_sweep(
+    cfg: Config,
+    *,
+    event_prefix: str,
+    now: Any = None,
+) -> Any:
+    """Run ONE stale-lease reconcile sweep against the canonical saga store.
+
+    This is the single shared implementation behind both the boot-time recovery
+    (``_run_boot_recovery``) and the periodic in-loop watchdog
+    (``runner.lease_watchdog.LeaseWatchdog``) — per quality manifesto Q7, the
+    "open the store, reconcile stale leases, emit an event" capability exists
+    exactly once and both callers reuse it rather than re-implementing it.
 
     Reads the canonical task-saga store; if it does not exist (repo never
-    ``init``'d a control plane), this is a no-op. Compensations reuse the
-    same worktree reaper as the success path. All best-effort: any failure
-    is recorded as a ``boot_recovery_failed`` event and swallowed so the
-    loop still starts.
+    ``init``'d a control plane), this is a no-op returning ``None``.
+    Compensations reuse the same worktree reaper as the success path. All
+    best-effort: any failure is recorded as a ``{event_prefix}_failed`` event
+    and swallowed so neither boot nor the running loop is blocked. On a sweep
+    that reconciled or errored, emits ``{event_prefix}`` with counts.
+
+    ``now`` is forwarded to ``reconcile_stale_sagas`` (and thus ``list_stale``)
+    so callers — and tests — can pin the staleness clock explicitly.
     """
     from functools import partial
 
@@ -104,18 +119,31 @@ def _run_boot_recovery(cfg: Config) -> Any:
         return None
     try:
         store = SqliteTaskSagaStore(path)
-        report = reconcile_stale_sagas(store, reap_worktree=partial(reap_worktree, cfg.repo))
-    except Exception as exc:  # noqa: BLE001 - recovery must never block boot
-        append_event(cfg.events_file, "boot_recovery_failed", error=str(exc))
+        report = reconcile_stale_sagas(
+            store, now=now, reap_worktree=partial(reap_worktree, cfg.repo)
+        )
+    except Exception as exc:  # noqa: BLE001 - recovery must never block boot or the loop
+        append_event(cfg.events_file, f"{event_prefix}_failed", error=str(exc))
         return None
     if report.recovered or report.errors:
         append_event(
             cfg.events_file,
-            "boot_recovery",
+            event_prefix,
             recovered=report.recovered_count,
             errors=len(report.errors),
         )
     return report
+
+
+def _run_boot_recovery(cfg: Config) -> Any:
+    """Reconcile dead-worker sagas at boot so the loop resumes cleanly.
+
+    Thin wrapper over :func:`_lease_reconcile_sweep` that fixes the event
+    prefix to ``boot_recovery`` (preserving the historical ``boot_recovery`` /
+    ``boot_recovery_failed`` event names). See that helper for the full
+    contract.
+    """
+    return _lease_reconcile_sweep(cfg, event_prefix="boot_recovery")
 
 
 def _install_signal_handlers(cfg: Config, state: RunnerState | None = None) -> None:
@@ -369,6 +397,20 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     # observes the same store the tick will read.
     _run_crash_recovery(cfg)
 
+    # Issue #325 — periodic stale-lease watchdog. A worker that silently stops
+    # heart-beating mid-run would otherwise hold its lease (and its dispatch
+    # slot) until the next boot or a manual `forge-loop recover`. This reuses
+    # the exact boot sweep on a bounded interval so a lapsed lease is reaped
+    # while the loop keeps running, with no reboot. interval <= 0 disables it.
+    from functools import partial as _partial
+
+    from forge_loop.runner.lease_watchdog import LeaseWatchdog
+
+    lease_watchdog = LeaseWatchdog(
+        interval_s=getattr(cfg, "lease_watchdog_interval_s", 0.0),
+        sweep=_partial(_lease_reconcile_sweep, cfg, event_prefix="watchdog_recovery"),
+    )
+
     tick = 0
     while state.should_run:
         if cfg.stop_file.exists():
@@ -379,6 +421,10 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
             write_state(cfg.state_file, {"state": "paused", "tick": tick})
             time.sleep(15)
             continue
+
+        # Reap any silently-dead worker leases before doing more work this tick
+        # (cheap no-op until one watchdog interval has elapsed).
+        lease_watchdog.maybe_reap()
 
         tick += 1
         if cfg.max_ticks and tick > cfg.max_ticks:
