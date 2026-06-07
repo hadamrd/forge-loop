@@ -5,3 +5,9 @@ dist-ssr
 .vite
 .DS_Store
 *.log
+
+# The user's global ~/.gitignore_global ignores any dir named `lib/` (a Python idiom);
+# our front-end source tree has src/lib/ — re-include it explicitly so it can never be
+# silently dropped from a commit again.
+!src/lib/
+!src/lib/**
