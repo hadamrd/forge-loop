@@ -43,7 +43,14 @@ from forge_loop.runner.persistent_dispatch import (
 )
 from forge_loop.sandbox import CapabilityPolicy, FilesystemScope, McpGrant, NetworkPolicy
 from forge_loop.state import append_event
-from forge_loop.tasks import Compensation, SqliteTaskSagaStore, TaskSaga, TaskSagaStore, TaskState
+from forge_loop.tasks import (
+    Compensation,
+    CompensationKind,
+    SqliteTaskSagaStore,
+    TaskSaga,
+    TaskSagaStore,
+    TaskState,
+)
 from forge_loop.worker import WorkerOutcome, run_repair_worker, run_worker
 from forge_loop.worker_sessions import WorkerSessionStore
 
@@ -266,7 +273,7 @@ def record_worker_task_policy(
             worktree=worktree_path,
             compensations=(
                 Compensation(
-                    kind="remove-worktree",
+                    kind=CompensationKind.REMOVE_WORKTREE,
                     target=worktree_path,
                     reason="cleanup worker worktree after task terminal state",
                 ),
@@ -309,7 +316,7 @@ def _seed_worker_saga(
         worktree=worktree_path,
         compensations=(
             Compensation(
-                kind="remove-worktree",
+                kind=CompensationKind.REMOVE_WORKTREE,
                 target=worktree_path,
                 reason="cleanup after worker task terminal state",
             ),

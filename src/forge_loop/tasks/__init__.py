@@ -2,6 +2,7 @@
 
 from forge_loop.tasks.saga import (
     Compensation,
+    CompensationKind,
     LeaseConflictError,
     TaskSaga,
     TaskSagaError,
@@ -12,6 +13,7 @@ from forge_loop.tasks.store import SqliteTaskSagaStore, TaskSagaStore
 
 __all__ = [
     "Compensation",
+    "CompensationKind",
     "LeaseConflictError",
     "SqliteTaskSagaStore",
     "TaskSaga",

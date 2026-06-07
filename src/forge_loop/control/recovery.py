@@ -16,10 +16,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from forge_loop.tasks import TaskSagaStore
+from forge_loop.tasks import CompensationKind, TaskSagaStore
 
 # Reap a worker's worktree, keyed by issue number (best-effort, idempotent).
 ReapWorktree = Callable[[int], None]
+
+# Compensation kinds this engine knows how to run during a recovery sweep. A
+# stale saga carrying any kind NOT in this set (e.g. the close-pr / delete-branch
+# kinds #272 adds) cannot be honestly driven to COMPENSATED here, so it is left
+# non-terminal for the next sweep (or that kind's handler) to finish.
+_HANDLED_COMPENSATION_KINDS: frozenset[str] = frozenset({CompensationKind.REMOVE_WORKTREE})
 
 
 @dataclass(frozen=True)
@@ -71,6 +77,13 @@ def reconcile_stale_sagas(
     A failure on one saga is captured and the sweep continues to the next —
     recovery must make as much progress as it can, not abort on the first
     snag.
+
+    A saga carrying a compensation kind this engine has no handler for is NOT
+    marked COMPENSATED: driving it terminal would assert a side effect was
+    undone when it never ran (a wrong-but-green integrity hole). Instead the
+    saga is left non-terminal and an entry naming its id + the unhandled
+    kind(s) is appended to ``RecoveryReport.errors`` so the next sweep (or that
+    kind's future handler) can finish it.
     """
     moment = now or datetime.now(UTC)
     recovered: list[RecoveredSaga] = []
@@ -78,10 +91,18 @@ def reconcile_stale_sagas(
 
     for saga in saga_store.list_stale(now=moment):
         try:
+            unhandled = sorted(
+                {c.kind for c in saga.compensations if c.kind not in _HANDLED_COMPENSATION_KINDS}
+            )
+            if unhandled:
+                errors.append(
+                    f"{saga.saga_id}: left non-terminal, "
+                    f"unhandled compensation kind(s): {', '.join(unhandled)}"
+                )
+                continue
             reaped: list[str] = []
             for compensation in saga.compensations:
-                if compensation.kind != "remove-worktree":
-                    continue
+                # Every kind here is handled (unhandled kinds short-circuit above).
                 if reap_worktree is not None and saga.issue is not None:
                     reap_worktree(saga.issue)
                 reaped.append(compensation.target)
