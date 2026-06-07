@@ -44,6 +44,7 @@ class CapabilityPolicy:
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
     mcp: tuple[McpGrant, ...] = ()
     secret_names: tuple[str, ...] = ()
+    preserve_on_failure: bool = False
 
     def allows_secret(self, name: str) -> bool:
         return name in self.secret_names
@@ -60,6 +61,7 @@ class CapabilityPolicy:
             },
             "mcp": [{"server": grant.server, "tools": list(grant.tools)} for grant in self.mcp],
             "secret_names": list(self.secret_names),
+            "preserve_on_failure": self.preserve_on_failure,
         }
 
     @classmethod
@@ -87,6 +89,7 @@ class CapabilityPolicy:
                 if isinstance(grant, dict) and grant.get("server")
             ),
             secret_names=tuple(value.get("secret_names") or ()),
+            preserve_on_failure=bool(value.get("preserve_on_failure", False)),
         )
 
 
@@ -158,6 +161,7 @@ def render_capability_policy(policy: CapabilityPolicy) -> str:
         or "(none)"
     )
     secrets = ", ".join(policy.secret_names) or "(none)"
+    preserve = "yes" if policy.preserve_on_failure else "no"
     return (
         "CAPABILITY POLICY:\n"
         f"- filesystem read: {read_roots}\n"
@@ -165,4 +169,5 @@ def render_capability_policy(policy: CapabilityPolicy) -> str:
         f"- network: {network_prefix}; allow {allow_domains}\n"
         f"- mcp: {mcp}\n"
         f"- secrets: {secrets}\n"
+        f"- preserve on failure: {preserve}\n"
     )
