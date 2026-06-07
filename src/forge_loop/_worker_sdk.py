@@ -293,6 +293,17 @@ def _clean_sdk_env() -> dict[str, str]:
     env = dict(os.environ)
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_SSE_PORT", None)
+    # Isolation (#315, AC #5) — make a stray ``pip install -e .`` from the
+    # /tmp worktree INERT against the operator/user site, killing the #144
+    # poison at the root rather than only healing it after the fact.
+    # ``PIP_REQUIRE_VIRTUALENV`` makes plain ``pip install`` REFUSE outside a
+    # virtualenv (so it can't write to ``~/.local/.../site-packages``); the
+    # worker brief's sanctioned ``uv venv .venv && uv pip install -e .`` still
+    # works because it targets the worktree-local venv. ``PYTHONNOUSERSITE``
+    # additionally stops the user site from shadowing imports. The worker may
+    # override these for a worktree-local venv via the declared env contract.
+    env.setdefault("PIP_REQUIRE_VIRTUALENV", "1")
+    env.setdefault("PYTHONNOUSERSITE", "1")
     return env
 
 

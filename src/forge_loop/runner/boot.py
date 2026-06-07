@@ -83,6 +83,43 @@ def _check_environment_poison(cfg: Config) -> Any:
         return PoisonResult(poisoned=False)
 
 
+def _heal_environment_poison(cfg: Config, poison: Any) -> Any:
+    """Self-heal a worktree-shaped operator poison (#315).
+
+    Delegates to the pure planner + :class:`SiteHealer` boundary in
+    ``poison_guard``. Best-effort like :func:`_check_environment_poison`: any
+    unexpected failure (a guard bug, ``current_site_packages`` hiccup) is caught,
+    surfaced as a ``boot_poison_heal_error`` event, and returned as a ``FAILED``
+    :class:`HealResult` so boot falls back to the refuse path rather than
+    crashing with an unhandled exception (AC #4).
+    """
+    from forge_loop.runner.poison_guard import (
+        FilesystemSiteHealer,
+        HealOutcome,
+        HealResult,
+        current_site_packages,
+        heal_poisoned_environment,
+    )
+
+    try:
+        return heal_poisoned_environment(
+            poison,
+            FilesystemSiteHealer(),
+            site_packages=current_site_packages(),
+        )
+    except Exception as exc:  # noqa: BLE001 — heal must never crash boot
+        append_event(
+            cfg.events_file,
+            "boot_poison_heal_error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return HealResult(
+            outcome=HealOutcome.FAILED,
+            offending_path=getattr(poison, "offending_path", None),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
 def _lease_reconcile_sweep(
     cfg: Config,
     *,
@@ -331,19 +368,41 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     cfg.events_file.touch()
 
-    # Issue #144 — refuse to start if a previous worker poisoned the operator
-    # Python with an editable ``pip install -e`` pointing into a worktree. The
-    # guard reports + refuses (exit 3); it never mutates the operator's
-    # site-packages. Runs before any worker dispatch.
+    # Issue #144 / #315 — a previous worker that ran an editable ``pip install
+    # -e`` pointing into a worktree poisons the operator Python. Detection (#144)
+    # stays pure; on a HEALABLE (worktree-shaped) poison we now SELF-HEAL (#315)
+    # — remove the stray editable artifacts and continue booting — instead of
+    # the old FATAL ``return 3`` that bricked every ``forge-loop run`` until a
+    # human intervened. A non-worktree poison, or a heal that fails, preserves
+    # the refuse-to-start path. Runs before any worker dispatch.
     poison = _check_environment_poison(cfg)
     if poison.poisoned:
-        append_event(
-            cfg.events_file,
-            "boot_environment_poisoned",
-            offending_path=poison.offending_path,
-        )
-        _sys.stderr.write(poison.render_error())
-        return 3
+        from forge_loop.runner.poison_guard import HealOutcome
+
+        heal = _heal_environment_poison(cfg, poison)
+        if heal.outcome is HealOutcome.HEALED:
+            append_event(
+                cfg.events_file,
+                "boot_environment_self_healed",
+                offending_path=heal.offending_path,
+                removed=list(heal.removed),
+            )
+        else:
+            if heal.outcome is HealOutcome.FAILED:
+                append_event(
+                    cfg.events_file,
+                    "boot_environment_heal_failed",
+                    offending_path=heal.offending_path,
+                    error=heal.error,
+                )
+            else:
+                append_event(
+                    cfg.events_file,
+                    "boot_environment_poisoned",
+                    offending_path=poison.offending_path,
+                )
+            _sys.stderr.write(poison.render_error())
+            return 3
 
     if state is None:
         state = get_default_state()

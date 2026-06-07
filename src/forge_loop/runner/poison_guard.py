@@ -21,17 +21,28 @@ The live ``pip show`` call is hidden behind the :class:`PipShowReader`
 Protocol (manifesto Q2) with a real subprocess impl here and a
 ``FakePipShowReader`` under ``forge_loop/_testing/`` for tests.
 
-The guard **reports and refuses**; it never mutates the operator's
-site-packages (that is explicitly out of scope for #144).
+Self-heal (#315). A guard whose only exit is human intervention is a
+zero-HITL violation: the 2026-06-07 incident bricked *every* ``forge-loop
+run`` for hours because a worker poisoned the operator site and boot could
+only ``return 3``. The detection above stays pure; the **mutation** that
+neutralizes a worker-caused poison lives behind the :class:`SiteHealer`
+Protocol (manifesto Q2/Q6) so it is unit-testable with a Fake. The
+:func:`plan_heal` *planner* is pure and SCOPED & SAFE (AC #3): it only
+plans removal when the offending ``Location:`` is worktree-shaped, so a
+uv-managed install or a canonical-checkout editable is never touched and
+the old refuse-to-start path is preserved.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 import sys
 import sysconfig
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
@@ -252,4 +263,189 @@ def check_environment_not_poisoned(
         package=package,
         site_packages=site_packages if site_packages is not None else current_site_packages(),
         reinstall_target=reinstall_target,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Self-heal (#315): plan (pure) → SiteHealer Protocol (mutation) → orchestrate.
+# ---------------------------------------------------------------------------
+
+
+class HealOutcome(StrEnum):
+    """Cross-module discriminator for the heal result (manifesto enum rule).
+
+    ``HEALED`` — the stray editable was neutralized; boot may continue.
+    ``NOT_HEALABLE`` — the poison is NOT worktree-shaped (a uv-managed or
+    canonical-checkout editable); the caller preserves the refuse-to-start
+    path. ``FAILED`` — cleanup itself raised; the caller falls back to refuse.
+    """
+
+    HEALED = "healed"
+    NOT_HEALABLE = "not_healable"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class HealPlan:
+    """Pure plan: scan ``site_packages`` and neutralize forge-loop editable
+    artifacts (``.pth`` / editable finder / dist-info / shim symlink) that point
+    into ``offending_path`` (a worker worktree) so the uv-managed install
+    re-surfaces. ``module`` is the import name (``forge_loop``)."""
+
+    offending_path: str
+    site_packages: str
+    module: str = "forge_loop"
+
+
+@dataclass(frozen=True)
+class HealResult:
+    """Structured outcome of a heal attempt (see :class:`HealOutcome`)."""
+
+    outcome: HealOutcome
+    offending_path: str | None = None
+    removed: tuple[str, ...] = field(default_factory=tuple)
+    error: str | None = None
+
+
+def plan_heal(
+    result: PoisonResult,
+    *,
+    site_packages: str | None,
+    package: str = DEFAULT_PACKAGE,
+) -> HealPlan | None:
+    """Pure heal planner (AC #1/#3/#6).
+
+    Returns a :class:`HealPlan` ONLY when the poison is safely healable: the
+    result is poisoned, the offending ``Location:`` is worktree-shaped, and we
+    know which operator site to scan. Returns ``None`` — so the caller keeps the
+    old refuse-to-start behavior — when the offending path is NOT worktree-shaped
+    (a uv-managed / canonical-checkout editable) or the site is unknown. The
+    planner never touches the filesystem; it only decides whether a heal is in
+    scope and what to scan.
+    """
+    if not result.poisoned or result.offending_path is None:
+        return None
+    if not _location_in_worktree(result.offending_path, None):
+        return None
+    if not site_packages:
+        return None
+    return HealPlan(
+        offending_path=result.offending_path,
+        site_packages=site_packages,
+        module=package.replace("-", "_"),
+    )
+
+
+_POINTER_SUFFIXES = (".pth", ".py", ".egg-link")
+
+
+def _is_forge_editable_artifact(name: str, module: str) -> bool:
+    """True when ``name`` is a forge-loop editable POINTER artifact in the site.
+
+    By the single-editable invariant (a site holds at most one editable install
+    of a package) and the fact that we only reach a heal when detection proved
+    forge-loop's editable points into a worktree, these artifacts ARE the
+    poison. Matches editable ``.pth`` / finder ``.py`` / ``.egg-link`` /
+    ``.dist-info`` / ``.egg-info`` whose name carries the module, plus the
+    legacy bare ``roles.pth`` shim. A non-forge-loop name never matches (AC #3).
+    """
+    low = name.lower().replace("-", "_")
+    mod = module.lower()
+    if name.endswith((".dist-info", ".egg-info")) and low.startswith(mod):
+        return True
+    if not name.endswith(_POINTER_SUFFIXES):
+        return False
+    if mod not in low:
+        return low == "roles.pth"
+    # forge-loop-named pointer: an editable finder/impl, a legacy .pth, or an
+    # egg-link. A plain ``.py`` that is NOT editable-shaped is left alone.
+    return "editable" in low or name.endswith((".pth", ".egg-link"))
+
+
+class SiteHealer(Protocol):
+    """Typed boundary (manifesto Q2) around the operator-site MUTATION.
+
+    Detection stays pure; this is the ONLY seam that removes files, so the heal
+    is unit-testable with a ``Fake`` while production wires the real
+    :class:`FilesystemSiteHealer`.
+    """
+
+    def heal(self, plan: HealPlan) -> tuple[str, ...]:
+        """Remove the planned editable artifacts pointing into the worktree and
+        return the absolute paths actually removed. Raise on an irrecoverable IO
+        error (the orchestrator turns that into a ``FAILED`` outcome)."""
+        ...
+
+
+@dataclass(frozen=True)
+class FilesystemSiteHealer:
+    """Real :class:`SiteHealer` — neutralizes forge-loop editable artifacts.
+
+    SCOPED & SAFE (AC #3): it removes a path ONLY when that path is provably a
+    forge-loop editable artifact (name carries the module) OR a
+    ``forge_loop``/``roles`` SYMLINK whose target is worktree-shaped. A real
+    (non-symlink) package directory, a uv-managed install (which lives in uv's
+    own venv, not the operator site), and any unrelated package are never
+    touched. Existence-independent: a dangling ``.pth`` whose worktree was
+    already reaped is still removed.
+    """
+
+    def heal(self, plan: HealPlan) -> tuple[str, ...]:
+        site = Path(plan.site_packages)
+        if not site.is_dir():
+            return ()
+        removed: list[str] = []
+        for entry in sorted(site.iterdir()):
+            if self._should_remove(entry, plan):
+                self._remove(entry)
+                removed.append(str(entry))
+        return tuple(removed)
+
+    def _should_remove(self, entry: Path, plan: HealPlan) -> bool:
+        name = entry.name
+        if entry.is_symlink() and name in (plan.module, "roles"):
+            try:
+                target = os.readlink(entry)
+            except OSError:
+                return False
+            return _location_in_worktree(target, None)
+        return _is_forge_editable_artifact(name, plan.module)
+
+    @staticmethod
+    def _remove(entry: Path) -> None:
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+        else:
+            shutil.rmtree(entry)
+
+
+def heal_poisoned_environment(
+    result: PoisonResult,
+    healer: SiteHealer,
+    *,
+    site_packages: str | None,
+    package: str = DEFAULT_PACKAGE,
+) -> HealResult:
+    """Orchestrate a heal: plan (pure) → mutate (behind ``healer``).
+
+    Best-effort like the existing guard (AC #4): a planner that declines returns
+    ``NOT_HEALABLE`` (caller refuses), and a healer that raises is caught and
+    returned as ``FAILED`` (caller emits ``heal_failed`` + refuses) — never an
+    unhandled exception out of boot.
+    """
+    plan = plan_heal(result, site_packages=site_packages, package=package)
+    if plan is None:
+        return HealResult(outcome=HealOutcome.NOT_HEALABLE, offending_path=result.offending_path)
+    try:
+        removed = healer.heal(plan)
+    except Exception as exc:  # noqa: BLE001 — cleanup failure falls back to refuse, never crashes boot
+        return HealResult(
+            outcome=HealOutcome.FAILED,
+            offending_path=result.offending_path,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    return HealResult(
+        outcome=HealOutcome.HEALED,
+        offending_path=result.offending_path,
+        removed=tuple(removed),
     )

@@ -200,9 +200,11 @@ def _make_cfg(tmp_path: Path) -> SimpleNamespace:
     )
 
 
-def test_run_exits_nonzero_with_cleanup_in_stderr_when_poisoned(
+def test_run_refuses_when_poison_is_not_worktree_shaped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # AC #3 — a NON-worktree offending path is NOT auto-healed: the old
+    # refuse-to-start (exit 3, ``boot_environment_poisoned``) path is preserved.
     from forge_loop.runner import boot
 
     cfg = _make_cfg(tmp_path)
@@ -210,7 +212,7 @@ def test_run_exits_nonzero_with_cleanup_in_stderr_when_poisoned(
     def _poisoned(_cfg: object) -> PoisonResult:
         return PoisonResult(
             poisoned=True,
-            offending_path="/tmp/wt-loop-124/src",
+            offending_path="/opt/legit/site-packages",  # NOT worktree-shaped
             cleanup_commands=(
                 "python -m pip uninstall -y forge-loop",
                 "rm -rf /site/forge_loop /site/roles",
@@ -224,11 +226,12 @@ def test_run_exits_nonzero_with_cleanup_in_stderr_when_poisoned(
 
     assert rc != 0
     err = capsys.readouterr().err
-    assert "/tmp/wt-loop-124/src" in err
+    assert "/opt/legit/site-packages" in err
     assert "uv tool install --reinstall --force" in err
     # Boot must NOT proceed to dispatch: no loop_start event written.
     events = cfg.events_file.read_text(encoding="utf-8") if cfg.events_file.exists() else ""
     assert "boot_environment_poisoned" in events
+    assert "boot_environment_self_healed" not in events
     assert "loop_start" not in events
 
 
