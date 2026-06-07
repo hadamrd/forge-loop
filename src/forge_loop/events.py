@@ -342,6 +342,26 @@ class StuckSweepDemotedEvent(EventBase):
 
 
 @register_event
+class EpicSweepDoneEvent(EventBase):
+    """One per-tick epic-auto-close sweep result (issue #367).
+
+    Emitted by ``forge_loop.runner.tick_checks.run_epic_sweep`` on the
+    maintenance cadence. Each list holds epic issue NUMBERS: ``closed`` were
+    auto-closed (all tracked sub-issues resolved); ``skipped_open_subs`` had
+    ≥ 1 still-open sub-issue; ``skipped_no_subs`` had no tracked sub-issues;
+    ``errors`` hit a GhClient failure (sub-issue lookup or close) and were
+    left untouched.
+    """
+
+    KIND: ClassVar[str] = "epic_sweep_done"
+    tick: int = Field(ge=0, default=0)
+    closed: list[int] = Field(default_factory=list)
+    skipped_open_subs: list[int] = Field(default_factory=list)
+    skipped_no_subs: list[int] = Field(default_factory=list)
+    errors: list[int] = Field(default_factory=list)
+
+
+@register_event
 class WorkerPreCommitInstalledEvent(EventBase):
     """Pre-commit hook propagation result for one worker worktree."""
 
@@ -535,6 +555,7 @@ __all__ = [
     "AuditCleanEvent",
     "AuditViolationFiledEvent",
     "CriticReviewErroredEvent",
+    "EpicSweepDoneEvent",
     "EventBase",
     "LoopStartEvent",
     "LoopStopEvent",

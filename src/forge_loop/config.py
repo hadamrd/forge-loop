@@ -184,6 +184,11 @@ class Config:
     stuck_threshold_attempts: int = 2
     stuck_tail_events: int = 100
 
+    # Epic auto-close sweep (issue #367). The label that marks an issue as an
+    # epic; the deterministic epic sweep closes an open epic once every tracked
+    # sub-issue is closed. Sourced from settings.maintenance.epic_label.
+    epic_label: str = "epic"
+
     @property
     def state_dir(self) -> Path:
         return self.repo / "docs" / "ops"
@@ -334,6 +339,7 @@ def _from_settings(s: Settings) -> Config:
         worker_max_iterations=s.iteration.max_iterations,
         stuck_threshold_attempts=s.maintenance.stuck_threshold_attempts,
         stuck_tail_events=s.maintenance.stuck_tail_events,
+        epic_label=s.maintenance.epic_label,
     )
 
 

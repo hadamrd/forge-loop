@@ -446,6 +446,9 @@ class MaintenanceSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
     stuck_threshold_attempts: int = 2
     stuck_tail_events: int = 100
+    # Label marking an issue as an epic; the deterministic epic sweep (#367)
+    # closes an open epic once every tracked sub-issue is closed.
+    epic_label: str = "epic"
 
 
 class MiscSettings(BaseSettings):

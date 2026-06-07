@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 
 from forge_loop.config import Config
+from forge_loop.epic_sweep import EpicSweepReport, GhClientLike
+from forge_loop.epic_sweep import sweep as _epic_sweep
 from forge_loop.maintenance import run_maintenance
 from forge_loop.state import append_event, write_state
 from forge_loop.stuck_sweep import SweepReport
@@ -53,6 +55,56 @@ def run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
     return report
 
 
+def run_epic_sweep(
+    cfg: Config, tick: int, *, client: GhClientLike | None = None
+) -> EpicSweepReport | None:
+    """Auto-close epics whose tracked sub-issues are all resolved (issue #367).
+
+    Runs on the maintenance cadence (``maintenance_every_n_ticks``) only — a
+    no-op off-cadence (returns ``None`` without touching GitHub). Deterministic
+    Python; spawns NO LLM subagent. Emits a typed ``epic_sweep_done`` summary
+    event and returns the report. ``client`` is injectable for tests; in
+    production it is the real ``GithubkitClient``.
+    """
+    if cfg.maintenance_every_n_ticks <= 0 or tick % cfg.maintenance_every_n_ticks != 0:
+        return None
+    if cfg.github_repo is None or "/" not in cfg.github_repo:
+        return None
+    owner, repo = cfg.github_repo.split("/", 1)
+    if client is None:
+        try:
+            from forge_loop.gh_client import GithubkitClient
+
+            client = GithubkitClient()
+        except Exception as ex:  # noqa: BLE001
+            append_event(
+                cfg.events_file,
+                "epic_sweep_skipped",
+                tick=tick,
+                reason=f"gh_client_init: {ex}"[:200],
+            )
+            return None
+    try:
+        report = _epic_sweep(client, owner=owner, repo=repo, epic_label=cfg.epic_label)
+    except Exception as ex:  # noqa: BLE001 — the sweep never raises, but belt-and-braces
+        append_event(cfg.events_file, "epic_sweep_crashed", tick=tick, err=str(ex)[:200])
+        return None
+
+    from forge_loop.events import EpicSweepDoneEvent, emit
+
+    emit(
+        cfg.events_file,
+        EpicSweepDoneEvent(
+            tick=tick,
+            closed=report.closed,
+            skipped_open_subs=report.skipped_open_subs,
+            skipped_no_subs=report.skipped_no_subs,
+            errors=list(report.errors),
+        ),
+    )
+    return report
+
+
 def run_codebase_audit(cfg: Config, tick: int) -> None:
     """Emit codebase-audit drift events on the maintenance cadence."""
     try:
@@ -98,8 +150,10 @@ def run_maintenance_tick(cfg: Config, tick: int) -> None:
     write_state(cfg.state_file, {"state": "maintenance", "tick": tick})
     append_event(cfg.events_file, "maintenance_start", tick=tick)
     brief = cfg.briefs.maintenance
-    outcome = run_maintenance(cfg.repo, cfg.logs_dir, brief=brief) if brief else run_maintenance(
-        cfg.repo, cfg.logs_dir
+    outcome = (
+        run_maintenance(cfg.repo, cfg.logs_dir, brief=brief)
+        if brief
+        else run_maintenance(cfg.repo, cfg.logs_dir)
     )
     append_event(
         cfg.events_file,

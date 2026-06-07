@@ -61,6 +61,7 @@ from forge_loop.runner.repairs import (
 )
 from forge_loop.runner.rescue import rescue_uncommitted_work as _rescue_uncommitted_work
 from forge_loop.runner.tick_checks import run_codebase_audit as _run_codebase_audit
+from forge_loop.runner.tick_checks import run_epic_sweep as _run_epic_sweep
 from forge_loop.runner.tick_checks import run_maintenance_tick as _run_maintenance_tick
 from forge_loop.runner.tick_checks import run_stuck_sweep as _run_stuck_sweep
 from forge_loop.state import append_event, consolidate_sprint, write_state
@@ -547,6 +548,10 @@ def _maybe_run_maintenance(cfg: Config, tick: int, *, short_sleep: Any) -> bool:
     """
     if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
         _run_codebase_audit(cfg, tick)
+        # Deterministic epic auto-close (#367) — runs beside the codebase audit
+        # on the maintenance cadence, before the LLM groomer sub-tick (which is
+        # told to SKIP epics). No LLM subagent; pure Python.
+        _run_epic_sweep(cfg, tick)
     if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
         _run_maintenance_tick(cfg, tick)
         short_sleep(cfg.tick_interval_s, cfg)
