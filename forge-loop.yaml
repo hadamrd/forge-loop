@@ -17,7 +17,10 @@ scheduling:
   tick_interval_s: 60
   worker_timeout_s: 3600
   max_ticks: 1
-  maintenance_every_n_ticks: 0
+  # Operational-convergence axis: the maintenance role runs the GC arcs (epic-sweep,
+  # and — once wired — branch/worktree GC + checkout-restore). 0 disabled it, which
+  # is how the loop accreted ~120 branches + 17 epics. Run it every N ticks.
+  maintenance_every_n_ticks: 5
 
 labels:
   ready: "loop:ready"

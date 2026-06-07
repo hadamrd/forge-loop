@@ -1,33 +1,42 @@
 product_goal: 'Make forge-loop a resumable, self-improving autonomous loop: it ships
-  PRs from well-specified issues, recovers from crashes, and gets measurably better
-  from its own outcomes.'
+  PRs from well-specified issues, recovers from crashes, converges its own operational
+  state, and gets measurably better from its own outcomes.'
 current_problem: >-
-  The outer PDCA loop is open: Check and Act-on-direction are scaffolded but
-  switched off. The durable event log has 267+ rows of merge/critic/task outcomes
-  and grows every tick via LegacyEventMirror, but projection_cursors is empty —
-  nothing measures whether the loop's own output is improving, so the
-  self-improvement claim is currently unfalsifiable. Plan-intent (axes/vision)
-  and Act-on-quality (the manifesto ratchet) exist; the return arcs do not.
+  The outer loop is open in TWO directions and both showed up empirically. (1) The
+  CHECK/measurement arc: the durable event log has 500+ rows of merge/critic/task
+  outcomes but projection_cursors is empty — nothing measures whether the loop's
+  output is improving, so the self-improvement claim is unfalsifiable. (2) The
+  CONVERGENCE/maintenance arc: the loop generates faster than it garbage-collects.
+  Left running it accreted ~120 branches, unreaped worktrees, 17 open epics (growing
+  monotonically), and a shared checkout drifted onto a feature branch — operational
+  entropy, because generation pressure has no matching GC pressure
+  (maintenance_every_n_ticks was 0). Both are missing RETURN arcs: the system Plans
+  and Does but does not Check or Act on its own state. A ruthless manual cleanup
+  reset it to one branch / clean backlog; the product fix is to make that GC autonomous.
 next_expansion: >-
-  Register the Scorecard projection on the existing replay framework (the single
-  reserved seam in build_boot_sources) to derive first-pass critic acceptance,
-  repair-rounds-to-converge, sev2-regeneration, lead time and abandonment as a
-  TREND; then gate a reversible frontier-advance policy (emitting the reserved
-  frontier.advanced event) and value-ranked brainstorming on that curve. This is
-  activation/wiring of dormant scaffolding, not greenfield.
+  Wire BOTH return arcs, measurement first because it is the prerequisite signal.
+  (A) Register the Scorecard projection on the existing replay framework (the reserved
+  seam in build_boot_sources) to derive first-pass acceptance, repair-rounds, sev2-
+  regeneration, lead time and abandonment as a TREND. (B) Wire operational convergence:
+  enable the maintenance role (now on), branch-GC on issue-closed, worktree-GC against
+  the live lease set, a backlog ceiling on brainstorm, a restore-base_branch checkout
+  invariant, and an operational-entropy metric. Both are activation of dormant
+  scaffolding, not greenfield.
 why_now: >-
-  The durable log, the Projection protocol, replay_projection, the writable
-  FrontierStore, the reserved FRONTIER_ADVANCED kind, and the manifesto ratchet
-  all already landed and are verified present but unwired. The data to measure
-  from already exists; measurement-first because every downstream arc is
-  unfalsifiable noise until the trend curve exists to gate it.
-objective: Make recursive self-improvement falsifiable, then act on it.
+  The mess was lived, not theorised: stopping the loop required deleting ~120 branches
+  and closing 45 issues by hand. The convergence arc is now the most concrete evidence
+  the outer loop is open (see paper/10-the-outer-loop.md). Restarting the loop before
+  the GC arc is wired just re-starts the entropy generator. Measurement scaffolding
+  (Projection protocol, replay, writable FrontierStore) and maintenance scaffolding
+  (maintenance role, epic-sweep) all already landed and are verified present.
+objective: Close both outer-loop return arcs — make improvement falsifiable AND make
+  the loop converge its own operational state — then act on both.
 key_result: >-
-  mean repair-rounds-to-converge trends down across a rolling 20-merge window
-  AND sev2-regeneration rate stays flat-or-down, both derived by the Scorecard
-  projection — checked before any frontier.advance fires. (Typed objective/
-  key_result fields land with the value-ranking ticket; until then these are
-  documented intent the loader ignores.)
+  (measurement) mean repair-rounds-to-converge trends down across a rolling 20-merge
+  window AND sev2-regeneration stays flat-or-down, derived by the Scorecard projection;
+  AND (convergence) open-branch / live-worktree / open-epic counts stay bounded under
+  a ceiling across a multi-tick run with maintenance enabled — both checked before any
+  frontier.advance fires.
 active_decisions:
 - Context windows are working memory, not durable state; externalise cognition to
   .forge.
@@ -40,6 +49,10 @@ active_decisions:
   (anti-reinvention); measurement (Check) precedes prescription (Act).
 - Act-on-direction must be evidence-gated and reversible — no frontier.advance
   unless the KR is met across the window; the prior cursor stays recoverable.
+- Generation must be matched by convergence — every arc that creates state (branches,
+  worktrees, backlog, checkout) needs a paired GC arc, or operational entropy wins.
+- Do NOT restart the autonomous loop until the convergence/GC arcs are wired; an
+  ungoverned generator re-accretes the mess within hours.
 rejected_paths:
 - idea: commit binary sqlite stores (memory.db / events.db) to git
   reason: no diffs, merge conflicts, repo bloat; events.db rotates at 10MB
@@ -56,6 +69,10 @@ rejected_paths:
   reason: reinvents proven human structure (PDCA / OKR / retro) AND duplicates
     dormant in-repo scaffolding; the retro is a wiring job, not a new agent
   revisit_if: the wired evidence-gated frontier-advance proves insufficient in practice
+- idea: leave operational cleanup (branches/worktrees/backlog) as a manual operator chore
+  reason: it does not scale and re-accretes every run; the loop must GC its own exhaust
+    autonomously (operational-convergence axis)
+  revisit_if: ''
 hot_files:
 - ref: src/forge_loop/eventlog/projections.py
   why_hot: the Projection/replay framework the Scorecard plugs into (no concrete
@@ -66,24 +83,30 @@ hot_files:
 - ref: src/forge_loop/frontier/store.py
   why_hot: writable cursor (load/save) + the OKR round-trip for value-ranking and
     the frontier-advance policy
-- ref: src/forge_loop/manifesto_suggest.py
-  why_hot: the bug->rule ratchet to EXTEND to recurring critic-finding patterns
-    (reuse build_prompt/parse_suggestion/build_pr_plan; never rebuild)
 - ref: src/forge_loop/brainstormer.py
-  why_hot: add value/effort ranking + emit OKR scoring inputs (the one genuine build)
+  why_hot: add value/effort ranking + a TOTAL-backlog ceiling so refill cannot run
+    the epic count unbounded (the convergence arc on generation)
+- ref: src/forge_loop/runner/tick.py
+  why_hot: the maintenance hook (maintenance_every_n_ticks) is where branch-GC /
+    worktree-GC / checkout-restore must run each maintenance tick
+- ref: src/forge_loop/console_api.py
+  why_hot: the read API that should also surface the operational-entropy metric
+    (open branches / worktrees / epics) the convergence KR is checked against
 hot_tests:
-- ref: tests/test_maestro_plan.py
-  why_hot: planner behaviour + matching
 - ref: tests/test_recovery.py
   why_hot: resumability / dead-worker reconciliation invariants
+- ref: tests/test_console_api.py
+  why_hot: the lease-reconciliation primitive (zombie-worker fix) the worktree-GC reuses
 open_questions:
 - '$/merged-PR has no cost signal in event payloads — what records per-task cost,
   and where does it attach? (parked; ship the other five metrics first)'
 - Which KR balancing-pair best resists Goodhart (repair-rounds + sev2-regen vs
   acceptance-alone)?
 - 'Memory persistence: committed text export vs single-maintainer binary memory.db?'
+- What is the right backlog ceiling + epic TTL so brainstorm refills without re-accreting
+  the 17-epic pile?
 external_sources:
 - docs/design/context-awareness.md
 - docs/design/long-running-agent-architecture.md
 - paper/10-the-outer-loop.md
-version: 2
+version: 3

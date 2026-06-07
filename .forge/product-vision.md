@@ -71,3 +71,29 @@ cleanup, and boot recovery path can explain and recover stale or crashed work.
 
 Do not treat markdown manifestos as sufficient architecture. They are inputs to
 the control plane, not the control plane itself.
+
+Do not run the loop as a pure generator. Every arc that creates state — a branch,
+a worktree, a backlog item, a moved checkout — must have a paired arc that bounds
+or reclaims it. A generator without proportional garbage collection accumulates
+operational entropy (orphan branches, stale worktrees, an unbounded epic pile, a
+drifting checkout) until a human has to clean up by hand. That happened. The fix is
+not a cleanup script; it is the missing return arc.
+
+## Operational convergence
+
+The loop must converge its own operational state, not only generate code. This is
+the same PLAN/DO/CHECK/ACT discipline turned inward on the system's exhaust:
+
+- **Branches**: merged work is deleted automatically (issue-closed is the
+  landed-signal, since squash-merge hides git's own merged flag).
+- **Worktrees**: disk is reconciled against the live in-flight lease set every
+  maintenance tick; anything not leased is reaped.
+- **Backlog**: brainstorm refill is bounded by a total-open ceiling and a value/TTL
+  filter, so the epic pile cannot grow monotonically.
+- **Checkout**: dispatch never leaves the shared checkout on a feature branch.
+- **Visibility**: operational entropy (open branches / live worktrees / open epics /
+  backlog age) is measured and surfaced (status, the operator console, the scorecard)
+  so generation can be gated on convergence.
+
+The operator console (`forge_loop.console_api` + `console/`) is the inspection
+surface for all of this — a read-only, real-time view of the durable control plane.
