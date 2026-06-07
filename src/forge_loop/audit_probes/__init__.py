@@ -10,5 +10,6 @@ Each probe is a small module exposing one class that satisfies the
 """
 
 from forge_loop.audit_probes.file_size import FileSizeProbe
+from forge_loop.audit_probes.function_size import FunctionSizeProbe
 
-__all__ = ["FileSizeProbe"]
+__all__ = ["FileSizeProbe", "FunctionSizeProbe"]

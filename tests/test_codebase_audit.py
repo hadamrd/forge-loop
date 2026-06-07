@@ -29,6 +29,10 @@ from forge_loop.audit_probes.file_size import (
     FileSizeProbe,
     _count_significant_lines,
 )
+from forge_loop.audit_probes.function_size import (
+    DEFAULT_MAX_LINES,
+    FunctionSizeProbe,
+)
 from forge_loop.codebase_audit import (
     AUDIT_AXIS_LABEL,
     PROBE_LABEL_PREFIX,
@@ -198,6 +202,83 @@ def test_file_size_probe_per_language_thresholds(tmp_path: Path) -> None:
     assert "Big.java" in targets
     assert "big.ts" in targets
     assert "small.ts" not in targets
+
+
+# ---------------------------------------------------------------------------
+# FunctionSizeProbe — Q8 god-function state-gate (issue #306)
+# ---------------------------------------------------------------------------
+
+
+def _plant_py_function(path: Path, body_lines: int, name: str = "big_func") -> None:
+    """Write a .py file with one function whose body has ``body_lines`` sig lines.
+
+    Significant LOC counted by the probe = 1 (the ``def`` line) + ``body_lines``.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"def {name}():"]
+    lines.extend(f"    y_{i} = {i}" for i in range(body_lines))
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_function_size_probe_small_file_yields_nothing(tmp_path: Path) -> None:
+    _plant_py_function(tmp_path / "src" / "small.py", body_lines=10)
+    probe = FunctionSizeProbe()
+    assert list(probe.scan(tmp_path)) == []
+
+
+def test_function_size_probe_flags_god_function(tmp_path: Path) -> None:
+    # 1 def line + 90 body lines = 91 significant LOC > 80 cap.
+    _plant_py_function(tmp_path / "src" / "huge.py", body_lines=90)
+    probe = FunctionSizeProbe()
+    violations = list(probe.scan(tmp_path))
+    assert len(violations) == 1
+    v = violations[0]
+    assert v.probe == "function-size"
+    assert v.target == "src/huge.py::big_func"
+    assert v.metrics["loc"] == 91
+    assert v.metrics["max_lines"] == DEFAULT_MAX_LINES
+    # 91/80 = 1.14 < default hard multiplier (2.0) → severity 2.
+    assert v.severity == 2
+
+
+def test_function_size_probe_at_cap_is_not_flagged(tmp_path: Path) -> None:
+    # 1 def line + 79 body lines = 80 significant LOC == cap → not flagged.
+    _plant_py_function(tmp_path / "edge.py", body_lines=79)
+    probe = FunctionSizeProbe()
+    assert list(probe.scan(tmp_path)) == []
+
+
+def test_function_size_probe_severity_1_above_hard_multiplier(tmp_path: Path) -> None:
+    # 1 def line + 200 body lines = 201 LOC; 201/80 = 2.5 ≥ 2.0 → severity 1.
+    _plant_py_function(tmp_path / "monster.py", body_lines=200)
+    [v] = list(FunctionSizeProbe().scan(tmp_path))
+    assert v.severity == 1
+
+
+def test_function_size_probe_qualifies_nested_names(tmp_path: Path) -> None:
+    src = (
+        "class Foo:\n"
+        "    def method(self):\n"
+        + "".join(f"        z_{i} = {i}\n" for i in range(90))
+    )
+    (tmp_path / "nested.py").write_text(src)
+    [v] = list(FunctionSizeProbe().scan(tmp_path))
+    assert v.target == "nested.py::Foo.method"
+
+
+def test_function_size_probe_ignores_unparseable_file(tmp_path: Path) -> None:
+    """Adversarial: a syntactically broken .py must not crash the scan."""
+    (tmp_path / "broken.py").write_text("def oops(:\n    pass\n")
+    # No exception, no violations.
+    assert list(FunctionSizeProbe().scan(tmp_path)) == []
+
+
+def test_function_size_probe_registered_in_audit(tmp_path: Path) -> None:
+    """Integration: audit() runs the probe and aggregates its violations."""
+    _plant_py_function(tmp_path / "huge.py", body_lines=90)
+    report = audit(tmp_path)  # default_probes()
+    assert "function-size" in report.probes_run
+    assert any(v.probe == "function-size" for v in report.violations)
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +473,7 @@ def test_cli_audit_json_emits_violations(tmp_path: Path, monkeypatch, capsys) ->
     assert rc == 0
     out = capsys.readouterr().out
     payload = json.loads(out)
-    assert payload["probes_run"] == ["file-size"]
+    assert payload["probes_run"] == ["file-size", "function-size"]
     assert any(
         v["target"] == "src/huge.py" for v in payload["violations"]
     )
