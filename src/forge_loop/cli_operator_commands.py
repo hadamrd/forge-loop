@@ -95,6 +95,7 @@ class OperatorCommandsMixin:
         )
         from forge_loop.control.doctor import (
             collect_control_plane_doctor,
+            mutation_survivors_check,
             unavailable_checks,
         )
 
@@ -251,6 +252,11 @@ class OperatorCommandsMixin:
                 )
         else:
             control_plane = unavailable_checks("config load failed; cannot locate .forge stores")
+
+        # Mutation-survivor probe (issue #380): how many planted faults survive
+        # the oracle on the configured high-risk module. The real checker is
+        # wired by #379; until then this degrades to ``warn`` (count=None).
+        control_plane["mutation_survivors"] = mutation_survivors_check(None)
 
         _cp_marker = {_CP_PASS: "green", "warn": "yellow", _CP_FAIL: "red"}
         for name, result in control_plane.items():

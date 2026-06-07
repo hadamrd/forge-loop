@@ -22,12 +22,15 @@ from typing import Any
 import pytest
 
 from forge_loop import cli
+from forge_loop._testing.mutation_checker import FakeMutationChecker
 from forge_loop.control.doctor import (
+    DEFAULT_MUTATION_MODULE,
     FAIL,
     PASS,
     WARN,
     _replay_determinism_check,
     collect_control_plane_doctor,
+    mutation_survivors_check,
 )
 from forge_loop.control.status import collect_control_plane_status
 from forge_loop.eventlog import EventKind, ProjectionCursor, SqliteEventLog
@@ -397,6 +400,47 @@ def _run_doctor_json(monkeypatch: Any, cfg: SimpleNamespace, capsys: Any) -> tup
     return rc, json.loads(capsys.readouterr().out)
 
 
+class TestMutationSurvivors:
+    """Unit coverage for the ``mutation_survivors`` probe (issue #380)."""
+
+    def test_pinned_module_passes_with_zero_count(self) -> None:
+        check = mutation_survivors_check(FakeMutationChecker.pinned())
+        assert check["status"] == PASS
+        assert check["count"] == 0
+        assert check["module"] == DEFAULT_MUTATION_MODULE
+        assert check["remediation"] is None
+
+    def test_named_module_is_carried_through(self) -> None:
+        check = mutation_survivors_check(FakeMutationChecker.pinned("forge_loop.frontier.store"))
+        assert check["module"] == "forge_loop.frontier.store"
+        assert "forge_loop.frontier.store" in check["detail"]
+
+    def test_survivor_fails_with_positive_count_and_remediation(self) -> None:
+        check = mutation_survivors_check(FakeMutationChecker.with_survivors(3))
+        assert check["status"] == FAIL
+        assert check["count"] == 3
+        assert check["module"] == DEFAULT_MUTATION_MODULE
+        assert check["remediation"]
+        assert "3" in check["detail"]
+
+    def test_unavailable_checker_degrades_to_warn(self) -> None:
+        # No #379 checker wired → warn with a null count, never a crash.
+        check = mutation_survivors_check(None)
+        assert check["status"] == WARN
+        assert check["count"] is None
+        assert check["module"] == DEFAULT_MUTATION_MODULE
+        assert check["remediation"]
+
+    def test_checker_that_raises_degrades_to_warn(self) -> None:
+        # Adversarial: the scoped check blows up (e.g. subprocess error). The
+        # probe must degrade to warn, not propagate and crash doctor.
+        checker = FakeMutationChecker(raises=RuntimeError("mutmut exploded"))
+        check = mutation_survivors_check(checker)
+        assert check["status"] == WARN
+        assert check["count"] is None
+        assert "exploded" in check["detail"]
+
+
 class TestDoctorJsonIntegration:
     def test_json_emits_control_plane_object_and_zero_exit_when_healthy(
         self, monkeypatch: Any, tmp_path: Path, capsys: Any
@@ -428,8 +472,16 @@ class TestDoctorJsonIntegration:
             "stale_leases",
             "memory_integrity",
             "replay_determinism",
+            "mutation_survivors",
         }
-        for result in control.values():
+        # The mutation-survivor probe degrades to ``warn`` (no real #379 checker
+        # wired) and names the configured module with a null count.
+        assert control["mutation_survivors"]["status"] == WARN
+        assert control["mutation_survivors"]["module"]
+        assert control["mutation_survivors"]["count"] is None
+        for name, result in control.items():
+            if name == "mutation_survivors":
+                continue
             assert result["status"] != FAIL
         # No control-plane failure → control plane does not force exit 1.
         # (rc may still be 0 here since git/tmux/orphans only warn.)
