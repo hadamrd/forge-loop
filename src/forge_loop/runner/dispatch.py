@@ -966,6 +966,22 @@ def _run_critic_for_outcomes(
                 if critic_outcome.report is not None:
                     try:
                         lines = _gh.pr_changed_lines(o.pr_url, repo=cfg.github_repo)
+                        # #311 self-clearing guard: a large zero-finding approve is
+                        # held as suspicious UNLESS the PR added tests (best-effort).
+                        try:
+                            _changed = _gh.pr_changed_files(o.pr_url, repo=cfg.github_repo)
+                        except Exception:
+                            _changed = []
+                        _touches_tests = any(
+                            isinstance(p, str)
+                            and (
+                                p.startswith("tests/")
+                                or "/tests/" in p
+                                or p.rsplit("/", 1)[-1].startswith("test_")
+                                or p.endswith("_test.py")
+                            )
+                            for p in (_changed or [])
+                        )
                         plan = apply_critic_report(
                             critic_outcome.report,
                             o.pr_url,
@@ -975,6 +991,7 @@ def _run_critic_for_outcomes(
                             gh=_gh,
                             repo=cfg.github_repo,
                             emit=bus_emit,
+                            pr_touches_tests=_touches_tests,
                         )
                         if plan.block_merge:
                             o.status = "open"

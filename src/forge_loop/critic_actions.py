@@ -101,6 +101,7 @@ def plan_actions(
     pr_changed_lines: int,
     block_on_sev2: bool,
     min_findings_for_approve: int,
+    pr_touches_tests: bool = False,
 ) -> CriticActionPlan:
     """Pure decision: report + PR size + knobs → plan.
 
@@ -149,11 +150,17 @@ def plan_actions(
         report.overall == "approve"
         and not report.findings
         and pr_changed_lines > max(min_findings_for_approve, MIN_SUSPICIOUS_APPROVE_LINES)
+        # Self-clear (#311): a large zero-finding "approve" is far less likely a
+        # rubber-stamp when the PR ADDED TESTS — rubber-stamps don't write tests.
+        # So only hold-as-suspicious when the diff is large, clean, AND test-free.
+        # A clean, well-tested large PR (e.g. a +665 change with 37 new tests)
+        # proceeds via the normal merge path with zero human action.
+        and not pr_touches_tests
     ):
         plan.suspicious_approve = True
         plan.block_merge = True
         plan.labels_to_add.append("critic:suspicious")
-        reasons.append(f"approve_with_zero_findings_on_{pr_changed_lines}_line_pr")
+        reasons.append(f"approve_with_zero_findings_on_{pr_changed_lines}_line_pr_no_tests")
 
     for f in report.findings:
         if f.severity == "sev1":
@@ -185,6 +192,7 @@ def apply_critic_report(
     gh: GhClient,
     repo: str | None,
     emit: Callable[[str, dict[str, Any]], None] | None = None,
+    pr_touches_tests: bool = False,
 ) -> CriticActionPlan:
     """Compute the plan and execute it via ``gh``. Returns the plan so the
     runner can log a summary event."""
@@ -193,6 +201,7 @@ def apply_critic_report(
         pr_changed_lines,
         block_on_sev2,
         min_findings_for_approve,
+        pr_touches_tests=pr_touches_tests,
     )
     mutation_failed = False
 
