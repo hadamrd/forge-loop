@@ -8,7 +8,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
-from forge_loop.eventlog import ProjectionCursor, SqliteEventLog
+from forge_loop.eventlog import (
+    SCORECARD_PROJECTION_NAME,
+    ProjectionCursor,
+    ScorecardProjection,
+    SqliteEventLog,
+)
 from forge_loop.eventlog.projections import ProjectionReplayError, replay_projection
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import MemoryItem, MemoryKind, SqliteMemoryStore
@@ -274,15 +279,15 @@ def build_boot_sources(repo: Path | str) -> BootSources:
     # missing store is not silently materialised on open.
     tasks_path = canonical_task_saga_path(repo)
     task_store = SqliteTaskSagaStore(tasks_path) if tasks_path.exists() else None
-    # ``projections`` is intentionally left empty here: no concrete production
-    # ``Projection`` exists in the repo yet, so there is nothing for the
-    # CLI/maestro boot path to reconcile. This is the single seam where future
-    # production projections register — once one lands, add it to this mapping
-    # and ``assemble_boot_context`` drives it to the log tail automatically. The
-    # replay-to-tail mechanism itself is fully exercised by the boot tests.
+    # The ``scorecard`` projection (issue #307) is the first concrete production
+    # ``Projection`` registered on this seam: ``assemble_boot_context`` drives it
+    # from its saved durable cursor to the event-log tail, materialising trend
+    # metrics into ``projection_cursors``. Future projections register the same
+    # way — add another keyed entry to this mapping.
     return BootSources(
         frontier_store=FrontierStore(frontier_path),
         event_log=SqliteEventLog(forge_dir / "events.db"),
         memory_store=SqliteMemoryStore(forge_dir / "memory.db"),
         task_store=task_store,
+        projections={SCORECARD_PROJECTION_NAME: ScorecardProjection()},
     )

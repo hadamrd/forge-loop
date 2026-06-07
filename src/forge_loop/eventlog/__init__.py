@@ -34,6 +34,11 @@ from forge_loop.eventlog.projections import (
     ProjectionReplayError,
     replay_projection,
 )
+from forge_loop.eventlog.scorecard import (
+    SCORECARD_PROJECTION_NAME,
+    ScorecardMetrics,
+    ScorecardProjection,
+)
 from forge_loop.eventlog.sqlite import CompactionResult, SqliteEventLog
 from forge_loop.eventlog.store import EventLog, InMemoryEventLog
 
@@ -57,6 +62,9 @@ __all__ = [
     "ProjectionCursor",
     "ProjectionReplayError",
     "PrunePartition",
+    "SCORECARD_PROJECTION_NAME",
+    "ScorecardMetrics",
+    "ScorecardProjection",
     "SqliteEventLog",
     "compute_event_hash",
     "guard_prune",

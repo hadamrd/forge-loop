@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from forge_loop.control.boot import BootContextError, BootSources, assemble_boot_context
-from forge_loop.eventlog import EventEnvelope, EventKind, ProjectionCursor, SqliteEventLog
+from forge_loop.control.boot import (
+    BootContextError,
+    BootSources,
+    assemble_boot_context,
+    build_boot_sources,
+)
+from forge_loop.eventlog import (
+    EventEnvelope,
+    EventKind,
+    ProjectionCursor,
+    ScorecardProjection,
+    SqliteEventLog,
+)
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import (
     REJECTED_PATH_TAG,
@@ -264,3 +276,117 @@ def test_boot_context_treats_missing_optional_stores_as_empty(tmp_path: Path) ->
     assert context.active_memory_ids == ()
     assert context.rejected_path_memory_ids == ()
     assert context.in_flight_task_ids == ()
+
+
+def _seed_task_events(eventlog: SqliteEventLog) -> int:
+    """Append a small mirror-shaped task stream; return latest sequence."""
+    eventlog.append(EventKind.TASK_PLANNED, {"issue": 1}, task_id="issue:1")
+    eventlog.append(
+        EventKind.CRITIQUE_ISSUED,
+        {"legacy_kind": "critic_verdict_merged"},
+        task_id="issue:1",
+    )
+    return eventlog.append(
+        EventKind.TASK_COMPLETED, {"status": "merged"}, task_id="issue:1"
+    ).sequence
+
+
+def test_boot_drives_scorecard_projection_to_tail(tmp_path: Path) -> None:
+    frontier_path = tmp_path / "frontier.yaml"
+    eventlog_path = tmp_path / "events.db"
+    FrontierStore(frontier_path).save(_frontier())
+
+    latest = _seed_task_events(SqliteEventLog(eventlog_path))
+
+    context = assemble_boot_context(
+        BootSources(
+            frontier_store=FrontierStore(frontier_path),
+            event_log=SqliteEventLog(eventlog_path),
+            projections={"scorecard": ScorecardProjection()},
+        )
+    )
+
+    status = context.projection_cursors["scorecard"]
+    assert status.sequence == latest
+    assert status.lag == 0
+
+
+def test_boot_drives_scorecard_from_partial_cursor_to_head(tmp_path: Path) -> None:
+    frontier_path = tmp_path / "frontier.yaml"
+    eventlog_path = tmp_path / "events.db"
+    FrontierStore(frontier_path).save(_frontier())
+
+    latest = _seed_task_events(SqliteEventLog(eventlog_path))
+    # Pre-existing partial cursor mid-log: boot must drive only the remaining tail.
+    SqliteEventLog(eventlog_path).set_projection_cursor("scorecard", ProjectionCursor(sequence=1))
+
+    context = assemble_boot_context(
+        BootSources(
+            frontier_store=FrontierStore(frontier_path),
+            event_log=SqliteEventLog(eventlog_path),
+            projections={"scorecard": ScorecardProjection()},
+        )
+    )
+
+    assert context.projection_cursors["scorecard"].sequence == latest
+    assert context.projection_cursors["scorecard"].lag == 0
+
+
+def test_build_boot_sources_registers_scorecard(tmp_path: Path) -> None:
+    forge_dir = tmp_path / ".forge"
+    forge_dir.mkdir()
+    FrontierStore(forge_dir / "frontier.yaml").save(_frontier())
+
+    sources = build_boot_sources(tmp_path)
+
+    assert "scorecard" in sources.projections
+    assert isinstance(sources.projections["scorecard"], ScorecardProjection)
+
+
+@dataclass
+class _GappyEventLog:
+    """Event log whose ``since`` stops one event short of the head.
+
+    Simulates a replay that cannot reach the log tail (a gap/truncation),
+    exercising the head-mismatch guard in ``_drive_projections_to_tail``.
+    """
+
+    inner: SqliteEventLog
+
+    def latest_sequence(self) -> int:
+        return self.inner.latest_sequence()
+
+    def since(self, sequence: int = 0) -> Iterable[EventEnvelope]:
+        events = list(self.inner.since(sequence))
+        return events[:-1]  # never yields the head event
+
+    def advance_projection_cursor(self, projection_name: str, cursor: ProjectionCursor) -> None:
+        self.inner.advance_projection_cursor(projection_name, cursor)
+
+    def list_projection_cursors(self) -> Mapping[str, ProjectionCursor]:
+        return self.inner.list_projection_cursors()
+
+    def get_projection_cursor(self, projection_name: str) -> ProjectionCursor:
+        return self.inner.get_projection_cursor(projection_name)
+
+
+def test_boot_aborts_when_scorecard_cannot_reach_head(tmp_path: Path) -> None:
+    frontier_path = tmp_path / "frontier.yaml"
+    eventlog_path = tmp_path / "events.db"
+    FrontierStore(frontier_path).save(_frontier())
+
+    latest = _seed_task_events(SqliteEventLog(eventlog_path))
+    gappy = _GappyEventLog(SqliteEventLog(eventlog_path))
+
+    with pytest.raises(BootContextError, match="reconstruction is incomplete"):
+        assemble_boot_context(
+            BootSources(
+                frontier_store=FrontierStore(frontier_path),
+                event_log=gappy,
+                projections={"scorecard": ScorecardProjection()},
+            )
+        )
+
+    # The cursor must NOT be advanced to/past the head on an incomplete replay.
+    persisted = SqliteEventLog(eventlog_path).get_projection_cursor("scorecard")
+    assert persisted.sequence < latest
