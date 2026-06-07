@@ -260,3 +260,98 @@ def test_integration_policy_network_flows_to_options_and_attestation(tmp_path: P
     # The same lease binds its egress list into the SDK sandbox options.
     opts = claude_permission_options("standard", policy)
     assert opts["sandbox"]["network"]["allowedDomains"] == ["github.com", "api.github.com"]
+
+
+# --- preserve_on_failure capability flag (#356) ------------------------------
+
+
+def test_preserve_on_failure_defaults_false() -> None:
+    """A default-constructed policy preserves deny-by-default semantics."""
+    assert CapabilityPolicy().preserve_on_failure is False
+
+
+def test_preserve_on_failure_flips_policy_hash() -> None:
+    """Two policies differing ONLY in preserve_on_failure hash differently —
+    so the saga grant can attest which preserve decision was authorised."""
+    from forge_loop.sandbox import policy_hash
+
+    keep = CapabilityPolicy(preserve_on_failure=True)
+    drop = CapabilityPolicy(preserve_on_failure=False)
+    assert policy_hash(keep) != policy_hash(drop)
+
+
+def test_to_json_obj_includes_preserve_on_failure() -> None:
+    obj = CapabilityPolicy(preserve_on_failure=True).to_json_obj()
+    assert obj["preserve_on_failure"] is True
+    assert CapabilityPolicy().to_json_obj()["preserve_on_failure"] is False
+
+
+def test_preserve_on_failure_round_trips() -> None:
+    policy = CapabilityPolicy(preserve_on_failure=True)
+    assert CapabilityPolicy.from_json_obj(policy.to_json_obj()) == policy
+
+
+def test_preserve_on_failure_backward_compatible_default() -> None:
+    """A grant persisted before this field existed (no key) defaults False."""
+    legacy = {
+        "filesystem": {"read_roots": [], "write_roots": []},
+        "network": {"allow_domains": [], "deny_by_default": True},
+        "mcp": [],
+        "secret_names": [],
+    }
+    assert CapabilityPolicy.from_json_obj(legacy).preserve_on_failure is False
+
+
+def test_render_capability_policy_shows_preserve_line() -> None:
+    from forge_loop.sandbox import render_capability_policy
+
+    assert "preserve on failure: yes" in render_capability_policy(
+        CapabilityPolicy(preserve_on_failure=True)
+    )
+    assert "preserve on failure: no" in render_capability_policy(
+        CapabilityPolicy(preserve_on_failure=False)
+    )
+
+
+def test_preserve_on_failure_tamper_evident() -> None:
+    """Adversarial: flipping the serialised flag breaks the attested digest."""
+    from forge_loop.sandbox import canonical_policy_json, policy_hash
+
+    original = CapabilityPolicy(preserve_on_failure=True)
+    original_digest = policy_hash(original)
+
+    import json
+
+    obj = json.loads(canonical_policy_json(original))
+    obj["preserve_on_failure"] = False
+    tampered = CapabilityPolicy.from_json_obj(obj)
+    assert policy_hash(tampered) != original_digest
+
+
+@pytest.mark.parametrize("bad", ["yes", None, 0, 1])
+def test_preserve_on_failure_malformed_coerces_via_bool(bad: object) -> None:
+    """Malformed serialised values coerce via bool(...) without raising —
+    mirrors the deny_by_default handling at policy.py."""
+    policy = CapabilityPolicy.from_json_obj({"preserve_on_failure": bad})
+    assert policy.preserve_on_failure is bool(bad)
+
+
+def test_integration_preserve_on_failure_attested_on_grant(tmp_path: Path) -> None:
+    """Integration (#356): a populated preserve flag flows through the
+    settings-plant attestation path so the saga grant records a digest that
+    differs from the same grant with preserve_on_failure=False."""
+    from forge_loop.sandbox import policy_hash
+    from forge_loop.worker_worktree import plant_worker_settings
+
+    keep = CapabilityPolicy(preserve_on_failure=True)
+    events_file = tmp_path / "events.jsonl"
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    plant_worker_settings(wt, keep, events_file=events_file)
+
+    import json
+
+    lines = [json.loads(x) for x in events_file.read_text().splitlines() if x.strip()]
+    enforced = [e for e in lines if e.get("kind") == "worker_policy_enforced"]
+    assert enforced and enforced[0]["policy_hash"] == policy_hash(keep)
+    assert policy_hash(keep) != policy_hash(CapabilityPolicy(preserve_on_failure=False))
