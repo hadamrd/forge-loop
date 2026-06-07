@@ -62,6 +62,28 @@ class Issue:
 
 
 @dataclass
+class SubIssue:
+    """A tracked sub-issue of an epic (issue #367).
+
+    Returned by :meth:`GhClient.sub_issues`. Carries just enough to make the
+    epic-auto-close DECISION (``state``) and to build the audit comment
+    (``number`` + the PR that closed it, when GitHub can surface one via
+    ``closedByPullRequestsReferences``). A purpose-built shape rather than
+    :class:`Issue` because :class:`Issue` has no place for the closing-PR
+    reference and the epic sweep needs both in a single GraphQL round-trip
+    (no N+1 — see manifesto Q9).
+    """
+
+    number: int
+    state: str = "open"
+    title: str = ""
+    #: PR number that closed this sub-issue, or ``None`` when GitHub reports
+    #: no closing PR (closed by hand, or still open).
+    closing_pr: int | None = None
+    closing_pr_url: str = ""
+
+
+@dataclass
 class PullRequest:
     """Subset of a GitHub pull request the loop actually reads."""
 
@@ -151,6 +173,8 @@ class GhClient(Protocol):
     def issues_by_label(self, owner: str, repo: str, label: str, limit: int) -> list[Issue]: ...
 
     def get_issue(self, owner: str, repo: str, number: int) -> Issue | None: ...
+
+    def sub_issues(self, owner: str, repo: str, number: int) -> list[SubIssue]: ...
 
     def add_comment(self, owner: str, repo: str, number: int, body: str) -> None: ...
 
@@ -252,9 +276,7 @@ class GhClient(Protocol):
     ) -> bool: ...
 
     # -- auto-merge ----------------------------------------------------------
-    def enable_pr_auto_merge(
-        self, owner: str, repo: str, number: int
-    ) -> AutoMergeResult: ...
+    def enable_pr_auto_merge(self, owner: str, repo: str, number: int) -> AutoMergeResult: ...
 
     def disable_pr_auto_merge(self, owner: str, repo: str, number: int) -> bool: ...
 
@@ -462,6 +484,66 @@ class GithubkitClient:
             state=str(item.state),
             labels=_label_names(item.labels),
         )
+
+    def sub_issues(self, owner: str, repo: str, number: int) -> list[SubIssue]:
+        """Return an issue's tracked sub-issues via GitHub's GraphQL sub-issues
+        API (issue #367). One round-trip also fetches each sub-issue's closing
+        PR (``closedByPullRequestsReferences``) so the epic sweep can build its
+        audit comment without an N+1 (manifesto Q9).
+
+        Degrades to ``[]`` on ANY failure (API outage, permission error, the
+        sub-issues feature being unavailable). The epic sweep treats an empty
+        result as "no tracked sub-issues" and therefore NEVER closes the epic —
+        the conservative direction required by the issue's acceptance criteria.
+        """
+        query = (
+            "query($owner: String!, $name: String!, $number: Int!) {\n"
+            "  repository(owner: $owner, name: $name) {\n"
+            "    issue(number: $number) {\n"
+            "      subIssues(first: 100) {\n"
+            "        nodes {\n"
+            "          number state title\n"
+            "          closedByPullRequestsReferences(first: 1, includeClosedPrs: true) {\n"
+            "            nodes { number url }\n"
+            "          }\n"
+            "        }\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        try:
+            data = self._gh.graphql(query, {"owner": owner, "name": repo, "number": int(number)})
+        except Exception as exc:  # noqa: BLE001 — degrade to "no sub-issues found"
+            logger.warning("sub_issues GraphQL failed for #%s: %s", number, exc)
+            return []
+        repo_obj = (data or {}).get("repository") or {}
+        issue_obj = repo_obj.get("issue") or {}
+        nodes = (issue_obj.get("subIssues") or {}).get("nodes") or []
+        out: list[SubIssue] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            num = node.get("number")
+            if not isinstance(num, int):
+                continue
+            pr_nodes = (node.get("closedByPullRequestsReferences") or {}).get("nodes") or []
+            closing_pr: int | None = None
+            closing_pr_url = ""
+            if pr_nodes and isinstance(pr_nodes[0], dict):
+                pr_num = pr_nodes[0].get("number")
+                closing_pr = pr_num if isinstance(pr_num, int) else None
+                closing_pr_url = str(pr_nodes[0].get("url") or "")
+            out.append(
+                SubIssue(
+                    number=num,
+                    state=str(node.get("state") or "").upper(),
+                    title=str(node.get("title") or ""),
+                    closing_pr=closing_pr,
+                    closing_pr_url=closing_pr_url,
+                )
+            )
+        return out
 
     def add_comment(self, owner: str, repo: str, number: int, body: str) -> None:
         resp = self._gh.rest.issues.create_comment(
@@ -1255,6 +1337,8 @@ class MockGhClient:
 
     issues: dict[tuple[str, str, int], Issue] = field(default_factory=dict)
     pulls: dict[tuple[str, str, int], PullRequest] = field(default_factory=dict)
+    #: ``{epic_number: [SubIssue, ...]}`` returned by ``sub_issues`` (issue #367).
+    sub_issues_by_epic: dict[int, list[SubIssue]] = field(default_factory=dict)
     issues_by_label_response: list[Issue] = field(default_factory=list)
     raise_on: dict[str, GhError] = field(default_factory=dict)
     raise_on_create_titles: dict[str, Exception] = field(default_factory=dict)
@@ -1306,6 +1390,10 @@ class MockGhClient:
     def get_issue(self, owner: str, repo: str, number: int) -> Issue | None:
         self._record("get_issue", owner=owner, repo=repo, number=number)
         return self.issues.get((owner, repo, number))
+
+    def sub_issues(self, owner: str, repo: str, number: int) -> list[SubIssue]:
+        self._record("sub_issues", owner=owner, repo=repo, number=number)
+        return list(self.sub_issues_by_epic.get(number, []))
 
     def add_comment(self, owner: str, repo: str, number: int, body: str) -> None:
         self._record("add_comment", owner=owner, repo=repo, number=number, body=body)
@@ -1611,6 +1699,7 @@ __all__ = [
     "OpenBacklog",
     "PullRequest",
     "ResolvedToken",
+    "SubIssue",
     "TokenSource",
     "list_open_backlog",
     "resolve_token_info",
