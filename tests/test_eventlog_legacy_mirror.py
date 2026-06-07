@@ -4,7 +4,12 @@ from pathlib import Path
 import pytest
 
 from forge_loop.eventlog import EventKind, ProjectionCursor, SqliteEventLog
-from forge_loop.eventlog.legacy_mirror import LegacyEventMirror, replay_task_timeline
+from forge_loop.eventlog.legacy_mirror import (
+    _TERMINAL_STATUS_TO_KIND,
+    LegacyEventMirror,
+    LegacyWorkerStatus,
+    replay_task_timeline,
+)
 from forge_loop.events import WorkerSessionTransitionEvent, emit
 from forge_loop.state import append_event
 
@@ -553,3 +558,73 @@ def test_append_event_surfaces_unexpected_durable_mirror_bug(tmp_path: Path) -> 
         append_event(events_file, "tick_start", tick=2, issues=[167], durable_mirror=BuggyMirror())
 
     assert len(events_file.read_text().splitlines()) == 1
+
+
+# --- Terminal-mapping coverage gate (issue #304) --------------------------------
+#
+# WHY these invariants exist: ``_worker_done_specs`` (and ``_tick_done_specs``)
+# look up a worker's ``LegacyWorkerStatus`` in ``_TERMINAL_STATUS_TO_KIND`` to
+# emit a terminal task event (TASK_COMPLETED / TASK_FAILED / TASK_COMPENSATED).
+# If a status is MISSING from that dict, the lookup silently falls through to a
+# non-terminal ``WORKER_OBSERVATION``. On restart, ``replay_task_timeline`` never
+# sets ``task["terminal"]`` for an observation, so the in-flight view shows the
+# task as perpetually running. These tests fail CI the moment a worker outcome
+# status loses its terminal mapping, instead of silently dropping the milestone.
+
+# Statuses deliberately excluded from the terminal mapping. Empty today: all 7
+# current ``LegacyWorkerStatus`` members are terminal. Adding a member here is a
+# DOCUMENTED, intentional act — it asserts the new status is genuinely
+# non-terminal and must be handled some other way.
+_NON_TERMINAL_STATUSES: set[LegacyWorkerStatus] = set()
+
+_TERMINAL_KINDS = {
+    EventKind.TASK_COMPLETED,
+    EventKind.TASK_FAILED,
+    EventKind.TASK_COMPENSATED,
+}
+
+
+def test_every_worker_status_has_terminal_mapping() -> None:
+    """Every LegacyWorkerStatus must resolve to a terminal kind (or be excluded).
+
+    Pins the coverage relationship between the enum and the mapping: adding a
+    new ``LegacyWorkerStatus`` member without a ``_TERMINAL_STATUS_TO_KIND``
+    entry (and without listing it in ``_NON_TERMINAL_STATUSES``) makes this
+    test fail, preventing the silent ``WORKER_OBSERVATION`` fallthrough that
+    leaves a task perpetually unfinished on replay.
+    """
+
+    mapped = set(_TERMINAL_STATUS_TO_KIND)
+    assert set(LegacyWorkerStatus) - _NON_TERMINAL_STATUSES == mapped
+    # Excluded statuses must NOT also be mapped — the exclusion is meaningful.
+    assert _NON_TERMINAL_STATUSES.isdisjoint(mapped)
+
+
+def test_terminal_mapping_only_targets_terminal_kinds() -> None:
+    """No status may map to a non-terminal EventKind (e.g. WORKER_OBSERVATION)."""
+
+    for status, kind in _TERMINAL_STATUS_TO_KIND.items():
+        assert kind in _TERMINAL_KINDS, f"{status} maps to non-terminal {kind}"
+
+
+def test_unmapped_status_falls_through_to_observation(tmp_path: Path) -> None:
+    """Adversarial: an unmapped status mirrors only a WORKER_OBSERVATION.
+
+    This documents the exact regression the coverage tests above guard against.
+    A ``worker_done`` record whose status is not recognised by the parser (and
+    therefore absent from ``_TERMINAL_STATUS_TO_KIND``) produces a non-terminal
+    ``WORKER_OBSERVATION`` — so ``replay_task_timeline`` never marks the task
+    terminal and it looks perpetually running. The coverage tests ensure no
+    real enum member can ever land in this fallthrough.
+    """
+
+    bogus_status = "cancelled"
+    assert bogus_status not in {status.value for status in _TERMINAL_STATUS_TO_KIND}
+
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+    mirror.mirror_record({"kind": "worker_done", "tick": 1, "issue": 167, "status": bogus_status})
+
+    events = list(log.since(0))
+    assert [event.kind for event in events] == [EventKind.WORKER_OBSERVATION]
+    assert replay_task_timeline(log.since(0))["issue:167"]["terminal"] is None
