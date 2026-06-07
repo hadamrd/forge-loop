@@ -7,7 +7,28 @@ from pathlib import Path
 from typing import Any
 
 from forge_loop.control.recovery import reconcile_stale_sagas
-from forge_loop.tasks import Compensation, SqliteTaskSagaStore, TaskState
+from forge_loop.tasks import Compensation, CompensationKind, SqliteTaskSagaStore, TaskState
+
+
+def _stale_with_compensations(
+    store: SqliteTaskSagaStore, *, issue: int, compensations: tuple[Compensation, ...]
+) -> None:
+    """Seed a RUNNING saga with an expired lease and arbitrary compensations."""
+    store.create(
+        task_id=f"task-{issue}-worker",
+        saga_id=f"saga-{issue}-worker",
+        issue=issue,
+        branch=f"loop/{issue}",
+        worktree=f"/tmp/wt-loop-{issue}",
+        compensations=compensations,
+    )
+    acquired = datetime.now(UTC) - timedelta(minutes=10)
+    store.acquire_lease(
+        f"task-{issue}-worker",
+        owner_id=f"worker-{issue}",
+        expires_at=acquired + timedelta(minutes=1),
+        acquired_at=acquired,
+    )
 
 
 def _store(tmp_path: Path) -> SqliteTaskSagaStore:
@@ -93,6 +114,66 @@ def test_reconcile_continues_past_a_failing_saga(tmp_path: Path) -> None:
     assert any("saga-1-worker" in e for e in report.errors)
     assert store.get("task-2-worker").state == TaskState.COMPENSATED
     assert store.get("task-1-worker").state == TaskState.RUNNING  # untouched, still stale
+
+
+def test_reconcile_leaves_saga_with_unhandled_compensation_nonterminal(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=42,
+        compensations=(
+            Compensation(
+                kind="close-pr",  # a kind the recovery engine has no handler for
+                target="https://github.com/o/r/pull/42",
+                reason="close orphaned PR opened by dead worker",
+            ),
+        ),
+    )
+    reaped: list[int] = []
+
+    report = reconcile_stale_sagas(store, reap_worktree=reaped.append)
+
+    # Not recovered, not driven terminal — the side effect never ran.
+    assert report.recovered == ()
+    assert store.get("task-42-worker").state == TaskState.RUNNING
+    # The integrity hole is surfaced: the saga id + the unhandled kind are named.
+    assert len(report.errors) == 1
+    assert "saga-42-worker" in report.errors[0]
+    assert "close-pr" in report.errors[0]
+    # No handled compensation was run for a saga we refuse to compensate.
+    assert reaped == []
+
+
+def test_reconcile_with_mixed_handled_and_unhandled_kinds_stays_nonterminal(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=43,
+        compensations=(
+            Compensation(
+                kind=CompensationKind.REMOVE_WORKTREE,
+                target="/tmp/wt-loop-43",
+                reason="cleanup worktree",
+            ),
+            Compensation(
+                kind="delete-branch",  # unhandled — taints the whole saga
+                target="loop/43",
+                reason="delete orphaned branch",
+            ),
+        ),
+    )
+    reaped: list[int] = []
+
+    report = reconcile_stale_sagas(store, reap_worktree=reaped.append)
+
+    assert report.recovered == ()
+    assert store.get("task-43-worker").state == TaskState.RUNNING
+    assert any("delete-branch" in e for e in report.errors)
+    # We do not run the handled remove-worktree when another kind is unhandled:
+    # the saga is left wholly untouched for the next sweep.
+    assert reaped == []
 
 
 def test_runner_boot_recovery_reconciles_and_emits_event(tmp_path: Path) -> None:

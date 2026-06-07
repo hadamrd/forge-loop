@@ -21,6 +21,21 @@ class TaskState(StrEnum):
     QUARANTINED = "quarantined"
 
 
+class CompensationKind(StrEnum):
+    """Known compensation kinds, shared across the saga producer (dispatch) and
+    consumer (recovery).
+
+    The discriminator is shared as an enum per the manifesto rule on
+    stringly-typed cross-module boundaries: dispatch emits the kind and recovery
+    branches on it. ``Compensation.kind`` stays a plain ``str`` so a saga written
+    by a *newer* loop version (carrying a kind this version has never seen) is
+    still representable — recovery treats any kind it has no handler for as
+    unhandled rather than crashing.
+    """
+
+    REMOVE_WORKTREE = "remove-worktree"
+
+
 @dataclass(frozen=True)
 class Compensation:
     """A cleanup or rollback action registered for a task saga."""
