@@ -420,32 +420,129 @@ def _scorecard(repo: Path) -> dict[str, Any]:
 
 
 def _frontier(repo: Path) -> dict[str, Any]:
-    """Real frontier cursor → console Frontier. OKR/KR fields are absent on the
-    real cursor (the loop hasn't set them) → empty objective + zeroed KR."""
-    cur = _frontier_cursor(repo)
-    if cur is None:
-        return {"version": 0, "product_goal": "", "current_problem": "", "next_expansion": "",
-                "why_now": "", "objective": "", "key_result": "", "kr_current": 0, "kr_target": 0,
-                "kr_merges_window": 0, "kr_merges_observed": 0, "active_decisions": [],
-                "rejected_paths": [], "hot_files": [], "open_questions": []}
-    decisions = [{"id": f"D-{i + 1}", "text": str(d), "at": ""} for i, d in enumerate(getattr(cur, "active_decisions", ()))]
-    rejected = [{"idea": getattr(r, "idea", str(r)), "reason": getattr(r, "reason", ""),
-                 "revisit_if": getattr(r, "revisit_if", "")} for r in getattr(cur, "rejected_paths", ())]
-    hot = [{"ref": getattr(h, "ref", getattr(h, "path", str(h))), "why_hot": getattr(h, "why_hot", getattr(h, "reason", ""))}
-           for h in getattr(cur, "hot_files", ())]
+    """Frontier cursor → console Frontier, read straight from frontier.yaml so the
+    objective/key_result fields surface (the FrontierCursor loader ignores them).
+    Numeric KR (kr_current/target) is absent until the scorecard projection lands → 0."""
+    import yaml
+
+    empty = {"version": 0, "product_goal": "", "current_problem": "", "next_expansion": "",
+             "why_now": "", "objective": "", "key_result": "", "kr_current": 0, "kr_target": 0,
+             "kr_merges_window": 0, "kr_merges_observed": 0, "active_decisions": [],
+             "rejected_paths": [], "hot_files": [], "open_questions": []}
+    path = repo / ".forge" / "frontier.yaml"
+    if not path.exists():
+        return empty
+    try:
+        raw = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return empty
+    decisions = [
+        d if isinstance(d, dict) else {"id": f"D-{i + 1}", "text": str(d), "at": ""}
+        for i, d in enumerate(raw.get("active_decisions") or [])
+    ]
+    rejected = [
+        {"idea": r.get("idea", ""), "reason": r.get("reason", ""), "revisit_if": r.get("revisit_if", "")}
+        if isinstance(r, dict) else {"idea": str(r), "reason": "", "revisit_if": ""}
+        for r in (raw.get("rejected_paths") or [])
+    ]
+    hot = [
+        {"ref": h.get("ref", ""), "why_hot": h.get("why_hot", "")}
+        if isinstance(h, dict) else {"ref": str(h), "why_hot": ""}
+        for h in (raw.get("hot_files") or [])
+    ]
     return {
-        "version": int(getattr(cur, "version", 0) or 0),
-        "product_goal": getattr(cur, "product_goal", "") or "",
-        "current_problem": getattr(cur, "current_problem", "") or "",
-        "next_expansion": getattr(cur, "next_expansion", "") or "",
-        "why_now": getattr(cur, "why_now", "") or "",
-        "objective": "", "key_result": "",
-        "kr_current": 0, "kr_target": 0, "kr_merges_window": 0, "kr_merges_observed": 0,
+        "version": int(raw.get("version", 0) or 0),
+        "product_goal": raw.get("product_goal", "") or "",
+        "current_problem": raw.get("current_problem", "") or "",
+        "next_expansion": raw.get("next_expansion", "") or "",
+        "why_now": raw.get("why_now", "") or "",
+        "objective": raw.get("objective", "") or "",
+        "key_result": raw.get("key_result", "") or "",
+        "kr_current": float(raw.get("kr_current", 0) or 0),
+        "kr_target": float(raw.get("kr_target", 0) or 0),
+        "kr_merges_window": int(raw.get("kr_merges_window", 0) or 0),
+        "kr_merges_observed": int(raw.get("kr_merges_observed", 0) or 0),
         "active_decisions": decisions,
         "rejected_paths": rejected,
         "hot_files": hot,
-        "open_questions": list(getattr(cur, "open_questions", ()) or []),
+        "open_questions": list(raw.get("open_questions") or []),
     }
+
+
+_KNOWN_PR_LABELS = {"loop:ready", "epic", "critic:blocking", "critic:suspicious", "loop:auto-rescued", "clean"}
+
+
+def _manifestos(repo: Path) -> list[dict[str, Any]]:
+    """Parse the quality + testing manifesto markdown into console ManifestoRule[].
+
+    Each rule is a ``### <ID>. <rule>`` header; the following ``**Rationale:**`` line
+    is the rationale, and a ``#NNN`` in it is the source issue/PR. Severity isn't in
+    the seed format → default sev2 (the console renders it as a badge either way).
+    """
+    import re
+
+    out: list[dict[str, Any]] = []
+    for manifesto, fname in (("quality", "quality-manifesto.md"), ("testing", "testing-manifesto.md")):
+        path = repo / ".forge" / fname
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        for part in re.split(r"\n###\s+", "\n" + text)[1:]:
+            lines = part.splitlines()
+            header = lines[0].strip()
+            m = re.match(r"([A-Za-z]+-?\d+)\.\s*(.+)", header)
+            rid, rule = (m.group(1), m.group(2).strip()) if m else (header.split(".", 1)[0][:8] or "?", header)
+            body = "\n".join(lines[1:])
+            rat_m = re.search(r"\*\*Rationale:\*\*\s*(.+?)(?:\n\n|\Z)", body, re.S)
+            rationale = " ".join(rat_m.group(1).split()) if rat_m else ""
+            src_m = re.search(r"#(\d{2,6})", rationale)
+            out.append({
+                "id": rid,
+                "manifesto": manifesto,
+                "rule": rule,
+                "severity": "sev2",
+                "rationale": rationale,
+                "source_pr": ("#" + src_m.group(1)) if src_m else None,
+            })
+    return out
+
+
+def _backlog(repo: Path) -> list[dict[str, Any]]:
+    """Open GitHub issues → console Issue[]. axis from an ``axis:<name>`` label.
+
+    Best-effort: returns [] without a token / repo / network (the console degrades
+    to an honest-empty Backlog rather than erroring).
+    """
+    repo_slug = os.environ.get("LOOP_GITHUB_REPO") or "hadamrd/forge-loop"
+    if "/" not in repo_slug:
+        return []
+    owner, name = repo_slug.split("/", 1)
+    try:
+        from forge_loop.gh_client import GithubkitClient, list_open_backlog
+
+        backlog = list_open_backlog(GithubkitClient(), owner, name, limit=100)
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for issue in list(backlog.epics) + list(backlog.tickets):
+        if issue.number in seen:
+            continue
+        seen.add(issue.number)
+        labels = list(issue.labels or [])
+        axis = next((label.split(":", 1)[1] for label in labels if label.startswith("axis:")), "")
+        out.append({
+            "number": issue.number,
+            "title": issue.title,
+            "axis": axis,
+            "labels": [label for label in labels if label in _KNOWN_PR_LABELS],
+            "state": "open",
+            "epic": None,  # epic→sub-issue linkage needs the GraphQL sub-issue read; not wired here
+        })
+    return out
 
 
 def _memory(repo: Path) -> list[dict[str, Any]]:
@@ -603,11 +700,11 @@ def build_console_api(*, repo: Path, token: str | None = None, console_dist: Pat
 
     @app.get("/api/backlog")
     def backlog() -> Any:
-        return []  # external (GitHub issues) — not wired yet
+        return _backlog(repo)
 
     @app.get("/api/manifestos")
     def manifestos() -> Any:
-        return []  # external (rule files) — not wired yet
+        return _manifestos(repo)
 
     @app.get("/api/budget")
     def budget() -> Any:
