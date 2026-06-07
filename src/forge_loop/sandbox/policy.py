@@ -44,6 +44,11 @@ class CapabilityPolicy:
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
     mcp: tuple[McpGrant, ...] = ()
     secret_names: tuple[str, ...] = ()
+    # When True, a worker that FAILS keeps its worktree: recovery quarantines
+    # the checkout (renames it to ``.stale-<ts>``) and drives the saga to
+    # QUARANTINED instead of reaping it + running the remove-worktree
+    # compensation, so the crashed evidence survives for the operator (#357).
+    preserve_on_failure: bool = False
 
     def allows_secret(self, name: str) -> bool:
         return name in self.secret_names
@@ -60,6 +65,7 @@ class CapabilityPolicy:
             },
             "mcp": [{"server": grant.server, "tools": list(grant.tools)} for grant in self.mcp],
             "secret_names": list(self.secret_names),
+            "preserve_on_failure": self.preserve_on_failure,
         }
 
     @classmethod
@@ -87,6 +93,7 @@ class CapabilityPolicy:
                 if isinstance(grant, dict) and grant.get("server")
             ),
             secret_names=tuple(value.get("secret_names") or ()),
+            preserve_on_failure=bool(value.get("preserve_on_failure", False)),
         )
 
 

@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from forge_loop.tasks import CompensationKind, TaskSagaStore
+from forge_loop.tasks import CompensationKind, TaskSaga, TaskSagaStore
 
 # Reap a worker's worktree, keyed by issue number (best-effort, idempotent).
 ReapWorktree = Callable[[int], None]
@@ -64,6 +64,24 @@ class RecoveryReport:
         return "\n".join(lines)
 
 
+def _quarantine_saga_worktree(saga: TaskSaga) -> str | None:
+    """Rename a preserve-on-failure saga's worktree out of the way (#357).
+
+    Reuses the existing :func:`quarantine_if_blocking` helper so recovery and
+    ``prep_worktree`` share one quarantine mechanism. Best-effort: a saga with
+    no worktree, or one whose directory is already gone, yields ``None`` and
+    the saga is still driven QUARANTINED.
+    """
+    from pathlib import Path
+
+    from forge_loop.worker_worktree import quarantine_if_blocking
+
+    if not saga.worktree:
+        return None
+    moved = quarantine_if_blocking(Path(saga.worktree))
+    return str(moved) if moved is not None else None
+
+
 def reconcile_stale_sagas(
     saga_store: TaskSagaStore,
     *,
@@ -91,6 +109,25 @@ def reconcile_stale_sagas(
 
     for saga in saga_store.list_stale(now=moment):
         try:
+            if saga.capability_policy.preserve_on_failure:
+                # #357: a preserve-on-failure saga is NOT reaped. Quarantine its
+                # worktree (rename to ``.stale-<ts>``) and drive it QUARANTINED so
+                # the remove-worktree compensation never runs and the crashed
+                # checkout survives on disk for the operator to inspect.
+                _quarantine_saga_worktree(saga)
+                saga_store.mark_quarantined(
+                    saga.task_id,
+                    reason="recovered: preserve-on-failure dead-worker lease expired at boot",
+                )
+                recovered.append(
+                    RecoveredSaga(
+                        task_id=saga.task_id,
+                        saga_id=saga.saga_id,
+                        issue=saga.issue,
+                        worktrees_reaped=(),
+                    )
+                )
+                continue
             unhandled = sorted(
                 {c.kind for c in saga.compensations if c.kind not in _HANDLED_COMPENSATION_KINDS}
             )

@@ -421,6 +421,30 @@ def _stop_worker_heartbeat(handle: tuple[threading.Event, threading.Thread] | No
     thread.join(timeout=2.0)
 
 
+def _quarantine_failed_saga(
+    task_store: TaskSagaStore,
+    saga: TaskSaga,
+    *,
+    status: str,
+) -> None:
+    """Preserve a failed worker's worktree instead of reaping it (#357).
+
+    When the saga's policy sets ``preserve_on_failure`` the FAILED path must
+    NOT hand the worktree to the remove-worktree compensation: rename the
+    checkout out of the way via :func:`quarantine_if_blocking` (the same helper
+    ``prep_worktree`` uses) and drive the saga to QUARANTINED. The renamed
+    ``.stale-<ts>`` directory survives on disk so the operator can inspect the
+    crash instead of trusting a deleted checkout.
+    """
+    from forge_loop.worker_worktree import quarantine_if_blocking
+
+    if saga.worktree:
+        quarantine_if_blocking(Path(saga.worktree))
+    task_store.mark_quarantined(
+        saga.task_id, reason=f"preserve-on-failure: worker outcome: {status}"
+    )
+
+
 def _finalize_worker_saga(
     task_store: TaskSagaStore | None,
     *,
@@ -429,15 +453,22 @@ def _finalize_worker_saga(
 ) -> None:
     """Drive the saga to a terminal state from the worker outcome.
 
-    ``merged``/``open`` complete the saga; everything else fails it (the
-    remove-worktree compensation rides along from seeding). Best-effort so a
-    saga-store hiccup never masks the real worker outcome.
+    ``merged``/``open`` complete the saga. A failure normally fails the saga
+    (the remove-worktree compensation rides along from seeding) — but when the
+    leased policy sets ``preserve_on_failure`` the worktree is quarantined and
+    the saga goes QUARANTINED instead, so the crashed checkout survives for
+    inspection (#357). Best-effort so a saga-store hiccup never masks the real
+    worker outcome.
     """
     if task_store is None:
         return
     with contextlib.suppress(Exception):
         if status in ("merged", "open"):
             task_store.mark_completed(task_id, reason=f"worker outcome: {status}")
+            return
+        saga = task_store.get(task_id)
+        if saga is not None and saga.capability_policy.preserve_on_failure:
+            _quarantine_failed_saga(task_store, saga, status=status)
         else:
             task_store.mark_failed(task_id, reason=f"worker outcome: {status}")
 
