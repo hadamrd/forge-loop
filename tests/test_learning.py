@@ -9,6 +9,7 @@ from pathlib import Path
 from forge_loop.memory.models import MemoryKind
 from forge_loop.memory.store import SqliteMemoryStore
 from forge_loop.runner.learning import (
+    _MAX_REASON_LEN,
     record_failed_outcomes,
     record_merged_outcomes,
 )
@@ -197,8 +198,11 @@ def test_record_failed_truncates_long_reason(tmp_path: Path) -> None:
 
     item = store.get("episodic-failed-3")
     assert item is not None
-    # The reason is truncated, so the full 5000-char blob never lands.
-    assert len(item.body) < 5000
+    # The reason is truncated to exactly _MAX_REASON_LEN chars: the lesson line
+    # carries that many 'x' and no more, pinning the cap rather than the body.
+    assert item.body.count("x") == _MAX_REASON_LEN
+    assert f"lesson: {'x' * _MAX_REASON_LEN}" in item.body
+    assert "x" * (_MAX_REASON_LEN + 1) not in item.body
 
 
 def test_record_failed_skips_records_without_issue_number(tmp_path: Path) -> None:
