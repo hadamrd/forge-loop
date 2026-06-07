@@ -7,7 +7,69 @@ import inspect
 from pathlib import Path
 from typing import Any
 
+from forge_loop.log import get_logger
+from forge_loop.memory.models import MemoryKind
+from forge_loop.memory.store import MemoryStore
 from forge_loop.sandbox import CapabilityPolicy, render_capability_policy
+
+_log = get_logger("forge_loop.worker_brief")
+
+#: Max episodes injected into a repair brief's PRIOR ATTEMPTS section so the
+#: brief cannot grow unbounded from accumulated episodic memory (failed first,
+#: then shipped).
+_PRIOR_EPISODE_CAP = 2
+#: Per-episode body truncation cap (chars): a single large episode body cannot
+#: blow up the brief.
+_PRIOR_EPISODE_BODY_CAP = 600
+#: Marker appended to a truncated episode body.
+_PRIOR_EPISODE_TRUNCATION_MARKER = "…[truncated]"
+
+
+def _render_prior_episodes(memory_store: MemoryStore | None, n: int) -> str:
+    """Render the bounded ``PRIOR ATTEMPTS / LESSONS`` section for issue ``#n``.
+
+    Loads the *active* episodic memory items for the source issue by their
+    deterministic ids (``episodic-failed-{n}`` first, then
+    ``episodic-shipped-{n}``) and renders each episode's title + body, with the
+    body truncated to :data:`_PRIOR_EPISODE_BODY_CAP` chars and the whole
+    section capped at :data:`_PRIOR_EPISODE_CAP` episodes.
+
+    Returns ``""`` when no store is wired, when the store has no active episodes
+    for the issue, or when the store raises — so the brief is byte-identical to
+    the historical output in every empty case. The degrade-gracefully shape
+    mirrors :meth:`brainstormer.Brainstormer._load_rejected_paths`. Superseded
+    rows never appear because lookup goes through the active-only
+    :meth:`MemoryStore.list_active` query path, not a raw ``get()``.
+    """
+    if memory_store is None:
+        return ""
+    try:
+        active = {
+            item.memory_id: item
+            for item in memory_store.list_active(kind=MemoryKind.EPISODIC)
+        }
+    except Exception:  # noqa: BLE001 — boundary; degrade gracefully
+        _log.warning("repair_brief_prior_episodes_unavailable")
+        return ""
+
+    ordered_ids = (f"episodic-failed-{n}", f"episodic-shipped-{n}")
+    episodes = [active[mid] for mid in ordered_ids if mid in active][:_PRIOR_EPISODE_CAP]
+    if not episodes:
+        return ""
+
+    blocks: list[str] = []
+    for item in episodes:
+        body = item.body.strip()
+        if len(body) > _PRIOR_EPISODE_BODY_CAP:
+            body = body[:_PRIOR_EPISODE_BODY_CAP] + _PRIOR_EPISODE_TRUNCATION_MARKER
+        blocks.append(f"- {item.title}\n{body}")
+    rendered = "\n\n".join(blocks)
+    return (
+        "\nPRIOR ATTEMPTS / LESSONS (from durable episodic memory):\n"
+        "These are real outcomes from earlier attempts on this exact ticket. "
+        "Do not repeat the dead-ends they describe.\n"
+        f"{rendered}\n"
+    )
 
 
 def _render_verify_section(verify_commands: tuple[str, ...]) -> str:
@@ -188,10 +250,12 @@ def make_repair_brief(
     coauthor: str = "",
     verify_commands: tuple[str, ...] = (),
     scope_soft_loc_cap: int = 150,
+    memory_store: MemoryStore | None = None,
 ) -> str:
     """Render a worker brief for repairing an existing blocked PR."""
     body = (issue.get("body") or "")[:6000]
     n = issue["number"]
+    prior_episodes_section = _render_prior_episodes(memory_store, n)
     pr_url = pr.get("url") or f"https://github.com/pull/{pr.get('number', '')}"
     pr_number = pr.get("number", "")
     head = pr.get("headRefName") or ""
@@ -217,7 +281,7 @@ REVIEW / CRITIC CONTEXT TO ADDRESS:
 ---
 {review_context[:12000]}
 ---
-{scope_discipline_section}
+{prior_episodes_section}{scope_discipline_section}
 CONTRACT:
 1. Repair the EXISTING PR branch. Do not create a new branch and do not open a new PR.
 2. Address every unresolved review thread and every sev1/blocking review point with production behavior and tests.
