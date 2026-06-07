@@ -6,6 +6,7 @@ from forge_loop.sandbox.policy import (
     McpGrant,
     NetworkPolicy,
     canonical_policy_json,
+    mcp_allow_patterns,
     policy_hash,
     render_capability_policy,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "McpGrant",
     "NetworkPolicy",
     "canonical_policy_json",
+    "mcp_allow_patterns",
     "policy_hash",
     "render_capability_policy",
 ]
