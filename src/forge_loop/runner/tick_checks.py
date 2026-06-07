@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import subprocess
+from collections.abc import Callable
+from pathlib import Path
 
+from forge_loop.branch_sweep import BranchSweepReport
+from forge_loop.branch_sweep import sweep as _branch_sweep
 from forge_loop.config import Config
 from forge_loop.epic_sweep import EpicSweepReport, GhClientLike
 from forge_loop.epic_sweep import sweep as _epic_sweep
@@ -101,6 +106,77 @@ def run_epic_sweep(
             skipped_no_subs=report.skipped_no_subs,
             errors=list(report.errors),
         ),
+    )
+    return report
+
+
+def _list_remote_branches(repo: Path) -> list[str]:
+    """Remote branch short-names via ``git ls-remote --heads origin`` — repo ops, not
+    business GitHub logic. Returns [] on any failure (the sweep then no-ops)."""
+    try:
+        out = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return []
+    names: list[str] = []
+    for line in out.splitlines():
+        parts = line.split("\trefs/heads/", 1)
+        if len(parts) == 2:
+            names.append(parts[1].strip())
+    return names
+
+
+def run_branch_sweep(
+    cfg: Config,
+    tick: int,
+    *,
+    client: GhClientLike | None = None,
+    branch_lister: Callable[[], list[str]] | None = None,
+) -> BranchSweepReport | None:
+    """Delete ``loop/<n>`` branches whose issue is closed (operational-convergence axis).
+
+    Maintenance-cadence only; deterministic Python, no LLM. Squash-merge severs git's
+    own merged-signal, so issue-closed is the landed-signal. Conservative: only loop/<n>
+    branches, never the base branch. ``client`` + ``branch_lister`` injectable for tests.
+    """
+    if cfg.maintenance_every_n_ticks <= 0 or tick % cfg.maintenance_every_n_ticks != 0:
+        return None
+    if cfg.github_repo is None or "/" not in cfg.github_repo:
+        return None
+    owner, repo = cfg.github_repo.split("/", 1)
+    if client is None:
+        try:
+            from forge_loop.gh_client import GithubkitClient
+
+            client = GithubkitClient()
+        except Exception as ex:  # noqa: BLE001
+            append_event(
+                cfg.events_file, "branch_sweep_skipped", tick=tick, reason=f"gh_client_init: {ex}"[:200]
+            )
+            return None
+    branches = branch_lister() if branch_lister is not None else _list_remote_branches(cfg.repo)
+    protected = frozenset({cfg.base_branch, "trunk", "main", "master", "HEAD"})
+    try:
+        report = _branch_sweep(
+            client, owner=owner, repo=repo, branch_names=branches, protected=protected
+        )
+    except Exception as ex:  # noqa: BLE001 — the sweep never raises; belt-and-braces
+        append_event(cfg.events_file, "branch_sweep_crashed", tick=tick, err=str(ex)[:200])
+        return None
+    append_event(
+        cfg.events_file,
+        "branch_sweep_done",
+        tick=tick,
+        deleted=report.deleted,
+        skipped_open=len(report.skipped_open),
+        skipped_unknown=len(report.skipped_unknown),
+        errors=list(report.errors),
     )
     return report
 
