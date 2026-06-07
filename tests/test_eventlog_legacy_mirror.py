@@ -628,3 +628,76 @@ def test_unmapped_status_falls_through_to_observation(tmp_path: Path) -> None:
     events = list(log.since(0))
     assert [event.kind for event in events] == [EventKind.WORKER_OBSERVATION]
     assert replay_task_timeline(log.since(0))["issue:167"]["terminal"] is None
+
+
+# --- #403: per-task cost_usd / tokens land on the pr.merged payload -----------
+# WHY: console_api._budget derives real $/merged-PR from cost_usd on pr.merged
+# events. The explicit PR_MERGED payload in _tick_done_specs used to DROP the
+# worker's cost, so production spend rendered as $0 even though every
+# WorkerOutcome carries a real cost_usd. These tests pin the lift so the cost
+# signal cannot silently regress to the consumer (manifesto Q10: load-bearing
+# data must not be dropped on a cross-component seam).
+
+
+def _pr_merged_payload(log: SqliteEventLog) -> dict:
+    merged = [e for e in log.since(0) if e.kind is EventKind.PR_MERGED]
+    assert len(merged) == 1, f"expected exactly one PR_MERGED, got {[e.kind for e in log.since(0)]}"
+    return dict(merged[0].payload)
+
+
+def test_tick_done_merged_outcome_carries_cost_and_tokens(tmp_path: Path) -> None:
+    """Happy path: a merged outcome's cost_usd + token usage land on pr.merged."""
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+    mirror.mirror_record(
+        {
+            "kind": "tick_done",
+            "tick": 3,
+            "merged": [167],
+            "outcomes": [
+                {
+                    "issue": 167,
+                    "title": "real cost",
+                    "status": "merged",
+                    "pr_url": "https://github.com/acme/forge-loop/pull/167",
+                    "duration_s": 12.0,
+                    "cost_usd": 2.75,
+                    "usage": {"input_tokens": 1200, "output_tokens": 340},
+                }
+            ],
+        }
+    )
+    payload = _pr_merged_payload(log)
+    assert payload["cost_usd"] == 2.75
+    assert payload["input_tokens"] == 1200
+    assert payload["output_tokens"] == 340
+
+
+def test_tick_done_merged_outcome_without_cost_defaults_to_zero(tmp_path: Path) -> None:
+    """Adversarial: a merged outcome missing cost_usd/usage must not raise.
+
+    A legacy or codex worker may serialize an outcome with no cost telemetry.
+    The lift must default to a real $0.0 / 0 tokens rather than KeyError-ing or
+    omitting the field — the consumer reads cost_usd unconditionally.
+    """
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+    mirror.mirror_record(
+        {
+            "kind": "tick_done",
+            "tick": 4,
+            "merged": [42],
+            "outcomes": [
+                {
+                    "issue": 42,
+                    "title": "no telemetry",
+                    "status": "merged",
+                    "pr_url": "https://github.com/acme/forge-loop/pull/42",
+                }
+            ],
+        }
+    )
+    payload = _pr_merged_payload(log)
+    assert payload["cost_usd"] == 0.0
+    assert payload["input_tokens"] == 0
+    assert payload["output_tokens"] == 0
