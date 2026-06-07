@@ -116,7 +116,12 @@ def test_reconcile_continues_past_a_failing_saga(tmp_path: Path) -> None:
     assert store.get("task-1-worker").state == TaskState.RUNNING  # untouched, still stale
 
 
-def test_reconcile_leaves_saga_with_unhandled_compensation_nonterminal(tmp_path: Path) -> None:
+def test_reconcile_quarantines_saga_with_unhandled_compensation(tmp_path: Path) -> None:
+    """#360: an unhandled kind drives the saga TERMINAL (QUARANTINED), not COMPENSATED.
+
+    Liveness: the saga must stop being immortal. Integrity: it must not claim
+    the side effect was undone. QUARANTINED satisfies both.
+    """
     store = _store(tmp_path)
     _stale_with_compensations(
         store,
@@ -133,20 +138,27 @@ def test_reconcile_leaves_saga_with_unhandled_compensation_nonterminal(tmp_path:
 
     report = reconcile_stale_sagas(store, reap_worktree=reaped.append)
 
-    # Not recovered, not driven terminal — the side effect never ran.
+    # Driven terminal (QUARANTINED), NOT COMPENSATED, NOT left RUNNING.
     assert report.recovered == ()
-    assert store.get("task-42-worker").state == TaskState.RUNNING
+    saga = store.get("task-42-worker")
+    assert saga.state == TaskState.QUARANTINED
+    assert saga.is_terminal is True
+    # The terminal reason names the unhandled kind so an operator knows why.
+    assert "close-pr" in (saga.terminal_reason or "")
     # The integrity hole is surfaced: the saga id + the unhandled kind are named.
     assert len(report.errors) == 1
     assert "saga-42-worker" in report.errors[0]
     assert "close-pr" in report.errors[0]
     # No handled compensation was run for a saga we refuse to compensate.
     assert reaped == []
+    # Liveness: it has drained from the in-flight view.
+    assert store.list_in_flight() == ()
 
 
-def test_reconcile_with_mixed_handled_and_unhandled_kinds_stays_nonterminal(
+def test_reconcile_quarantines_saga_with_mixed_handled_and_unhandled_kinds(
     tmp_path: Path,
 ) -> None:
+    """#360: any unhandled kind taints the saga → QUARANTINED, no reap claimed."""
     store = _store(tmp_path)
     _stale_with_compensations(
         store,
@@ -169,11 +181,128 @@ def test_reconcile_with_mixed_handled_and_unhandled_kinds_stays_nonterminal(
     report = reconcile_stale_sagas(store, reap_worktree=reaped.append)
 
     assert report.recovered == ()
-    assert store.get("task-43-worker").state == TaskState.RUNNING
+    saga = store.get("task-43-worker")
+    assert saga.state == TaskState.QUARANTINED
+    assert saga.is_terminal is True
     assert any("delete-branch" in e for e in report.errors)
     # We do not run the handled remove-worktree when another kind is unhandled:
-    # the saga is left wholly untouched for the next sweep.
+    # the saga is quarantined whole, no side effect claimed.
     assert reaped == []
+
+
+def test_reconcile_quarantine_reason_lists_every_unhandled_kind(tmp_path: Path) -> None:
+    """#360: multiple unhandled kinds → the terminal reason names them all."""
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=44,
+        compensations=(
+            Compensation(kind="close-pr", target="pr/44", reason="close pr"),
+            Compensation(kind="delete-branch", target="loop/44", reason="del branch"),
+        ),
+    )
+    reaped: list[int] = []
+
+    report = reconcile_stale_sagas(store, reap_worktree=reaped.append)
+
+    saga = store.get("task-44-worker")
+    assert saga.state == TaskState.QUARANTINED
+    reason = saga.terminal_reason or ""
+    assert "close-pr" in reason
+    assert "delete-branch" in reason
+    assert reaped == []  # no reap_worktree side effect claimed
+    assert len(report.errors) == 1
+
+
+def test_reconcile_mixed_sweep_one_compensated_one_quarantined(tmp_path: Path) -> None:
+    """#360: a handled saga and an unhandled saga in one sweep both reach terminal.
+
+    One bad saga must not abort the sweep.
+    """
+    store = _store(tmp_path)
+    _stale_running(store, issue=7)  # handled REMOVE_WORKTREE → COMPENSATED
+    _stale_with_compensations(
+        store,
+        issue=8,
+        compensations=(
+            Compensation(kind="close-pr", target="pr/8", reason="close pr"),
+        ),
+    )
+    reaped: list[int] = []
+
+    report = reconcile_stale_sagas(store, reap_worktree=reaped.append)
+
+    assert [r.issue for r in report.recovered] == [7]
+    assert reaped == [7]  # only the handled saga reaped
+    assert store.get("task-7-worker").state == TaskState.COMPENSATED
+    assert store.get("task-8-worker").state == TaskState.QUARANTINED
+    # Both terminal: nothing left in flight.
+    assert store.list_in_flight() == ()
+    assert any("close-pr" in e for e in report.errors)
+
+
+def test_reconcile_quarantined_saga_not_reprocessed_on_resweep(tmp_path: Path) -> None:
+    """#360: proves the immortal-saga bug is fixed — a re-sweep is a no-op.
+
+    Once quarantined the saga is terminal, so ``list_stale`` excludes it and a
+    second ``reconcile_stale_sagas`` neither re-reports nor re-mutates it.
+    """
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=45,
+        compensations=(Compensation(kind="close-pr", target="pr/45", reason="x"),),
+    )
+
+    first = reconcile_stale_sagas(store, reap_worktree=lambda _: None)
+    assert store.get("task-45-worker").state == TaskState.QUARANTINED
+    assert len(first.errors) == 1
+
+    second = reconcile_stale_sagas(store, reap_worktree=lambda _: None)
+    # No longer stale (terminal) ⇒ not re-processed, not re-reported.
+    assert second.errors == ()
+    assert second.recovered == ()
+
+
+def test_reconcile_quarantines_raw_string_kind_not_in_enum(tmp_path: Path) -> None:
+    """#360 (adversarial): a kind written by a newer loop version (not in the enum).
+
+    ``Compensation.kind`` is a plain str, so a saga can carry a kind this
+    version has never seen. It must still be driven terminal, never crash, never
+    stranded.
+    """
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=46,
+        compensations=(
+            Compensation(
+                kind="some-future-kind-2027",  # not a CompensationKind member at all
+                target="whatever",
+                reason="written by a newer loop",
+            ),
+        ),
+    )
+
+    report = reconcile_stale_sagas(store, reap_worktree=lambda _: None)
+
+    saga = store.get("task-46-worker")
+    assert saga.state == TaskState.QUARANTINED
+    assert saga.is_terminal is True
+    assert "some-future-kind-2027" in (saga.terminal_reason or "")
+    assert any("some-future-kind-2027" in e for e in report.errors)
+
+
+def test_recovery_handler_keyset_is_exhaustive_over_compensation_kinds() -> None:
+    """#360 exhaustiveness contract: every CompensationKind has a recovery entry.
+
+    Goes RED the moment a member is added to ``CompensationKind`` without
+    registering it in ``_HANDLED_COMPENSATION_KINDS`` — the gap is then caught
+    at test time, not in production recovery.
+    """
+    from forge_loop.control.recovery import _HANDLED_COMPENSATION_KINDS
+
+    assert set(CompensationKind) == _HANDLED_COMPENSATION_KINDS
 
 
 def test_runner_boot_recovery_reconciles_and_emits_event(tmp_path: Path) -> None:
