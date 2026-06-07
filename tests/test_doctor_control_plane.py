@@ -38,8 +38,7 @@ from forge_loop.memory import (
     MemoryProvenance,
     SqliteMemoryStore,
 )
-from forge_loop.worker_sessions import WorkerSessionStore
-from forge_loop.worker_state import WorkerState
+from forge_loop.tasks import SqliteTaskSagaStore, TaskSaga, TaskState
 
 _FIXED_NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
 
@@ -140,11 +139,33 @@ def _seed_sessions(
     *,
     lease_expires_at: datetime,
 ) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    store = WorkerSessionStore(state_dir / "worker-sessions.db")
-    running = store.create(issue=1, branch="loop/1")
-    store.transition_to(running.session_id, WorkerState.RUNNING)
-    store.set_lease_expires_at(running.session_id, lease_expires_at.isoformat())
+    """Seed one RUNNING saga with the given lease in the canonical store.
+
+    Issue #373: doctor/status read task health from ``.forge/tasks.db`` (the
+    canonical ``SqliteTaskSagaStore``), not the legacy ``worker-sessions.db``.
+    ``state_dir`` is ``<repo>/docs/ops`` in every caller, so the repo root —
+    and thus the canonical saga path — is ``state_dir.parent.parent``.
+    """
+    repo = state_dir.parent.parent
+    store = SqliteTaskSagaStore(repo / ".forge" / "tasks.db")
+    store.put(
+        TaskSaga(
+            task_id="task-1",
+            saga_id="saga-task-1",
+            state=TaskState.DISPATCHED,
+            issue=1,
+            branch="loop/1",
+            worktree="/tmp/task-1",
+        )
+    )
+    # ``acquire_lease`` requires the expiry to be strictly after acquisition, so
+    # anchor acquisition just before the lease instant (works for past leases).
+    store.acquire_lease(
+        "task-1",
+        owner_id="worker-task-1",
+        acquired_at=lease_expires_at - timedelta(minutes=1),
+        expires_at=lease_expires_at,
+    )
     store.close()
 
 

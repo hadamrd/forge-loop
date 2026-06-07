@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from forge_loop import cli
+from forge_loop.control.status import collect_control_plane_status
 from forge_loop.eventlog import EventKind, ProjectionCursor, SqliteEventLog
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import (
@@ -16,8 +17,61 @@ from forge_loop.memory import (
     MemoryProvenance,
     SqliteMemoryStore,
 )
+from forge_loop.tasks import SqliteTaskSagaStore, TaskSaga, TaskState
 from forge_loop.worker_sessions import WorkerSessionStore
 from forge_loop.worker_state import WorkerState
+
+
+def _seed_running_saga(
+    store: SqliteTaskSagaStore,
+    task_id: str,
+    *,
+    issue: int,
+    acquired_at: datetime,
+    expires_at: datetime,
+) -> None:
+    """Put a DISPATCHED saga then drive it RUNNING via ``acquire_lease``.
+
+    Mirrors the real dispatch path (``put`` then ``acquire_lease``), so the
+    lease-expiry semantics under test are the production ones, not a hand-rolled
+    RUNNING row.
+    """
+
+    store.put(
+        TaskSaga(
+            task_id=task_id,
+            saga_id=f"saga-{task_id}",
+            state=TaskState.DISPATCHED,
+            issue=issue,
+            branch=f"loop/{issue}",
+            worktree=f"/tmp/{task_id}",
+        )
+    )
+    store.acquire_lease(
+        task_id,
+        owner_id=f"worker-{task_id}",
+        acquired_at=acquired_at,
+        expires_at=expires_at,
+    )
+
+
+def _seed_legacy_worker_sessions(ops_dir: Path, now: datetime) -> None:
+    """Seed the legacy ``worker-sessions.db`` (the store #373 stops reading)."""
+
+    ops_dir.mkdir(parents=True, exist_ok=True)
+    session_store = WorkerSessionStore(ops_dir / "worker-sessions.db")
+    running = session_store.create(issue=1, branch="loop/1")
+    session_store.transition_to(running.session_id, WorkerState.RUNNING)
+    session_store.set_lease_expires_at(running.session_id, (now - timedelta(minutes=5)).isoformat())
+    awaiting = session_store.create(issue=2, branch="loop/2")
+    session_store.transition_to(awaiting.session_id, WorkerState.RUNNING)
+    session_store.set_lease_expires_at(
+        awaiting.session_id, (now + timedelta(minutes=5)).isoformat()
+    )
+    session_store.transition_to(awaiting.session_id, WorkerState.AWAITING_CRITIC)
+    abandoned = session_store.create(issue=3, branch="loop/3")
+    session_store.transition_to(abandoned.session_id, WorkerState.ABANDONED)
+    session_store.close()
 
 
 def _cfg(tmp_path: Path) -> SimpleNamespace:
@@ -98,24 +152,35 @@ class TestStatusControlPlane:
                 ),
             )
         )
-        ops_dir = tmp_path / "docs" / "ops"
-        ops_dir.mkdir(parents=True)
-        session_store = WorkerSessionStore(ops_dir / "worker-sessions.db")
         now = datetime.now(UTC)
-        running = session_store.create(issue=1, branch="loop/1")
-        session_store.transition_to(running.session_id, WorkerState.RUNNING)
-        session_store.set_lease_expires_at(
-            running.session_id, (now - timedelta(minutes=5)).isoformat()
+        # Seed BOTH stores: the legacy worker-sessions.db (which #373 makes the
+        # status path ignore) AND the canonical .forge/tasks.db. The tasks block
+        # must reflect ONLY the canonical store.
+        _seed_legacy_worker_sessions(tmp_path / "docs" / "ops", now)
+        saga_store = SqliteTaskSagaStore(forge_dir / "tasks.db")
+        _seed_running_saga(
+            saga_store,
+            "task-expired",
+            issue=10,
+            acquired_at=now - timedelta(minutes=10),
+            expires_at=now - timedelta(seconds=1),
         )
-        awaiting = session_store.create(issue=2, branch="loop/2")
-        session_store.transition_to(awaiting.session_id, WorkerState.RUNNING)
-        session_store.set_lease_expires_at(
-            awaiting.session_id, (now + timedelta(minutes=5)).isoformat()
+        _seed_running_saga(
+            saga_store,
+            "task-fresh",
+            issue=11,
+            acquired_at=now,
+            expires_at=now + timedelta(minutes=5),
         )
-        session_store.transition_to(awaiting.session_id, WorkerState.AWAITING_CRITIC)
-        abandoned = session_store.create(issue=3, branch="loop/3")
-        session_store.transition_to(abandoned.session_id, WorkerState.ABANDONED)
-        session_store.close()
+        _seed_running_saga(
+            saga_store,
+            "task-done",
+            issue=12,
+            acquired_at=now - timedelta(minutes=3),
+            expires_at=now + timedelta(minutes=5),
+        )
+        saga_store.mark_completed("task-done")
+        saga_store.close()
 
         blob = _status_json(monkeypatch, tmp_path, capsys)
 
@@ -140,13 +205,16 @@ class TestStatusControlPlane:
         }
         assert control["tasks"] == {
             "available": True,
-            "path": str(tmp_path / "docs" / "ops" / "worker-sessions.db"),
+            "path": str(forge_dir / "tasks.db"),
             "in_flight_count": 2,
             "stale_lease_count": 1,
         }
         assert control["boot"]["available"] is True
         assert "memory: m1, m2" in control["boot"]["summary"]
         assert "in_flight:" in control["boot"]["summary"]
+        # Boot summary names the canonical saga task ids, not legacy session ids.
+        assert "task-expired" in control["boot"]["summary"]
+        assert "task-fresh" in control["boot"]["summary"]
 
     def test_status_json_reports_missing_control_plane_stores_as_unavailable(
         self,
@@ -177,8 +245,124 @@ class TestStatusControlPlane:
         }
         assert control["tasks"] == {
             "available": False,
-            "path": str(tmp_path / "docs" / "ops" / "worker-sessions.db"),
+            "path": str(tmp_path / ".forge" / "tasks.db"),
             "in_flight_count": None,
             "stale_lease_count": None,
         }
         assert control["boot"] == {"available": False, "summary": None}
+
+
+class TestTasksStatusReadsCanonicalSagaStore:
+    """Focused coverage of the ``['tasks']`` block per issue #373.
+
+    Each test asserts the task block resolves from ``.forge/tasks.db`` via the
+    canonical ``SqliteTaskSagaStore`` APIs (``list_in_flight`` / ``list_stale``),
+    never the legacy ``docs/ops/worker-sessions.db``.
+    """
+
+    def test_happy_path_running_with_expired_lease_is_in_flight_and_stale(
+        self, tmp_path: Path
+    ) -> None:
+        now = datetime.now(UTC)
+        store = SqliteTaskSagaStore(tmp_path / ".forge" / "tasks.db")
+        _seed_running_saga(
+            store,
+            "task-1",
+            issue=1,
+            acquired_at=now - timedelta(minutes=10),
+            expires_at=now - timedelta(seconds=1),
+        )
+        store.close()
+
+        tasks = collect_control_plane_status(tmp_path, now)["tasks"]
+
+        assert tasks == {
+            "available": True,
+            "path": str(tmp_path / ".forge" / "tasks.db"),
+            "in_flight_count": 1,
+            "stale_lease_count": 1,
+        }
+
+    def test_mixed_excludes_terminal_and_counts_only_expired_as_stale(self, tmp_path: Path) -> None:
+        now = datetime.now(UTC)
+        store = SqliteTaskSagaStore(tmp_path / ".forge" / "tasks.db")
+        _seed_running_saga(
+            store,
+            "task-expired",
+            issue=1,
+            acquired_at=now - timedelta(minutes=10),
+            expires_at=now - timedelta(seconds=1),
+        )
+        _seed_running_saga(
+            store,
+            "task-fresh",
+            issue=2,
+            acquired_at=now,
+            expires_at=now + timedelta(minutes=5),
+        )
+        _seed_running_saga(
+            store,
+            "task-done",
+            issue=3,
+            acquired_at=now - timedelta(minutes=3),
+            expires_at=now + timedelta(minutes=5),
+        )
+        store.mark_completed("task-done")
+        store.close()
+
+        tasks = collect_control_plane_status(tmp_path, now)["tasks"]
+
+        assert tasks["available"] is True
+        assert tasks["in_flight_count"] == 2  # terminal excluded
+        assert tasks["stale_lease_count"] == 1  # only the expired lease
+
+    def test_legacy_worker_sessions_db_does_not_change_tasks_block(self, tmp_path: Path) -> None:
+        now = datetime.now(UTC)
+        store = SqliteTaskSagaStore(tmp_path / ".forge" / "tasks.db")
+        _seed_running_saga(
+            store,
+            "task-1",
+            issue=1,
+            acquired_at=now - timedelta(minutes=10),
+            expires_at=now - timedelta(seconds=1),
+        )
+        store.close()
+
+        without_legacy = collect_control_plane_status(tmp_path, now)["tasks"]
+
+        # Now seed a populated legacy store; the tasks block must be byte-for-byte
+        # identical — the legacy store is fully ignored.
+        _seed_legacy_worker_sessions(tmp_path / "docs" / "ops", now)
+        with_legacy = collect_control_plane_status(tmp_path, now)["tasks"]
+
+        assert with_legacy == without_legacy
+        assert with_legacy["path"] == str(tmp_path / ".forge" / "tasks.db")
+
+    def test_absent_canonical_store_degrades_to_unavailable(self, tmp_path: Path) -> None:
+        # Even a populated legacy store must not make tasks "available".
+        now = datetime.now(UTC)
+        _seed_legacy_worker_sessions(tmp_path / "docs" / "ops", now)
+
+        tasks = collect_control_plane_status(tmp_path, now)["tasks"]
+
+        assert tasks == {
+            "available": False,
+            "path": str(tmp_path / ".forge" / "tasks.db"),
+            "in_flight_count": None,
+            "stale_lease_count": None,
+        }
+
+    def test_corrupt_canonical_store_degrades_with_error_no_raise(self, tmp_path: Path) -> None:
+        now = datetime.now(UTC)
+        forge_dir = tmp_path / ".forge"
+        forge_dir.mkdir()
+        # Non-sqlite bytes at the canonical path: opening must degrade, not crash.
+        (forge_dir / "tasks.db").write_bytes(b"this is not a sqlite database")
+
+        tasks = collect_control_plane_status(tmp_path, now)["tasks"]
+
+        assert tasks["available"] is False
+        assert tasks["in_flight_count"] is None
+        assert tasks["stale_lease_count"] is None
+        assert tasks["error"]
+        assert tasks["path"] == str(forge_dir / "tasks.db")

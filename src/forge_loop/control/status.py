@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from forge_loop.control.boot import BootContext
+from forge_loop.control.boot import BootContext, canonical_task_saga_path
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import SqliteMemoryStore
-from forge_loop.worker_sessions import WorkerSessionStore, recoverable_sessions
+from forge_loop.tasks import SqliteTaskSagaStore
 
 
 def collect_control_plane_status(
@@ -19,14 +19,21 @@ def collect_control_plane_status(
     *,
     state_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Return durable control-plane health for ``forge-loop status --json``."""
+    """Return durable control-plane health for ``forge-loop status --json``.
 
+    ``state_dir`` is accepted for caller compatibility (doctor passes it) but
+    no longer locates task health: task in-flight / stale-lease facts are read
+    from the canonical saga store at ``.forge/tasks.db`` — the same store the
+    runner dispatch path, :func:`assemble_boot_context`, and ``forge-loop
+    recover`` use — never the legacy ``worker-sessions.db`` (issue #373).
+    """
+
+    del state_dir  # legacy worker-sessions.db location is no longer consulted
     forge_dir = repo / ".forge"
-    runner_state_dir = state_dir or repo / "docs" / "ops"
     event_log_path = forge_dir / "events.db"
     frontier_path = forge_dir / "frontier.yaml"
     memory_path = forge_dir / "memory.db"
-    tasks_path = runner_state_dir / "worker-sessions.db"
+    tasks_path = canonical_task_saga_path(repo)
 
     event_log, projections, last_sequence = _event_log_status(event_log_path)
     frontier, frontier_cursor = _frontier_status(frontier_path)
@@ -167,34 +174,40 @@ def _unavailable_memory(path: Path) -> dict[str, Any]:
 
 
 def _tasks_status(path: Path, now: datetime) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Read task health from the canonical saga store at ``.forge/tasks.db``.
+
+    Uses the same APIs dispatch / boot / recover use — ``list_in_flight`` and
+    ``list_stale(now=...)`` — so there is no reimplemented lease-expiry math and
+    the operator's numbers match the store work is actually dispatched to.
+    """
+
     if not path.exists():
         return _unavailable_tasks(path), ()
 
     try:
-        store = WorkerSessionStore(path)
-        sessions = list(recoverable_sessions(store))
-        store.close()
+        store = SqliteTaskSagaStore(path)
+        try:
+            in_flight = store.list_in_flight()
+            stale = store.list_stale(now=now)
+        finally:
+            store.close()
     except (OSError, sqlite3.Error, ValueError) as exc:
         status = _unavailable_tasks(path)
         status["error"] = str(exc)
         return status, ()
 
-    in_flight_ids = tuple(session.session_id for session in sessions)
-    stale_lease_count = sum(
-        1
-        for session in sessions
-        if (lease_expires_at := _parse_datetime(session.lease_expires_at)) is not None
-        and lease_expires_at < now
-    )
+    # Boot summary consistency: the ids fed into ``_boot_status`` are the saga
+    # task ids (``saga.task_id``), matching ``assemble_boot_context``.
+    in_flight_task_ids = tuple(saga.task_id for saga in in_flight)
 
     return (
         {
             "available": True,
             "path": str(path),
-            "in_flight_count": len(sessions),
-            "stale_lease_count": stale_lease_count,
+            "in_flight_count": len(in_flight),
+            "stale_lease_count": len(stale),
         },
-        in_flight_ids,
+        in_flight_task_ids,
     )
 
 
@@ -205,18 +218,6 @@ def _unavailable_tasks(path: Path) -> dict[str, Any]:
         "in_flight_count": None,
         "stale_lease_count": None,
     }
-
-
-def _parse_datetime(raw: object) -> datetime | None:
-    if not isinstance(raw, str) or not raw:
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
 
 
 def _boot_status(

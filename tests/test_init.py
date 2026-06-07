@@ -46,7 +46,7 @@ def test_init_creates_empty_durable_control_plane_stores(tmp_path: Path) -> None
     }
     assert status["tasks"] == {
         "available": True,
-        "path": str(tmp_path / "docs" / "ops" / "worker-sessions.db"),
+        "path": str(tmp_path / ".forge" / "tasks.db"),
         "in_flight_count": 0,
         "stale_lease_count": 0,
     }
