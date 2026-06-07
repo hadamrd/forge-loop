@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
+from forge_loop.memory.models import MemoryItem, MemoryKind, MemoryProvenance
+from forge_loop.memory.store import SqliteMemoryStore
 from forge_loop.sandbox import CapabilityPolicy, FilesystemScope, McpGrant, NetworkPolicy
 from forge_loop.worker import make_brief, make_repair_brief
+
+_EPISODE_NOW = datetime(2026, 6, 3, 12, 0, 0, tzinfo=UTC)
 
 
 def test_make_brief_includes_issue_number_and_body(tmp_path: Path) -> None:
@@ -236,3 +241,188 @@ def test_make_repair_brief_includes_cut_not_grow_directive(tmp_path: Path) -> No
     assert "THIS IS A REPAIR" in brief
     assert "CUT, do not grow" in brief
     assert "never ship a larger diff than you started with" in brief
+
+
+# ---------------------------------------------------------------------------
+# PRIOR ATTEMPTS / LESSONS — inject prior episodic memory into the repair brief
+# (#349). The repair worker re-learning a dead-end from scratch is the failure.
+# ---------------------------------------------------------------------------
+
+
+def _episodic_item(
+    memory_id: str,
+    *,
+    issue: int,
+    title: str,
+    body: str,
+    tag: str,
+) -> MemoryItem:
+    """Build an EPISODIC memory item mirroring runner.learning's write shape."""
+    return MemoryItem(
+        memory_id=memory_id,
+        kind=MemoryKind.EPISODIC,
+        title=title,
+        body=body,
+        provenance=MemoryProvenance(
+            source_event=None,
+            authored_by="maestro",
+            source_task_ref=f"issue:#{issue}",
+            confidence=1.0,
+            created_at=_EPISODE_NOW,
+        ),
+        tags=(tag,),
+    )
+
+
+def test_make_repair_brief_no_store_is_byte_identical(tmp_path: Path) -> None:
+    issue = {"number": 349, "title": "fix", "body": "z"}
+    pr = {"number": 7, "url": "https://x/pull/7", "headRefName": "loop/349-fix"}
+    baseline = make_repair_brief(issue, tmp_path / "wt", pr=pr, review_context="ctx")
+    with_none = make_repair_brief(
+        issue, tmp_path / "wt", pr=pr, review_context="ctx", memory_store=None
+    )
+    # Default (no kwarg) and explicit None must both be byte-identical, and must
+    # not render an empty PRIOR ATTEMPTS header.
+    assert with_none == baseline
+    assert "PRIOR ATTEMPTS" not in baseline
+
+
+def test_make_repair_brief_empty_store_is_byte_identical(tmp_path: Path) -> None:
+    issue = {"number": 349, "title": "fix", "body": "z"}
+    pr = {"number": 7, "url": "https://x/pull/7", "headRefName": "loop/349-fix"}
+    baseline = make_repair_brief(issue, tmp_path / "wt", pr=pr, review_context="ctx")
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    with_empty = make_repair_brief(
+        issue, tmp_path / "wt", pr=pr, review_context="ctx", memory_store=store
+    )
+    assert with_empty == baseline
+
+
+def test_make_repair_brief_injects_active_failed_episode(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    lesson = "repair enlarged the diff instead of cutting it"
+    store.put(
+        _episodic_item(
+            "episodic-failed-261",
+            issue=261,
+            title="failed #261: critic bounced twice",
+            body=lesson,
+            tag="failed",
+        )
+    )
+    issue = {"number": 261, "title": "fix", "body": "z"}
+    pr = {"number": 7, "url": "https://x/pull/7", "headRefName": "loop/261-fix"}
+    brief = make_repair_brief(
+        issue, tmp_path / "wt", pr=pr, review_context="ctx", memory_store=store
+    )
+    assert "PRIOR ATTEMPTS / LESSONS" in brief
+    assert lesson in brief
+    assert "failed #261: critic bounced twice" in brief
+
+
+def test_make_repair_brief_injects_both_failed_and_shipped(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.put(
+        _episodic_item(
+            "episodic-failed-261",
+            issue=261,
+            title="failed #261",
+            body="FAILED-BODY-MARKER",
+            tag="failed",
+        )
+    )
+    store.put(
+        _episodic_item(
+            "episodic-shipped-261",
+            issue=261,
+            title="shipped #261",
+            body="SHIPPED-BODY-MARKER",
+            tag="shipped",
+        )
+    )
+    issue = {"number": 261, "title": "fix", "body": "z"}
+    pr = {"number": 7, "url": "https://x/pull/7", "headRefName": "loop/261-fix"}
+    brief = make_repair_brief(
+        issue, tmp_path / "wt", pr=pr, review_context="ctx", memory_store=store
+    )
+    assert "FAILED-BODY-MARKER" in brief
+    assert "SHIPPED-BODY-MARKER" in brief
+    # Failed must render before shipped.
+    assert brief.index("FAILED-BODY-MARKER") < brief.index("SHIPPED-BODY-MARKER")
+
+
+def test_make_repair_brief_truncates_long_episode_body(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    long_body = "Q" * 5000
+    store.put(
+        _episodic_item(
+            "episodic-failed-261",
+            issue=261,
+            title="failed #261",
+            body=long_body,
+            tag="failed",
+        )
+    )
+    issue = {"number": 261, "title": "fix", "body": "z"}
+    pr = {"number": 7, "url": "https://x/pull/7", "headRefName": "loop/261-fix"}
+    brief = make_repair_brief(
+        issue, tmp_path / "wt", pr=pr, review_context="ctx", memory_store=store
+    )
+    # The truncation marker is present and the full body is absent.
+    assert "…[truncated]" in brief
+    assert long_body not in brief
+    # The rendered run of Q's is bounded by the per-episode body cap.
+    assert brief.count("Q") <= 600
+
+
+def test_make_repair_brief_skips_superseded_failed_episode(tmp_path: Path) -> None:
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.put(
+        _episodic_item(
+            "episodic-failed-261",
+            issue=261,
+            title="failed #261",
+            body="STALE-FAILED-LESSON",
+            tag="failed",
+        )
+    )
+    # Later the ticket merged → the failed episode is superseded by the shipped one.
+    store.put(
+        _episodic_item(
+            "episodic-shipped-261",
+            issue=261,
+            title="shipped #261",
+            body="shipped successfully",
+            tag="shipped",
+        )
+    )
+    store.supersede("episodic-failed-261", by_memory_id="episodic-shipped-261")
+    issue = {"number": 261, "title": "fix", "body": "z"}
+    pr = {"number": 7, "url": "https://x/pull/7", "headRefName": "loop/261-fix"}
+    brief = make_repair_brief(
+        issue, tmp_path / "wt", pr=pr, review_context="ctx", memory_store=store
+    )
+    # The superseded failed episode must NOT appear...
+    assert "STALE-FAILED-LESSON" not in brief
+    # ...but the still-active shipped episode does.
+    assert "shipped successfully" in brief
+
+
+def test_make_repair_brief_store_raising_degrades_to_no_section(tmp_path: Path) -> None:
+    class _RaisingStore:
+        def list_active(self, *, kind: object | None = None) -> tuple[MemoryItem, ...]:
+            raise RuntimeError("db is wedged")
+
+    issue = {"number": 349, "title": "fix", "body": "z"}
+    pr = {"number": 7, "url": "https://x/pull/7", "headRefName": "loop/349-fix"}
+    baseline = make_repair_brief(issue, tmp_path / "wt", pr=pr, review_context="ctx")
+    degraded = make_repair_brief(
+        issue,
+        tmp_path / "wt",
+        pr=pr,
+        review_context="ctx",
+        memory_store=_RaisingStore(),  # type: ignore[arg-type]
+    )
+    # A raising store yields the byte-identical no-episode brief, not a crash.
+    assert degraded == baseline
+    assert "PRIOR ATTEMPTS" not in degraded
