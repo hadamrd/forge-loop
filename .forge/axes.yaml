@@ -88,3 +88,19 @@ axes:
       - "snapshot churn"
       - "test rename"
       - "assert true"
+
+  - name: operational-convergence
+    customer: "A forge-loop operator who must not drown in the loop's own exhaust — orphan branches, stale worktrees, an ever-growing epic backlog, a drifting shared checkout."
+    valuable_means: "The loop bounds and garbage-collects its OWN operational state. Generation is matched by convergence: merged branches are deleted, dead worktrees reaped against the live lease set, the backlog has a ceiling and a TTL, the shared checkout returns to base_branch, and operational entropy is measured so generation can be gated on it. An autonomous generator without proportional GC accumulates entropy; this axis is the return arc that stops it."
+    acceptable_work:
+      - "Branch GC: delete a loop/<n> branch once issue #n is closed (squash-merge severs git's own merged-signal, so closure is the landed-signal)."
+      - "Worktree GC: reconcile worktrees on disk against the authoritative in-flight lease set each maintenance tick; reap the rest (same primitive that fixed the zombie-worker bug)."
+      - "Backlog convergence: gate brainstorm on TOTAL open issue count, not just the loop:ready floor; dedup proposals; expire low-value epics by TTL or staleness."
+      - "Checkout invariant: dispatch never leaves the shared checkout on a feature branch — run detached or restore base_branch after each batch."
+      - "An operational-entropy metric (open branches / live worktrees / open epics / backlog age) surfaced on status + scorecard, used to gate further generation."
+    rejected_as_cosmetic:
+      - "generate without converging"
+      - "delete branches by hand"
+      - "a one-off cleanup script run once"
+      - "manual worktree pruning"
+      - "ignore the exhaust"
