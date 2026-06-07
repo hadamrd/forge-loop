@@ -103,6 +103,21 @@ def blocking_pr_repairs(
                 reason="issue_fetch_failed",
             )
             continue
+        # Issue-closed gate (#312): never dispatch a repair worker for a PR whose
+        # source issue the operator intentionally CLOSED — that would burn a
+        # worker on work that will never merge (the issue-closed merge gate would
+        # refuse it anyway). This applies to adopted/auto-rescued PRs too. Only an
+        # EXPLICIT closed state skips; a missing/unknown state is treated as open
+        # so a `fetch_issue` that omits the field preserves legacy selection.
+        if str(issue.get("state") or "").upper() == "CLOSED":
+            append_event(
+                cfg.events_file,
+                "repair_pr_skipped",
+                pr=pr.get("url"),
+                issue=issue_num,
+                reason="issue_closed",
+            )
+            continue
         if axis_filter and not matches_axes(issue.get("labels") or [], axis_filter):
             append_event(
                 cfg.events_file,

@@ -878,3 +878,198 @@ def test_pre_dispatch_repairs_merges_approved_pr_no_repair_worker_across_n_ticks
         e["kind"] == "orphan_pr_skipped" and e.get("reason") == "already_adopted"
         for e in _events(cfg)
     )
+
+
+# ---------------------------------------------------------------------------
+# #312 — adopted / auto-rescued PRs must get repair ticks, never freeze.
+#
+# A loop PR stamped ``loop:adopted`` (by the #213 orphan-adoption scan) or
+# ``loop:auto-rescued`` (by the rescue path) that the critic then BLOCKS must
+# re-enter the SAME blocking-PR repair path as any other blocked PR — the
+# marker labels must NOT stamp it out of the repair loop. The #230 anti-stall
+# guard (an adopted + approved + CLEAN PR with only leftover sev3 critic
+# threads is NOT repaired) must still hold.
+# ---------------------------------------------------------------------------
+
+
+def _labeled_pr(num: int, labels: list[str], *, merge: str = "CLEAN") -> dict[str, Any]:
+    return {
+        "number": num,
+        "title": f"t{num}",
+        "body": f"fixes #{num}",
+        "headRefName": f"loop/{num}-fix",
+        "baseRefName": "trunk",
+        "url": f"https://github.com/o/r/pull/{num}",
+        "labels": [{"name": n} for n in labels],
+        "updatedAt": f"2026-06-04T19:0{num % 10}:00Z",
+        "mergeStateStatus": merge,
+    }
+
+
+def _open_issue(num: int, repo=None) -> dict[str, Any]:
+    return {"number": num, "title": f"t{num}", "labels": [], "state": "OPEN"}
+
+
+def test_real_selector_selects_adopted_blocked_pr(tmp_path: Path, monkeypatch) -> None:
+    """#312 AC1: the REAL ``prs_requiring_repair`` returns a PR carrying BOTH
+    ``loop:adopted`` and ``critic:blocking`` — the marker label does not exclude
+    it from the repair set, and ``critic:blocking`` drives selection."""
+    pr = _labeled_pr(299, ["critic:blocking", "loop:adopted"])
+    monkeypatch.setattr(
+        _ghmod,
+        "_GH_CLIENT",
+        MockGhClient(open_prs_response=[pr], review_threads_by_pr={299: []}),
+    )
+    selected = _ghmod.prs_requiring_repair(5, repo="o/r")
+    assert [p["number"] for p in selected] == [299]
+    assert "critic:blocking" in selected[0]["repairReasons"]
+
+
+def test_real_selector_selects_auto_rescued_blocked_pr(tmp_path: Path, monkeypatch) -> None:
+    """#312 AC2: the same holds for a PR carrying ``loop:auto-rescued`` plus a
+    repairable ``critic:blocking`` finding."""
+    pr = _labeled_pr(300, ["critic:blocking", "loop:auto-rescued"])
+    monkeypatch.setattr(
+        _ghmod,
+        "_GH_CLIENT",
+        MockGhClient(open_prs_response=[pr], review_threads_by_pr={300: []}),
+    )
+    selected = _ghmod.prs_requiring_repair(5, repo="o/r")
+    assert [p["number"] for p in selected] == [300]
+    assert "critic:blocking" in selected[0]["repairReasons"]
+
+
+def test_blocking_pr_repairs_builds_tuple_for_adopted_blocked_pr(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#312: ``blocking_pr_repairs`` builds a ``(issue, pr, ctx)`` tuple for an
+    adopted blocked PR and emits ``repair_pr_selected`` — no silent drop."""
+    from forge_loop.runner.repairs import blocking_pr_repairs
+
+    cfg = _cfg(tmp_path)
+    pr = _labeled_pr(299, ["critic:blocking", "loop:adopted"])
+    monkeypatch.setattr(
+        _ghmod,
+        "_GH_CLIENT",
+        MockGhClient(open_prs_response=[pr], review_threads_by_pr={299: []}),
+    )
+    repairs = blocking_pr_repairs(
+        cfg,
+        fetch_issue_fn=_open_issue,
+        pr_review_context_fn=lambda *_a, **_k: "ctx",
+    )
+    assert [(issue["number"], rpr["number"], ctx) for issue, rpr, ctx in repairs] == [
+        (299, 299, "ctx")
+    ]
+    selected = [
+        e
+        for e in _events(cfg)
+        if e["kind"] == "repair_pr_selected" and e.get("issue") == 299
+    ]
+    assert len(selected) == 1
+    assert "critic:blocking" in (selected[0].get("reasons") or [])
+
+
+def test_blocking_pr_repairs_skips_closed_issue_pr(tmp_path: Path, monkeypatch) -> None:
+    """#312 adversarial: an adopted blocked PR whose source issue is CLOSED must
+    NOT be dispatched to a repair worker (the issue-closed gate is respected),
+    and the skip is surfaced via ``repair_pr_skipped reason=issue_closed`` — no
+    silent drop and no wasted worker on work the operator intentionally closed.
+    """
+    from forge_loop.runner.repairs import blocking_pr_repairs
+
+    cfg = _cfg(tmp_path)
+    pr = _labeled_pr(299, ["critic:blocking", "loop:adopted"])
+    monkeypatch.setattr(
+        _ghmod,
+        "_GH_CLIENT",
+        MockGhClient(open_prs_response=[pr], review_threads_by_pr={299: []}),
+    )
+    repairs = blocking_pr_repairs(
+        cfg,
+        fetch_issue_fn=lambda num, repo=None: {
+            "number": num,
+            "title": "t",
+            "labels": [],
+            "state": "CLOSED",
+        },
+        pr_review_context_fn=lambda *_a, **_k: "ctx",
+    )
+    assert repairs == []  # no repair worker dispatched against a closed-issue PR
+    skips = [
+        e
+        for e in _events(cfg)
+        if e["kind"] == "repair_pr_skipped" and e.get("reason") == "issue_closed"
+    ]
+    assert len(skips) == 1
+    assert skips[0].get("issue") == 299
+
+
+def test_real_selector_excludes_adopted_approved_clean_pr(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#312 AC4 / #230 regression: an adopted PR that is approved + CLEAN with
+    only leftover sev3 *critic* threads (no block label) must NOT be selected
+    for repair — making adopted PRs repair-eligible must not reopen the #229
+    multi-hour stall. The exclusion surfaces as ``repair_pr_skipped
+    reason=approved_mergeable`` (no silent drop)."""
+    from forge_loop.runner.repairs import blocking_pr_repairs
+
+    cfg = _cfg(tmp_path)
+    pr = _labeled_pr(301, ["loop:adopted"])  # approved (no block label) + CLEAN
+    monkeypatch.setattr(
+        _ghmod,
+        "_GH_CLIENT",
+        MockGhClient(
+            open_prs_response=[pr], review_threads_by_pr={301: [_critic_thread()]}
+        ),
+    )
+    repairs = blocking_pr_repairs(
+        cfg,
+        fetch_issue_fn=_open_issue,
+        pr_review_context_fn=lambda *_a, **_k: "ctx",
+    )
+    assert repairs == []  # adopted-but-approved PR is terminal, never repaired
+    assert any(
+        e["kind"] == "repair_pr_skipped" and e.get("reason") == "approved_mergeable"
+        for e in _events(cfg)
+    )
+
+
+def test_pre_dispatch_repairs_dispatches_repair_worker_for_adopted_blocked_pr(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#312 integration: drive the REAL ``_run_pre_dispatch_repairs`` over a
+    ``MockGhClient`` whose open-PR list includes an adopted + blocked PR. A
+    repair worker is dispatched against it within one tick, and across ≥3
+    consecutive ticks it keeps being selected — the ``loop:adopted`` marker
+    never stamps it out of the repair loop."""
+    from forge_loop.gh_client import Issue
+    from forge_loop.runner import tick as tickmod
+
+    cfg = _cfg(tmp_path)  # critic disabled
+    pr = _labeled_pr(299, ["critic:blocking", "loop:adopted"])
+    monkeypatch.setattr(
+        _ghmod,
+        "_GH_CLIENT",
+        MockGhClient(
+            open_prs_response=[pr],
+            review_threads_by_pr={299: []},
+            issues={("o", "r", 299): Issue(number=299, title="t299", state="open")},
+        ),
+    )
+    dispatched: list[Any] = []
+    monkeypatch.setattr(
+        tickmod,
+        "_run_repair_workers",
+        lambda cfg_, repairs, *a, **k: dispatched.append([i["number"] for i, _p, _c in repairs])
+        or [],
+    )
+    monkeypatch.setattr(tickmod, "_run_stuck_sweep", lambda *_a, **_k: None)
+
+    for _ in range(3):
+        tickmod._run_pre_dispatch_repairs(
+            cfg, 1, bus_emit=None, short_sleep=lambda *_a, **_k: None
+        )
+
+    assert dispatched == [[299], [299], [299]]  # selected every tick, not stamped out
