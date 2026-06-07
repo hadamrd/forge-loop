@@ -6,6 +6,11 @@ legacy JSONL events through :mod:`forge_loop.state` and
 control-plane work should use.
 """
 
+from forge_loop.eventlog.chain import (
+    GENESIS_HASH,
+    EventChainIntegrityError,
+    compute_event_hash,
+)
 from forge_loop.eventlog.guard import (
     LoadBearingGuardError,
     PrunePartition,
@@ -37,7 +42,9 @@ __all__ = [
     "LEGACY_TELEMETRY_KINDS",
     "LOAD_BEARING_EVENT_KINDS",
     "TELEMETRY_EVENT_KINDS",
+    "GENESIS_HASH",
     "CompactionResult",
+    "EventChainIntegrityError",
     "EventEnvelope",
     "EventId",
     "EventKind",
@@ -51,6 +58,7 @@ __all__ = [
     "ProjectionReplayError",
     "PrunePartition",
     "SqliteEventLog",
+    "compute_event_hash",
     "guard_prune",
     "is_load_bearing",
     "partition_for_prune",

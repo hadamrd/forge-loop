@@ -11,6 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from forge_loop.eventlog.chain import (
+    GENESIS_HASH,
+    EventChainIntegrityError,
+    compute_event_hash,
+)
 from forge_loop.eventlog.guard import guard_prune
 from forge_loop.eventlog.models import (
     EventEnvelope,
@@ -44,7 +49,9 @@ CREATE TABLE IF NOT EXISTS events (
     saga_id TEXT,
     causal_event_id TEXT,
     causal_sequence INTEGER,
-    idempotency_key TEXT UNIQUE
+    idempotency_key TEXT UNIQUE,
+    prev_hash TEXT,
+    event_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS projection_cursors (
@@ -65,6 +72,23 @@ class SqliteEventLog:
         if str(path) != ":memory:":
             self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.executescript(_SCHEMA)
+        self._migrate_hash_chain_columns()
+
+    def _migrate_hash_chain_columns(self) -> None:
+        """Add the hash-chain columns to logs created before issue #338.
+
+        Rows written before this migration keep ``NULL`` hashes; the read path
+        treats a ``NULL`` ``event_hash`` as an unchained legacy row and skips
+        verification for it (there is nothing to recompute against) while still
+        verifying every event appended after the migration.
+        """
+
+        columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(events)")}
+        with self._connection:
+            if "prev_hash" not in columns:
+                self._connection.execute("ALTER TABLE events ADD COLUMN prev_hash TEXT")
+            if "event_hash" not in columns:
+                self._connection.execute("ALTER TABLE events ADD COLUMN event_hash TEXT")
 
     def append(
         self,
@@ -85,6 +109,18 @@ class SqliteEventLog:
         payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         event_id = EventId(uuid.uuid4().hex)
         occurred_at = datetime.now(UTC).isoformat()
+        prev_hash = self._tail_hash()
+        event_hash = compute_event_hash(
+            prev_hash=prev_hash,
+            event_id=str(event_id),
+            kind=kind.value,
+            payload_json=payload_json,
+            schema_version=1,
+            occurred_at=occurred_at,
+            task_id=task_id,
+            saga_id=saga_id,
+            idempotency_key=idempotency_key,
+        )
 
         try:
             with self._connection:
@@ -98,9 +134,11 @@ class SqliteEventLog:
                         occurred_at,
                         task_id,
                         saga_id,
-                        idempotency_key
+                        idempotency_key,
+                        prev_hash,
+                        event_hash
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(event_id),
@@ -111,6 +149,8 @@ class SqliteEventLog:
                         task_id,
                         saga_id,
                         idempotency_key,
+                        prev_hash,
+                        event_hash,
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -136,7 +176,16 @@ class SqliteEventLog:
         )
 
     def since(self, sequence: int = 0) -> Iterable[EventEnvelope]:
-        """Yield events with sequence greater than ``sequence`` in log order."""
+        """Yield events with sequence greater than ``sequence`` in log order.
+
+        The hash chain is verified as events are streamed (issue #338): each
+        stored ``event_hash`` is recomputed from its canonical payload and the
+        running prev-hash and compared to the stored value. The first sequence
+        whose hash/chain no longer recomputes raises
+        :class:`EventChainIntegrityError` instead of yielding a poisoned event,
+        so replay refuses to fold a tampered, truncated, or reordered log into
+        projections. An untouched log replays without raising.
+        """
 
         rows = self._connection.execute(
             """
@@ -151,14 +200,112 @@ class SqliteEventLog:
                 saga_id,
                 causal_event_id,
                 causal_sequence,
-                idempotency_key
+                idempotency_key,
+                prev_hash,
+                event_hash
             FROM events
             WHERE sequence > ?
             ORDER BY sequence ASC
             """,
             (sequence,),
         )
-        return (self._envelope_from_row(row) for row in rows)
+        return self._verified_stream(rows, self._chain_anchor(sequence))
+
+    def _verified_stream(
+        self, rows: Iterable[sqlite3.Row], running: str
+    ) -> Iterable[EventEnvelope]:
+        for row in rows:
+            stored = row["event_hash"]
+            if stored is not None:
+                expected = self._row_hash(row, prev_hash=running)
+                if expected != stored:
+                    raise EventChainIntegrityError(
+                        int(row["sequence"]),
+                        "stored event_hash does not recompute from payload and "
+                        "running prev-hash (payload tampered, row deleted, or "
+                        "events reordered)",
+                    )
+                running = stored
+            yield self._envelope_from_row(row)
+
+    def _chain_anchor(self, sequence: int) -> str:
+        """Return the running prev-hash to seed verification of a ``since`` window.
+
+        For ``since(0)`` the anchor is the genesis hash. For a mid-log window the
+        anchor is the stored ``event_hash`` of the last event at or before
+        ``sequence`` (the predecessor of the first yielded row), so a partial
+        replay verifies against the same prev-hash the writer chained from. A
+        legacy (``NULL``-hash) predecessor falls back to genesis.
+        """
+
+        if sequence <= 0:
+            return GENESIS_HASH
+        row = self._connection.execute(
+            "SELECT event_hash FROM events WHERE sequence <= ? ORDER BY sequence DESC LIMIT 1",
+            (sequence,),
+        ).fetchone()
+        if row is None or row["event_hash"] is None:
+            return GENESIS_HASH
+        return str(row["event_hash"])
+
+    @staticmethod
+    def _row_hash(row: sqlite3.Row, *, prev_hash: str) -> str:
+        return compute_event_hash(
+            prev_hash=prev_hash,
+            event_id=row["event_id"],
+            kind=row["kind"],
+            payload_json=row["payload_json"],
+            schema_version=row["schema_version"],
+            occurred_at=row["occurred_at"],
+            task_id=row["task_id"],
+            saga_id=row["saga_id"],
+            idempotency_key=row["idempotency_key"],
+        )
+
+    def _tail_hash(self) -> str:
+        """Return the ``event_hash`` of the latest event, or genesis when empty."""
+
+        row = self._connection.execute(
+            "SELECT event_hash FROM events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if row is None or row["event_hash"] is None:
+            return GENESIS_HASH
+        return str(row["event_hash"])
+
+    def _rechain(self) -> None:
+        """Recompute the hash chain over the surviving rows in sequence order.
+
+        Called after a *legitimate* deletion (guarded prune / compaction) so the
+        survivors form a valid chain again — otherwise the read-path verifier
+        could not distinguish an authorised compaction from out-of-band tampering
+        and would refuse to replay a freshly compacted log.
+        """
+
+        rows = self._connection.execute(
+            """
+            SELECT
+                sequence,
+                event_id,
+                kind,
+                payload_json,
+                schema_version,
+                occurred_at,
+                task_id,
+                saga_id,
+                idempotency_key
+            FROM events
+            ORDER BY sequence ASC
+            """
+        ).fetchall()
+        running = GENESIS_HASH
+        with self._connection:
+            for row in rows:
+                event_hash = self._row_hash(row, prev_hash=running)
+                self._connection.execute(
+                    "UPDATE events SET prev_hash = ?, event_hash = ? WHERE sequence = ?",
+                    (running, event_hash, int(row["sequence"])),
+                )
+                running = event_hash
 
     def latest_sequence(self) -> int:
         """Return the highest event sequence, or 0 when the log is empty."""
@@ -260,6 +407,9 @@ class SqliteEventLog:
                 f"DELETE FROM events WHERE sequence IN ({present_placeholders})",
                 present,
             )
+        # Re-link the surviving rows so the read-path verifier accepts an
+        # authorised prune (issue #338).
+        self._rechain()
         return len(present)
 
     def compact_noise(self, *, emit_marker: bool = True) -> CompactionResult:
@@ -321,6 +471,9 @@ class SqliteEventLog:
                     f"DELETE FROM events WHERE sequence IN ({placeholders})",
                     droppable,
                 )
+            # Re-link survivors so an authorised compaction still replays cleanly
+            # through the read-path integrity verifier (issue #338).
+            self._rechain()
 
         if emit_marker:
             self.append(
