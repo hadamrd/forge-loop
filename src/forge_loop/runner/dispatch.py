@@ -20,7 +20,11 @@ from forge_loop import master_log as _mlog
 from forge_loop.config import Config
 from forge_loop.control.boot import canonical_task_saga_path
 from forge_loop.critic import review_pr as _critic_review
-from forge_loop.critic_actions import apply_critic_report
+from forge_loop.critic_actions import (
+    SuspiciousResolution,
+    apply_critic_report,
+    reconcile_suspicious,
+)
 from forge_loop.events import CriticReviewErroredEvent
 from forge_loop.events import emit as _emit_typed
 from forge_loop.runner.critic_flow import (
@@ -969,7 +973,13 @@ def _run_critic_for_outcomes(
                             repo=cfg.github_repo,
                             emit=bus_emit,
                         )
-                        if plan.block_merge:
+                        if plan.suspicious_approve:
+                            # Issue #311: a suspicious flag is self-clearing, not
+                            # human-terminal. Run ONE independent second pass and
+                            # resolve it autonomously — clear → merge, corroborate
+                            # → normal repair-loop block. Never frozen on a human.
+                            _resolve_suspicious_approval(cfg, o, bus_emit)
+                        elif plan.block_merge:
                             o.status = "open"
                             reason = "; ".join(critic_outcome.reasons) or critic_outcome.verdict
                             note = f"critic blocked merge: {reason}"[:200]
@@ -1017,6 +1027,148 @@ def _run_critic_for_outcomes(
                         )
             except Exception as ex_:
                 append_event(cfg.events_file, "critic_failed", issue=o.issue, err=str(ex_)[:200])
+
+
+def _resolve_suspicious_approval(
+    cfg: Config,
+    o: WorkerOutcome,
+    bus_emit: Any,
+) -> SuspiciousResolution | None:
+    """Self-clear a ``critic:suspicious`` flag via ONE independent second pass.
+
+    Issue #311: today ``critic:suspicious`` freezes a PR until a human verifies
+    and merges — and it false-positives on clean PRs, making it the throughput
+    limiter. This replaces "freeze + wait for human" with "resolve autonomously":
+
+    - run ONE second, independent critic pass;
+    - ``CLEARED`` (no real sev1/sev2): drop the suspicious label and let the PR
+      flow to the normal merge gate (verdict is already ``approved``) — zero
+      human action;
+    - ``CORROBORATED`` (real sev1/sev2): demote the suspicious flag to a NORMAL
+      critic block carrying the second pass's findings, so the repair loop fixes
+      it autonomously. NEVER auto-merge a corroborated real sev1/sev2.
+
+    Returns the resolution, or ``None`` when the second pass could not adjudicate
+    (errored / no report) — the PR is held blocked and the next tick retries, so
+    it is never frozen pending only a human.
+    """
+    pr_url = o.pr_url
+    assert pr_url is not None  # caller only enters the suspicious branch with a PR
+    second = _critic_review(
+        pr_url,
+        o.issue,
+        cfg.repo,
+        cfg.logs_dir,
+        timeout_s=cfg.critic.timeout_s,
+        emit=bus_emit,
+        model=cfg.critic.model,
+        provider=getattr(cfg.critic, "provider", "claude"),
+        sev3_demotion_round_threshold=getattr(cfg.critic, "sev3_demotion_round_threshold", 3),
+    )
+    append_event(
+        cfg.events_file,
+        "critic_suspicious_second_pass",
+        issue=o.issue,
+        pr=pr_url,
+        verdict=second.verdict,
+        sev_counts=_sev_counts(second),
+    )
+
+    if second.report is None:
+        # Second pass errored / unparseable: it has NO opinion, so it can neither
+        # clear nor corroborate. Keep the PR held (blocked, not merged) and let
+        # the next tick re-run the resolution — autonomous, never human-terminal.
+        o.status = "open"
+        note = "critic:suspicious second pass inconclusive; retrying next tick"
+        o.error = f"{o.error}; {note}" if o.error else note
+        return None
+
+    resolution = reconcile_suspicious(second.report)
+    o.critic_verdict = second.verdict
+
+    if resolution is SuspiciousResolution.CLEARED:
+        _clear_suspicious(cfg, o, pr_url, bus_emit)
+    else:
+        _corroborate_suspicious(cfg, o, pr_url, second.report, bus_emit)
+    return resolution
+
+
+def _clear_suspicious(
+    cfg: Config,
+    o: WorkerOutcome,
+    pr_url: str,
+    bus_emit: Any,
+) -> None:
+    """CLEARED branch of #311: the independent second opinion agrees the diff is
+    clean → un-freeze and let the merge gate proceed. Drop the suspicious/blocking
+    labels the first pass stamped; do NOT set ``o.error`` so auto-merge is not
+    withheld."""
+    _clear_stale_critic_block_labels(pr_url, repo=cfg.github_repo, bus_emit=bus_emit)
+    append_event(
+        cfg.events_file,
+        "critic_suspicious_cleared",
+        issue=o.issue,
+        pr=pr_url,
+    )
+
+
+def _corroborate_suspicious(
+    cfg: Config,
+    o: WorkerOutcome,
+    pr_url: str,
+    report: Any,
+    bus_emit: Any,
+) -> None:
+    """CORROBORATED branch of #311: the second pass found a real sev1/sev2 the
+    rubber-stamp hid. Replace the suspicious flag with a NORMAL critic block
+    carrying the second pass's findings so the repair loop addresses it.
+
+    AC5 safety invariant: NEVER auto-merge a corroborated real sev1/sev2. We stamp
+    ``critic:blocking`` UNCONDITIONALLY here rather than relying on
+    ``apply_critic_report``'s overall/block_on_sev2 logic — a second pass can carry
+    a real sev2 under an ``approve`` overall with block_on_sev2 off, which would
+    otherwise leave the PR unblocked and mergeable.
+    """
+    if not _gh.remove_pr_label(pr_url, "critic:suspicious", repo=cfg.github_repo):
+        bus_emit(
+            "critic_actions_failed",
+            {
+                "pr": pr_url,
+                "method": "remove_pr_label",
+                "label": "critic:suspicious",
+                "auth_source": getattr(_gh, "auth_source", "github-client"),
+            },
+        )
+    if not _gh.add_pr_label(pr_url, ["critic:blocking"], repo=cfg.github_repo):
+        bus_emit(
+            "critic_actions_failed",
+            {
+                "pr": pr_url,
+                "method": "add_pr_label",
+                "label": "critic:blocking",
+                "auth_source": getattr(_gh, "auth_source", "github-client"),
+            },
+        )
+    lines = _gh.pr_changed_lines(pr_url, repo=cfg.github_repo)
+    apply_critic_report(
+        report,
+        pr_url,
+        lines,
+        cfg.critic.block_on_sev2,
+        cfg.critic.min_findings_for_approve,
+        gh=_gh,
+        repo=cfg.github_repo,
+        emit=bus_emit,
+    )
+    o.status = "open"
+    note = "critic:suspicious corroborated by independent second pass"
+    o.error = f"{o.error}; {note}" if o.error else note
+    append_event(
+        cfg.events_file,
+        "critic_suspicious_corroborated",
+        issue=o.issue,
+        pr=pr_url,
+    )
 
 
 def run_multirepo(

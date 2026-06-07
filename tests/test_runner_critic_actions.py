@@ -25,6 +25,8 @@ class _FakeGh:
     label_result: bool = True
     comment_result: bool = True
     remove_label_result: bool = True
+    changed_lines: int = 1000
+    auth_source: str = "github-client"
 
     def add_pr_label(self, pr, labels, repo=None):  # type: ignore[no-untyped-def]
         self.label_calls.append((pr, tuple(labels), repo))
@@ -43,6 +45,9 @@ class _FakeGh:
     def remove_pr_label(self, pr, label, repo=None):  # type: ignore[no-untyped-def]
         self.remove_label_calls.append((pr, label, repo))
         return self.remove_label_result
+
+    def pr_changed_lines(self, pr, repo=None):  # type: ignore[no-untyped-def]
+        return self.changed_lines
 
 
 def _report(overall: str, findings: list[Finding]) -> CriticReport:
@@ -342,7 +347,7 @@ def test_run_critic_block_reopens_optimistic_merged_outcome(monkeypatch, tmp_pat
     monkeypatch.setattr(
         dispatch_mod,
         "apply_critic_report",
-        lambda *_a, **_kw: SimpleNamespace(block_merge=True),
+        lambda *_a, **_kw: SimpleNamespace(block_merge=True, suspicious_approve=False),
     )
 
     dispatch_mod._run_critic_for_outcomes(cfg, [outcome], lambda *_a, **_kw: None)
@@ -382,7 +387,7 @@ def test_run_critic_reports_failed_cleanup_label_removal(monkeypatch, tmp_path) 
     monkeypatch.setattr(
         dispatch_mod,
         "apply_critic_report",
-        lambda *_a, **_kw: SimpleNamespace(block_merge=False),
+        lambda *_a, **_kw: SimpleNamespace(block_merge=False, suspicious_approve=False),
     )
     monkeypatch.setattr(dispatch_mod._gh, "auth_source", "gh cli", raising=False)
     monkeypatch.setattr(dispatch_mod._gh, "remove_pr_label", lambda *_a, **_kw: False)
@@ -500,6 +505,191 @@ def test_run_critic_error_label_clear_failure_is_reported(monkeypatch, tmp_path)
     failures = [p for k, p in emitted if k == "critic_actions_failed"]
     assert [f["label"] for f in failures] == ["critic:blocking", "critic:suspicious"]
     assert all(f["method"] == "remove_pr_label" for f in failures)
+
+
+# ---------------------------------------------------------------------------
+# Issue #311 — self-clearing critic:suspicious guard
+# ---------------------------------------------------------------------------
+
+
+def _seq_review(outcomes: list[CriticOutcome]):  # type: ignore[no-untyped-def]
+    """Return a _critic_review stub that yields ``outcomes`` in order — so the
+    FIRST (suspicious) pass and the SECOND (adjudicating) pass differ."""
+    it = iter(outcomes)
+
+    def _review(*_a, **_kw):  # type: ignore[no-untyped-def]
+        return next(it)
+
+    return _review
+
+
+def _suspicious_first() -> CriticOutcome:
+    """A first pass that trips the suspicious guard: approve + ZERO findings."""
+    return CriticOutcome(
+        verdict="approved",
+        reasons=[],
+        duration_s=1.0,
+        stdout_tail="",
+        report=_report("approve", []),
+    )
+
+
+# reconcile_suspicious — pure adjudication (one test per edge, T1)
+
+
+def test_reconcile_clears_on_zero_findings_second_pass() -> None:
+    from forge_loop.critic_actions import SuspiciousResolution, reconcile_suspicious
+
+    assert reconcile_suspicious(_report("approve", [])) is SuspiciousResolution.CLEARED
+
+
+def test_reconcile_clears_when_only_sev3() -> None:
+    from forge_loop.critic_actions import SuspiciousResolution, reconcile_suspicious
+
+    rep = _report("approve", [Finding("sev3", "style", "a.py", 1, "nit")])
+    assert reconcile_suspicious(rep) is SuspiciousResolution.CLEARED
+
+
+def test_reconcile_corroborates_on_sev1() -> None:
+    from forge_loop.critic_actions import SuspiciousResolution, reconcile_suspicious
+
+    rep = _report("block", [Finding("sev1", "correctness", "a.py", 1, "real bug")])
+    assert reconcile_suspicious(rep) is SuspiciousResolution.CORROBORATED
+
+
+def test_reconcile_corroborates_on_sev2() -> None:
+    from forge_loop.critic_actions import SuspiciousResolution, reconcile_suspicious
+
+    rep = _report("request_changes", [Finding("sev2", "reuse", "a.py", 1, "dup")])
+    assert reconcile_suspicious(rep) is SuspiciousResolution.CORROBORATED
+
+
+# _run_critic_for_outcomes — end-to-end suspicious resolution
+
+
+def _suspicious_cfg(tmp_path) -> Config:  # type: ignore[no-untyped-def]
+    return Config(
+        repo=tmp_path,
+        github_repo="o/r",
+        critic=CriticConfig(enabled=True, timeout_s=10),
+    )
+
+
+def _suspicious_outcome() -> WorkerOutcome:
+    return WorkerOutcome(
+        issue=108,
+        title="clean PR mislabeled suspicious",
+        pr_url="https://github.com/o/r/pull/108",
+        status="open",
+        duration_s=1.0,
+        stdout_tail="",
+    )
+
+
+def test_suspicious_cleared_by_second_pass_merges_with_zero_human_action(
+    monkeypatch, tmp_path
+) -> None:
+    """AC: a clean PR mislabeled suspicious gets a second pass and proceeds to
+    merge with ZERO human action — no error set, verdict approved, the
+    suspicious label dropped, and the real merge gate no longer withholds."""
+    from forge_loop.runner.tick import _automerge_withheld_reason
+
+    cfg = _suspicious_cfg(tmp_path)
+    outcome = _suspicious_outcome()
+    gh = _FakeGh()
+    monkeypatch.setattr(dispatch_mod, "_gh", gh)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_critic_review",
+        _seq_review([_suspicious_first(), _suspicious_first()]),
+    )
+
+    dispatch_mod._run_critic_for_outcomes(cfg, [outcome], lambda *_a, **_kw: None)
+
+    # First pass stamped critic:suspicious; the second pass un-froze it.
+    assert ("critic:suspicious",) in [labs for _, labs, _ in gh.label_calls]
+    assert "critic:suspicious" in {label for _, label, _ in gh.remove_label_calls}
+    # No human gate left: open, no blocking error, verdict approved.
+    assert outcome.status == "open"
+    assert not outcome.error
+    assert outcome.critic_verdict == "approved"
+    # The real merge gate would now PROCEED (no withhold reason).
+    assert _automerge_withheld_reason(outcome) is None
+    # Resolution events landed for observability.
+    events = cfg.events_file.read_text()
+    assert "critic_suspicious_second_pass" in events
+    assert "critic_suspicious_cleared" in events
+
+
+def test_suspicious_corroborated_is_held_never_merges(monkeypatch, tmp_path) -> None:
+    """AC: a real rubber-stamp (0 findings on a huge diff) hiding a sev1 is
+    corroborated by the independent second pass and HELD as a normal critic
+    block for the repair loop — NEVER auto-merged."""
+    from forge_loop.runner.tick import _automerge_withheld_reason
+
+    cfg = _suspicious_cfg(tmp_path)
+    outcome = _suspicious_outcome()
+    gh = _FakeGh()
+    monkeypatch.setattr(dispatch_mod, "_gh", gh)
+    second = CriticOutcome(
+        verdict="blocked",
+        reasons=["[sev1/correctness] silent data loss"],
+        duration_s=1.0,
+        stdout_tail="",
+        report=_report("block", [Finding("sev1", "correctness", "x.py", 9, "silent data loss")]),
+    )
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_critic_review",
+        _seq_review([_suspicious_first(), second]),
+    )
+
+    dispatch_mod._run_critic_for_outcomes(cfg, [outcome], lambda *_a, **_kw: None)
+
+    # Suspicious flag demoted to a normal block carrying the real finding.
+    assert "critic:suspicious" in {label for _, label, _ in gh.remove_label_calls}
+    assert ("critic:blocking",) in [labs for _, labs, _ in gh.label_calls]
+    # Held: open + blocking error, and the merge gate refuses (verdict != approved).
+    assert outcome.status == "open"
+    assert outcome.error and "corroborated" in outcome.error
+    assert _automerge_withheld_reason(outcome) is not None
+    events = cfg.events_file.read_text()
+    assert "critic_suspicious_corroborated" in events
+
+
+def test_suspicious_second_pass_error_holds_and_retries(monkeypatch, tmp_path) -> None:
+    """Adversarial: when the second pass itself errors (no report), the PR is
+    held (not merged) with an inconclusive note so the NEXT tick retries — it is
+    never frozen pending only a human, and never auto-merged on a non-verdict."""
+    from forge_loop.runner.tick import _automerge_withheld_reason
+
+    cfg = _suspicious_cfg(tmp_path)
+    outcome = _suspicious_outcome()
+    gh = _FakeGh()
+    monkeypatch.setattr(dispatch_mod, "_gh", gh)
+    errored = CriticOutcome(
+        verdict="error",
+        reasons=[],
+        duration_s=1.0,
+        stdout_tail="(timeout)",
+        report=None,
+        error="critic exceeded 10s",
+    )
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_critic_review",
+        _seq_review([_suspicious_first(), errored]),
+    )
+
+    dispatch_mod._run_critic_for_outcomes(cfg, [outcome], lambda *_a, **_kw: None)
+
+    assert outcome.status == "open"
+    assert outcome.error and "inconclusive" in outcome.error
+    # verdict stays the first pass's "approved", but the blocking error withholds
+    # merge — and the second_pass event proves the retry path was taken.
+    assert _automerge_withheld_reason(outcome) is None  # verdict-based gate
+    assert outcome.error  # ...but error-based gate in tick withholds the merge
+    assert "critic_suspicious_second_pass" in cfg.events_file.read_text()
 
 
 if __name__ == "__main__":

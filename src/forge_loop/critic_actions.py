@@ -9,10 +9,123 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Protocol
 
 from forge_loop.critic import CriticReport, Finding
 from forge_loop.critic_format import finding_tag
+
+
+class SuspiciousResolution(StrEnum):
+    """Verdict of the issue #311 self-clearing second critic pass.
+
+    A ``str`` Enum (not a string literal) so the discriminator is shared across
+    the decision function here and the orchestration in ``runner.dispatch`` —
+    the manifesto's "no stringly-typed cross-module event boundaries" rule.
+
+    - ``CLEARED``: the independent second pass found no real sev1/sev2, so the
+      first pass's zero-findings approve was genuine → auto-merge, no human.
+    - ``CORROBORATED``: the second pass found a real sev1/sev2 the rubber-stamp
+      hid → HOLD as a normal critic block (repair loop), NEVER auto-merge.
+    """
+
+    CLEARED = "cleared"
+    CORROBORATED = "corroborated"
+
+
+def reconcile_suspicious(second: CriticReport) -> SuspiciousResolution:
+    """Adjudicate a ``critic:suspicious`` flag from an independent second pass.
+
+    Issue #311: the suspicious guard must be self-clearing, never human-terminal.
+    The first pass flagged "approve with ZERO findings on a huge diff" — an
+    implausible rubber-stamp. The second INDEPENDENT pass is the tie-breaker:
+
+    - it surfaces a real sev1/sev2 (finding OR manifesto violation) → the
+      rubber-stamp was hiding genuine problems → ``CORROBORATED`` (held).
+    - it surfaces no real sev1/sev2 → the clean approve was genuine →
+      ``CLEARED`` (auto-merge with zero human action).
+
+    Note a second zero-findings approve is ``CLEARED``: two independent passes
+    agreeing the diff is clean is the strongest possible evidence it is, so the
+    PR must not stay frozen pending only a human.
+    """
+    if second.has_sev1() or second.has_sev2():
+        return SuspiciousResolution.CORROBORATED
+    return SuspiciousResolution.CLEARED
+
+
+def resolve_suspicious_timeout(
+    verdicts: list[str],
+    *,
+    has_real_sev: bool,
+) -> SuspiciousResolution:
+    """Resolve a still-held ``critic:suspicious`` PR once it ages past the
+    configured timeout — so it NEVER sits frozen pending only a human (AC4).
+
+    The resolution is the *majority* recorded verdict across the passes:
+    ``"approved"`` votes vs everything else. A strict approve majority →
+    ``CLEARED`` (default to the agreed-clean verdict). A tie, an empty record,
+    or a non-approve majority → ``CORROBORATED`` (the conservative direction —
+    a held flag only ever auto-resolves DOWN to merge on a clear approve
+    majority).
+
+    AC5 safety invariant (never violated): if ANY recorded pass carried a real
+    sev1/sev2, the resolution is ALWAYS ``CORROBORATED`` regardless of the
+    vote — a corroborated real severity is never auto-merged by the timeout.
+    """
+    if has_real_sev:
+        return SuspiciousResolution.CORROBORATED
+    approve_votes = sum(1 for v in verdicts if v == "approved")
+    if approve_votes * 2 > len(verdicts):
+        return SuspiciousResolution.CLEARED
+    return SuspiciousResolution.CORROBORATED
+
+
+@dataclass(frozen=True)
+class SuspiciousCalibration:
+    """Result of the Part-B (issue #311) self-calibration stub."""
+
+    effective_min_lines: int
+    loosened: bool = False
+
+
+def suspicious_precision(window: list[SuspiciousResolution]) -> float | None:
+    """Precision of the ``critic:suspicious`` flag over a rolling window (AC7).
+
+    Precision = true-positives / total = the fraction of suspicious PRs the
+    second pass (or a human) CORROBORATED. A low value means the flag is
+    firing mostly on clean PRs (false positives). ``None`` for an empty
+    window (no signal yet).
+    """
+    if not window:
+        return None
+    corroborated = sum(1 for r in window if r is SuspiciousResolution.CORROBORATED)
+    return corroborated / len(window)
+
+
+def calibrate_suspicious_threshold(
+    *,
+    precision: float | None,
+    base_min_lines: int = 600,
+    enabled: bool = False,
+    precision_floor: float = 0.5,
+) -> SuspiciousCalibration:
+    """Part B (issue #311), GATED on the Scorecard projection (#307).
+
+    When the suspicious flag's precision is low (too many false positives), the
+    heuristic is loosened by raising the effective ``MIN_SUSPICIOUS_APPROVE_LINES``
+    floor so fewer clean PRs are flagged. Ships DISABLED (``enabled=False``):
+    a no-op returning the base threshold until #307 lands the precision signal.
+
+    TODO(#307): feed ``precision`` from the Scorecard projection's rolling
+    suspicious-precision trend and flip ``enabled`` on via config.
+    """
+    if not enabled or precision is None:
+        return SuspiciousCalibration(effective_min_lines=base_min_lines, loosened=False)
+    if precision < precision_floor:
+        return SuspiciousCalibration(effective_min_lines=base_min_lines * 2, loosened=True)
+    return SuspiciousCalibration(effective_min_lines=base_min_lines, loosened=False)
+
 
 MIN_SUSPICIOUS_APPROVE_LINES = 600  # calibrated 2026-06-05 from live data:
 # scope-capped clean PRs run ~350-500 changed lines and legitimately have 0
