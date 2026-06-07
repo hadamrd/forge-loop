@@ -862,3 +862,165 @@ def test_run_degrades_to_none_when_research_store_raises() -> None:
     prompt = fn.captured["prompt"]  # type: ignore[attr-defined]
     assert "External research inputs" in prompt
     assert "(none)" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Open-backlog dedup guardrail (issue #300)
+# ---------------------------------------------------------------------------
+
+
+def _backlog_client(*, epics: list[Issue] | None = None, tickets: list[Issue] | None = None):
+    """Fake gh_client whose ``issues_by_label`` yields a populated OpenBacklog.
+
+    Mirrors ``list_open_backlog``'s two-call protocol: ``label="epic"`` returns
+    the epics; the empty label returns everything open (epics ∪ tickets).
+    """
+    epics = list(epics or [])
+    tickets = list(tickets or [])
+
+    class _Client:
+        def issues_by_label(self, owner, repo, label, limit):  # noqa: ARG002
+            if label == "epic":
+                return list(epics)
+            return list(epics) + list(tickets)
+
+    return _Client()
+
+
+def _solo_ticket(title: str, *, axis: str = "throughput") -> dict:
+    return {
+        "title": title,
+        "body": "x",
+        "axis": axis,
+        "customer_story": "operator: I need this",
+    }
+
+
+def _solo_epic(title: str, *, axis: str = "throughput") -> dict:
+    return {
+        "title": title,
+        "body": "x",
+        "axis": axis,
+        "customer_story": "operator: I need this",
+    }
+
+
+def test_run_drops_ticket_duplicating_open_backlog_issue() -> None:
+    """A proposed ticket whose normalized title matches an open issue is dropped;
+    a sibling proposal with a novel title survives."""
+    client = _backlog_client(
+        tickets=[Issue(number=212, title="Stream worker logs to operator console")]
+    )
+    payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [
+            _solo_ticket("Stream worker logs to operator console"),
+            _solo_ticket("Ship cost telemetry widget"),
+        ],
+    }
+    report = Brainstormer(
+        sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client
+    ).run(_vision())
+    assert [t.title for t in report.proposed_tickets] == ["Ship cost telemetry widget"]
+
+
+def test_run_drops_epic_duplicating_open_backlog_issue() -> None:
+    """A proposed epic whose normalized title matches an open issue is dropped;
+    matching is against the union of backlog epics+tickets."""
+    client = _backlog_client(epics=[Issue(number=88, title="Resumable worker loop", labels=["epic"])])
+    payload = {
+        "proposed_epics": [
+            _solo_epic("Resumable worker loop"),
+            _solo_epic("Self-improving critic"),
+        ],
+        "proposed_tickets": [],
+    }
+    report = Brainstormer(
+        sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client
+    ).run(_vision())
+    assert [e.title for e in report.proposed_epics] == ["Self-improving critic"]
+
+
+def test_open_backlog_match_is_whitespace_and_case_insensitive() -> None:
+    """Adversarial: a re-proposal differing from the open issue title only by
+    leading/trailing/collapsed whitespace and case is still dropped — guards
+    against silent re-litigation via cosmetic title drift."""
+    client = _backlog_client(tickets=[Issue(number=212, title="Stream Worker Logs")])
+    payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [_solo_ticket("  stream   worker  logs ")],
+    }
+    report = Brainstormer(
+        sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client
+    ).run(_vision())
+    assert report.proposed_tickets == []
+
+
+def test_run_noop_when_backlog_empty() -> None:
+    """An empty OpenBacklog (no owner/repo ⇒ ``_scan_backlog`` returns empty)
+    leaves all proposals untouched — identical to today."""
+    payload = {
+        "proposed_epics": [_solo_epic("Resumable worker loop")],
+        "proposed_tickets": [_solo_ticket("Stream worker logs to operator console")],
+    }
+    report = Brainstormer(sdk_fn=_stub_sdk(payload)).run(_vision())
+    assert [e.title for e in report.proposed_epics] == ["Resumable worker loop"]
+    assert [t.title for t in report.proposed_tickets] == [
+        "Stream worker logs to operator console"
+    ]
+
+
+def test_open_backlog_drop_logs_reason_and_issue_number(monkeypatch) -> None:
+    """An INFO log with ``reason="duplicate_open_backlog"`` and the matched
+    issue ``number`` is emitted on each drop."""
+    rec = _RecLogger()
+    from forge_loop import brainstormer as bs_mod
+
+    monkeypatch.setattr(bs_mod, "_log", rec)
+
+    client = _backlog_client(
+        tickets=[Issue(number=212, title="Stream worker logs to operator console")]
+    )
+    payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [_solo_ticket("  Stream   Worker  Logs to operator console ")],
+    }
+    report = Brainstormer(
+        sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client
+    ).run(_vision())
+    assert report.proposed_tickets == []
+    drop = next(
+        r
+        for r in rec.records
+        if r["event"] == "brainstormer_dropped"
+        and r.get("reason") == "duplicate_open_backlog"
+    )
+    assert drop["number"] == 212
+    assert drop["kind"] == "ticket"
+
+
+def test_open_backlog_filter_composes_after_cosmetic_and_rejected_filters() -> None:
+    """Integration: a duplicate that also passes the cosmetic rubric and the
+    rejected-path memory is still dropped by the open-backlog guardrail — i.e.
+    the new filter composes correctly *after* the prior two in the chain."""
+    client = _backlog_client(
+        tickets=[Issue(number=212, title="Stream worker logs to operator console")]
+    )
+    store = FakeMemoryStore()  # empty rejected-path memory — duplicate passes it
+    payload = {
+        "proposed_epics": [],
+        "proposed_tickets": [
+            # Passes cosmetic rubric (has axis + story, no rejected phrase) and
+            # rejected-path memory (store empty) — only the backlog filter drops it.
+            _solo_ticket("Stream worker logs to operator console"),
+            _solo_ticket("A genuinely novel idea"),
+        ],
+    }
+    report = Brainstormer(
+        sdk_fn=_stub_sdk(payload),
+        owner="o",
+        repo="r",
+        gh_client=client,
+        memory_store=store,
+    ).run(_vision())
+    assert [t.title for t in report.proposed_tickets] == ["A genuinely novel idea"]

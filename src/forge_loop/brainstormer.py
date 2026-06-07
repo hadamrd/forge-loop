@@ -361,9 +361,11 @@ class Brainstormer:
             ) from exc
 
         # 4. Apply the anti-cosmetic guardrail, then drop anything that
-        #    matches a previously-rejected path (anti-relitigation).
+        #    matches a previously-rejected path (anti-relitigation), then
+        #    drop anything duplicating a live open-backlog issue.
         filtered = filter_report_for_vision(raw, vision)[0]
-        return self._filter_rejected_paths(filtered, rejected_paths)
+        filtered = self._filter_rejected_paths(filtered, rejected_paths)
+        return self._filter_open_backlog(filtered, backlog)
 
     # -- helpers --------------------------------------------------------
 
@@ -447,6 +449,54 @@ class Brainstormer:
         epics = [e for e in report.proposed_epics if _keep(e, "epic")]
         tickets = [t for t in report.proposed_tickets if _keep(t, "ticket")]
         return BrainstormReport(proposed_epics=epics, proposed_tickets=tickets)
+
+    def _filter_open_backlog(self, report: BrainstormReport, backlog: Any) -> BrainstormReport:
+        """Drop proposals whose normalized title duplicates an open backlog issue.
+
+        Final dedup guardrail (issue #300). A drifting or context-truncated SDK
+        session can re-propose an already-open epic/ticket verbatim — it sails
+        through the cosmetic (`filter_report_for_vision`) and rejected-path
+        (`_filter_rejected_paths`) guardrails untouched, burning a frontier slot
+        on work already in flight. This drops any proposed epic/ticket whose
+        title-component of ``normalize_candidate_key`` equals the normalized
+        title of any issue in the open backlog (epics ∪ tickets — an open ticket
+        can collide with a proposed epic of the same title and vice-versa).
+
+        Matching is title-only (open backlog issues carry no axis) and reuses
+        ``normalize_candidate_key`` / ``_normalize_text``, so it is whitespace-
+        and case-insensitive. Degrades to a no-op when the backlog scan returned
+        empty — identical to today.
+        """
+        epics = list(getattr(backlog, "epics", []) or [])
+        tickets = list(getattr(backlog, "tickets", []) or [])
+        if not epics and not tickets:
+            return report
+
+        from forge_loop.frontier.decisions import normalize_candidate_key
+
+        index: dict[str, Any] = {}
+        for issue in (*epics, *tickets):
+            title_key = normalize_candidate_key(getattr(issue, "title", "") or "", "")[0]
+            index.setdefault(title_key, issue)
+
+        def _keep(proposal: Any, kind: str) -> bool:
+            title_key = normalize_candidate_key(proposal.title, proposal.axis)[0]
+            match = index.get(title_key)
+            if match is None:
+                return True
+            _log.info(
+                "brainstormer_dropped",
+                kind=kind,
+                title=proposal.title,
+                axis=proposal.axis,
+                reason="duplicate_open_backlog",
+                number=getattr(match, "number", None),
+            )
+            return False
+
+        epics_out = [e for e in report.proposed_epics if _keep(e, "epic")]
+        tickets_out = [t for t in report.proposed_tickets if _keep(t, "ticket")]
+        return BrainstormReport(proposed_epics=epics_out, proposed_tickets=tickets_out)
 
     def _scan_backlog(self) -> Any:
         """Return open backlog via gh_client (or an empty stand-in)."""
