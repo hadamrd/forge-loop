@@ -9,7 +9,15 @@ import subprocess
 from pathlib import Path
 
 from forge_loop.config import Config
+from forge_loop.state import append_event
 from forge_loop.worker import WorkerOutcome
+
+# Loop-planted infrastructure file (see worker_brief.py "DO NOT TOUCH" note).
+# Worker SDK sessions mutate it as a pure side-effect (permissions cache), so a
+# worktree can read as dirty with zero real product changes. Auto-rescue must
+# neither ship a PR for a settings-only diff nor include this file in a mixed
+# rescue commit (issue #366).
+_PLANTED_SETTINGS_PATH = ".claude/settings.json"
 
 _TEST_FILE_GLOBS = (
     "**/test/**",
@@ -32,7 +40,16 @@ def rescue_uncommitted_work(outcome: WorkerOutcome, cfg: Config) -> str | None:
     from forge_loop.worker_worktree import worktree_path
 
     worktree = worktree_path(cfg.repo, outcome.issue)
-    if not worktree.exists() or not _has_uncommitted_changes(worktree):
+    if not worktree.exists():
+        return None
+
+    dirty = _dirty_paths(worktree)
+    if not dirty:
+        return None
+    if _diff_is_settings_only(dirty):
+        # Only the loop-planted settings file changed — no product value to
+        # ship. Skip loudly so operators see *why* no PR appeared (#366).
+        append_event(cfg.events_file, "rescue_skipped_settings_only", issue=outcome.issue)
         return None
 
     branch = _current_branch(worktree)
@@ -52,16 +69,47 @@ def rescue_uncommitted_work(outcome: WorkerOutcome, cfg: Config) -> str | None:
     return url
 
 
-def _has_uncommitted_changes(worktree: Path) -> bool:
+def _dirty_paths(worktree: Path) -> list[str]:
+    """Worktree-relative paths reported dirty by ``git status --porcelain``.
+
+    Covers untracked (``??``), modified (`` M``) and staged (``M ``) entries.
+    The porcelain v1 line is ``XY <path>`` (two status columns + a space);
+    renames render ``XY orig -> new`` — we keep the post-rename path.
+
+    ``--untracked-files=all`` lists individual untracked files rather than
+    collapsing a wholly-untracked directory to ``dir/`` — without it a freshly
+    untracked ``.claude/settings.json`` would surface as ``.claude/`` and dodge
+    the settings-only guard. The diff is a single small worktree, so the
+    large-repo ``-uall`` caveat does not apply here.
+    """
     status = subprocess.run(
-        ["git", "status", "--porcelain"],
+        ["git", "status", "--porcelain", "--untracked-files=all"],
         cwd=worktree,
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
     )
-    return status.returncode == 0 and bool(status.stdout.strip())
+    if status.returncode != 0:
+        return []
+    paths: list[str] = []
+    for line in status.stdout.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        paths.append(path.strip())
+    return paths
+
+
+def _diff_is_settings_only(dirty: list[str]) -> bool:
+    """True iff the *only* dirty path is the loop-planted settings file.
+
+    Exact-path match (not substring/glob), so siblings like
+    ``.claude/settings.json.bak`` or ``src/app/settings.json`` are treated as
+    real changes and still get rescued (#366 over-eager-match guard)."""
+    return bool(dirty) and all(p == _PLANTED_SETTINGS_PATH for p in dirty)
 
 
 def _current_branch(worktree: Path) -> str:
@@ -94,12 +142,25 @@ def _run_rescue_formatter(worktree: Path, cfg: Config) -> None:
 
 def _commit_and_push(worktree: Path, branch: str, outcome: WorkerOutcome, cfg: Config) -> bool:
     commit_msg = _commit_message(outcome, cfg)
-    return (
+    if (
         subprocess.run(
             ["git", "add", "-A"], cwd=worktree, capture_output=True, timeout=60, check=False
         ).returncode
-        == 0
-        and subprocess.run(
+        != 0
+    ):
+        return False
+    # Never ship the loop-planted settings file: unstage it so the mixed-diff
+    # rescue commit carries only real worker output (#366). Best-effort — if the
+    # path was never staged, ``git reset`` is a harmless no-op.
+    subprocess.run(
+        ["git", "reset", "-q", "--", _PLANTED_SETTINGS_PATH],
+        cwd=worktree,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    return (
+        subprocess.run(
             ["git", "commit", "--no-verify", "-m", commit_msg, "--allow-empty-message"],
             cwd=worktree,
             capture_output=True,
