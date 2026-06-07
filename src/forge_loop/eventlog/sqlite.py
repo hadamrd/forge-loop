@@ -268,9 +268,24 @@ class SqliteEventLog:
         Issue #210, option (b): the load-bearing remainder is forced to survive
         in the live tier (it is simply never selected for deletion) while only
         non-load-bearing rows are pruned. The current high-water-mark row is
-        ALWAYS preserved regardless of kind, so ``latest_sequence()`` and every
-        projection cursor's accounting stay invariant across a compaction — this
-        is what keeps the boot-reconstruction invariant intact.
+        ALWAYS preserved regardless of kind, so ``latest_sequence()`` stays
+        stable across a compaction — this keeps the boot-reconstruction
+        invariant intact.
+
+        Issue #323: compaction additionally respects the **slowest registered
+        projection cursor**. A *prune floor* is computed as ``min(sequence)``
+        over :meth:`list_projection_cursors`; any event whose ``sequence`` is
+        **strictly greater than** that floor is protected from deletion,
+        because a lagging cursor — e.g. one left far behind head after a
+        crash/restart — may still need to replay it via ``since(cursor)``.
+        Pruning such events would silently corrupt that projection's aggregate
+        with no error raised. When **no cursors are registered** there is no
+        floor and behaviour is byte-for-byte identical to the pre-#323 prune
+        (load-bearing + tail preservation only). The cursor invariant is
+        therefore *conditional*: a cursor's accounting survives compaction for
+        load-bearing/tail rows (always) and for any event strictly above the
+        slowest cursor floor (always); noise at-or-below the slowest cursor is
+        still pruned.
 
         When ``emit_marker`` is true a :class:`EventKind.COMPACTION_PERFORMED`
         telemetry event is appended after the prune (this advances the log tail,
@@ -278,6 +293,10 @@ class SqliteEventLog:
         isolate the pure prune).
         """
         high_water = self.latest_sequence()
+        # Issue #323: protect everything strictly above the slowest cursor so a
+        # lagging projection can still replay it. No cursors ⇒ no floor.
+        cursors = self.list_projection_cursors()
+        prune_floor = min((c.sequence for c in cursors.values()), default=None)
         rows = self._connection.execute("SELECT sequence, kind FROM events").fetchall()
         scanned = len(rows)
         droppable: list[int] = []
@@ -289,6 +308,9 @@ class SqliteEventLog:
                 continue
             if sequence == high_water:
                 # Never prune the tail: keeps latest_sequence() stable.
+                continue
+            if prune_floor is not None and sequence > prune_floor:
+                # Protected: a lagging projection cursor may still replay it.
                 continue
             droppable.append(sequence)
 
