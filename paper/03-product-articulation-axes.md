@@ -81,7 +81,11 @@ every shipped change with the axis it served (`axis:<name>` labels). Value
 flows forward into what gets built, not just backward into what gets
 filtered. This closes a loop that prose vision alone cannot: the
 specification of value *drives the backlog* rather than passively grading
-it.
+it. (This is the *forward* arc only — articulation into backlog. The *return*
+arc — outcomes measured and fed back to re-rank value and advance the frontier
+— is the open half; articulation is the **Plan-intent** stage of a larger
+control loop the system half-built and never closed, taken up in
+[The Outer Loop](./10-the-outer-loop.md).)
 
 ## 3.4 The anti-cosmetic guardrail as a Goodhart defense
 
