@@ -50,6 +50,15 @@ def _seed(repo: Path) -> None:
     log.append(EventKind.TASK_COMPLETED, {"issue": 999}, task_id="issue:999", saga_id="tick:1")
 
 
+@pytest.fixture(autouse=True)
+def _no_network_open_issues(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default: no issue reconciliation (deterministic, never touches the network).
+    Reconciliation tests override console_api._open_issue_numbers explicitly."""
+    import forge_loop.console_api as capi
+
+    monkeypatch.setattr(capi, "_open_issue_numbers", lambda repo: None)
+
+
 @pytest.fixture
 def client(tmp_path: Path) -> TestClient:
     _seed(tmp_path)
@@ -208,3 +217,65 @@ def test_backlog_maps_axis_and_filters_labels(tmp_path: Path, monkeypatch: pytes
     assert bl[2]["axis"] == "frontier-generation"
     assert "loop:ready" in bl[2]["labels"]
     assert "noise-label" not in bl[2]["labels"]
+
+
+def _seed_dispatched(tmp_path: Path, *, issue: int) -> None:
+    (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
+    log = SqliteEventLog(tmp_path / ".forge" / "events.db")
+    log.append(
+        EventKind.TASK_DISPATCHED,
+        {"issue": issue, "title": "Work"},
+        task_id=f"issue:{issue}",
+        saga_id="tick:1",
+    )
+
+
+def test_saga_with_closed_issue_is_dropped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-terminal saga whose issue is CLOSED is a resolved historical ghost
+    (its terminal event was compacted out) — dropped, not shown as ABANDONED."""
+    import forge_loop.console_api as capi
+
+    _seed_dispatched(tmp_path, issue=7)
+    monkeypatch.setattr(capi, "_open_issue_numbers", lambda repo: set())  # issue 7 closed
+    c = TestClient(build_console_api(repo=tmp_path, token=None))
+    assert "issue:7" not in {s["saga_id"] for s in c.get("/api/sagas").json()}
+
+
+def test_saga_with_open_issue_is_abandoned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-terminal saga whose issue is still OPEN is genuinely stalled → ABANDONED."""
+    import forge_loop.console_api as capi
+
+    _seed_dispatched(tmp_path, issue=7)
+    monkeypatch.setattr(capi, "_open_issue_numbers", lambda repo: {7})  # issue 7 open
+    c = TestClient(build_console_api(repo=tmp_path, token=None))
+    saga = next(s for s in c.get("/api/sagas").json() if s["saga_id"] == "issue:7")
+    assert saga["state"] == "ABANDONED"
+
+
+def test_pr_labels_consistent_and_closed_issue_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An approved PR is never also critic:blocking (a stale merge.blocked must not
+    contradict the latest verdict); a PR whose issue is closed leaves the open tabs."""
+    import forge_loop.console_api as capi
+
+    (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
+    log = SqliteEventLog(tmp_path / ".forge" / "events.db")
+    log.append(EventKind.PR_OPENED, {"pr": 10, "title": "P"}, task_id="issue:50", saga_id="tick:1")
+    log.append(EventKind.MERGE_BLOCKED, {"pr": 10, "reason": "stale"}, task_id="issue:50", saga_id="tick:1")
+    log.append(
+        EventKind.CRITIQUE_ISSUED,
+        {"pr": 10, "round": 2, "verdict": "approved", "sev2": 0},
+        task_id="issue:50",
+        saga_id="tick:1",
+    )
+
+    monkeypatch.setattr(capi, "_open_issue_numbers", lambda repo: {50})  # issue open
+    open_pr = next(p for p in TestClient(build_console_api(repo=tmp_path, token=None)).get("/api/prs").json() if p["number"] == 10)
+    assert open_pr["state"] == "open"
+    assert open_pr["review"]["verdict"] == "approved"
+    assert "critic:blocking" not in open_pr["labels"]  # approved ⇒ never blocking
+
+    monkeypatch.setattr(capi, "_open_issue_numbers", lambda repo: set())  # issue closed
+    closed_pr = next(p for p in TestClient(build_console_api(repo=tmp_path, token=None)).get("/api/prs").json() if p["number"] == 10)
+    assert closed_pr["state"] == "closed"
