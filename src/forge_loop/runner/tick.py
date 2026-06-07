@@ -65,6 +65,7 @@ from forge_loop.runner.tick_checks import run_branch_sweep as _run_branch_sweep
 from forge_loop.runner.tick_checks import run_epic_sweep as _run_epic_sweep
 from forge_loop.runner.tick_checks import run_maintenance_tick as _run_maintenance_tick
 from forge_loop.runner.tick_checks import run_stuck_sweep as _run_stuck_sweep
+from forge_loop.runner.tick_checks import run_worktree_sweep as _run_worktree_sweep
 from forge_loop.state import append_event, consolidate_sprint, write_state
 from forge_loop.worker import WorkerOutcome
 
@@ -574,6 +575,9 @@ def _maybe_run_maintenance(cfg: Config, tick: int, *, short_sleep: Any) -> bool:
         # Deterministic branch GC (operational-convergence axis): delete loop/<n>
         # branches whose issue is closed. Pure Python, conservative, no LLM.
         _run_branch_sweep(cfg, tick)
+        # Deterministic worktree GC: reap orphaned task worktrees under worktree_root
+        # that no live in-flight lease owns. Pure Python, conservative, no LLM.
+        _run_worktree_sweep(cfg, tick)
     if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
         _run_maintenance_tick(cfg, tick)
         short_sleep(cfg.tick_interval_s, cfg)

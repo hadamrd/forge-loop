@@ -16,6 +16,8 @@ from forge_loop.maintenance import run_maintenance
 from forge_loop.state import append_event, write_state
 from forge_loop.stuck_sweep import SweepReport
 from forge_loop.stuck_sweep import sweep as _stuck_sweep
+from forge_loop.worktree_sweep import WorktreeSweepReport
+from forge_loop.worktree_sweep import sweep as _worktree_sweep
 
 
 def run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
@@ -176,6 +178,101 @@ def run_branch_sweep(
         deleted=report.deleted,
         skipped_open=len(report.skipped_open),
         skipped_unknown=len(report.skipped_unknown),
+        errors=list(report.errors),
+    )
+    return report
+
+
+def _list_worktrees(repo: Path) -> list[str]:
+    """Paths of every git worktree of THIS repo (`git worktree list --porcelain`).
+    Scoped to forge-loop's own worktrees by git; [] on failure."""
+    try:
+        out = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return []
+    return [
+        line[len("worktree ") :].strip()
+        for line in out.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
+def _remove_worktree(repo: Path, path: str) -> bool:
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", path],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        return True
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _inflight_worktrees(cfg: Config) -> set[str]:
+    """Worktree paths the control plane still leases (authoritative tasks.db). A live
+    lease's worktree is never reaped. Empty set on any error — but see the protected/
+    root guards: an empty live-set still can't touch the main checkout or off-root dirs."""
+    try:
+        from forge_loop.control.boot import canonical_task_saga_path
+        from forge_loop.tasks import SqliteTaskSagaStore
+
+        path = canonical_task_saga_path(cfg.repo)
+        if not path.exists():
+            return set()
+        store = SqliteTaskSagaStore(path)
+        try:
+            return {s.worktree for s in store.list_in_flight() if s.worktree}
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def run_worktree_sweep(
+    cfg: Config,
+    tick: int,
+    *,
+    worktrees: list[str] | None = None,
+    live_paths: set[str] | None = None,
+    remove: Callable[[str], bool] | None = None,
+) -> WorktreeSweepReport | None:
+    """Reap orphaned task worktrees under ``worktree_root`` (operational-convergence).
+
+    Maintenance-cadence only; deterministic, no LLM. Removes worktrees under the loop's
+    worktree_root that no live in-flight lease owns — never the main checkout, never a
+    leased worktree. Args injectable for tests.
+    """
+    if cfg.maintenance_every_n_ticks <= 0 or tick % cfg.maintenance_every_n_ticks != 0:
+        return None
+    root = getattr(cfg, "worktree_root", None)
+    if not root:
+        return None
+    wts = worktrees if worktrees is not None else _list_worktrees(cfg.repo)
+    live = live_paths if live_paths is not None else _inflight_worktrees(cfg)
+    rm = remove if remove is not None else (lambda p: _remove_worktree(cfg.repo, p))
+    protected = {str(cfg.repo)}
+    try:
+        report = _worktree_sweep(rm, wts, live_paths=live, root=str(root), protected=protected)
+    except Exception as ex:  # noqa: BLE001 — the sweep never raises; belt-and-braces
+        append_event(cfg.events_file, "worktree_sweep_crashed", tick=tick, err=str(ex)[:200])
+        return None
+    append_event(
+        cfg.events_file,
+        "worktree_sweep_done",
+        tick=tick,
+        reaped=report.reaped,
+        kept_live=len(report.kept_live),
         errors=list(report.errors),
     )
     return report
