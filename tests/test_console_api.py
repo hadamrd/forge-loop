@@ -126,6 +126,25 @@ def test_budget_shape(client: TestClient) -> None:
     assert b["cumulative"] == 1.5  # the one merged PR's cost_usd
 
 
+def test_dangling_saga_reconciled_to_abandoned(tmp_path: Path) -> None:
+    """A saga whose event trail ends non-terminally but which the control plane
+    does NOT track as in-flight must read ABANDONED — never a live worker with an
+    expired heartbeat (the zombie-worker bug)."""
+    (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
+    log = SqliteEventLog(tmp_path / ".forge" / "events.db")
+    log.append(
+        EventKind.TASK_DISPATCHED,
+        {"issue": 7, "title": "Dangling", "worktree": "/wt/7"},
+        task_id="issue:7",
+        saga_id="tick:9",
+    )
+    # No terminal event AND no tasks.db → control plane doesn't track it in-flight.
+    c = TestClient(build_console_api(repo=tmp_path, token=None))
+    saga = next(s for s in c.get("/api/sagas").json() if s["saga_id"] == "issue:7")
+    assert saga["state"] == "ABANDONED"
+    assert c.get("/api/workers").json() == []
+
+
 def test_auth_enforced_when_token_set(tmp_path: Path) -> None:
     _seed(tmp_path)
     c = TestClient(build_console_api(repo=tmp_path, token="secret"))

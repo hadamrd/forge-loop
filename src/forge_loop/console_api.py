@@ -183,9 +183,40 @@ def _pr_number(val: Any) -> int | None:
     return None
 
 
+def _live_inflight_task_ids(repo: Path) -> set[str]:
+    """task_ids the control plane currently tracks as in-flight — the authoritative
+    tasks.db lease store (the same source ``forge-loop status`` uses).
+
+    Empty on any error: a non-terminal saga in the event log is only "live" if the
+    control plane agrees. Otherwise it's a dead saga whose last event simply never
+    reached a terminal kind — showing it as a live worker with an expired heartbeat
+    is the bug this guards against.
+    """
+    path = repo / ".forge" / "tasks.db"
+    if not path.exists():
+        return set()
+    try:
+        from forge_loop.tasks import SqliteTaskSagaStore
+
+        store = SqliteTaskSagaStore(path)
+        try:
+            return {s.task_id for s in store.list_in_flight()}
+        finally:
+            store.close()
+    except Exception:
+        return set()
+
+
 def _reconstruct_sagas(repo: Path) -> list[dict[str, Any]]:
-    """Group events by task_id and fold each into a console Saga."""
+    """Group events by task_id and fold each into a console Saga.
+
+    A saga whose event trail ends non-terminally but which the control plane no
+    longer tracks as in-flight is reconciled to ABANDONED — the event log only
+    records that work *started*, not that it died, so without this the loop would
+    appear to have zombie workers running forever.
+    """
     events = _read_events(repo)
+    live = _live_inflight_task_ids(repo)
     by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for e in events:
         if e.get("task_id"):
@@ -222,6 +253,11 @@ def _reconstruct_sagas(repo: Path) -> list[dict[str, Any]]:
             state = "RUNNING"
         else:
             state = "DISPATCHED"
+
+        # Reconcile against the control plane: a "live" computed state is only real
+        # if tasks.db still tracks this task as in-flight; otherwise it's abandoned.
+        if state in {"RUNNING", "AWAITING_CRITIC", "REVISING", "DISPATCHED"} and task_id not in live:
+            state = "ABANDONED"
 
         rounds = [int(_p(e, "round", 0) or 0) for e in evs if e["kind"] == "critique.issued"]
         repair_rounds = max(rounds) if rounds else 0
