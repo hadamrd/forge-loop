@@ -1,4 +1,4 @@
-[← Agent Enablement](./08-agent-enablement.md) · [Index](./README.md) · [Next: Limitations →](./10-limitations.md)
+[← Agent Enablement](./08-agent-enablement.md) · [Index](./README.md) · [Next: The Outer Loop →](./10-the-outer-loop.md)
 
 ---
 
@@ -271,4 +271,4 @@ Convergence asks whether, having acted and been judged, it can *get to done*.
 
 ---
 
-[← Agent Enablement](./08-agent-enablement.md) · [Index](./README.md) · [Next: Limitations →](./10-limitations.md)
+[← Agent Enablement](./08-agent-enablement.md) · [Index](./README.md) · [Next: The Outer Loop →](./10-the-outer-loop.md)

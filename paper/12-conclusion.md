@@ -1,10 +1,10 @@
-[← Limitations](./10-limitations.md) · [Index](./README.md)
+[← Limitations](./11-limitations.md) · [Index](./README.md)
 
 ---
 
-# 11. Conclusion
+# 12. Conclusion
 
-## 9.1 The argument, restated
+## 12.1 The argument, restated
 
 We began with an inversion: in an era where language models can reliably
 generate correct code, the hard problem of autonomous software development
@@ -38,7 +38,7 @@ non-decreasing value over an unbounded number of unsupervised actions** —
 bought with an upfront specification cost that amortizes while per-action
 review cost never does (Section 2).
 
-## 9.2 Why the tradeoff is favorable
+## 12.2 Why the tradeoff is favorable
 
 The economic core of the argument is an asymmetry. Specification is a fixed
 cost that an unbounded number of future actions draw against; per-PR review
@@ -50,12 +50,12 @@ sense in which the architecture is "scientifically a good tradeoff": not
 that it is free, but that its cost structure is the right shape for the
 regime it targets.
 
-## 9.3 What is durable here
+## 12.3 What is durable here
 
 The forge-loop *product* competes in a crowded and fast-converging space;
 platform-native "assign an issue, get a PR" features may well absorb the
 dispatch loop. We are explicit about that, and about the artifact's own
-unevenness (Section 10).
+unevenness (Section 11).
 
 But the **idea** is more durable than the product. The proposition that
 autonomous agents should be governed by *machine-checkable value and
@@ -68,7 +68,19 @@ on the thing that changes fastest (the model); they depend on the thing
 that changes slowest (what the operator actually values and refuses to
 ship).
 
-## 9.4 Closing
+Three chapters written after that original triad widen the claim rather than
+soften it. **Agent enablement** (Section 8) is governance's dual — the agent
+must be *able* to act before gating what it produces is meaningful.
+**Convergence** (Section 9) is the requirement that, once judged, the agent can
+reach *done* in a bounded number of steps — distinct from, and not bought by,
+gate quality. And **the outer loop** (Section 10) is the requirement standing
+above all of these: that the system measure itself, prioritize by value, and
+steer its own direction — the difference between a factory that merely runs and
+one that improves. The governance gates remain the core contribution;
+enablement, convergence, and the outer loop are the boundaries we have since
+learned the core does not, by itself, reach.
+
+## 12.4 Closing
 
 If there is a single sentence to carry away, it is this:
 
@@ -84,4 +96,4 @@ gates are the contribution. Everything else is plumbing.
 
 ---
 
-[← Limitations](./10-limitations.md) · [Index](./README.md)
+[← Limitations](./11-limitations.md) · [Index](./README.md)
