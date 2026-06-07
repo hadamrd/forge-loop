@@ -123,14 +123,32 @@ def _remove_ready_label(
     _remove_ready_label_impl(cfg, issue, status=status, pr_url=pr_url, unlabel_fn=unlabel)
 
 
-def _record_merged_memory(cfg: Config, merged: list[WorkerOutcome]) -> None:
+# Sentinel for "no mutation-check result supplied" (issue #381). Distinct from
+# ``None`` (which the oracle gate treats as "check ran but errored/unavailable"
+# → conservative refuse). When the production caller leaves the mutation result
+# _UNSET the oracle gate stays dormant; tests inject a result or ``None``.
+_UNSET: Any = object()
+
+
+def _record_merged_memory(
+    cfg: Config,
+    merged: list[WorkerOutcome],
+    *,
+    refused_issues: set[int] | None = None,
+) -> None:
     """Best-effort: promote episodic memory from merged outcomes.
 
     Opens the canonical ``.forge/memory.db`` store and records one EPISODIC
     item per merged issue. Wrapped so a failure here never breaks the tick: it
     emits ``memory_promoted`` (count) on success or ``memory_promote_failed``
     (err) on any error.
+
+    Issue #381: ``refused_issues`` (gated by the issue-closed / oracle-strength
+    merge gates) are excluded — a refused patch must NOT advance frontier or
+    episodic memory even if the worker optimistically reported it as merged.
     """
+    if refused_issues:
+        merged = [o for o in merged if o.issue not in refused_issues]
     if not merged:
         return
     try:
@@ -1045,14 +1063,26 @@ def _run_merge_gate(
     used_pipeline: bool,
     bus_emit: Any,
     master_log_path: Path,
-) -> None:
-    """Critic → ready-label cleanup → issue-closed gate → enable auto-merge.
+    mutation_result: Any = _UNSET,
+) -> set[int]:
+    """Critic → ready-label cleanup → merge gates → enable auto-merge.
 
     Issue #65: the pre-merge issue-closed gate runs AFTER the critic has had its
     say but BEFORE any outcome is declared ``merged`` — an operator who closed
     the issue mid-flight (dup / not-planned / scope-change) wants the loop to
     STOP, and the gate is conservative on ``gh`` failure (refuse rather than
     land work on a closed ticket).
+
+    Issue #381: the oracle-strength gate then refuses any PR whose scoped
+    mutation check (#379) reports surviving mutants above the configured
+    threshold, so a wrong-but-green patch cannot auto-merge and promote itself
+    into durable cognition. ``mutation_result`` is injected (the #379 runner is
+    not yet merged); the production caller leaves it ``_UNSET`` so the gate stays
+    dormant until a result source is wired, while tests inject a result (or
+    ``None`` to exercise the conservative-on-uncertainty branch).
+
+    Returns the union of issue numbers refused by either gate so the caller can
+    exclude them from frontier/episodic-memory promotion.
     """
     if cfg.critic.enabled and not used_pipeline:
         _run_critic_for_outcomes(cfg, outcomes, bus_emit)
@@ -1062,7 +1092,10 @@ def _run_merge_gate(
             _remove_ready_label(cfg, o.issue, status=o.status, pr_url=o.pr_url)
 
     from forge_loop import gh_issues as _gh
-    from forge_loop.runner.merge_gate import apply_issue_closed_gate
+    from forge_loop.runner.merge_gate import (
+        apply_issue_closed_gate,
+        apply_mutation_survivor_gate,
+    )
 
     refused = apply_issue_closed_gate(
         outcomes,
@@ -1071,17 +1104,40 @@ def _run_merge_gate(
         events_file=cfg.events_file,
         emit=bus_emit,
     )
+
+    # Oracle-strength gate (#381). Dormant in production until a result source
+    # is wired (mutation_result left _UNSET); a provided result/None engages it.
+    mutation_refused: list[int] = []
+    if mutation_result is not _UNSET:
+        mutation_refused = apply_mutation_survivor_gate(
+            outcomes,
+            result=mutation_result,
+            config=cfg.mutation_gate,
+            gh=_gh,
+            repo=cfg.github_repo,
+            events_file=cfg.events_file,
+            emit=bus_emit,
+        )
+
+    refused_all = set(refused) | set(mutation_refused)
     _enable_automerge_for_reviewed_outcomes(
         cfg,
         outcomes,
         risk_gated_issues=risk_gated_issues,
-        refused_issues=set(refused),
+        refused_issues=refused_all,
     )
     if refused:
         _mlog.info(
             master_log_path,
             f"merge gate refused {len(refused)} PR(s) — closed issues: {refused}",
         )
+    if mutation_refused:
+        _mlog.info(
+            master_log_path,
+            f"mutation gate refused {len(mutation_refused)} PR(s) — weak oracle "
+            f"on {cfg.mutation_gate.module}: {mutation_refused}",
+        )
+    return refused_all
 
 
 def _record_attempts(
@@ -1172,6 +1228,7 @@ def _finalize_tick(
     fingerprint_by_issue: dict[int, str],
     short_sleep: Any,
     skip_sleep: bool = False,
+    refused_issues: set[int] | None = None,
 ) -> None:
     """Record attempts → promote memory → reap → redeploy → drift → consolidate.
 
@@ -1190,8 +1247,14 @@ def _finalize_tick(
     merged_nums = [o.issue for o in outcomes if o.status == "merged"]
 
     # Close the cognition feedback loop: durable episodic memory from real
-    # merged outcomes. Strictly best-effort — never breaks the tick.
-    _record_merged_memory(cfg, [o for o in outcomes if o.status == "merged"])
+    # merged outcomes. Strictly best-effort — never breaks the tick. Merge-gate
+    # refused issues (#65 closed / #381 weak-oracle) are excluded so a refused
+    # patch never advances frontier/episodic memory.
+    _record_merged_memory(
+        cfg,
+        [o for o in outcomes if o.status == "merged"],
+        refused_issues=refused_issues,
+    )
 
     append_event(
         cfg.events_file,
@@ -1382,7 +1445,7 @@ def _tick(cfg: Config, tick: int) -> None:
         master_log_path=master_log_path,
     )
 
-    _run_merge_gate(
+    refused_issues = _run_merge_gate(
         cfg,
         outcomes,
         risk_gated_issues=risk_gated_issues,
@@ -1399,4 +1462,5 @@ def _tick(cfg: Config, tick: int) -> None:
         short_sleep=_short_sleep,
         # #262: the repair tick already slept this interval; don't double-sleep.
         skip_sleep=bool(repairs_ran),
+        refused_issues=refused_issues,
     )

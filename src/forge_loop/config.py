@@ -94,6 +94,21 @@ class CriticConfig:
 
 
 @dataclass(frozen=True)
+class MutationGateConfig:
+    """Oracle-strength merge gate config (issue #381).
+
+    When ``enabled`` and the scoped mutation-check (#379) reports more than
+    ``survivor_threshold`` surviving mutants for ``module``, the runner refuses
+    auto-merge and skips frontier/episodic-memory promotion for the affected
+    issue. ``enabled=False`` preserves the pre-#381 behaviour.
+    """
+
+    enabled: bool = True
+    module: str = "forge_loop/eventlog/chain.py"
+    survivor_threshold: int = 0
+
+
+@dataclass(frozen=True)
 class POConfig:
     enabled: bool = True
     timeout_s: int = 480
@@ -170,6 +185,7 @@ class Config:
     labels: Labels = field(default_factory=Labels)
     briefs: Briefs = field(default_factory=Briefs)
     critic: CriticConfig = field(default_factory=CriticConfig)
+    mutation_gate: MutationGateConfig = field(default_factory=MutationGateConfig)
     po: POConfig = field(default_factory=POConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     attempts: AttemptsConfig = field(default_factory=AttemptsConfig)
@@ -307,6 +323,11 @@ def _from_settings(s: Settings) -> Config:
             provider=s.critic.provider,
             sev3_demotion_round_threshold=s.critic.sev3_demotion_round_threshold,
         ),
+        mutation_gate=MutationGateConfig(
+            enabled=s.mutation_gate.enabled,
+            module=s.mutation_gate.module,
+            survivor_threshold=s.mutation_gate.survivor_threshold,
+        ),
         po=POConfig(
             enabled=s.po.enabled,
             timeout_s=s.po.timeout_s,
@@ -361,6 +382,7 @@ __all__ = [
     "Labels",
     "LumenConfig",
     "ModelConfigError",
+    "MutationGateConfig",
     "POConfig",
     "WorkerConfig",
     "load",
