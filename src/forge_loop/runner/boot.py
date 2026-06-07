@@ -83,6 +83,66 @@ def _check_environment_poison(cfg: Config) -> Any:
         return PoisonResult(poisoned=False)
 
 
+def _heal_environment_poison(cfg: Config, poison: Any) -> bool:
+    """Self-heal a worker-caused editable poison; report whether boot may go on.
+
+    Issue #315. The #144 guard only *detected* the poison and aborted with
+    ``return 3`` — a zero-HITL violation that bricked every ``forge-loop run``
+    until a human re-pointed the ``.pth``. Now: if the poison is a worktree
+    editable, remove the stray operator-site artifacts so the uv-managed install
+    re-surfaces, emit ``boot_environment_self_healed`` and return ``True`` (boot
+    continues to dispatch). If the poison is NOT safely healable (location not
+    worktree-shaped, or site dir unknown) return ``False`` so the caller
+    preserves the #144 refuse-to-start path. If the heal itself fails, emit
+    ``boot_environment_heal_failed`` and return ``False`` (refuse fallback). The
+    heal is best-effort and MUST NOT crash boot (AC #4).
+    """
+    from forge_loop.runner.poison_guard import (
+        RealHealFilesystem,
+        heal_poison,
+        operator_site_dirs,
+    )
+
+    offending_path = getattr(poison, "offending_path", None)
+    try:
+        result = heal_poison(
+            offending_path,
+            site_dirs=operator_site_dirs(),
+            fs=RealHealFilesystem(),
+        )
+    except Exception as exc:  # noqa: BLE001 — heal must never crash boot (AC #4)
+        append_event(
+            cfg.events_file,
+            "boot_environment_heal_failed",
+            offending_path=offending_path,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return False
+
+    if not result.healable:
+        # Not worktree-shaped (uv-managed / canonical) → preserve the #144
+        # refuse-to-start path (AC #3); the caller emits boot_environment_poisoned.
+        return False
+
+    if not result.healed:
+        append_event(
+            cfg.events_file,
+            "boot_environment_heal_failed",
+            offending_path=result.offending_path,
+            error=result.error or "unknown",
+            removed=list(result.removed),
+        )
+        return False
+
+    append_event(
+        cfg.events_file,
+        "boot_environment_self_healed",
+        offending_path=result.offending_path,
+        removed=list(result.removed),
+    )
+    return True
+
+
 def _run_boot_recovery(cfg: Config) -> Any:
     """Reconcile dead-worker sagas at boot so the loop resumes cleanly.
 
@@ -283,7 +343,11 @@ def run(cfg: Config, state: RunnerState | None = None) -> int:
     # guard reports + refuses (exit 3); it never mutates the operator's
     # site-packages. Runs before any worker dispatch.
     poison = _check_environment_poison(cfg)
-    if poison.poisoned:
+    # Issue #315 — self-heal a worker-caused editable poison instead of the #144
+    # FATAL abort. If the poison is healable we remove the stray operator-site
+    # artifacts and CONTINUE booting to dispatch; only an unhealable poison (or a
+    # failed heal) falls back to the #144 refuse-to-start (exit 3).
+    if poison.poisoned and not _heal_environment_poison(cfg, poison):
         append_event(
             cfg.events_file,
             "boot_environment_poisoned",

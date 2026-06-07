@@ -21,16 +21,25 @@ The live ``pip show`` call is hidden behind the :class:`PipShowReader`
 Protocol (manifesto Q2) with a real subprocess impl here and a
 ``FakePipShowReader`` under ``forge_loop/_testing/`` for tests.
 
-The guard **reports and refuses**; it never mutates the operator's
-site-packages (that is explicitly out of scope for #144).
+The #144 guard **reported and refused** — it never mutated the operator's
+site-packages. Issue #315 turns that refuse into a **self-heal**: a
+worker-caused poison is a zero-HITL bricking class, so boot now auto-removes
+the stray editable artifacts (behind the :class:`HealFilesystem` Protocol,
+manifesto Q2) and continues. The heal is strictly NARROWER than detection —
+see :func:`is_worktree_shaped` / :func:`plan_heal` — so it can only ever
+remove forge-loop editable artifacts pointing into a worktree.
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import shutil
 import subprocess
 import sys
 import sysconfig
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -253,3 +262,204 @@ def check_environment_not_poisoned(
         site_packages=site_packages if site_packages is not None else current_site_packages(),
         reinstall_target=reinstall_target,
     )
+
+
+# ---------------------------------------------------------------------------
+# Self-heal (#315). Detection above stays a PURE refuse-or-not decision over a
+# ``PipShowPayload`` (#144 contract, unchanged). #144 only *refused* to start,
+# which made a worker-caused poison a zero-HITL brick (2026-06-07: every
+# ``forge-loop run`` exited 3 for hours). Boot now auto-cleans and continues.
+# The heal is deliberately NARROWER than detection: it fires ONLY for an
+# unambiguously worktree-shaped offending path AND removes ONLY forge-loop
+# editable artifacts, so it can never delete a uv-managed / canonical install
+# or an unrelated package (AC #3). The mutation lives behind the
+# :class:`HealFilesystem` Protocol (manifesto Q2) so it is Fake-unit-testable.
+# ---------------------------------------------------------------------------
+
+# Site-packages entries that are forge-loop editable-install artifacts. The
+# ``.pth`` / finder re-point ``import forge_loop`` at the worktree; the
+# ``forge_loop`` / ``roles`` shim dirs are the legacy direct-path leak. Prefix
+# matching covers the version-suffixed forms pip emits
+# (``__editable__.forge_loop-0.1.0.pth``).
+_EDITABLE_ARTIFACT_PREFIXES: tuple[str, ...] = (
+    "_editable_impl_forge_loop",
+    "__editable__.forge_loop",
+    "__editable___forge_loop",
+    "forge_loop.egg-link",
+)
+_SHIM_DIR_NAMES: frozenset[str] = frozenset({"forge_loop", "roles"})
+
+
+def _is_forge_loop_editable_artifact(name: str) -> bool:
+    """True only for forge-loop editable artifacts — never unrelated packages."""
+    if name in _SHIM_DIR_NAMES:
+        return True
+    return any(name.startswith(prefix) for prefix in _EDITABLE_ARTIFACT_PREFIXES)
+
+
+def is_worktree_shaped(path: str | None) -> bool:
+    """True when ``path`` carries an unambiguous ``wt-loop-*`` worktree segment.
+
+    Stricter than :func:`_location_in_worktree` (which also accepts anything
+    under the configured ``worktree_root``): the heal DELETES files, so it only
+    fires on the unambiguous worker-worktree shape — never on a path that
+    merely happens to sit under a configured root (AC #3). A non-worktree
+    poison therefore preserves the #144 refuse path.
+    """
+    if not path:
+        return False
+    return _WT_LOOP_SEGMENT_RE.search(path.rstrip("/")) is not None
+
+
+@dataclass(frozen=True)
+class HealPlan:
+    """Pure plan: the exact set of site-packages paths to remove.
+
+    ``healable`` is ``False`` (and ``remove_paths`` empty) when the offending
+    path is not worktree-shaped — the caller then preserves the #144 refuse
+    path instead of deleting anything.
+    """
+
+    healable: bool
+    offending_path: str | None = None
+    remove_paths: tuple[str, ...] = field(default_factory=tuple)
+
+
+def plan_heal(
+    offending_path: str | None,
+    *,
+    sites: Mapping[str, Iterable[str]],
+) -> HealPlan:
+    """Pure heal planner (AC #6).
+
+    Given a worktree-pointing editable and a listing of each operator site dir
+    (``site_dir -> entry names``), return the EXACT paths to remove. Returns
+    ``healable=False`` with no paths for a uv-managed / canonical /
+    non-worktree-shaped location — nothing is ever planned for deletion there.
+    Only forge-loop editable artifacts are ever included, so a non-forge-loop
+    entry that merely sits under the same site dir is never touched (AC #3).
+    Existence-independent: a dangling (reaped-worktree) offending path still
+    plans removal of the artifacts that remain in the operator site.
+    """
+    if not is_worktree_shaped(offending_path):
+        return HealPlan(healable=False, offending_path=offending_path)
+    remove: list[str] = []
+    for site_dir, entries in sites.items():
+        for name in entries:
+            if _is_forge_loop_editable_artifact(name):
+                remove.append(str(Path(site_dir) / name))
+    return HealPlan(
+        healable=True,
+        offending_path=offending_path,
+        remove_paths=tuple(sorted(remove)),
+    )
+
+
+@dataclass(frozen=True)
+class HealResult:
+    """Outcome of an attempted heal.
+
+    * ``healable=False`` → not worktree-shaped; caller preserves refuse path
+      (emit ``boot_environment_poisoned``, exit 3).
+    * ``healable=True, healed=True`` → artifacts removed; boot continues.
+    * ``healable=True, healed=False`` → cleanup raised; caller emits
+      ``boot_environment_heal_failed`` and falls back to refuse.
+    """
+
+    healable: bool
+    healed: bool
+    offending_path: str | None = None
+    removed: tuple[str, ...] = field(default_factory=tuple)
+    error: str | None = None
+
+
+class HealFilesystem(Protocol):
+    """Typed boundary (manifesto Q2) around the mutating site-packages cleanup."""
+
+    def list_site_entries(self, site_dir: str) -> tuple[str, ...]:
+        """Return the entry names directly under ``site_dir`` (``()`` if absent)."""
+        ...
+
+    def remove(self, path: str) -> None:
+        """Remove a file or directory tree at ``path`` (best-effort)."""
+        ...
+
+
+def heal_poison(
+    offending_path: str | None,
+    *,
+    site_dirs: Iterable[str],
+    fs: HealFilesystem,
+) -> HealResult:
+    """Plan + execute the heal behind the :class:`HealFilesystem` boundary.
+
+    Best-effort like the #144 guard: any failure during listing/removal is
+    captured into ``error`` (``healed=False``) rather than raised, so boot can
+    fall back to refuse instead of crashing (AC #4). A dangling offending path
+    (worktree already reaped) still heals — the artifacts live in the operator
+    site, not the reaped worktree, so we never depend on the target existing.
+    """
+    if not is_worktree_shaped(offending_path):
+        return HealResult(healable=False, healed=False, offending_path=offending_path)
+    removed: list[str] = []
+    try:
+        sites = {site_dir: fs.list_site_entries(site_dir) for site_dir in site_dirs}
+        plan = plan_heal(offending_path, sites=sites)
+        for path in plan.remove_paths:
+            fs.remove(path)
+            removed.append(path)
+    except Exception as exc:  # noqa: BLE001 — heal is best-effort; never crash boot
+        return HealResult(
+            healable=True,
+            healed=False,
+            offending_path=offending_path,
+            removed=tuple(removed),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    return HealResult(
+        healable=True,
+        healed=True,
+        offending_path=offending_path,
+        removed=tuple(removed),
+    )
+
+
+def operator_site_dirs() -> tuple[str, ...]:
+    """Operator interpreter site dirs to scan for stray editable artifacts.
+
+    Unions the global ``site.getsitepackages()``, the user site
+    (``~/.local/lib/...`` — where the 2026-06-07 incident landed), and the
+    ``sysconfig`` purelib, de-duplicated. Each source is best-effort: an
+    interpreter that doesn't expose one simply contributes nothing.
+    """
+    import site as _site
+
+    dirs: list[str] = []
+    with contextlib.suppress(Exception):
+        dirs.extend(_site.getsitepackages())
+    with contextlib.suppress(Exception):
+        user = _site.getusersitepackages()
+        if user:
+            dirs.append(user)
+    purelib = current_site_packages()
+    if purelib:
+        dirs.append(purelib)
+    return tuple(dict.fromkeys(dirs))
+
+
+@dataclass(frozen=True)
+class RealHealFilesystem:
+    """Real :class:`HealFilesystem` over the operator's filesystem."""
+
+    def list_site_entries(self, site_dir: str) -> tuple[str, ...]:
+        try:
+            return tuple(os.listdir(site_dir))
+        except OSError:
+            return ()
+
+    def remove(self, path: str) -> None:
+        target = Path(path)
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink(missing_ok=True)

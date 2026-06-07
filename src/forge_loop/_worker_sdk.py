@@ -292,6 +292,15 @@ def _clean_sdk_env() -> dict[str, str]:
     env = dict(os.environ)
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_SSE_PORT", None)
+    # Issue #315 (root-cause isolation for #144): a worker that runs
+    # ``pip install -e .`` from its /tmp worktree poisons the OPERATOR Python by
+    # leaking the worktree into the shared/user site-packages. Force every pip
+    # the worker spawns to REFUSE unless a virtualenv is active, so a bare
+    # ``pip install -e .`` can no longer reach the operator/user site — it errors
+    # out instead. The brief's recommended worktree-local ``uv venv .venv``
+    # path is unaffected (this only gates classic ``pip``), and the critic's
+    # ``detect_pip_editable_poison`` rule remains the review-time backstop.
+    env["PIP_REQUIRE_VIRTUALENV"] = "1"
     return env
 
 
