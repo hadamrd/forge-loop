@@ -30,7 +30,12 @@ from datetime import UTC, datetime
 from forge_loop.memory.models import MemoryItem, MemoryKind, MemoryProvenance
 from forge_loop.memory.store import MemoryStore
 
-__all__ = ["record_merged_outcomes"]
+__all__ = ["record_failed_outcomes", "record_merged_outcomes"]
+
+#: Upper bound on how many characters of a failure reason are persisted as the
+#: lesson body. Mirrors the 2000-char cap used by ``runner/_helpers.py`` when it
+#: scans worker error text, so a runaway traceback never bloats the memory row.
+_MAX_REASON_LEN = 2000
 
 
 def _coerce_issue(merged: object) -> tuple[int, str, str | None] | None:
@@ -63,6 +68,105 @@ def _coerce_issue(merged: object) -> tuple[int, str, str | None] | None:
     title_str = str(title or "").strip()
     pr_str = str(pr_url).strip() if pr_url else None
     return n, title_str, (pr_str or None)
+
+
+def _coerce_failure(record: object) -> tuple[int, str, str, str] | None:
+    """Normalise one failed record into ``(issue_number, title, status, reason)``.
+
+    Reuses :func:`_coerce_issue` for the issue-number/title extraction (so the
+    two paths share one normalisation scheme) and additionally pulls the
+    terminal ``status`` and the ``reason``/``error`` text. Returns ``None`` for
+    records without a usable issue number so callers skip them rather than
+    crashing the loop.
+    """
+    coerced = _coerce_issue(record)
+    if coerced is None:
+        return None
+    n, title, _pr = coerced
+
+    status: object
+    reason: object
+    if isinstance(record, Mapping):
+        status = record.get("status", "")
+        reason = record.get("reason", record.get("error"))
+    else:
+        status = getattr(record, "status", "")
+        reason = getattr(record, "reason", getattr(record, "error", None))
+
+    status_str = str(status or "").strip()
+    reason_str = str(reason or "").strip()[:_MAX_REASON_LEN]
+    return n, title, status_str, reason_str
+
+
+def record_failed_outcomes(
+    memory_store: MemoryStore,
+    failures: Iterable[object],
+    *,
+    now: datetime | None = None,
+) -> tuple[str, ...]:
+    """Record one EPISODIC failure memory per abandoned/failed issue.
+
+    Sibling of :func:`record_merged_outcomes` for the *did-not-ship* path: when
+    a worker saga reaches a terminal failure (e.g. ``ABANDONED``), this upserts
+    one EPISODIC :class:`MemoryItem` titled ``"failed #N: <title>"`` whose
+    structured body carries the terminal ``status`` and the (truncated) failure
+    reason as the durable lesson. Provenance uses ``source_task_ref="issue:#N"``
+    and ``authored_by="maestro"``; the item is tagged ``("failed",)``.
+
+    The ``memory_id`` is the deterministic ``episodic-failed-{N}`` so re-runs
+    upsert in place rather than duplicating — the lesson survives a maestro
+    context reset instead of vanishing with the worker.
+
+    Args:
+        memory_store: The durable memory store to write to.
+        failures: Failed/abandoned records — mappings or objects exposing an
+            issue number (``issue``/``number``), optional ``title``, a terminal
+            ``status``, and a failure ``reason`` (or ``error``).
+        now: Optional fixed timestamp for deterministic provenance; defaults to
+            the current UTC time.
+
+    Returns:
+        The promoted ``memory_id`` values, in input order, deduplicated by
+        issue number (the first record for a given issue wins).
+    """
+    created_at = now if now is not None else datetime.now(UTC)
+
+    promoted: list[str] = []
+    seen: set[int] = set()
+    for record in failures:
+        coerced = _coerce_failure(record)
+        if coerced is None:
+            continue
+        n, title, status, reason = coerced
+        if n in seen:
+            continue
+        seen.add(n)
+
+        memory_id = f"episodic-failed-{n}"
+        failed_title = f"failed #{n}: {title}" if title else f"failed #{n}"
+        body_lines = [failed_title, f"status: {status or 'failed'}"]
+        if reason:
+            body_lines.append(f"lesson: {reason}")
+        body = "\n".join(body_lines)
+
+        item = MemoryItem(
+            memory_id=memory_id,
+            kind=MemoryKind.EPISODIC,
+            title=failed_title,
+            body=body,
+            provenance=MemoryProvenance(
+                source_event=None,
+                authored_by="maestro",
+                source_task_ref=f"issue:#{n}",
+                confidence=1.0,
+                created_at=created_at,
+            ),
+            tags=("failed",),
+        )
+        memory_store.put(item)
+        promoted.append(memory_id)
+
+    return tuple(promoted)
 
 
 def record_merged_outcomes(
