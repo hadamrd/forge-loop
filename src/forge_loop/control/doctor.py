@@ -17,13 +17,14 @@ probes degrade to ``warn`` rather than crashing or hard-failing ``doctor``.
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from forge_loop.control.status import collect_control_plane_status
 from forge_loop.eventlog.projections import (
@@ -192,6 +193,25 @@ def _memory_integrity_check(status: dict[str, Any], memory_path: Path) -> dict[s
     return _check(PASS, detail, None)
 
 
+class _StateProjection(Protocol):
+    """A projection that also exposes its rebuilt ``state()`` for comparison.
+
+    The determinism probe needs more than the public :class:`Projection`
+    protocol (which only carries ``cursor`` + ``apply``): it must observe the
+    *rebuilt state* two replays produce. Rather than widen the public protocol
+    (explicitly out of scope for #327), the doctor probe carries its own
+    ``state()`` and the check accepts any factory yielding this shape.
+    """
+
+    cursor: ProjectionCursor
+
+    def apply(self, event: Any) -> None: ...
+
+    def state(self) -> Any:
+        """Return the JSON-serialisable rebuilt state for canonical comparison."""
+        ...
+
+
 @dataclass
 class _CountingProjection:
     """A minimal projection that re-applies every event by sequence only.
@@ -200,6 +220,9 @@ class _CountingProjection:
     event-log head"; the probe deliberately does NOT decode payloads (which
     would couple it to every event kind's schema and could raise on an
     unexpected one). It only needs ``event.sequence`` to advance its cursor.
+    Its :meth:`state` is replay-order-independent (it only folds in monotonic
+    sequence facts), so a clean log yields byte-identical canonical JSON across
+    two replays.
     """
 
     cursor: ProjectionCursor = ProjectionCursor()
@@ -208,6 +231,9 @@ class _CountingProjection:
     def apply(self, event: Any) -> None:
         self.cursor = ProjectionCursor(sequence=event.sequence)
         self.applied += 1
+
+    def state(self) -> dict[str, int]:
+        return {"applied": self.applied, "head": self.cursor.sequence}
 
 
 @dataclass
@@ -244,7 +270,35 @@ class _ReadOnlyReplayTarget:
         self.persisted = cursor
 
 
-def _replay_determinism_check(status: dict[str, Any], event_log_path: Path) -> dict[str, Any]:
+def _canonical_state_json(projection: _StateProjection) -> str:
+    """Canonical JSON of a projection's rebuilt state.
+
+    Reuses the canonical-JSON convention of
+    :func:`forge_loop.sandbox.policy.canonical_policy_json`
+    (``sort_keys=True, separators=(",", ":")``) rather than inventing a new
+    canonicaliser, so two byte strings are comparable iff the states are equal.
+    """
+
+    return json.dumps(projection.state(), sort_keys=True, separators=(",", ":"))
+
+
+def _one_replay(
+    target: ProjectionEventLog,
+    projection_factory: Callable[[], _StateProjection],
+) -> tuple[ProjectionCursor, str]:
+    """Replay the whole log into a fresh projection; return (head, canonical state)."""
+
+    projection = projection_factory()
+    cursor = replay_projection(target, "doctor-replay-probe", cast("Projection", projection))
+    return cursor, _canonical_state_json(projection)
+
+
+def _replay_determinism_check(
+    status: dict[str, Any],
+    event_log_path: Path,
+    *,
+    projection_factory: Callable[[], _StateProjection] = _CountingProjection,
+) -> dict[str, Any]:
     event_log = status["event_log"]
     if not event_log["available"]:
         return _check(WARN, "event log absent; replay determinism not applicable", None)
@@ -252,11 +306,14 @@ def _replay_determinism_check(status: dict[str, Any], event_log_path: Path) -> d
     last_sequence = event_log["last_sequence"] or 0
 
     # The lightweight read-only target/projection only consume ``event.sequence``;
-    # cast to the structural protocols replay_projection expects.
+    # cast to the structural protocols replay_projection expects. We replay the
+    # durable log TWICE over fresh projections so we can compare the rebuilt
+    # state, not just the sequence head — an order-dependent or wall-clock
+    # projection reaches the same head yet yields divergent state (#327).
     target = cast("ProjectionEventLog", _ReadOnlyReplayTarget(event_log_path))
-    projection = cast("Projection", _CountingProjection())
     try:
-        rebuilt = replay_projection(target, "doctor-replay-probe", projection)
+        rebuilt, first_state = _one_replay(target, projection_factory)
+        _, second_state = _one_replay(target, projection_factory)
         cursors = _live_projection_cursors(event_log_path)
     except (ProjectionReplayError, sqlite3.Error, OSError, ValueError) as exc:
         return _check(
@@ -289,9 +346,26 @@ def _replay_determinism_check(status: dict[str, Any], event_log_path: Path) -> d
             REPROJECT_REMEDIATION,
         )
 
+    # Same head, but does the rebuilt STATE match byte-for-byte across two
+    # replays? If not the projection is non-deterministic (order/clock/set
+    # iteration) and boot reconstruction is not reproducible.
+    if first_state != second_state:
+        return _check(
+            FAIL,
+            (
+                "two clean replays produced divergent projection state "
+                "(non-deterministic reduce): canonical JSON differs "
+                f"({first_state!r} != {second_state!r})"
+            ),
+            REPROJECT_REMEDIATION,
+        )
+
     return _check(
         PASS,
-        f"clean re-projection reproduced the event-log head at sequence {last_sequence}",
+        (
+            f"clean re-projection reproduced the event-log head at sequence "
+            f"{last_sequence}; projection state byte-identical across two replays"
+        ),
         None,
     )
 

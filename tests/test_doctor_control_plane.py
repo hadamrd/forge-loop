@@ -11,7 +11,9 @@ invariant).
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,8 +26,10 @@ from forge_loop.control.doctor import (
     FAIL,
     PASS,
     WARN,
+    _replay_determinism_check,
     collect_control_plane_doctor,
 )
+from forge_loop.control.status import collect_control_plane_status
 from forge_loop.eventlog import EventKind, ProjectionCursor, SqliteEventLog
 from forge_loop.memory import (
     REJECTED_PATH_TAG,
@@ -264,7 +268,70 @@ class TestMemoryIntegrity:
         assert mem["remediation"] is not None
 
 
+@dataclass
+class _DeterministicProbe:
+    """Replay-order-independent probe: ``state()`` folds set into sorted list."""
+
+    cursor: ProjectionCursor = field(default_factory=ProjectionCursor)
+    seen: set[int] = field(default_factory=set)
+
+    def apply(self, event: Any) -> None:
+        self.cursor = ProjectionCursor(sequence=event.sequence)
+        self.seen.add(event.sequence)
+
+    def state(self) -> dict[str, Any]:
+        # Sorted ⇒ canonical regardless of set iteration order.
+        return {"sequences": sorted(self.seen)}
+
+
+# A shared monotonic "clock": each ``state()`` call reads a new value, so two
+# replays of the SAME log produce DIFFERENT serialisations — standing in for a
+# wall-clock / set-iteration / dict-ordering non-determinism, but deterministic
+# for the test (it always diverges, never flakes).
+_PROBE_CLOCK = itertools.count()
+
+
+@dataclass
+class _NonDeterministicProbe:
+    """Order/clock-dependent probe: ``state()`` embeds a fresh clock tick."""
+
+    cursor: ProjectionCursor = field(default_factory=ProjectionCursor)
+
+    def apply(self, event: Any) -> None:
+        self.cursor = ProjectionCursor(sequence=event.sequence)
+
+    def state(self) -> dict[str, Any]:
+        return {"stamp": next(_PROBE_CLOCK)}
+
+
 class TestReplayDeterminism:
+    def test_deterministic_projection_state_passes(self, tmp_path: Path) -> None:
+        # A projection whose state() is replay-order-independent yields
+        # byte-identical canonical JSON across two replays → PASS.
+        repo = _seeded_repo(tmp_path, cursor_sequence=2)
+        status = collect_control_plane_status(repo, _FIXED_NOW)
+        result = _replay_determinism_check(
+            status,
+            repo / ".forge" / "events.db",
+            projection_factory=_DeterministicProbe,
+        )
+        assert result["status"] == PASS
+        assert result["remediation"] is None
+
+    def test_nondeterministic_projection_state_fails(self, tmp_path: Path) -> None:
+        # Adversarial / sad path: two replays of the same log produce divergent
+        # serialised state → FAIL with a state-divergence detail + remediation.
+        repo = _seeded_repo(tmp_path, cursor_sequence=2)
+        status = collect_control_plane_status(repo, _FIXED_NOW)
+        result = _replay_determinism_check(
+            status,
+            repo / ".forge" / "events.db",
+            projection_factory=_NonDeterministicProbe,
+        )
+        assert result["status"] == FAIL
+        assert result["remediation"] is not None
+        assert "divergent projection state" in result["detail"]
+
     def test_passes_when_reprojection_matches_cursor(self, tmp_path: Path) -> None:
         repo = _seeded_repo(tmp_path, cursor_sequence=2)
         checks = collect_control_plane_doctor(repo, _FIXED_NOW, state_dir=tmp_path / "docs" / "ops")
