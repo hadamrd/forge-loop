@@ -111,7 +111,9 @@ export function AppShell() {
             <span className="dot-pulse" style={{ background: C.emerald }} />
             <div style={{ minWidth: 0 }}>
               <div style={{ fontSize: 11.5, color: C.mid, fontWeight: 500 }}>{status?.boot.version ?? "forge"}</div>
-              <div style={{ fontSize: 10.5, color: C.faint, fontFamily: "var(--mono)" }}>mock api · live</div>
+              <div style={{ fontSize: 10.5, color: C.faint, fontFamily: "var(--mono)" }}>
+                {(import.meta.env.VITE_FORGE_API === "real" ? "real api" : "mock api") + " · live"}
+              </div>
             </div>
           </div>
         </nav>

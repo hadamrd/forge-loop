@@ -48,6 +48,12 @@ def _row_to_envelope(row: sqlite3.Row) -> dict[str, Any]:
         payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
     except (json.JSONDecodeError, TypeError):
         payload = {}
+    # Normalize a `pr` payload that's a full GitHub URL to its int number so every
+    # consumer (ticker, recent-merges, drawers) shows "#1289", not the raw URL.
+    if isinstance(payload, dict) and "pr" in payload:
+        n = _pr_number(payload["pr"])
+        if n is not None:
+            payload["pr"] = n
     return {
         "sequence": int(row["sequence"]),
         "event_id": row["event_id"],
@@ -183,6 +189,36 @@ def _pr_number(val: Any) -> int | None:
     return None
 
 
+def _issue_from_task_id(task_id: str | None) -> int | None:
+    """The issue number behind a ``issue:<n>`` task_id, else None."""
+    if task_id and task_id.startswith("issue:"):
+        try:
+            return int(task_id.split(":", 1)[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _open_issue_numbers(repo: Path) -> set[int] | None:
+    """All open issue numbers (epics + tickets), or None if it can't be fetched.
+
+    ``None`` means "do not reconcile" — a transient GitHub failure must never cause
+    the console to hide or relabel work. A closed issue is the landed-signal used to
+    tell a resolved saga/PR (outcome compacted out of the durable log) from a live one.
+    """
+    repo_slug = os.environ.get("LOOP_GITHUB_REPO") or "hadamrd/forge-loop"
+    if "/" not in repo_slug:
+        return None
+    owner, name = repo_slug.split("/", 1)
+    try:
+        from forge_loop.gh_client import GithubkitClient, list_open_backlog
+
+        backlog = list_open_backlog(GithubkitClient(), owner, name, limit=200)
+    except Exception:
+        return None
+    return {issue.number for issue in (list(backlog.epics) + list(backlog.tickets))}
+
+
 def _live_inflight_task_ids(repo: Path) -> set[str]:
     """task_ids the control plane currently tracks as in-flight — the authoritative
     tasks.db lease store (the same source ``forge-loop status`` uses).
@@ -217,6 +253,7 @@ def _reconstruct_sagas(repo: Path) -> list[dict[str, Any]]:
     """
     events = _read_events(repo)
     live = _live_inflight_task_ids(repo)
+    open_issues = _open_issue_numbers(repo)
     by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for e in events:
         if e.get("task_id"):
@@ -254,9 +291,18 @@ def _reconstruct_sagas(repo: Path) -> list[dict[str, Any]]:
         else:
             state = "DISPATCHED"
 
-        # Reconcile against the control plane: a "live" computed state is only real
-        # if tasks.db still tracks this task as in-flight; otherwise it's abandoned.
-        if state in {"RUNNING", "AWAITING_CRITIC", "REVISING", "DISPATCHED"} and task_id not in live:
+        # Reconcile a non-terminal computed state against authoritative state.
+        has_explicit_terminal = bool({"pr.merged", "task.failed", "task.compensated"} & set(kinds))
+        if not has_explicit_terminal and task_id not in live:
+            issue_closed = (
+                open_issues is not None and issue is not None and int(issue) not in open_issues
+            )
+            if issue_closed:
+                # Outcome landed but its terminal event predates / was compacted out of
+                # the durable log — a resolved historical saga, not a live one. Drop it
+                # rather than render a misleading ABANDONED/RUNNING ghost.
+                continue
+            # No live lease and the issue is still open (or unknowable) → genuinely stalled.
             state = "ABANDONED"
 
         rounds = [int(_p(e, "round", 0) or 0) for e in evs if e["kind"] == "critique.issued"]
@@ -315,6 +361,7 @@ def _reconstruct_prs(repo: Path) -> list[dict[str, Any]]:
     review carries the verdict, sev2 trajectory, and round from critique events.
     """
     events = _read_events(repo)
+    open_issues = _open_issue_numbers(repo)
     by_pr: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for e in events:
         if e["kind"] not in {"pr.opened", "critique.issued", "pr.merged", "merge.blocked"}:
@@ -333,13 +380,22 @@ def _reconstruct_prs(repo: Path) -> list[dict[str, Any]]:
         verdict = str(_p(last_crit or {}, "verdict", "approved") or "approved") if last_crit else "approved"
         sev2 = int(_p(last_crit or {}, "sev2", 0) or 0) if last_crit else 0
         round_n = int(_p(last_crit or {}, "round", 1) or 1) if last_crit else 1
-        blocked = any(e["kind"] == "merge.blocked" for e in evs)
         state = "merged" if merged else "open"
+        # Reconcile against issue state: a PR whose issue is closed is resolved, not
+        # "open" — the event log just lacks its close/merge event. Drop it out of the
+        # open tabs (state "closed") so the screen shows only actually-open PRs.
+        if state == "open":
+            issue_num = _issue_from_task_id(
+                next((e.get("task_id") for e in evs if e.get("task_id")), None)
+            )
+            if open_issues is not None and issue_num is not None and issue_num not in open_issues:
+                state = "closed"
+        # Labels are derived from the LATEST critic verdict only — never "approved AND
+        # critic:blocking" (a stale merge.blocked event must not contradict an approval).
+        is_blocking = state == "open" and (verdict in {"changes_requested", "error"} or sev2 > 0)
         labels = []
-        if state == "open" and (blocked or verdict == "changes_requested" or sev2 > 0):
-            labels.append("critic:blocking")
-        elif state != "merged" and verdict == "approved" and sev2 == 0:
-            labels.append("clean")
+        if state == "open":
+            labels.append("critic:blocking" if is_blocking else "clean")
         history = [{"round": int(_p(c, "round", i + 1) or i + 1), "sev2": int(_p(c, "sev2", 0) or 0)}
                    for i, c in enumerate(crits)] or [{"round": 1, "sev2": sev2}]
         prs.append({
@@ -348,7 +404,7 @@ def _reconstruct_prs(repo: Path) -> list[dict[str, Any]]:
             "branch": str(_p(merged or opened or {}, "branch", "") or ""),
             "additions": int(_p(opened or {}, "additions", 0) or 0),
             "deletions": int(_p(opened or {}, "deletions", 0) or 0),
-            "mergeable": state != "open" or not blocked,
+            "mergeable": state == "open" and not is_blocking,
             "state": state,
             "saga_id": (opened or merged or evs[0]).get("task_id"),
             "labels": labels,
