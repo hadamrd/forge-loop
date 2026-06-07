@@ -151,3 +151,60 @@ def test_auth_enforced_when_token_set(tmp_path: Path) -> None:
     assert c.get("/api/status").status_code == 401
     assert c.get("/api/status", headers={"authorization": "Bearer secret"}).status_code == 200
     assert c.get("/healthz").status_code == 200  # health stays open
+
+
+def test_frontier_surfaces_okr(tmp_path: Path) -> None:
+    """objective/key_result come straight from frontier.yaml (the cursor loader ignores them)."""
+    (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".forge" / "frontier.yaml").write_text(
+        "product_goal: G\n"
+        "objective: Close both return arcs\n"
+        "key_result: KR holds across the window\n"
+        "version: 3\n"
+        "active_decisions:\n- a plain string decision\n"
+        "rejected_paths:\n- idea: bad idea\n  reason: because\n  revisit_if: ''\n"
+        "hot_files:\n- ref: src/x.py\n  why_hot: churny\n"
+        "open_questions:\n- what now?\n"
+    )
+    c = TestClient(build_console_api(repo=tmp_path, token=None))
+    f = c.get("/api/frontier").json()
+    assert f["objective"] == "Close both return arcs"
+    assert f["key_result"] == "KR holds across the window"
+    assert f["version"] == 3
+    assert f["active_decisions"][0]["text"] == "a plain string decision"
+    assert f["rejected_paths"][0]["idea"] == "bad idea"
+    assert f["hot_files"][0]["ref"] == "src/x.py"
+    assert f["open_questions"] == ["what now?"]
+
+
+def test_manifestos_parsed(tmp_path: Path) -> None:
+    (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".forge" / "quality-manifesto.md").write_text(
+        "# quality\n\n"
+        "### Q1. No shared mutable module-level state.\n\n"
+        "Body prose.\n\n**Rationale:** see #100, the runner leaked state.\n\n"
+        "### Q2. Typed boundaries behind a Protocol.\n\n**Rationale:** mocks drift.\n"
+    )
+    c = TestClient(build_console_api(repo=tmp_path, token=None))
+    by_id = {r["id"]: r for r in c.get("/api/manifestos").json()}
+    assert "Q1" in by_id and "Q2" in by_id
+    assert by_id["Q1"]["manifesto"] == "quality"
+    assert "module-level state" in by_id["Q1"]["rule"]
+    assert by_id["Q1"]["source_pr"] == "#100"
+
+
+def test_backlog_maps_axis_and_filters_labels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from forge_loop import gh_client
+    from forge_loop.gh_client import Issue, OpenBacklog
+
+    epic = Issue(number=1, title="Epic A", labels=["epic", "axis:durable-control-plane"])
+    ticket = Issue(number=2, title="Ticket B", labels=["loop:ready", "axis:frontier-generation", "noise-label"])
+    monkeypatch.setenv("LOOP_GITHUB_REPO", "o/r")
+    monkeypatch.setattr(gh_client, "GithubkitClient", lambda *a, **k: object())
+    monkeypatch.setattr(gh_client, "list_open_backlog", lambda *a, **k: OpenBacklog(epics=[epic], tickets=[ticket]))
+    c = TestClient(build_console_api(repo=tmp_path, token=None))
+    bl = {i["number"]: i for i in c.get("/api/backlog").json()}
+    assert bl[1]["axis"] == "durable-control-plane"
+    assert bl[2]["axis"] == "frontier-generation"
+    assert "loop:ready" in bl[2]["labels"]
+    assert "noise-label" not in bl[2]["labels"]
