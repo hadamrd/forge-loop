@@ -178,31 +178,16 @@ def _p(e: dict[str, Any], key: str, default: Any = None) -> Any:
 def _findings_from_payload(crit: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Read serialized critic findings off a ``critique.issued`` event (#404).
 
-    Back-compat: a legacy event with no ``findings`` field (or a malformed,
-    non-list, or partially-bad payload) degrades to ``[]`` / skips the bad row
-    — never raises. Each surviving row is normalized to the ``Finding`` shape
-    (``file``/``line`` nullable).
+    Delegates to the single validated parser ``critic.deserialize_findings`` so
+    back-compat / adversarial safety lives in one place (a legacy event with no
+    ``findings`` field, or a malformed/non-list/partially-bad payload, degrades
+    to ``[]`` / skips the bad row — never raises), then re-serializes to the
+    plain-JSON dict shape the console review object expects.
     """
+    from forge_loop.critic import deserialize_findings, serialize_findings
+
     raw = _p(crit or {}, "findings", []) if crit else []
-    if not isinstance(raw, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for row in raw:
-        if not isinstance(row, dict):
-            continue
-        sev = row.get("severity")
-        msg = row.get("message")
-        if not isinstance(sev, str) or not isinstance(msg, str):
-            continue
-        line = row.get("line")
-        out.append({
-            "severity": sev,
-            "category": row.get("category") if isinstance(row.get("category"), str) else "",
-            "file": row.get("file") if isinstance(row.get("file"), str) else None,
-            "line": line if isinstance(line, int) and not isinstance(line, bool) else None,
-            "message": msg,
-        })
-    return out
+    return serialize_findings(deserialize_findings(raw))
 
 
 def _mptg_from_payload(crit: dict[str, Any] | None) -> list[str]:
