@@ -278,8 +278,45 @@ def test_list_endpoints_return_arrays(client: TestClient) -> None:
 
 def test_budget_shape(client: TestClient) -> None:
     b = client.get("/api/budget").json()
-    assert {"points", "spend_today", "cumulative", "cost_per_merged_pr"} <= set(b)
+    assert {"points", "spend_today", "cumulative", "cost_per_merged_pr", "tokens_today"} <= set(b)
     assert b["cumulative"] == 1.5  # the one merged PR's cost_usd
+    # The seed's pr.merged has cost but no token counts → tokens stay honestly 0.
+    assert b["tokens_today"] == 0
+
+
+def test_budget_derives_real_spend_and_tokens_from_mirrored_merge(tmp_path: Path) -> None:
+    """Seam (#403): a merged WorkerOutcome's cost_usd/tokens flow through the
+    legacy mirror onto the pr.merged payload, and /api/budget reports non-zero
+    spend + tokens. This pins the whole cross-component path the console depends
+    on — outcome → mirror → events.db → _budget — so spend can never silently
+    regress to $0 again (manifesto Q10)."""
+    from forge_loop.eventlog.legacy_mirror import LegacyEventMirror
+
+    (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
+    log = SqliteEventLog(tmp_path / ".forge" / "events.db")
+    LegacyEventMirror(log).mirror_record(
+        {
+            "kind": "tick_done",
+            "tick": 1,
+            "merged": [314],
+            "outcomes": [
+                {
+                    "issue": 314,
+                    "title": "real cost flows to console",
+                    "status": "merged",
+                    "pr_url": "https://github.com/o/r/pull/314",
+                    "cost_usd": 3.5,
+                    "usage": {"input_tokens": 900, "output_tokens": 100},
+                }
+            ],
+        }
+    )
+    c = TestClient(build_console_api(repo=tmp_path, token=None))
+    b = c.get("/api/budget").json()
+    assert b["cumulative"] == 3.5
+    assert b["spend_today"] == 3.5
+    assert b["cost_per_merged_pr"] == 3.5
+    assert b["tokens_today"] == 1000
 
 
 def test_dangling_saga_reconciled_to_abandoned(tmp_path: Path) -> None:

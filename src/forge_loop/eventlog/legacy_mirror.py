@@ -73,6 +73,28 @@ _TERMINAL_STATUS_TO_KIND: dict[LegacyWorkerStatus, EventKind] = {
 }
 
 
+def _cost_fields(outcome: Mapping[str, Any]) -> dict[str, Any]:
+    """Per-task cost/token fields to lift onto the terminal ``pr.merged`` event (#403).
+
+    The console's ``/api/budget`` derives real spend and ``$/merged-PR`` from
+    ``cost_usd`` on ``pr.merged`` payloads, but the explicit PR_MERGED payload
+    built in :func:`_tick_done_specs` historically dropped the worker's cost —
+    so production spend rendered as ``$0`` even though every ``WorkerOutcome``
+    carries a real ``cost_usd``. Lift it (and token counts when the Anthropic
+    SDK reported them) from the serialized outcome so the merged event carries
+    the truth. Tokens default to ``0`` when ``usage`` is absent or empty, which
+    is the honest "SDK reported none" state, not a fabricated number.
+    """
+    usage = outcome.get("usage")
+    if not isinstance(usage, Mapping):
+        usage = {}
+    return {
+        "cost_usd": float(outcome.get("cost_usd", 0.0) or 0.0),
+        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+    }
+
+
 @dataclass(frozen=True)
 class _AppendSpec:
     kind: EventKind
@@ -457,6 +479,7 @@ def _tick_done_specs(
                         "issue": issue,
                         "status": status.value,
                         "pr_url": pr_url,
+                        **_cost_fields(outcome),
                     },
                     tick=tick,
                     issue=issue,

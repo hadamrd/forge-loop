@@ -470,21 +470,33 @@ def _reconstruct_prs(repo: Path) -> list[dict[str, Any]]:
 
 
 def _budget(repo: Path) -> dict[str, Any]:
-    """Derive spend from pr.merged cost_usd payloads, bucketed by hour."""
+    """Derive spend from pr.merged cost_usd payloads, bucketed by hour.
+
+    Tokens (input + output) are summed from the same payloads when the worker
+    recorded them (#403); they stay ``0`` when the SDK reported none, which is
+    the honest "no token signal" state rather than a fabricated count.
+    """
     events = _read_events(repo)
     merges = [e for e in events if e["kind"] == "pr.merged"]
     total = sum(float(_p(e, "cost_usd", 0) or 0) for e in merges)
     today = datetime.now(UTC).date().isoformat()
     spend_today = sum(float(_p(e, "cost_usd", 0) or 0) for e in merges if str(e["occurred_at"]).startswith(today))
+    tokens_today = sum(
+        int(_p(e, "input_tokens", 0) or 0) + int(_p(e, "output_tokens", 0) or 0)
+        for e in merges
+        if str(e["occurred_at"]).startswith(today)
+    )
     by_hour: dict[str, float] = defaultdict(float)
+    tokens_by_hour: dict[str, int] = defaultdict(int)
     for e in merges:
         hour = str(e["occurred_at"])[:13]
         by_hour[hour] += float(_p(e, "cost_usd", 0) or 0)
+        tokens_by_hour[hour] += int(_p(e, "input_tokens", 0) or 0) + int(_p(e, "output_tokens", 0) or 0)
     points, cum = [], 0.0
     for hour in sorted(by_hour):
         cum += by_hour[hour]
         points.append({"t": hour + ":00:00", "hourly": round(by_hour[hour], 2),
-                       "cumulative": round(cum, 2), "tokens": 0})
+                       "cumulative": round(cum, 2), "tokens": tokens_by_hour[hour]})
     if not points:
         points = [{"t": datetime.now(UTC).isoformat(), "hourly": 0.0, "cumulative": 0.0, "tokens": 0}]
     n_merges = len(merges) or 1
@@ -492,7 +504,7 @@ def _budget(repo: Path) -> dict[str, Any]:
         "points": points,
         "spend_today": round(spend_today, 2),
         "cumulative": round(total, 2),
-        "tokens_today": 0,
+        "tokens_today": tokens_today,
         "cost_per_merged_pr": round(total / n_merges, 2),
     }
 
