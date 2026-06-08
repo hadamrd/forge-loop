@@ -91,3 +91,29 @@ def sweep(
         elif _under_root(raw, root) and _norm(raw) in live:
             report.kept_live.append(raw)
     return report
+
+
+def sweep_roots(
+    remove: Callable[[str], bool],
+    worktree_paths: Iterable[str],
+    *,
+    roots: Iterable[str],
+    live_paths: Iterable[str],
+    protected: Iterable[str] = (),
+) -> WorktreeSweepReport:
+    """Reconcile ``worktree_paths`` against MULTIPLE disjoint roots in one pass and
+    merge the per-root reports (issue #405: ``worktree_root`` plus the agent
+    ``<repo>/.claude/worktrees`` root). Each root reuses the single-root :func:`sweep`,
+    so every safety invariant (protected main checkout, off-root never touched,
+    live-lease preserved, fail-safe on unknown) holds per-root. ``roots`` MUST be
+    disjoint (no path under two roots) so a path is reaped at most once."""
+    paths = list(worktree_paths)
+    live = list(live_paths)
+    prot = list(protected)
+    merged = WorktreeSweepReport()
+    for root in roots:
+        rep = sweep(remove, paths, live_paths=live, root=root, protected=prot)
+        merged.reaped.extend(rep.reaped)
+        merged.kept_live.extend(rep.kept_live)
+        merged.errors.update(rep.errors)
+    return merged

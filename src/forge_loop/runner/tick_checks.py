@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -16,8 +18,8 @@ from forge_loop.maintenance import run_maintenance
 from forge_loop.state import append_event, write_state
 from forge_loop.stuck_sweep import SweepReport
 from forge_loop.stuck_sweep import sweep as _stuck_sweep
-from forge_loop.worktree_sweep import WorktreeSweepReport
-from forge_loop.worktree_sweep import sweep as _worktree_sweep
+from forge_loop.worktree_sweep import WorktreeSweepReport, _under_root
+from forge_loop.worktree_sweep import sweep_roots as _worktree_sweep
 
 
 def run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
@@ -183,11 +185,10 @@ def run_branch_sweep(
     return report
 
 
-def _list_worktrees(repo: Path) -> list[str]:
-    """Paths of every git worktree of THIS repo (`git worktree list --porcelain`).
-    Scoped to forge-loop's own worktrees by git; [] on failure."""
+def _worktree_porcelain(repo: Path) -> str:
+    """Raw ``git worktree list --porcelain`` for THIS repo; "" on any failure."""
     try:
-        out = subprocess.run(
+        return subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
             cwd=str(repo),
             capture_output=True,
@@ -196,12 +197,86 @@ def _list_worktrees(repo: Path) -> list[str]:
             check=True,
         ).stdout
     except (subprocess.SubprocessError, OSError):
-        return []
-    return [
-        line[len("worktree ") :].strip()
-        for line in out.splitlines()
-        if line.startswith("worktree ")
-    ]
+        return ""
+
+
+def _parse_worktree_records(porcelain: str) -> list[tuple[str, bool, bool]]:
+    """Parse porcelain into ``(path, locked, prunable)`` per worktree block. Git emits
+    one block per worktree, fields one-per-line, blocks separated by a blank line; the
+    optional ``locked`` / ``prunable`` markers are git's own liveness signal (#405)."""
+    records: list[tuple[str, bool, bool]] = []
+    path: str | None = None
+    locked = prunable = False
+    for line in porcelain.splitlines():
+        if line.startswith("worktree "):
+            if path is not None:
+                records.append((path, locked, prunable))
+            path, locked, prunable = line[len("worktree ") :].strip(), False, False
+        elif line == "locked" or line.startswith("locked "):
+            locked = True
+        elif line == "prunable" or line.startswith("prunable "):
+            prunable = True
+    if path is not None:
+        records.append((path, locked, prunable))
+    return records
+
+
+def _list_worktrees(repo: Path) -> list[str]:
+    """Paths of every git worktree of THIS repo (`git worktree list --porcelain`).
+    Scoped to forge-loop's own worktrees by git; [] on failure."""
+    return [path for path, _locked, _prunable in _parse_worktree_records(_worktree_porcelain(repo))]
+
+
+def _agent_root(repo: Path) -> Path:
+    """Second GC root (#405): the harness's agent worktrees under the checkout."""
+    return repo / ".claude" / "worktrees"
+
+
+# Conservative age floor (#405): an intact, unlocked agent worktree is only reaped
+# once it has been idle on disk longer than this. Git marks a worktree ``prunable``
+# ONLY when its working dir is already gone — a crashed run that leaves an intact
+# ``.claude/worktrees/wt-*`` dir behind is never prunable, so without this floor it
+# would accrete forever. Anything younger (or whose mtime can't be read) is kept.
+_AGENT_WORKTREE_MIN_AGE_S = 24 * 3600
+
+
+def _path_age_s(path: str, now: float) -> float | None:
+    """Seconds since ``path`` was last modified; ``None`` if its mtime can't be read
+    (fail-safe on unknown — an unreadable age must never make a worktree reapable)."""
+    try:
+        return now - os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _agent_live_paths(
+    repo: Path, *, min_age_s: float = _AGENT_WORKTREE_MIN_AGE_S, now: float | None = None
+) -> set[str]:
+    """Live ``.claude/worktrees/*`` agent worktrees (#405).
+
+    The task-saga store knows nothing about agent worktrees, so liveness comes from
+    git's own porcelain markers plus a conservative age floor:
+      * ``locked`` ⇒ always LIVE (in use).
+      * ``prunable`` and not locked ⇒ git-confirmed dead ⇒ reapable.
+      * intact (no marker), unlocked ⇒ reapable ONLY once idle longer than
+        ``min_age_s``; younger, or mtime unreadable ⇒ kept (fail-safe on unknown).
+    This adds the positive reap path for intact-but-stale crashed agent worktrees,
+    which git never marks prunable."""
+    agent_root = str(_agent_root(repo))
+    clock = time.time() if now is None else now
+    live: set[str] = set()
+    for path, locked, prunable in _parse_worktree_records(_worktree_porcelain(repo)):
+        if not _under_root(path, agent_root):
+            continue
+        if locked:
+            live.add(path)
+            continue
+        if prunable:
+            continue  # git-confirmed dead → reapable
+        age = _path_age_s(path, clock)
+        if age is None or age < min_age_s:
+            live.add(path)  # too young / unknown age → keep (fail-safe)
+    return live
 
 
 def _remove_worktree(repo: Path, path: str) -> bool:
@@ -247,11 +322,15 @@ def run_worktree_sweep(
     live_paths: set[str] | None = None,
     remove: Callable[[str], bool] | None = None,
 ) -> WorktreeSweepReport | None:
-    """Reap orphaned task worktrees under ``worktree_root`` (operational-convergence).
+    """Reap orphaned worktrees across BOTH GC roots (operational-convergence, #405).
 
-    Maintenance-cadence only; deterministic, no LLM. Removes worktrees under the loop's
-    worktree_root that no live in-flight lease owns — never the main checkout, never a
-    leased worktree. Args injectable for tests.
+    Maintenance-cadence only; deterministic, no LLM. Reconciles two disjoint roots in
+    one pass: the loop's ``worktree_root`` (task worktrees, liveness = in-flight lease)
+    and ``<repo>/.claude/worktrees`` (agent worktrees, liveness = git porcelain
+    locked/prunable markers). Removes any worktree under either root that no live
+    owner claims — never the main checkout, never a leased/locked worktree, fail-safe
+    on unknown. Args injectable for tests; ``live_paths`` overrides BOTH liveness
+    sources with a single combined set.
     """
     if cfg.maintenance_every_n_ticks <= 0 or tick % cfg.maintenance_every_n_ticks != 0:
         return None
@@ -259,11 +338,16 @@ def run_worktree_sweep(
     if not root:
         return None
     wts = worktrees if worktrees is not None else _list_worktrees(cfg.repo)
-    live = live_paths if live_paths is not None else _inflight_worktrees(cfg)
+    live = (
+        live_paths
+        if live_paths is not None
+        else (_inflight_worktrees(cfg) | _agent_live_paths(cfg.repo))
+    )
     rm = remove if remove is not None else (lambda p: _remove_worktree(cfg.repo, p))
     protected = {str(cfg.repo)}
+    roots = [str(root), str(_agent_root(cfg.repo))]
     try:
-        report = _worktree_sweep(rm, wts, live_paths=live, root=str(root), protected=protected)
+        report = _worktree_sweep(rm, wts, roots=roots, live_paths=live, protected=protected)
     except Exception as ex:  # noqa: BLE001 — the sweep never raises; belt-and-braces
         append_event(cfg.events_file, "worktree_sweep_crashed", tick=tick, err=str(ex)[:200])
         return None
