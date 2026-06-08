@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from forge_loop.branch_sweep import loop_issue_number
 from forge_loop.control.boot import BootContext, canonical_task_saga_path
 from forge_loop.frontier import FrontierCursor, FrontierStore
 from forge_loop.memory import SqliteMemoryStore
@@ -115,12 +116,17 @@ def _branch_name(line: str) -> str:
 def _open_branches(repo: Path, git: GitClient | None) -> int | None:
     """Count local ``loop/<n>`` branches via ``git branch``; ``None`` on git failure.
 
-    Only ``loop/``-prefixed branches are counted: they are the loop's own
-    exhaust (generation branches that must converge / be drained), the signal an
-    operator watches for 'quietly accumulating orphan branches'. Unrelated
-    branches (``trunk``, feature branches) are not divergence the loop owns, so
-    counting them would make this a misleading convergence gauge (issue #415).
-    ``git branch`` markers are stripped before the prefix test: ``* `` marks the
+    Only loop branches are counted: they are the loop's own exhaust (generation
+    branches that must converge / be drained), the signal an operator watches for
+    'quietly accumulating orphan branches'. Unrelated branches (``trunk``,
+    feature branches) are not divergence the loop owns, so counting them would
+    make this a misleading convergence gauge (issue #415).
+
+    What *is* a loop branch is single-sourced from
+    :func:`forge_loop.branch_sweep.loop_issue_number` — the same canonical
+    ``loop/<n>`` matcher the #413 entropy snapshot and the branch sweeper use —
+    so this gauge agrees with them by construction (no second, fragile prefix
+    heuristic). ``git branch`` markers are stripped first: ``* `` marks the
     current branch and ``+ `` marks a branch checked out in a linked worktree
     (git >= 2.7). The loop leases worktrees on ``loop/<n>`` branches, so the
     ``+``-marked lines are exactly the actively-leased loop branches this gauge
@@ -132,7 +138,9 @@ def _open_branches(repo: Path, git: GitClient | None) -> int | None:
         if not result.ok:
             return None
         return sum(
-            1 for line in result.stdout.splitlines() if _branch_name(line).startswith("loop/")
+            1
+            for line in result.stdout.splitlines()
+            if loop_issue_number(_branch_name(line)) is not None
         )
     except Exception:  # noqa: BLE001 — best-effort metric, never raises
         return None
