@@ -302,6 +302,44 @@ class TestStatusOperationalEntropy:
         # the degraded counts render as "?" placeholders, never crash the table
         assert "epics=" in out
 
+    def test_status_json_exposes_top_level_entropy_snapshot(
+        self,
+        monkeypatch: Any,
+        tmp_path: Path,
+        capsys: Any,
+    ) -> None:
+        """Issue #414 — ``status --json`` carries a top-level ``entropy`` object
+        whose fields equal the operational-entropy snapshot, so operators reach
+        it via ``status --json | jq .entropy`` without the deep control_plane
+        path."""
+        blob = _status_json(monkeypatch, tmp_path, capsys)
+
+        assert "entropy" in blob
+        entropy = blob["entropy"]
+        assert set(entropy) == {
+            "open_branches",
+            "live_worktrees",
+            "open_epics",
+            "backlog_age_days",
+        }
+        # The top-level alias IS the nested snapshot — one computed source of
+        # truth, never a divergent recompute (manifesto Q7).
+        assert entropy == blob["control_plane"]["operational_entropy"]
+
+    def test_status_table_renders_entropy_row_with_all_four_fields(
+        self,
+        monkeypatch: Any,
+        tmp_path: Path,
+        capsys: Any,
+    ) -> None:
+        """Issue #414 — the Rich status table renders an entropy row showing all
+        four snapshot fields; degraded counts render as ``?`` and never crash."""
+        out = _status_table(monkeypatch, tmp_path, capsys)
+
+        assert "entropy" in out
+        for field in ("branches=", "worktrees=", "epics=", "backlog_age_days="):
+            assert field in out
+
 
 class TestTasksStatusReadsCanonicalSagaStore:
     """Focused coverage of the ``['tasks']`` block per issue #373.
