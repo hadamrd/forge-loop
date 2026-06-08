@@ -20,11 +20,14 @@ from pathlib import Path
 from forge_loop.config import CriticConfig, MutationGateConfig
 from forge_loop.runner.merge_gate import (
     MutationCheckResult,
+    WorkerLeaseRef,
     _mutation_refusal_comment,
     _refusal_comment,
     apply_issue_closed_gate,
     apply_mutation_survivor_gate,
+    apply_write_root_escape_gate,
     check_issue_closed_gate,
+    collect_changed_paths,
 )
 from forge_loop.worker import WorkerOutcome
 
@@ -571,3 +574,180 @@ def test_run_merge_gate_skips_promotion_for_refused_issue(tmp_path: Path, monkey
     still_merged = _outcome(47, pr="https://gh/u/r/pull/62", status="merged")
     _tick._record_merged_memory(cfg, [still_merged], refused_issues=refused)
     assert promoted_inputs == []  # nothing promoted — refused issue excluded
+
+
+# ---------------------------------------------------------------------------
+# Write-root-escape gate (issue #443).
+# ---------------------------------------------------------------------------
+
+
+def _lease(worktree: str, *, task_id: str = "task-47-worker") -> WorkerLeaseRef:
+    """A lease whose only write root is the worktree (the production shape)."""
+    return WorkerLeaseRef(task_id=task_id, worktree=worktree, write_roots=(worktree,))
+
+
+def test_write_root_gate_passes_for_in_bounds_diff(tmp_path: Path) -> None:
+    # Happy path: every changed path lives under the leased worktree → the gate
+    # is a byte-for-byte pass-through (no refuse, no quarantine, no event).
+    gh = _FakeGh()
+    wt = str(tmp_path / "wt")
+    o = _outcome(47, pr="https://gh/u/r/pull/62", status="merged")
+    quarantined: list[Path] = []
+    marked: list[tuple[str, str]] = []
+    events = tmp_path / "events.jsonl"
+
+    refused = apply_write_root_escape_gate(
+        [o],
+        lease_for=lambda _o: _lease(wt),
+        changed_paths=lambda w: [w + "/src/forge_loop/x.py"],
+        gh=gh,
+        repo="o/r",
+        quarantine=lambda p: quarantined.append(p) or p,
+        mark_quarantined=lambda tid, reason: marked.append((tid, reason)),
+        events_file=events,
+    )
+
+    assert refused == []
+    assert o.status == "merged"  # unchanged
+    assert gh.disable_calls == []
+    assert quarantined == []
+    assert marked == []
+    assert not events.exists()
+
+
+def test_write_root_gate_refuses_and_quarantines_on_escape(tmp_path: Path) -> None:
+    # Adversarial: a path outside the worktree → refuse, quarantine, event,
+    # status flip merged→open, comment posted.
+    gh = _FakeGh()
+    wt = str(tmp_path / "wt")
+    escape = "/home/u/forge-loop/src/forge_loop/runner/tick.py"
+    o = _outcome(47, pr="https://gh/u/r/pull/62", status="merged")
+    quarantined: list[Path] = []
+    marked: list[tuple[str, str]] = []
+    events = tmp_path / "events.jsonl"
+    emitted: list[tuple[str, dict]] = []
+
+    refused = apply_write_root_escape_gate(
+        [o],
+        lease_for=lambda _o: _lease(wt),
+        changed_paths=lambda w: [w + "/ok.py", escape],
+        gh=gh,
+        repo="o/r",
+        quarantine=lambda p: quarantined.append(p) or p,
+        mark_quarantined=lambda tid, reason: marked.append((tid, reason)),
+        events_file=events,
+        emit=lambda kind, payload: emitted.append((kind, payload)),
+    )
+
+    assert refused == [47]
+    assert o.status == "open"  # flipped
+    assert gh.disable_calls == [("https://gh/u/r/pull/62", "o/r")]
+    assert len(gh.comment_calls) == 1
+    assert escape in gh.comment_calls[0]["body"]
+    # quarantine primitives reused on the worktree.
+    assert quarantined == [Path(wt)]
+    assert marked == [("task-47-worker", "write-root escape (#443)")]
+    # event emitted with the offending path.
+    assert emitted == [
+        ("merge_refused_write_root_escape", {"issue": 47, "pr": o.pr_url, "paths": [escape]})
+    ]
+    rows = [json.loads(line) for line in events.read_text().splitlines() if line.strip()]
+    assert rows[-1]["kind"] == "merge_refused_write_root_escape"
+    assert rows[-1]["paths"] == [escape]
+
+
+def test_write_root_gate_side_effects_are_best_effort(tmp_path: Path) -> None:
+    # A raising pr_comment / disable_pr_auto_merge MUST NOT prevent the event +
+    # status flip from firing (mirrors apply_mutation_survivor_gate's contract).
+    gh = _FakeGh(disable_raises=True, comment_raises=True)
+    wt = str(tmp_path / "wt")
+    escape = "/etc/passwd"
+    o = _outcome(47, pr="https://gh/u/r/pull/62", status="merged")
+    events = tmp_path / "events.jsonl"
+
+    def _raising_quarantine(_p: Path) -> Path | None:
+        raise RuntimeError("simulated quarantine failure")
+
+    refused = apply_write_root_escape_gate(
+        [o],
+        lease_for=lambda _o: _lease(wt),
+        changed_paths=lambda w: [escape],
+        gh=gh,
+        repo="o/r",
+        quarantine=_raising_quarantine,
+        mark_quarantined=lambda tid, reason: (_ for _ in ()).throw(RuntimeError("boom")),
+        events_file=events,
+    )
+
+    # Despite EVERY side effect raising, the gate still refused + flipped + emitted.
+    assert refused == [47]
+    assert o.status == "open"
+    rows = [json.loads(line) for line in events.read_text().splitlines() if line.strip()]
+    assert rows[-1]["kind"] == "merge_refused_write_root_escape"
+
+
+def test_write_root_gate_skips_unresolvable_lease(tmp_path: Path) -> None:
+    # lease_for → None (no saga / no worktree) → nothing inspectable → skip.
+    gh = _FakeGh()
+    o = _outcome(47, pr="https://gh/u/r/pull/62", status="merged")
+    called: list[str] = []
+
+    refused = apply_write_root_escape_gate(
+        [o],
+        lease_for=lambda _o: None,
+        changed_paths=lambda w: called.append(w) or ["/etc/passwd"],
+        gh=gh,
+        repo="o/r",
+    )
+
+    assert refused == []
+    assert o.status == "merged"
+    assert called == []  # never even collected a diff
+
+
+def test_write_root_gate_skips_no_pr_outcome(tmp_path: Path) -> None:
+    gh = _FakeGh()
+    wt = str(tmp_path / "wt")
+    o = _outcome(55, pr=None, status="failed")
+    refused = apply_write_root_escape_gate(
+        [o],
+        lease_for=lambda _o: _lease(wt),
+        changed_paths=lambda w: ["/etc/passwd"],
+        gh=gh,
+        repo="o/r",
+    )
+    assert refused == []
+    assert o.status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# collect_changed_paths: the git seam. Both returncode branches (T3).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeCompleted:
+    returncode: int
+    stdout: str = ""
+
+
+def test_collect_changed_paths_returncode_zero(tmp_path: Path) -> None:
+    wt = str(tmp_path / "wt")
+
+    def _run(cmd, **kw):  # type: ignore[no-untyped-def]
+        assert cmd[:3] == ["git", "diff", "--name-only"]
+        return _FakeCompleted(returncode=0, stdout="a.py\nsrc/b.py\n\n")
+
+    paths = collect_changed_paths(wt, "trunk", run=_run)
+    assert paths == [f"{wt}/a.py", f"{wt}/src/b.py"]
+
+
+def test_collect_changed_paths_nonzero_returncode_is_empty(tmp_path: Path) -> None:
+    wt = str(tmp_path / "wt")
+
+    def _run(cmd, **kw):  # type: ignore[no-untyped-def]
+        return _FakeCompleted(returncode=128, stdout="garbage\n")
+
+    # A failed git call yields no paths → the gate is a pass-through, never a
+    # false refusal on a transient git failure.
+    assert collect_changed_paths(wt, "trunk", run=_run) == []
