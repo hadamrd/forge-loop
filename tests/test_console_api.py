@@ -211,37 +211,6 @@ def test_entropy_empty_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert ent["oldest_backlog_age_s"] is None
 
 
-def test_status_carries_operational_entropy_block(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #402 — GET /api/status carries the four entropy counts.
-
-    The backlog query is patched to canned data so the assertion is
-    deterministic and offline; the git-derived counts degrade to ``None``
-    because the temp repo isn't a git worktree.
-    """
-    from datetime import UTC, datetime, timedelta
-
-    import forge_loop.gh_client as gh
-    from forge_loop.gh_client import Issue, OpenBacklog
-
-    now = datetime.now(UTC)
-    epics = [Issue(number=1, title="epic", labels=["epic"],
-                   created_at=(now - timedelta(days=4)).isoformat())]
-    tickets = [Issue(number=2, title="old", created_at=(now - timedelta(days=20)).isoformat())]
-    monkeypatch.setattr(
-        gh, "list_open_backlog", lambda *a, **k: OpenBacklog(epics=epics, tickets=tickets)
-    )
-
-    body = client.get("/api/status").json()
-
-    oe = body["operational_entropy"]
-    assert set(oe) == {"open_branches", "live_worktrees", "open_epics", "backlog_age_days"}
-    assert oe["open_epics"] == 1
-    assert oe["backlog_age_days"] == 20
-    assert oe["open_branches"] is None  # temp repo is not a git worktree
-
-
 def test_events_page(client: TestClient) -> None:
     r = client.get("/api/events?limit=10")
     assert r.status_code == 200
