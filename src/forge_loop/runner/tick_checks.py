@@ -11,6 +11,8 @@ from pathlib import Path
 
 from forge_loop.branch_sweep import BranchSweepReport
 from forge_loop.branch_sweep import sweep as _branch_sweep
+from forge_loop.checkout_reconcile import CheckoutReconcileReport, ReconcileOutcome
+from forge_loop.checkout_reconcile import reconcile as _reconcile
 from forge_loop.config import Config
 from forge_loop.epic_sweep import EpicSweepReport, GhClientLike
 from forge_loop.epic_sweep import sweep as _epic_sweep
@@ -183,6 +185,207 @@ def run_branch_sweep(
         errors=list(report.errors),
     )
     return report
+
+
+def restore_base_branch(
+    repo: Path,
+    base_branch: str,
+    *,
+    events_file: Path,
+    tick: int,
+) -> str:
+    """Restore the shared/main checkout's HEAD to ``base_branch`` (issue #401).
+
+    Operational-convergence axis: a dispatch tick must never leave the shared
+    checkout at ``cfg.repo`` sitting on a worker/feature branch (a "HEAD-hop"),
+    or the next ``git fetch origin <base>`` sync diffs against the wrong ref and
+    ``forge-loop doctor`` reports spurious drift. Worker *worktrees* keep their
+    own ``loop/<n>`` branches — this only touches the main checkout's HEAD and is
+    a deliberate no-op when HEAD is already on ``base_branch`` (the common case).
+
+    Reuses the ``_current_branch`` probe from ``runner/rescue.py`` (don't
+    reinvent the ``rev-parse --abbrev-ref HEAD`` call). Mirrors the
+    swallow-and-emit pattern of :func:`run_branch_sweep`: a checkout failure
+    (dirty tree, missing/detached base) emits a best-effort
+    ``base_branch_restore_failed`` event and returns without raising, so an
+    in-tick restore hiccup never crashes the tick.
+
+    Event convergence (issue #422): a *successful* restore emits the SAME typed
+    :class:`forge_loop.events.CheckoutRestoredEvent` (``kind="checkout_restored"``,
+    fields ``from_branch``/``to_branch``) as the maintenance-cadence
+    :func:`run_checkout_reconcile` — a single, documented event name records a
+    drifted-then-restored shared checkout from BOTH return arcs, never a third.
+    The *failure* path keeps its own ``base_branch_restore_failed`` name on
+    purpose: it is a distinct best-effort-degraded outcome (HEAD unreadable /
+    checkout rejected / git hang) with no typed model, and the reconcile's
+    failure events (``checkout_reconcile_*``) are likewise mechanism-specific;
+    only the restored-observation is shared.
+
+    Returns ``"noop"`` (HEAD already on base), ``"moved"`` (HEAD restored, one
+    ``checkout_restored`` event emitted with ``from_branch``/``to_branch``),
+    or ``"failed"`` (HEAD unreadable or checkout rejected).
+    """
+    from forge_loop.runner.rescue import _current_branch
+
+    # Both git interactions below run inside _tick's finally-guard, so a raised
+    # subprocess.TimeoutExpired / OSError (git hang, missing binary) would crash
+    # the tick — and mask a body exception. check=False only suppresses non-zero
+    # exit codes, not these. Swallow-and-emit, mirroring run_branch_sweep above.
+    try:
+        current = _current_branch(repo)
+    except (subprocess.SubprocessError, OSError) as ex:
+        append_event(
+            events_file,
+            "base_branch_restore_failed",
+            tick=tick,
+            reason=f"head_probe: {type(ex).__name__}"[:200],
+        )
+        return "failed"
+    if not current:
+        append_event(
+            events_file, "base_branch_restore_failed", tick=tick, reason="head_unreadable"
+        )
+        return "failed"
+    if current == base_branch:
+        return "noop"
+    try:
+        result = subprocess.run(
+            ["git", "checkout", base_branch],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as ex:
+        append_event(
+            events_file,
+            "base_branch_restore_failed",
+            tick=tick,
+            from_branch=current,
+            to_branch=base_branch,
+            err=f"{type(ex).__name__}: {ex}"[:200],
+        )
+        return "failed"
+    if result.returncode != 0:
+        append_event(
+            events_file,
+            "base_branch_restore_failed",
+            tick=tick,
+            from_branch=current,
+            to_branch=base_branch,
+            err=(result.stderr or "").strip()[:200],
+        )
+        return "failed"
+    from forge_loop.events import CheckoutRestoredEvent, emit
+
+    emit(
+        events_file,
+        CheckoutRestoredEvent(tick=tick, from_branch=current, to_branch=base_branch),
+    )
+    return "moved"
+
+
+def _checkout_is_dirty(repo: Path) -> bool:
+    """True iff the shared checkout has ANY uncommitted change or untracked file.
+
+    Reuses ``rescue._dirty_paths`` (``git status --porcelain --untracked-files=all``)
+    so the porcelain parsing lives in one place. Conservative: any output ⇒ dirty ⇒
+    the reconcile keeps its hands off (issue #416 never clobbers uncommitted work).
+    Note we intentionally do NOT apply the settings-only exemption here — for the
+    shared checkout, ANY dirtiness is a hands-off signal.
+    """
+    from forge_loop.runner.rescue import _dirty_paths
+
+    return bool(_dirty_paths(repo))
+
+
+def _switch_branch(repo: Path, branch: str) -> bool:
+    """``git checkout <branch>`` in the shared checkout; True on success.
+
+    Plain (non-``--force``) checkout — git itself refuses to switch when it would
+    clobber local changes, a second belt under the explicit dirty-tree guard. A
+    raised TimeoutExpired/OSError (git hang / missing binary) propagates to the
+    caller's try/except, which records it as an ERROR outcome.
+    """
+    result = subprocess.run(
+        ["git", "checkout", branch],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def run_checkout_reconcile(
+    cfg: Config,
+    tick: int,
+    *,
+    read_branch: Callable[[], str] | None = None,
+    read_dirty: Callable[[], bool] | None = None,
+    switch: Callable[[str], bool] | None = None,
+) -> CheckoutReconcileReport | None:
+    """Switch the shared checkout at ``cfg.repo`` back to ``base_branch`` (issue #416).
+
+    Sibling to ``run_branch_sweep`` / ``run_worktree_sweep``: maintenance-cadence
+    only (a no-op off-cadence, returning ``None``), deterministic Python, no LLM.
+    Conservative by construction — switches ONLY when the checkout sits on a
+    ``loop/<n>`` branch with a CLEAN tree; a dirty tree, an already-on-base checkout,
+    or a non-loop branch is left untouched. Emits a typed ``checkout_restored`` event
+    only when it actually moves HEAD; a dirty skip / error emits a best-effort skip
+    event. Never raises into the tick (belt-and-braces ``noqa: BLE001`` swallow).
+
+    The three git probes are injectable so the decision is unit-tested without real
+    git; in production they shell out against ``cfg.repo``.
+    """
+    if cfg.maintenance_every_n_ticks <= 0 or tick % cfg.maintenance_every_n_ticks != 0:
+        return None
+    repo = cfg.repo
+    rb = read_branch if read_branch is not None else (lambda: _current_branch(repo))
+    rd = read_dirty if read_dirty is not None else (lambda: _checkout_is_dirty(repo))
+    sw = switch if switch is not None else (lambda b: _switch_branch(repo, b))
+    try:
+        report = _reconcile(read_branch=rb, read_dirty=rd, switch=sw, base_branch=cfg.base_branch)
+    except Exception as ex:  # noqa: BLE001 — reconcile never raises; belt-and-braces
+        append_event(cfg.events_file, "checkout_reconcile_crashed", tick=tick, err=str(ex)[:200])
+        return None
+    if report.outcome is ReconcileOutcome.RESTORED:
+        from forge_loop.events import CheckoutRestoredEvent, emit
+
+        emit(
+            cfg.events_file,
+            CheckoutRestoredEvent(
+                tick=tick,
+                from_branch=report.from_branch or "",
+                to_branch=report.to_branch or "",
+            ),
+        )
+    elif report.outcome is ReconcileOutcome.SKIPPED_DIRTY:
+        append_event(
+            cfg.events_file,
+            "checkout_reconcile_skipped",
+            tick=tick,
+            from_branch=report.from_branch,
+            reason=report.reason or "dirty_tree",
+        )
+    elif report.outcome is ReconcileOutcome.ERROR:
+        append_event(
+            cfg.events_file,
+            "checkout_reconcile_crashed",
+            tick=tick,
+            from_branch=report.from_branch,
+            err=report.reason or "",
+        )
+    return report
+
+
+def _current_branch(repo: Path) -> str:
+    """Shared-checkout current branch via ``rescue._current_branch`` (no reinvent)."""
+    from forge_loop.runner.rescue import _current_branch as _cb
+
+    return _cb(repo)
 
 
 def _worktree_porcelain(repo: Path) -> str:

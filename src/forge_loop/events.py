@@ -362,6 +362,28 @@ class EpicSweepDoneEvent(EventBase):
 
 
 @register_event
+class CheckoutRestoredEvent(EventBase):
+    """The shared checkout at ``cfg.repo`` was switched back to base (issue #416).
+
+    The single, documented event for a drifted-then-restored shared checkout,
+    emitted by BOTH operational-convergence return arcs (issue #422):
+
+    * ``run_checkout_reconcile`` on the maintenance cadence, and
+    * ``restore_base_branch`` in ``_tick``'s end-of-batch ``finally``-guard,
+
+    each ONLY when a checkout parked on a ``loop/<n>`` branch was actually switched
+    back to ``base_branch``. ``from_branch`` is the ``loop/<n>`` branch the checkout
+    drifted onto; ``to_branch`` is ``base_branch``. A dirty tree, an already-on-base
+    checkout, or a non-loop branch never emits this event (a deliberate no-op).
+    """
+
+    KIND: ClassVar[str] = "checkout_restored"
+    tick: int = Field(ge=0, default=0)
+    from_branch: str = ""
+    to_branch: str = ""
+
+
+@register_event
 class WorkerPreCommitInstalledEvent(EventBase):
     """Pre-commit hook propagation result for one worker worktree."""
 
@@ -554,6 +576,7 @@ __all__ = [
     "EVENT_REGISTRY",
     "AuditCleanEvent",
     "AuditViolationFiledEvent",
+    "CheckoutRestoredEvent",
     "CriticReviewErroredEvent",
     "EpicSweepDoneEvent",
     "EventBase",

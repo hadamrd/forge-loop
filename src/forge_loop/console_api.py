@@ -163,7 +163,40 @@ def _status_payload(repo: Path) -> dict[str, Any]:
             "open_epics": entropy.get("open_epics"),
             "backlog_age_days": entropy.get("backlog_age_days"),
         },
+        "entropy": _entropy_snapshot_view(entropy),
         "tasks": [],
+    }
+
+
+def _entropy_snapshot_view(raw: dict[str, Any]) -> dict[str, Any]:
+    """Re-key the single-source operational-entropy counts into the convergence
+    snapshot contract of epic #412 / ticket #413 (issue #415 — wiring only).
+
+    The counts themselves come from ONE place — the control-plane
+    ``operational_entropy`` block computed in ``control/status.py`` (issue
+    #402/#409). This view does NOT recompute them (manifesto Q7/Q10 — no
+    parallel entropy computation); it only relabels them to the four-field
+    snapshot contract and normalises units:
+
+    * ``open_loop_branches`` / ``live_worktrees`` / ``open_epics`` — ints,
+      coalesced to ``0`` when the underlying git/GitHub signal is absent so the
+      field is always present with zeroed counts on a fresh repo.
+      ``open_branches`` upstream already counts only ``loop/<n>`` branches
+      (``control/status.py:_open_branches``), so this maps straight across — no
+      unrelated branches leak into the convergence gauge (issue #415 review).
+    * ``oldest_backlog_age_s`` — backlog age in **seconds** (the source carries
+      whole days), or ``None`` when the backlog is unreachable/unconfigured.
+
+    When #413's pure ``operational_entropy`` snapshot function lands, point this
+    seam at it: the counts gain sub-day backlog precision with no change to the
+    payload shape the console consumes.
+    """
+    age_days = raw.get("backlog_age_days")
+    return {
+        "open_loop_branches": int(raw.get("open_branches") or 0),
+        "live_worktrees": int(raw.get("live_worktrees") or 0),
+        "open_epics": int(raw.get("open_epics") or 0),
+        "oldest_backlog_age_s": None if age_days is None else int(age_days) * 86400,
     }
 
 
@@ -470,21 +503,33 @@ def _reconstruct_prs(repo: Path) -> list[dict[str, Any]]:
 
 
 def _budget(repo: Path) -> dict[str, Any]:
-    """Derive spend from pr.merged cost_usd payloads, bucketed by hour."""
+    """Derive spend from pr.merged cost_usd payloads, bucketed by hour.
+
+    Tokens (input + output) are summed from the same payloads when the worker
+    recorded them (#403); they stay ``0`` when the SDK reported none, which is
+    the honest "no token signal" state rather than a fabricated count.
+    """
     events = _read_events(repo)
     merges = [e for e in events if e["kind"] == "pr.merged"]
     total = sum(float(_p(e, "cost_usd", 0) or 0) for e in merges)
     today = datetime.now(UTC).date().isoformat()
     spend_today = sum(float(_p(e, "cost_usd", 0) or 0) for e in merges if str(e["occurred_at"]).startswith(today))
+    tokens_today = sum(
+        int(_p(e, "input_tokens", 0) or 0) + int(_p(e, "output_tokens", 0) or 0)
+        for e in merges
+        if str(e["occurred_at"]).startswith(today)
+    )
     by_hour: dict[str, float] = defaultdict(float)
+    tokens_by_hour: dict[str, int] = defaultdict(int)
     for e in merges:
         hour = str(e["occurred_at"])[:13]
         by_hour[hour] += float(_p(e, "cost_usd", 0) or 0)
+        tokens_by_hour[hour] += int(_p(e, "input_tokens", 0) or 0) + int(_p(e, "output_tokens", 0) or 0)
     points, cum = [], 0.0
     for hour in sorted(by_hour):
         cum += by_hour[hour]
         points.append({"t": hour + ":00:00", "hourly": round(by_hour[hour], 2),
-                       "cumulative": round(cum, 2), "tokens": 0})
+                       "cumulative": round(cum, 2), "tokens": tokens_by_hour[hour]})
     if not points:
         points = [{"t": datetime.now(UTC).isoformat(), "hourly": 0.0, "cumulative": 0.0, "tokens": 0}]
     n_merges = len(merges) or 1
@@ -492,7 +537,7 @@ def _budget(repo: Path) -> dict[str, Any]:
         "points": points,
         "spend_today": round(spend_today, 2),
         "cumulative": round(total, 2),
-        "tokens_today": 0,
+        "tokens_today": tokens_today,
         "cost_per_merged_pr": round(total / n_merges, 2),
     }
 
