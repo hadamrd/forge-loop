@@ -212,6 +212,16 @@ class StatusCommandsMixin:
             ),
         }
 
+        # Issue #414 — surface the operational-entropy snapshot as a top-level
+        # ``entropy`` object so an operator (or script) reaches the four
+        # divergence counts via ``status --json | jq .entropy`` instead of the
+        # deep ``control_plane.operational_entropy`` path. It is the SAME dict
+        # already computed by ``collect_control_plane_status`` — aliased by
+        # reference, never recomputed, so there is a single source of truth and
+        # no second snapshot implementation (manifesto Q7). The four fields are
+        # open loop branches / live worktrees / open epics / oldest backlog age.
+        payload["entropy"] = payload["control_plane"]["operational_entropy"]
+
         if getattr(args, "json", False):
             sys.stdout.write(json.dumps(payload, indent=2, default=str) + "\n")
             return 0
