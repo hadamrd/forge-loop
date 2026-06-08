@@ -35,7 +35,17 @@ export interface LoopStatus {
   projections: ProjectionStatus[];
   frontier: { current_problem: string; next_expansion: string; version: number };
   memory: { total: number; promoted_today: number; superseded: number };
+  operational_entropy: OperationalEntropy;
   tasks: Saga[];
+}
+
+// Read-only divergence counts surfaced on the Health screen (issue #402).
+// Each is null when its source (git / GitHub) was unreachable.
+export interface OperationalEntropy {
+  open_branches: number | null;
+  live_worktrees: number | null;
+  open_epics: number | null;
+  backlog_age_days: number | null;
 }
 
 // ── Saga / Task ──────────────────────────────────────────────────────

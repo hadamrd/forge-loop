@@ -20,6 +20,8 @@ export default function HealthScreen() {
 
   const projections = status.projections ?? [];
   const maxLag = projections.length > 0 ? Math.max(...projections.map((p) => p.lag)) : 0;
+  const entropy = status.operational_entropy;
+  const oe = (v: number | null) => (v === null ? "—" : v);
 
   return (
     <div className="page page-wide">
@@ -28,6 +30,14 @@ export default function HealthScreen() {
         <Kpi label="Event-log seq" value={status.sequence} icon="Hash" color={C.accent} sub={`${status.event_log.size_mb} MB · ${status.event_log.path}`} />
         <Kpi label="Max projection lag" value={maxLag} icon="Gauge" color={maxLag > 6 ? C.amber : C.emerald} sub={maxLag > 6 ? "memory rebuilding" : "caught up"} />
         <Kpi label="Cost / merged-PR" value={money(budget.cost_per_merged_pr)} icon="DollarSign" color={C.emerald} sub={`${money(budget.spend_today)} today`} />
+      </div>
+
+      {/* Issue #402 — operational-entropy: one read-only divergence row. */}
+      <div className="grid" style={{ gridTemplateColumns: "repeat(4,1fr)", marginBottom: 16 }}>
+        <Kpi label="Open branches" value={oe(entropy.open_branches)} icon="GitBranch" color={C.blue} sub="local branches" />
+        <Kpi label="Live worktrees" value={oe(entropy.live_worktrees)} icon="FolderTree" color={C.blue} sub="git worktree list" />
+        <Kpi label="Open epics" value={oe(entropy.open_epics)} icon="Layers" color={C.blue} sub="label:epic" />
+        <Kpi label="Backlog age" value={oe(entropy.backlog_age_days)} unit="d" icon="Clock" color={(entropy.backlog_age_days ?? 0) > 14 ? C.amber : C.emerald} sub="oldest open issue" />
       </div>
 
       <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", marginBottom: 14 }}>

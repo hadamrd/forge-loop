@@ -102,6 +102,21 @@ def _status_json(
     return json.loads(capsys.readouterr().out)
 
 
+def _status_table(
+    monkeypatch: Any,
+    tmp_path: Path,
+    capsys: Any,
+) -> str:
+    cfg = _cfg(tmp_path)
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli, "load", lambda: cfg)
+
+    rc = cli._cmd_status(SimpleNamespace(json=False, axis=[]))
+
+    assert rc == 0
+    return capsys.readouterr().out
+
+
 class TestStatusControlPlane:
     def test_status_json_reports_seeded_durable_stores(
         self,
@@ -250,6 +265,42 @@ class TestStatusControlPlane:
             "stale_lease_count": None,
         }
         assert control["boot"] == {"available": False, "summary": None}
+
+
+class TestStatusOperationalEntropy:
+    """Issue #402 — the four operational-entropy counts surface on CLI status."""
+
+    def test_status_json_exposes_the_four_entropy_keys(
+        self,
+        monkeypatch: Any,
+        tmp_path: Path,
+        capsys: Any,
+    ) -> None:
+        blob = _status_json(monkeypatch, tmp_path, capsys)
+
+        oe = blob["control_plane"]["operational_entropy"]
+        assert set(oe) == {
+            "open_branches",
+            "live_worktrees",
+            "open_epics",
+            "backlog_age_days",
+        }
+        # tmp_path is not a git repo and no github_repo is configured, so every
+        # source degrades to None — but the block is always present.
+        assert oe["open_epics"] is None
+        assert oe["backlog_age_days"] is None
+
+    def test_rich_table_renders_operational_entropy_row(
+        self,
+        monkeypatch: Any,
+        tmp_path: Path,
+        capsys: Any,
+    ) -> None:
+        out = _status_table(monkeypatch, tmp_path, capsys)
+
+        assert "operational-entropy" in out
+        # the degraded counts render as "?" placeholders, never crash the table
+        assert "epics=" in out
 
 
 class TestTasksStatusReadsCanonicalSagaStore:

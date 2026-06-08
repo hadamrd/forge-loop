@@ -148,6 +148,12 @@ function buildStatus(seq: number, _mergesToday: number): LoopStatus {
       version: seed.frontier.version,
     },
     memory: { total: seed.memory.length, promoted_today: 3, superseded: 1 },
+    operational_entropy: {
+      open_branches: 7,
+      live_worktrees: 3,
+      open_epics: 2,
+      backlog_age_days: 9,
+    },
     tasks: seed.sagas,
   };
 }

@@ -208,6 +208,7 @@ class StatusCommandsMixin:
                 Path(getattr(cfg, "repo", cfg.state_dir)),
                 now,
                 state_dir=Path(cfg.state_dir),
+                github_repo=getattr(cfg, "github_repo", None),
             ),
         }
 
@@ -267,6 +268,20 @@ class StatusCommandsMixin:
                 workers_text.append("\n")
             table.add_row("active workers", workers_text)
         table.add_row("events", str(cfg.events_file))
+
+        # Issue #402 — operational-entropy: a single read-only divergence signal
+        # (open branches / live worktrees / open epics / oldest-backlog age).
+        oe = payload["control_plane"].get("operational_entropy", {})
+
+        def _oe(key: str) -> str:
+            val = oe.get(key)
+            return "?" if val is None else str(val)
+
+        table.add_row(
+            "operational-entropy",
+            f"branches={_oe('open_branches')}  worktrees={_oe('live_worktrees')}  "
+            f"epics={_oe('open_epics')}  backlog_age_days={_oe('backlog_age_days')}",
+        )
 
         # Issue #126 — axis breakdown. Render one row per axis (sorted for
         # deterministic output) showing the issue count, plus a yellow
