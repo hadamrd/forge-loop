@@ -210,8 +210,19 @@ def restore_base_branch(
     ``base_branch_restore_failed`` event and returns without raising, so an
     in-tick restore hiccup never crashes the tick.
 
+    Event convergence (issue #422): a *successful* restore emits the SAME typed
+    :class:`forge_loop.events.CheckoutRestoredEvent` (``kind="checkout_restored"``,
+    fields ``from_branch``/``to_branch``) as the maintenance-cadence
+    :func:`run_checkout_reconcile` — a single, documented event name records a
+    drifted-then-restored shared checkout from BOTH return arcs, never a third.
+    The *failure* path keeps its own ``base_branch_restore_failed`` name on
+    purpose: it is a distinct best-effort-degraded outcome (HEAD unreadable /
+    checkout rejected / git hang) with no typed model, and the reconcile's
+    failure events (``checkout_reconcile_*``) are likewise mechanism-specific;
+    only the restored-observation is shared.
+
     Returns ``"noop"`` (HEAD already on base), ``"moved"`` (HEAD restored, one
-    ``base_branch_restored`` event emitted with ``from_branch``/``to_branch``),
+    ``checkout_restored`` event emitted with ``from_branch``/``to_branch``),
     or ``"failed"`` (HEAD unreadable or checkout rejected).
     """
     from forge_loop.runner.rescue import _current_branch
@@ -266,12 +277,11 @@ def restore_base_branch(
             err=(result.stderr or "").strip()[:200],
         )
         return "failed"
-    append_event(
+    from forge_loop.events import CheckoutRestoredEvent, emit
+
+    emit(
         events_file,
-        "base_branch_restored",
-        tick=tick,
-        from_branch=current,
-        to_branch=base_branch,
+        CheckoutRestoredEvent(tick=tick, from_branch=current, to_branch=base_branch),
     )
     return "moved"
 
