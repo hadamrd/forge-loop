@@ -185,6 +185,71 @@ def run_branch_sweep(
     return report
 
 
+def restore_base_branch(
+    repo: Path,
+    base_branch: str,
+    *,
+    events_file: Path,
+    tick: int,
+) -> str:
+    """Restore the shared/main checkout's HEAD to ``base_branch`` (issue #401).
+
+    Operational-convergence axis: a dispatch tick must never leave the shared
+    checkout at ``cfg.repo`` sitting on a worker/feature branch (a "HEAD-hop"),
+    or the next ``git fetch origin <base>`` sync diffs against the wrong ref and
+    ``forge-loop doctor`` reports spurious drift. Worker *worktrees* keep their
+    own ``loop/<n>`` branches — this only touches the main checkout's HEAD and is
+    a deliberate no-op when HEAD is already on ``base_branch`` (the common case).
+
+    Reuses the ``_current_branch`` probe from ``runner/rescue.py`` (don't
+    reinvent the ``rev-parse --abbrev-ref HEAD`` call). Mirrors the
+    swallow-and-emit pattern of :func:`run_branch_sweep`: a checkout failure
+    (dirty tree, missing/detached base) emits a best-effort
+    ``base_branch_restore_failed`` event and returns without raising, so an
+    in-tick restore hiccup never crashes the tick.
+
+    Returns ``"noop"`` (HEAD already on base), ``"moved"`` (HEAD restored, one
+    ``base_branch_restored`` event emitted with ``from_branch``/``to_branch``),
+    or ``"failed"`` (HEAD unreadable or checkout rejected).
+    """
+    from forge_loop.runner.rescue import _current_branch
+
+    current = _current_branch(repo)
+    if not current:
+        append_event(
+            events_file, "base_branch_restore_failed", tick=tick, reason="head_unreadable"
+        )
+        return "failed"
+    if current == base_branch:
+        return "noop"
+    result = subprocess.run(
+        ["git", "checkout", base_branch],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        append_event(
+            events_file,
+            "base_branch_restore_failed",
+            tick=tick,
+            from_branch=current,
+            to_branch=base_branch,
+            err=(result.stderr or "").strip()[:200],
+        )
+        return "failed"
+    append_event(
+        events_file,
+        "base_branch_restored",
+        tick=tick,
+        from_branch=current,
+        to_branch=base_branch,
+    )
+    return "moved"
+
+
 def _worktree_porcelain(repo: Path) -> str:
     """Raw ``git worktree list --porcelain`` for THIS repo; "" on any failure."""
     try:
