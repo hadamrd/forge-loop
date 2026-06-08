@@ -163,7 +163,37 @@ def _status_payload(repo: Path) -> dict[str, Any]:
             "open_epics": entropy.get("open_epics"),
             "backlog_age_days": entropy.get("backlog_age_days"),
         },
+        "entropy": _entropy_snapshot_view(entropy),
         "tasks": [],
+    }
+
+
+def _entropy_snapshot_view(raw: dict[str, Any]) -> dict[str, Any]:
+    """Re-key the single-source operational-entropy counts into the convergence
+    snapshot contract of epic #412 / ticket #413 (issue #415 — wiring only).
+
+    The counts themselves come from ONE place — the control-plane
+    ``operational_entropy`` block computed in ``control/status.py`` (issue
+    #402/#409). This view does NOT recompute them (manifesto Q7/Q10 — no
+    parallel entropy computation); it only relabels them to the four-field
+    snapshot contract and normalises units:
+
+    * ``open_loop_branches`` / ``live_worktrees`` / ``open_epics`` — ints,
+      coalesced to ``0`` when the underlying git/GitHub signal is absent so the
+      field is always present with zeroed counts on a fresh repo.
+    * ``oldest_backlog_age_s`` — backlog age in **seconds** (the source carries
+      whole days), or ``None`` when the backlog is unreachable/unconfigured.
+
+    When #413's pure ``operational_entropy`` snapshot function lands, point this
+    seam at it: the counts gain loop-branch and sub-day precision with no
+    change to the payload shape the console consumes.
+    """
+    age_days = raw.get("backlog_age_days")
+    return {
+        "open_loop_branches": int(raw.get("open_branches") or 0),
+        "live_worktrees": int(raw.get("live_worktrees") or 0),
+        "open_epics": int(raw.get("open_epics") or 0),
+        "oldest_backlog_age_s": None if age_days is None else int(age_days) * 86400,
     }
 
 
