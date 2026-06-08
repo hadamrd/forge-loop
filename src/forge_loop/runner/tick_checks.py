@@ -214,7 +214,20 @@ def restore_base_branch(
     """
     from forge_loop.runner.rescue import _current_branch
 
-    current = _current_branch(repo)
+    # Both git interactions below run inside _tick's finally-guard, so a raised
+    # subprocess.TimeoutExpired / OSError (git hang, missing binary) would crash
+    # the tick — and mask a body exception. check=False only suppresses non-zero
+    # exit codes, not these. Swallow-and-emit, mirroring run_branch_sweep above.
+    try:
+        current = _current_branch(repo)
+    except (subprocess.SubprocessError, OSError) as ex:
+        append_event(
+            events_file,
+            "base_branch_restore_failed",
+            tick=tick,
+            reason=f"head_probe: {type(ex).__name__}"[:200],
+        )
+        return "failed"
     if not current:
         append_event(
             events_file, "base_branch_restore_failed", tick=tick, reason="head_unreadable"
@@ -222,14 +235,25 @@ def restore_base_branch(
         return "failed"
     if current == base_branch:
         return "noop"
-    result = subprocess.run(
-        ["git", "checkout", base_branch],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "checkout", base_branch],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as ex:
+        append_event(
+            events_file,
+            "base_branch_restore_failed",
+            tick=tick,
+            from_branch=current,
+            to_branch=base_branch,
+            err=f"{type(ex).__name__}: {ex}"[:200],
+        )
+        return "failed"
     if result.returncode != 0:
         append_event(
             events_file,

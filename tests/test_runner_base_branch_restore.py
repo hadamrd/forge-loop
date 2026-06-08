@@ -202,6 +202,58 @@ def test_restore_detached_head_does_not_crash(tmp_path: Path) -> None:
     assert _current_branch(repo) == "trunk"
 
 
+def test_restore_swallows_head_probe_raise(tmp_path: Path, monkeypatch: Any) -> None:
+    """``_current_branch`` raising (git hang / missing binary) → "failed", no raise.
+
+    ``check=False`` only suppresses non-zero exit codes; ``subprocess.run`` still
+    raises ``TimeoutExpired``/``OSError``. The helper runs inside ``_tick``'s
+    ``finally``, so a raise here would crash the tick (and mask a body error).
+    """
+    import forge_loop.runner.rescue as _rescue
+
+    repo = _init_repo(tmp_path / "repo")
+    events = _events_path(tmp_path)
+
+    def _boom(_worktree: Path) -> str:
+        raise subprocess.TimeoutExpired(cmd="git", timeout=10)
+
+    monkeypatch.setattr(_rescue, "_current_branch", _boom)
+
+    result = restore_base_branch(repo, "trunk", events_file=events, tick=8)
+
+    assert result == "failed"
+    failed = [e for e in _read_events(events) if e["kind"] == "base_branch_restore_failed"]
+    assert len(failed) == 1
+    assert "TimeoutExpired" in failed[0]["reason"]
+
+
+def test_restore_swallows_checkout_raise(tmp_path: Path, monkeypatch: Any) -> None:
+    """``git checkout`` raising ``OSError`` (missing binary) → "failed", no raise."""
+    import forge_loop.runner.tick_checks as _tc
+
+    repo = _init_repo(tmp_path / "repo")
+    _git(["checkout", "-b", "loop/13-z"], repo)
+    events = _events_path(tmp_path)
+
+    real_run = subprocess.run
+
+    def _run(args: Any, *a: Any, **kw: Any) -> Any:
+        if isinstance(args, list) and args[:2] == ["git", "checkout"]:
+            raise OSError("git binary vanished")
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(_tc.subprocess, "run", _run)
+
+    result = restore_base_branch(repo, "trunk", events_file=events, tick=9)
+
+    assert result == "failed"
+    assert _current_branch(repo) == "loop/13-z"  # untouched, no crash
+    failed = [e for e in _read_events(events) if e["kind"] == "base_branch_restore_failed"]
+    assert len(failed) == 1
+    assert failed[0]["from_branch"] == "loop/13-z"
+    assert "OSError" in failed[0]["err"]
+
+
 # --------------------------------------------------------------------------- #
 # Integration: drive a real _tick + worker-worktree scope guardrail
 # --------------------------------------------------------------------------- #
