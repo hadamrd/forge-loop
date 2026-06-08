@@ -69,6 +69,8 @@ class GitClient(Protocol):
 
     def worktree_prune(self, cwd: Path) -> GitResult: ...
 
+    def branch_list(self, cwd: Path) -> GitResult: ...
+
     def status(self, cwd: Path, *, porcelain: bool = True) -> GitResult: ...
 
     def add(self, cwd: Path, *paths: str) -> GitResult: ...
@@ -139,6 +141,15 @@ class SubprocessGit:
 
     def worktree_prune(self, cwd: Path) -> GitResult:
         return _run(["git", "worktree", "prune"], cwd, check=False, timeout=self._timeout)
+
+    def branch_list(self, cwd: Path) -> GitResult:
+        # One local-branch name per line; cheap, read-only (manifesto Q9).
+        return _run(
+            ["git", "branch", "--format=%(refname:short)"],
+            cwd,
+            check=False,
+            timeout=self._timeout,
+        )
 
     def status(self, cwd: Path, *, porcelain: bool = True) -> GitResult:
         argv = ["git", "status"]
@@ -229,6 +240,9 @@ class FakeGitClient:
 
     def worktree_prune(self, cwd: Path) -> GitResult:  # noqa: D102
         return self._capture("worktree_prune", (cwd,), {})
+
+    def branch_list(self, cwd: Path) -> GitResult:  # noqa: D102
+        return self._capture("branch_list", (cwd,), {})
 
     def status(self, cwd: Path, *, porcelain: bool = True) -> GitResult:  # noqa: D102
         return self._capture("status", (cwd,), {"porcelain": porcelain})

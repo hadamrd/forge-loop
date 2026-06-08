@@ -75,10 +75,15 @@ def _seed(repo: Path) -> None:
 @pytest.fixture(autouse=True)
 def _no_network_open_issues(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default: no issue reconciliation (deterministic, never touches the network).
-    Reconciliation tests override console_api._open_issue_numbers explicitly."""
+    Reconciliation tests override console_api._open_issue_numbers explicitly.
+    Also neutralises the operational-entropy backlog query (#402) so the status
+    route never reaches GitHub; the dedicated entropy test re-patches it."""
     import forge_loop.console_api as capi
+    import forge_loop.gh_client as gh
 
     monkeypatch.setattr(capi, "_open_issue_numbers", lambda repo: None)
+    monkeypatch.setattr(gh, "GithubkitClient", lambda *a, **k: object())
+    monkeypatch.setattr(gh, "list_open_backlog", lambda *a, **k: gh.OpenBacklog())
 
 
 @pytest.fixture
@@ -93,6 +98,37 @@ def test_status_shape(client: TestClient) -> None:
     body = r.json()
     assert body["sequence"] >= 5
     assert {"boot", "event_log", "projections", "frontier", "memory"} <= set(body)
+
+
+def test_status_carries_operational_entropy_block(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #402 — GET /api/status carries the four entropy counts.
+
+    The backlog query is patched to canned data so the assertion is
+    deterministic and offline; the git-derived counts degrade to ``None``
+    because the temp repo isn't a git worktree.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    import forge_loop.gh_client as gh
+    from forge_loop.gh_client import Issue, OpenBacklog
+
+    now = datetime.now(UTC)
+    epics = [Issue(number=1, title="epic", labels=["epic"],
+                   created_at=(now - timedelta(days=4)).isoformat())]
+    tickets = [Issue(number=2, title="old", created_at=(now - timedelta(days=20)).isoformat())]
+    monkeypatch.setattr(
+        gh, "list_open_backlog", lambda *a, **k: OpenBacklog(epics=epics, tickets=tickets)
+    )
+
+    body = client.get("/api/status").json()
+
+    oe = body["operational_entropy"]
+    assert set(oe) == {"open_branches", "live_worktrees", "open_epics", "backlog_age_days"}
+    assert oe["open_epics"] == 1
+    assert oe["backlog_age_days"] == 20
+    assert oe["open_branches"] is None  # temp repo is not a git worktree
 
 
 def test_events_page(client: TestClient) -> None:

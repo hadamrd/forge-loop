@@ -115,8 +115,11 @@ def _frontier_cursor(repo: Path) -> Any:
 def _status_payload(repo: Path) -> dict[str, Any]:
     from forge_loop.control.status import collect_control_plane_status
 
-    raw = collect_control_plane_status(repo, datetime.now(UTC))
+    raw = collect_control_plane_status(
+        repo, datetime.now(UTC), github_repo=_github_repo_slug()
+    )
     ev, proj = raw.get("event_log", {}), raw.get("projections", {})
+    entropy = raw.get("operational_entropy", {})
     fr, mem, tasks, boot = (
         raw.get("frontier", {}), raw.get("memory", {}), raw.get("tasks", {}), raw.get("boot", {})
     )
@@ -154,6 +157,12 @@ def _status_payload(repo: Path) -> dict[str, Any]:
             "version": int(getattr(cur, "version", 0) or 0),
         },
         "memory": {"total": int(mem.get("active_count") or 0), "promoted_today": 0, "superseded": 0},
+        "operational_entropy": {
+            "open_branches": entropy.get("open_branches"),
+            "live_worktrees": entropy.get("live_worktrees"),
+            "open_epics": entropy.get("open_epics"),
+            "backlog_age_days": entropy.get("backlog_age_days"),
+        },
         "tasks": [],
     }
 
@@ -225,6 +234,17 @@ def _issue_from_task_id(task_id: str | None) -> int | None:
     return None
 
 
+def _github_repo_slug() -> str | None:
+    """The ``owner/name`` slug the console reconciles against, or ``None``.
+
+    Single resolution point reused by ``_open_issue_numbers`` and the
+    operational-entropy metric (issue #402) so the two never drift to different
+    defaults (manifesto Q7 — no parallel slug logic).
+    """
+    repo_slug = os.environ.get("LOOP_GITHUB_REPO") or "hadamrd/forge-loop"
+    return repo_slug if "/" in repo_slug else None
+
+
 def _open_issue_numbers(repo: Path) -> set[int] | None:
     """All open issue numbers (epics + tickets), or None if it can't be fetched.
 
@@ -232,8 +252,8 @@ def _open_issue_numbers(repo: Path) -> set[int] | None:
     the console to hide or relabel work. A closed issue is the landed-signal used to
     tell a resolved saga/PR (outcome compacted out of the durable log) from a live one.
     """
-    repo_slug = os.environ.get("LOOP_GITHUB_REPO") or "hadamrd/forge-loop"
-    if "/" not in repo_slug:
+    repo_slug = _github_repo_slug()
+    if repo_slug is None:
         return None
     owner, name = repo_slug.split("/", 1)
     try:

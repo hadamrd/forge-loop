@@ -59,6 +59,10 @@ class Issue:
     body: str = ""
     state: str = "open"
     labels: list[str] = field(default_factory=list)
+    #: ISO-8601 creation timestamp, or ``None`` when the source didn't supply
+    #: one. Used by the operational-entropy backlog-age metric (issue #402);
+    #: optional so existing constructors and fakes keep working unchanged.
+    created_at: str | None = None
 
 
 @dataclass
@@ -373,6 +377,20 @@ def _label_names(labels: Any) -> list[str]:
     return out
 
 
+def _iso_or_none(value: Any) -> str | None:
+    """Coerce a githubkit ``created_at`` (a ``datetime``) to an ISO string.
+
+    Returns ``None`` when GitHub didn't supply a timestamp so the backlog-age
+    metric degrades to "unknown age" rather than raising (issue #402).
+    """
+    if value is None:
+        return None
+    iso = getattr(value, "isoformat", None)
+    if callable(iso):
+        return str(iso())
+    return str(value)
+
+
 # ---------------------------------------------------------------------------
 # Real implementation — wraps githubkit.GitHub.
 # ---------------------------------------------------------------------------
@@ -466,6 +484,7 @@ class GithubkitClient:
                     body=item.body or "",
                     state=str(item.state),
                     labels=_label_names(item.labels),
+                    created_at=_iso_or_none(getattr(item, "created_at", None)),
                 )
             )
         return out
