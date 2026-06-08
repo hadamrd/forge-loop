@@ -77,16 +77,40 @@ class TestHappyPath:
             Issue(number=3, title="t-old", created_at=(now - timedelta(days=14)).isoformat()),
             Issue(number=4, title="t-new", created_at=(now - timedelta(days=2)).isoformat()),
         ]
-        git = _git(_ok("trunk\nloop/1\nloop/2\n"), _ok(_PORCELAIN))
+        git = _git(_ok("* trunk\n  loop/1\n  loop/2\n"), _ok(_PORCELAIN))
 
         oe = _entropy(tmp_path, now, git=git, gh=_LabelAwareGh(epics, tickets))
 
         assert oe == {
-            "open_branches": 3,
+            "open_branches": 2,  # only loop/<n> branches — trunk is not loop exhaust
             "live_worktrees": 2,
             "open_epics": 2,
             "backlog_age_days": 14,  # oldest of epics+tickets is the 14-day ticket
         }
+
+
+class TestOpenBranchesIsLoopOnly:
+    """Issue #415 review — ``open_branches`` is a *loop-branch* convergence gauge,
+    so non-``loop/`` lines (trunk, feature, detached HEAD) must not inflate it."""
+
+    def test_only_loop_prefixed_branches_are_counted(self, tmp_path):
+        now = datetime.now(UTC)
+        git = _git(
+            _ok("* trunk\n  feature/x\n  loop/7\n  loop/12\n  (HEAD detached at abc)\n"),
+            _ok(_PORCELAIN),
+        )
+
+        oe = _entropy(tmp_path, now, git=git, gh=_LabelAwareGh([], []))
+
+        assert oe["open_branches"] == 2  # loop/7 and loop/12 only
+
+    def test_no_loop_branches_is_zero_not_total(self, tmp_path):
+        now = datetime.now(UTC)
+        git = _git(_ok("* trunk\n  feature/x\n"), _ok(_PORCELAIN))
+
+        oe = _entropy(tmp_path, now, git=git, gh=_LabelAwareGh([], []))
+
+        assert oe["open_branches"] == 0
 
 
 class TestBacklogAgeEdges:
@@ -126,12 +150,12 @@ class TestAdversarialDegradation:
 
     def test_git_worktree_failure_yields_none_worktrees(self, tmp_path):
         now = datetime.now(UTC)
-        git = _git(_ok("trunk\n"), _fail())
+        git = _git(_ok("* trunk\n  loop/1\n"), _fail())
 
         oe = _entropy(tmp_path, now, git=git, gh=_LabelAwareGh([], []))
 
         assert oe["live_worktrees"] is None
-        assert oe["open_branches"] == 1
+        assert oe["open_branches"] == 1  # one loop/<n> branch; trunk excluded
 
     def test_garbage_porcelain_does_not_overcount_or_raise(self, tmp_path):
         now = datetime.now(UTC)
@@ -145,14 +169,14 @@ class TestAdversarialDegradation:
         # T2: the GitHub source's false/failure case is exercised explicitly.
         now = datetime.now(UTC)
         gh = MockGhClient(raise_on={"issues_by_label": _gh_error()})
-        git = _git(_ok("trunk\n"), _ok(_PORCELAIN))
+        git = _git(_ok("* trunk\n  loop/1\n"), _ok(_PORCELAIN))
 
         oe = _entropy(tmp_path, now, git=git, gh=gh)
 
         assert oe["open_epics"] is None
         assert oe["backlog_age_days"] is None
         # git-derived counts still resolve — sources degrade independently.
-        assert oe["open_branches"] == 1
+        assert oe["open_branches"] == 1  # one loop/<n> branch; trunk excluded
         assert oe["live_worktrees"] == 2
 
     def test_unconfigured_repo_slug_yields_none_gh_counts(self, tmp_path):

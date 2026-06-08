@@ -99,13 +99,26 @@ def _operational_entropy(
 
 
 def _open_branches(repo: Path, git: GitClient | None) -> int | None:
-    """Count local branches via ``git branch``; ``None`` on any git failure."""
+    """Count local ``loop/<n>`` branches via ``git branch``; ``None`` on git failure.
+
+    Only ``loop/``-prefixed branches are counted: they are the loop's own
+    exhaust (generation branches that must converge / be drained), the signal an
+    operator watches for 'quietly accumulating orphan branches'. Unrelated
+    branches (``trunk``, feature branches) are not divergence the loop owns, so
+    counting them would make this a misleading convergence gauge (issue #415).
+    The ``* `` current-branch marker and indentation from ``git branch`` are
+    stripped before the prefix test.
+    """
     try:
         client = git if git is not None else _default_git()
         result = client.branch_list(repo)
         if not result.ok:
             return None
-        return sum(1 for line in result.stdout.splitlines() if line.strip())
+        return sum(
+            1
+            for line in result.stdout.splitlines()
+            if line.strip().lstrip("* ").startswith("loop/")
+        )
     except Exception:  # noqa: BLE001 — best-effort metric, never raises
         return None
 

@@ -181,12 +181,15 @@ def _entropy_snapshot_view(raw: dict[str, Any]) -> dict[str, Any]:
     * ``open_loop_branches`` / ``live_worktrees`` / ``open_epics`` — ints,
       coalesced to ``0`` when the underlying git/GitHub signal is absent so the
       field is always present with zeroed counts on a fresh repo.
+      ``open_branches`` upstream already counts only ``loop/<n>`` branches
+      (``control/status.py:_open_branches``), so this maps straight across — no
+      unrelated branches leak into the convergence gauge (issue #415 review).
     * ``oldest_backlog_age_s`` — backlog age in **seconds** (the source carries
       whole days), or ``None`` when the backlog is unreachable/unconfigured.
 
     When #413's pure ``operational_entropy`` snapshot function lands, point this
-    seam at it: the counts gain loop-branch and sub-day precision with no
-    change to the payload shape the console consumes.
+    seam at it: the counts gain sub-day backlog precision with no change to the
+    payload shape the console consumes.
     """
     age_days = raw.get("backlog_age_days")
     return {
