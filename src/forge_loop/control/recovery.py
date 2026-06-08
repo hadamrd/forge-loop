@@ -37,6 +37,18 @@ _HANDLED_COMPENSATION_KINDS: frozenset[CompensationKind] = frozenset(
     {CompensationKind.REMOVE_WORKTREE}
 )
 
+# Kinds dispatch already ENQUEUES but whose recovery handler is a deferred epic
+# issue. They are intentionally absent from ``_HANDLED_COMPENSATION_KINDS`` so a
+# stale saga carrying one is quarantined (parked for a human) rather than falsely
+# marked COMPENSATED — but they are NOT "forgotten": the exhaustiveness contract
+# (``test_recovery``) requires every ``CompensationKind`` to be classified as
+# either handled or explicitly deferred, so adding a kind that is neither still
+# turns the contract red. ``DELETE_BRANCH`` (#433) is enqueued at dispatch; its
+# reclamation handler lands later in the same epic and will move here → handled.
+_DEFERRED_COMPENSATION_KINDS: frozenset[CompensationKind] = frozenset(
+    {CompensationKind.DELETE_BRANCH}
+)
+
 
 @dataclass(frozen=True)
 class RecoveredSaga:

@@ -272,13 +272,7 @@ def record_worker_task_policy(
             issue=issue,
             branch=branch,
             worktree=worktree_path,
-            compensations=(
-                Compensation(
-                    kind=CompensationKind.REMOVE_WORKTREE,
-                    target=worktree_path,
-                    reason="cleanup worker worktree after task terminal state",
-                ),
-            ),
+            compensations=_worker_compensations(worktree_path=worktree_path, branch=branch),
             capability_policy=capability_policy,
         )
     )
@@ -315,14 +309,37 @@ def _seed_worker_saga(
         issue=n,
         branch=branch,
         worktree=worktree_path,
-        compensations=(
-            Compensation(
-                kind=CompensationKind.REMOVE_WORKTREE,
-                target=worktree_path,
-                reason="cleanup after worker task terminal state",
-            ),
-        ),
+        compensations=_worker_compensations(worktree_path=worktree_path, branch=branch),
         capability_policy=capability_policy,
+    )
+
+
+def _worker_compensations(*, worktree_path: str, branch: str) -> tuple[Compensation, ...]:
+    """Build the compensation tuple registered when a worker saga is created.
+
+    Two cleanups are registered at dispatch, in the order they must run on
+    recovery: drop the worktree first, then delete the branch it planted.
+
+    * ``REMOVE_WORKTREE`` reaps the ``/tmp`` worktree the worker ran in.
+    * ``DELETE_BRANCH`` (#433, epic "Compensate the branch a failed worker
+      abandons") reclaims the exact ``loop/<n>`` branch this worker planted —
+      ``target`` is the canonical branch name derived for the issue, so a
+      failed worker can never leak a branch the control plane doesn't know to
+      delete. Both seed paths (the shared-store ``create`` and the
+      ``task_store is None`` fallback) build the tuple here so they can never
+      drift apart.
+    """
+    return (
+        Compensation(
+            kind=CompensationKind.REMOVE_WORKTREE,
+            target=worktree_path,
+            reason="cleanup worker worktree after task terminal state",
+        ),
+        Compensation(
+            kind=CompensationKind.DELETE_BRANCH,
+            target=branch,
+            reason="reclaim worker loop branch after task terminal state",
+        ),
     )
 
 

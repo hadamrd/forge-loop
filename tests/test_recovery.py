@@ -294,15 +294,21 @@ def test_reconcile_quarantines_raw_string_kind_not_in_enum(tmp_path: Path) -> No
 
 
 def test_recovery_handler_keyset_is_exhaustive_over_compensation_kinds() -> None:
-    """#360 exhaustiveness contract: every CompensationKind has a recovery entry.
+    """#360 exhaustiveness contract: every CompensationKind is classified.
 
+    Every member must be either HANDLED (recovery runs its undo) or explicitly
+    DEFERRED (enqueued but recovery quarantines it until its handler lands).
     Goes RED the moment a member is added to ``CompensationKind`` without
-    registering it in ``_HANDLED_COMPENSATION_KINDS`` — the gap is then caught
-    at test time, not in production recovery.
+    registering it in either set — the gap is caught at test time, not in
+    production recovery. The two sets are disjoint: a kind is never both.
     """
-    from forge_loop.control.recovery import _HANDLED_COMPENSATION_KINDS
+    from forge_loop.control.recovery import (
+        _DEFERRED_COMPENSATION_KINDS,
+        _HANDLED_COMPENSATION_KINDS,
+    )
 
-    assert set(CompensationKind) == _HANDLED_COMPENSATION_KINDS
+    assert not (_HANDLED_COMPENSATION_KINDS & _DEFERRED_COMPENSATION_KINDS)
+    assert set(CompensationKind) == _HANDLED_COMPENSATION_KINDS | _DEFERRED_COMPENSATION_KINDS
 
 
 def test_runner_boot_recovery_reconciles_and_emits_event(tmp_path: Path) -> None:
