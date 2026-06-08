@@ -22,29 +22,29 @@ from forge_loop.tasks import CompensationKind, TaskSagaStore
 ReapWorktree = Callable[[int], None]
 
 # Compensation kinds this engine knows how to run during a recovery sweep. This
-# keyset is the load-bearing exhaustiveness guard: an exhaustiveness contract
-# test asserts it equals ``set(CompensationKind)``, so adding a new enum member
-# without registering it here turns that test red (see ``test_recovery``).
-#
-# A stale saga carrying any kind NOT in this set (e.g. the close-pr /
-# delete-branch kinds #272 adds) cannot be honestly driven to COMPENSATED here —
-# doing so would assert a side effect was undone when no handler ran. Instead
-# such a saga is driven to the terminal QUARANTINED state ("parked for a human,
-# could not auto-compensate"): that ends the saga (liveness — it drains from the
-# in-flight view and is never swept again) without lying about the side effect
-# (integrity). See ``reconcile_stale_sagas``.
+# keyset, together with ``_DEFERRED_COMPENSATION_KINDS``, is the load-bearing
+# exhaustiveness guard: a contract test asserts their union equals
+# ``set(CompensationKind)``, so adding a new enum member without classifying it
+# turns that test red (see ``test_recovery``).
 _HANDLED_COMPENSATION_KINDS: frozenset[CompensationKind] = frozenset(
     {CompensationKind.REMOVE_WORKTREE}
 )
 
 # Kinds dispatch already ENQUEUES but whose recovery handler is a deferred epic
-# issue. They are intentionally absent from ``_HANDLED_COMPENSATION_KINDS`` so a
-# stale saga carrying one is quarantined (parked for a human) rather than falsely
-# marked COMPENSATED — but they are NOT "forgotten": the exhaustiveness contract
-# (``test_recovery``) requires every ``CompensationKind`` to be classified as
-# either handled or explicitly deferred, so adding a kind that is neither still
-# turns the contract red. ``DELETE_BRANCH`` (#433) is enqueued at dispatch; its
-# reclamation handler lands later in the same epic and will move here → handled.
+# issue. A stale saga carrying ONLY handled and/or deferred kinds is still
+# auto-recovered: the handled compensations run and the saga is driven
+# COMPENSATED, while the deferred kinds are knowingly skipped (their side effect
+# is left exactly as before this kind existed — never falsely claimed undone).
+# This is what keeps dead-worker worktrees auto-reaped instead of parked for a
+# human while a deferred handler is still in flight. ``DELETE_BRANCH`` (#433,
+# epic "Compensate the branch a failed worker abandons") is enqueued at
+# dispatch; its reclamation handler lands later in the same epic and will move
+# here → handled, at which point recovery will also delete the branch.
+#
+# A kind that is in NEITHER set is a genuine gap: recovery refuses to
+# half-compensate such a saga and drives it to the terminal QUARANTINED state
+# ("parked for a human, could not auto-compensate") — liveness without lying
+# about the side effect. See ``reconcile_stale_sagas``.
 _DEFERRED_COMPENSATION_KINDS: frozenset[CompensationKind] = frozenset(
     {CompensationKind.DELETE_BRANCH}
 )
@@ -100,25 +100,30 @@ def reconcile_stale_sagas(
     recovery must make as much progress as it can, not abort on the first
     snag.
 
-    A saga carrying a compensation kind this engine has no handler for is NOT
-    marked COMPENSATED: driving it COMPENSATED would assert a side effect was
-    undone when it never ran (a wrong-but-green integrity hole). Instead the
-    saga is driven to the terminal QUARANTINED state ("parked for a human") so
-    it stops being immortal — it drains from the in-flight view and is never
-    re-swept — without claiming the side effect was undone. No handled
-    compensation is run for such a saga (we refuse to half-compensate it), and
-    an entry naming its id + the unhandled kind(s) is appended to
-    ``RecoveryReport.errors`` so an operator knows a saga was parked and why.
+    A saga carrying a compensation kind this engine neither handles nor has
+    explicitly deferred is NOT marked COMPENSATED: driving it COMPENSATED would
+    assert a side effect was undone when it never ran (a wrong-but-green
+    integrity hole). Instead the saga is driven to the terminal QUARANTINED
+    state ("parked for a human") so it stops being immortal — it drains from the
+    in-flight view and is never re-swept — without claiming the side effect was
+    undone. No handled compensation is run for such a saga (we refuse to
+    half-compensate it), and an entry naming its id + the unhandled kind(s) is
+    appended to ``RecoveryReport.errors`` so an operator knows a saga was parked.
+
+    A *deferred* kind (enqueued at dispatch but whose handler has not landed
+    yet, e.g. ``DELETE_BRANCH``) does NOT taint the saga: the handled
+    compensations still run and the saga is driven COMPENSATED, while the
+    deferred kind is skipped. That keeps dead-worker worktrees auto-reaped
+    instead of parked for a human while a deferred handler is in flight.
     """
     moment = now or datetime.now(UTC)
     recovered: list[RecoveredSaga] = []
     errors: list[str] = []
+    classified = _HANDLED_COMPENSATION_KINDS | _DEFERRED_COMPENSATION_KINDS
 
     for saga in saga_store.list_stale(now=moment):
         try:
-            unhandled = sorted(
-                {c.kind for c in saga.compensations if c.kind not in _HANDLED_COMPENSATION_KINDS}
-            )
+            unhandled = sorted({c.kind for c in saga.compensations if c.kind not in classified})
             if unhandled:
                 kinds = ", ".join(unhandled)
                 saga_store.mark_quarantined(
@@ -135,7 +140,12 @@ def reconcile_stale_sagas(
                 continue
             reaped: list[str] = []
             for compensation in saga.compensations:
-                # Every kind here is handled (unhandled kinds short-circuit above).
+                # Run only the handled compensations; deferred kinds (no handler
+                # yet) are skipped, never falsely claimed undone. Filtering by
+                # kind also stops a non-worktree entry from double-firing the
+                # reaper or recording its target as a reaped worktree.
+                if compensation.kind != CompensationKind.REMOVE_WORKTREE:
+                    continue
                 if reap_worktree is not None and saga.issue is not None:
                     reap_worktree(saga.issue)
                 reaped.append(compensation.target)

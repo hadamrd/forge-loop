@@ -38,9 +38,10 @@ class CompensationKind(StrEnum):
     # path plants a ``loop/<n>`` branch for every worker and registers this
     # compensation at saga-creation time so a failed worker can never leak a
     # branch the control plane doesn't know to delete. The recovery *handler*
-    # for this kind is a sibling epic issue; until it lands, a stale saga
-    # carrying DELETE_BRANCH is quarantined by recovery rather than falsely
-    # marked COMPENSATED (see ``control/recovery.py``).
+    # for this kind is a sibling epic issue; until it lands, recovery classifies
+    # DELETE_BRANCH as deferred — it still reaps the worktree and drives the saga
+    # COMPENSATED, skipping (never falsely claiming) the branch deletion (see
+    # ``control/recovery.py``).
     DELETE_BRANCH = "delete-branch"
 
 
