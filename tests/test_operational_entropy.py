@@ -95,14 +95,20 @@ class TestOpenBranchesIsLoopOnly:
 
     def test_only_loop_prefixed_branches_are_counted(self, tmp_path):
         now = datetime.now(UTC)
+        # ``+ loop/9`` is a loop branch checked out in a linked worktree (git's
+        # ``+`` marker) — it MUST be counted, else the gauge undercounts exactly
+        # the actively-leased loop branches this ticket exists to surface (#415).
         git = _git(
-            _ok("* trunk\n  feature/x\n  loop/7\n  loop/12\n  (HEAD detached at abc)\n"),
+            _ok(
+                "* trunk\n  feature/x\n  loop/7\n  loop/12\n"
+                "+ loop/9\n  (HEAD detached at abc)\n"
+            ),
             _ok(_PORCELAIN),
         )
 
         oe = _entropy(tmp_path, now, git=git, gh=_LabelAwareGh([], []))
 
-        assert oe["open_branches"] == 2  # loop/7 and loop/12 only
+        assert oe["open_branches"] == 3  # loop/7, loop/12, and the +-marked loop/9
 
     def test_no_loop_branches_is_zero_not_total(self, tmp_path):
         now = datetime.now(UTC)
