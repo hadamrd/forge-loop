@@ -56,6 +56,22 @@ MUTATION_REMEDIATION = (
     "forge-loop mutation-check   # plant faults on the high-risk module and "
     "strengthen the tests that let survivors through"
 )
+# Advisory remediation for an over-threshold prunable-memory backlog (epic #426):
+# the non-load-bearing episodic items that accumulate one-per-issue and drown the
+# load-bearing decisions in boot context. The compaction mechanism itself is #428
+# (``compact_episodic``); this probe only *reports* the backlog, so the string is
+# advisory text rather than a copy-pasteable command that does not exist yet.
+COMPACT_REMEDIATION = (
+    "compact prunable episodic memory   # drop the non-load-bearing episodes so "
+    "the load-bearing decisions survive boot context (see #428 compact_episodic)"
+)
+
+# When the prunable-memory backlog (active items where ``is_load_bearing_memory``
+# is ``False``) strictly exceeds this count, ``memory_integrity`` flips to WARN so
+# compaction can be gated on a visible signal. Named once (no bare literal at the
+# call site) per the same convention as PASS/FAIL/WARN and the ``*_REMEDIATION``
+# constants.
+PRUNABLE_MEMORY_WARN_THRESHOLD = 50
 
 # The single high-risk control-plane module the scoped mutation-check targets by
 # default (epic #378): the event-log hash-chain integrity module. Kept as a
@@ -99,7 +115,9 @@ def collect_control_plane_doctor(
     return {
         "projection_lag": _projection_lag_check(status),
         "stale_leases": _stale_leases_check(status),
-        "memory_integrity": _memory_integrity_check(status, memory_path),
+        "memory_integrity": _memory_integrity_check(
+            status, memory_path, is_load_bearing=_resolve_load_bearing_predicate()
+        ),
         "replay_determinism": _replay_determinism_check(status, event_log_path),
     }
 
@@ -159,7 +177,33 @@ def _stale_leases_check(status: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _memory_integrity_check(status: dict[str, Any], memory_path: Path) -> dict[str, Any]:
+def _resolve_load_bearing_predicate() -> Callable[[Any], bool] | None:
+    """Resolve the ``is_load_bearing_memory`` predicate added by sibling #427.
+
+    Issue #429 *consumes* the pure predicate from #427 (same epic #426) and must
+    NOT re-implement the classification (out of scope; manifesto Q7). Until #427
+    merges the symbol is absent, so this looks it up dynamically and returns
+    ``None`` when unavailable. The probe then degrades — it reports the prunable
+    backlog as unmeasured and stays ``PASS`` rather than crashing ``doctor`` —
+    exactly as ``mutation_survivors_check`` degrades to ``warn`` without its #379
+    checker (declared-degrade per Q11). When #427 lands the symbol resolves and
+    the WARN gate lights up with no further change here.
+    """
+
+    import forge_loop.memory as memory_module
+
+    predicate = getattr(memory_module, "is_load_bearing_memory", None)
+    if not callable(predicate):
+        return None
+    return cast("Callable[[Any], bool]", predicate)
+
+
+def _memory_integrity_check(
+    status: dict[str, Any],
+    memory_path: Path,
+    *,
+    is_load_bearing: Callable[[Any], bool] | None = None,
+) -> dict[str, Any]:
     memory = status["memory"]
     if not memory["available"]:
         # Distinguish "absent" (fresh repo → warn, not applicable) from
@@ -195,10 +239,31 @@ def _memory_integrity_check(status: dict[str, Any], memory_path: Path) -> dict[s
             f"inspect or restore {memory_path}",
         )
 
-    detail = (
+    breakdown = (
         f"decisions/active={len(active)}, rejected_paths={len(rejected)}, "
         f"episodes={len(episodic)}, skills/procedural={len(procedural)}"
     )
+
+    # The prunable backlog: active items the #427 predicate classifies as NOT
+    # load-bearing (the episodic items that accumulate one-per-issue until they
+    # drown the load-bearing decisions in boot context — epic #426). Computed
+    # over the already-fetched ``active`` list, so no extra DB round-trip.
+    if is_load_bearing is None:
+        # #427 predicate not yet available — surface the field as unmeasured and
+        # stay PASS (declared degrade); we never raise a WARN we cannot back.
+        return _check(PASS, f"{breakdown}, prunable=unmeasured", None)
+
+    prunable = sum(1 for item in active if not is_load_bearing(item))
+    detail = f"{breakdown}, prunable={prunable}"
+    if prunable > PRUNABLE_MEMORY_WARN_THRESHOLD:
+        return _check(
+            WARN,
+            (
+                f"{detail}; prunable backlog {prunable} exceeds threshold "
+                f"{PRUNABLE_MEMORY_WARN_THRESHOLD} — compaction overdue"
+            ),
+            COMPACT_REMEDIATION,
+        )
     return _check(PASS, detail, None)
 
 
