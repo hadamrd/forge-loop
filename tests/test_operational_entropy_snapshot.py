@@ -18,6 +18,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+import forge_loop.operational_entropy as oe_mod
 from forge_loop.operational_entropy import OperationalEntropy, snapshot
 
 
@@ -113,4 +114,74 @@ def test_all_zero_inputs_yield_zeros_and_none() -> None:
         live_worktrees=0,
         open_epics=0,
         oldest_backlog_age_s=None,
+    )
+
+
+def test_snapshot_is_hashable_and_usable_as_dict_key_and_set_member() -> None:
+    """Equality AC, second half: frozen ⇒ hashable, so identical snapshots
+    collapse to one set member and key the same dict slot."""
+    kwargs = dict(
+        branch_names=["loop/1", "feat/x"],
+        worktree_paths=["/a", "/b"],
+        open_epics=[1, 2, 3],
+        backlog_created_ts=[100.0, 200.0],
+        now=500.0,
+    )
+    a = snapshot(**kwargs)
+    b = snapshot(**kwargs)
+    # Hashable as a set member: two equal snapshots collapse to one element.
+    assert len({a, b}) == 1
+    # Usable as a dict key: the second write hits the same slot as the first.
+    bucket = {a: "first"}
+    bucket[b] = "second"
+    assert bucket == {a: "second"}
+    assert hash(a) == hash(b)
+
+
+def test_clock_skew_now_before_oldest_does_not_crash_and_is_defined() -> None:
+    """Adversarial purity case: a skewed ``now`` *earlier* than the oldest
+    backlog timestamp must NOT crash; the age is simply a defined negative
+    value (``now - min(ts)``), because the function trusts its injected
+    inputs and never clamps against a real clock."""
+    oe = snapshot(
+        branch_names=[],
+        worktree_paths=[],
+        open_epics=[],
+        backlog_created_ts=[1000.0, 2000.0],
+        now=400.0,  # now < min(ts): clock skew
+    )
+    assert oe.oldest_backlog_age_s == -600.0  # 400 - 1000, a defined value
+
+
+def test_purity_monkeypatched_clock_does_not_change_output(monkeypatch) -> None:
+    """Purity AC: ``now`` is the SOLE time source. Breaking ``time.time`` (and
+    any module-level ``time`` reference) must not perturb the result — proving
+    the builder never reads an ambient clock. Calling twice with identical
+    inputs yields identical, equal snapshots."""
+    import time
+
+    def _boom() -> float:  # pragma: no cover - must never be invoked
+        raise AssertionError("snapshot() must not read the wall clock")
+
+    monkeypatch.setattr(time, "time", _boom)
+    # Defensive: if the module ever imported ``time``, sabotage that too.
+    if hasattr(oe_mod, "time"):
+        monkeypatch.setattr(oe_mod.time, "time", _boom, raising=False)
+
+    kwargs = dict(
+        branch_names=["loop/7", "loop/9", "trunk"],
+        worktree_paths=["/tmp/wt-a"],
+        open_epics=[{"number": 412}],
+        backlog_created_ts=[500.0, 750.0],
+        now=1000.0,
+    )
+    first = snapshot(**kwargs)
+    second = snapshot(**kwargs)
+
+    assert first == second
+    assert first == OperationalEntropy(
+        open_loop_branches=2,
+        live_worktrees=1,
+        open_epics=1,
+        oldest_backlog_age_s=500.0,
     )
