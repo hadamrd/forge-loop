@@ -205,6 +205,12 @@ class Config:
     # sub-issue is closed. Sourced from settings.maintenance.epic_label.
     epic_label: str = "epic"
 
+    # Epic TTL-expiry pass (issue #435). Whole-day TTL: an open epic with zero
+    # open sub-issues older than this is auto-closed with an expiry audit
+    # comment. ``0`` DISABLES the pass (pre-#435 no-op). Sourced from
+    # settings.maintenance.epic_ttl_days.
+    epic_ttl_days: int = 0
+
     @property
     def state_dir(self) -> Path:
         return self.repo / "docs" / "ops"
@@ -361,6 +367,7 @@ def _from_settings(s: Settings) -> Config:
         stuck_threshold_attempts=s.maintenance.stuck_threshold_attempts,
         stuck_tail_events=s.maintenance.stuck_tail_events,
         epic_label=s.maintenance.epic_label,
+        epic_ttl_days=s.maintenance.epic_ttl_days,
     )
 
 

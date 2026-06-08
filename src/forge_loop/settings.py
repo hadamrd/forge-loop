@@ -473,6 +473,11 @@ class MaintenanceSettings(BaseSettings):
     # Label marking an issue as an epic; the deterministic epic sweep (#367)
     # closes an open epic once every tracked sub-issue is closed.
     epic_label: str = "epic"
+    # TTL in whole days for the epic-expiry pass (issue #435). An open epic
+    # with zero open sub-issues older than this is auto-closed with an expiry
+    # audit comment. ``0`` (the default) DISABLES the TTL pass — pre-#435
+    # behaviour, so existing deployments keep expiring nothing until they opt in.
+    epic_ttl_days: int = 0
 
 
 class MiscSettings(BaseSettings):

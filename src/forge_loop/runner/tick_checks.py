@@ -7,6 +7,7 @@ import os
 import subprocess
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from forge_loop.branch_sweep import BranchSweepReport
@@ -67,15 +68,21 @@ def run_stuck_sweep(cfg: Config, tick: int) -> SweepReport | None:
 
 
 def run_epic_sweep(
-    cfg: Config, tick: int, *, client: GhClientLike | None = None
+    cfg: Config,
+    tick: int,
+    *,
+    client: GhClientLike | None = None,
+    now: datetime | None = None,
 ) -> EpicSweepReport | None:
-    """Auto-close epics whose tracked sub-issues are all resolved (issue #367).
+    """Auto-close resolved epics (#367) + expire stale undecomposed epics (#435).
 
     Runs on the maintenance cadence (``maintenance_every_n_ticks``) only — a
     no-op off-cadence (returns ``None`` without touching GitHub). Deterministic
     Python; spawns NO LLM subagent. Emits a typed ``epic_sweep_done`` summary
-    event and returns the report. ``client`` is injectable for tests; in
-    production it is the real ``GithubkitClient``.
+    event (carrying ``expired`` distinctly from ``closed``) and returns the
+    report. ``client`` is injectable for tests; in production it is the real
+    ``GithubkitClient``. ``now`` is injected for clock-free tests, defaulting to
+    the current UTC instant; it + ``cfg.epic_ttl_days`` drive the TTL pass.
     """
     if cfg.maintenance_every_n_ticks <= 0 or tick % cfg.maintenance_every_n_ticks != 0:
         return None
@@ -95,8 +102,16 @@ def run_epic_sweep(
                 reason=f"gh_client_init: {ex}"[:200],
             )
             return None
+    effective_now = now if now is not None else datetime.now(UTC)
     try:
-        report = _epic_sweep(client, owner=owner, repo=repo, epic_label=cfg.epic_label)
+        report = _epic_sweep(
+            client,
+            owner=owner,
+            repo=repo,
+            epic_label=cfg.epic_label,
+            epic_ttl_days=cfg.epic_ttl_days,
+            now=effective_now,
+        )
     except Exception as ex:  # noqa: BLE001 — the sweep never raises, but belt-and-braces
         append_event(cfg.events_file, "epic_sweep_crashed", tick=tick, err=str(ex)[:200])
         return None
@@ -108,6 +123,7 @@ def run_epic_sweep(
         EpicSweepDoneEvent(
             tick=tick,
             closed=report.closed,
+            expired=report.expired,
             skipped_open_subs=report.skipped_open_subs,
             skipped_no_subs=report.skipped_no_subs,
             errors=list(report.errors),
