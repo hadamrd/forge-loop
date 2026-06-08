@@ -97,7 +97,7 @@ def test_status_shape(client: TestClient) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["sequence"] >= 5
-    assert {"boot", "event_log", "projections", "frontier", "memory"} <= set(body)
+    assert {"boot", "event_log", "projections", "frontier", "memory", "entropy"} <= set(body)
 
 
 def test_status_carries_operational_entropy_block(
@@ -129,6 +129,86 @@ def test_status_carries_operational_entropy_block(
     assert oe["open_epics"] == 1
     assert oe["backlog_age_days"] == 20
     assert oe["open_branches"] is None  # temp repo is not a git worktree
+
+
+def test_status_payload_includes_entropy(client: TestClient) -> None:
+    """Issue #415 — GET /api/status carries an ``entropy`` convergence snapshot.
+
+    The key is always present with the four contract sub-fields of the correct
+    types; counts are zeroed (not ``None``) when the temp repo has no git/GitHub
+    signal, and the whole object is JSON-serializable end-to-end through the
+    FastAPI route (this is the integration assertion).
+    """
+    r = client.get("/api/status")
+    assert r.status_code == 200
+    ent = r.json()["entropy"]
+    assert set(ent) == {
+        "open_loop_branches",
+        "live_worktrees",
+        "open_epics",
+        "oldest_backlog_age_s",
+    }
+    assert isinstance(ent["open_loop_branches"], int)
+    assert isinstance(ent["live_worktrees"], int)
+    assert isinstance(ent["open_epics"], int)
+    assert ent["oldest_backlog_age_s"] is None or isinstance(ent["oldest_backlog_age_s"], int)
+
+
+def test_entropy_matches_snapshot(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #415 primary criterion — the payload's ``entropy`` equals the
+    snapshot derived from the SAME single-source operational-entropy computation
+    on the SAME repo state (no forked/parallel computation, manifesto Q7/Q10)."""
+    from datetime import UTC, datetime, timedelta
+
+    import forge_loop.gh_client as gh
+    from forge_loop.console_api import _entropy_snapshot_view, _github_repo_slug
+    from forge_loop.control.status import collect_control_plane_status
+    from forge_loop.gh_client import Issue, OpenBacklog
+
+    now = datetime.now(UTC)
+    epics = [Issue(number=1, title="epic", labels=["epic"],
+                   created_at=(now - timedelta(days=4)).isoformat())]
+    tickets = [Issue(number=2, title="old", created_at=(now - timedelta(days=20)).isoformat())]
+    monkeypatch.setattr(
+        gh, "list_open_backlog", lambda *a, **k: OpenBacklog(epics=epics, tickets=tickets)
+    )
+
+    ent = client.get("/api/status").json()["entropy"]
+
+    # Seeded-state assertions (falsifiable): one epic, oldest issue 20 days old
+    # expressed in seconds; git-derived counts zero on a non-git temp repo.
+    assert ent["open_epics"] == 1
+    assert ent["oldest_backlog_age_s"] == 20 * 86400
+    assert ent["open_loop_branches"] == 0
+    assert ent["live_worktrees"] == 0
+
+    # Single-source proof: equals the view of the raw control-plane entropy
+    # block computed independently from the same repo state.
+    raw = collect_control_plane_status(tmp_path, now, github_repo=_github_repo_slug())
+    assert ent == _entropy_snapshot_view(raw["operational_entropy"])
+
+
+def test_entropy_empty_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #415 sad path — a fresh repo with no branches and no configured
+    backlog still returns 200, an ``entropy`` key with zeroed counts, and
+    ``oldest_backlog_age_s == null`` (never a missing key, never a 500)."""
+    import forge_loop.console_api as capi
+
+    # No GitHub slug configured -> the backlog signal is unreachable, so the
+    # oldest-age field degrades to ``None`` rather than a count.
+    monkeypatch.setattr(capi, "_github_repo_slug", lambda: None)
+    _seed(tmp_path)
+    fresh = TestClient(build_console_api(repo=tmp_path, token=None))
+
+    r = fresh.get("/api/status")
+    assert r.status_code == 200
+    ent = r.json()["entropy"]
+    assert ent["open_loop_branches"] == 0
+    assert ent["live_worktrees"] == 0
+    assert ent["open_epics"] == 0
+    assert ent["oldest_backlog_age_s"] is None
 
 
 def test_events_page(client: TestClient) -> None:
