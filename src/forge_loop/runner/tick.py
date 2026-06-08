@@ -60,6 +60,7 @@ from forge_loop.runner.repairs import (
     ready_issue_open_pr_repairs as _ready_issue_open_pr_repairs_impl,
 )
 from forge_loop.runner.rescue import rescue_uncommitted_work as _rescue_uncommitted_work
+from forge_loop.runner.tick_checks import restore_base_branch as _restore_base_branch
 from forge_loop.runner.tick_checks import run_codebase_audit as _run_codebase_audit
 from forge_loop.runner.tick_checks import run_branch_sweep as _run_branch_sweep
 from forge_loop.runner.tick_checks import run_epic_sweep as _run_epic_sweep
@@ -1354,6 +1355,34 @@ def _tick(cfg: Config, tick: int) -> None:
     # aborts or blocks the tick.
     _run_tick_recovery(cfg)
 
+    # Issue #401 — operational-convergence: run the dispatch body inside a
+    # finally-guard so the shared/main checkout's HEAD is ALWAYS restored to
+    # ``base_branch`` at end-of-tick, even when the batch raises mid-flight. The
+    # restore is idempotent (no-op when HEAD is already on base) and never
+    # touches worker worktrees (they keep their own ``loop/<n>`` branches).
+    try:
+        _run_dispatch_body(cfg, tick, _bus_emit=_bus_emit, _short_sleep=_short_sleep)
+    finally:
+        _restore_base_branch(cfg.repo, cfg.base_branch, events_file=cfg.events_file, tick=tick)
+
+
+def _run_dispatch_body(
+    cfg: Config,
+    tick: int,
+    *,
+    _bus_emit: Any,
+    _short_sleep: Any,
+) -> None:
+    """Dispatch body of one tick (issue #401 extraction).
+
+    Everything after tick-recovery — maintenance, pre-dispatch repairs,
+    candidate selection, spec expansion, dispatch, merge gate, finalize. Split
+    out of :func:`_tick` so the caller can wrap it in a ``finally`` that restores
+    ``base_branch`` regardless of how this body exits (early return, partial
+    failure, or exception). Behaviour, ordering and emitted events are
+    byte-for-byte identical to the pre-#401 inline body — a pure mechanical
+    split, no semantics moved.
+    """
     if _maybe_run_maintenance(cfg, tick, short_sleep=_short_sleep):
         return
 
