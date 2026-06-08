@@ -19,19 +19,36 @@ Testing-manifesto coverage:
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from forge_loop.config import Config
-from forge_loop.epic_sweep import EpicSweepReport, build_close_comment, sweep
+from forge_loop.epic_sweep import (
+    EpicSweepReport,
+    build_close_comment,
+    build_expiry_comment,
+    sweep,
+)
 from forge_loop.gh_client import GhError, Issue, MockGhClient, SubIssue
 from forge_loop.runner.tick_checks import run_epic_sweep
 
 EPIC = "epic"
 
+# Fixed clock for the deterministic TTL tests — matches issue #435's worked
+# example (today = 2026-06-08), so a 2026-01-01 epic is 158 days old.
+NOW = datetime(2026, 6, 8, tzinfo=UTC)
 
-def _epic(number: int, *, state: str = "open") -> Issue:
-    return Issue(number=number, title=f"epic {number}", body="", state=state, labels=[EPIC])
+
+def _epic(number: int, *, state: str = "open", created_at: str | None = None) -> Issue:
+    return Issue(
+        number=number,
+        title=f"epic {number}",
+        body="",
+        state=state,
+        labels=[EPIC],
+        created_at=created_at,
+    )
 
 
 def _sub(number: int, *, state: str = "CLOSED", closing_pr: int | None = None) -> SubIssue:
@@ -216,6 +233,139 @@ def test_child_epic_close_does_not_cascade_close_parent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# TTL expiry pass (issue #435)
+# ---------------------------------------------------------------------------
+
+
+def test_stale_epic_with_no_open_subs_is_expired() -> None:
+    """Primary falsifiable acceptance: zero open subs + age > TTL → expired,
+    closed with the expiry reason, the expiry audit comment posted."""
+    epic = _epic(390, created_at="2026-01-01T00:00:00Z")  # 158 days old at NOW
+    gh = MockGhClient(issues_by_label_response=[epic], sub_issues_by_epic={})
+
+    rep = sweep(gh, owner="o", repo="r", epic_label=EPIC, epic_ttl_days=90, now=NOW)
+
+    assert rep.expired == [390]
+    assert rep.closed == []
+    assert rep.skipped_no_subs == []
+    assert rep.errors == {}
+    methods = [m for m, _ in gh.calls]
+    assert "add_comment" in methods
+    assert "close_issue" in methods
+    close_kw = [kw for m, kw in gh.calls if m == "close_issue"][0]
+    assert close_kw["number"] == 390
+    assert close_kw["reason"] == "not_planned"  # distinct from the "completed" path
+    comment = [kw for m, kw in gh.calls if m == "add_comment"][0]["body"]
+    assert "158 days" in comment
+    assert "TTL 90" in comment
+
+
+def test_epic_within_ttl_is_not_expired() -> None:
+    """Zero open subs but age < TTL → left open (skipped_no_subs), no comment."""
+    epic = _epic(391, created_at="2026-05-01T00:00:00Z")  # ~38 days old at NOW
+    gh = MockGhClient(issues_by_label_response=[epic], sub_issues_by_epic={})
+
+    rep = sweep(gh, owner="o", repo="r", epic_label=EPIC, epic_ttl_days=90, now=NOW)
+
+    assert rep.expired == []
+    assert rep.skipped_no_subs == [391]
+    methods = [m for m, _ in gh.calls]
+    assert "close_issue" not in methods
+    assert "add_comment" not in methods
+
+
+def test_epic_with_open_sub_is_never_expired_even_when_ancient() -> None:
+    """Fail-safe (load-bearing): ≥1 open sub dominates the TTL check — an
+    ancient epic with live work stays under skipped_open_subs, never expired."""
+    epic = _epic(392, created_at="2020-01-01T00:00:00Z")  # ~6 years old
+    gh = MockGhClient(
+        issues_by_label_response=[epic],
+        sub_issues_by_epic={392: [_sub(146), _sub(150, state="OPEN")]},
+    )
+
+    rep = sweep(gh, owner="o", repo="r", epic_label=EPIC, epic_ttl_days=90, now=NOW)
+
+    assert rep.expired == []
+    assert rep.closed == []
+    assert rep.skipped_open_subs == [392]
+    assert "close_issue" not in [m for m, _ in gh.calls]
+
+
+def test_epic_with_no_created_at_is_never_expired() -> None:
+    """created_at=None → age unprovable → fail safe (never expired), no raise."""
+    epic = _epic(393, created_at=None)
+    gh = MockGhClient(issues_by_label_response=[epic], sub_issues_by_epic={})
+
+    rep = sweep(gh, owner="o", repo="r", epic_label=EPIC, epic_ttl_days=90, now=NOW)
+
+    assert rep.expired == []
+    assert rep.skipped_no_subs == [393]
+    assert "close_issue" not in [m for m, _ in gh.calls]
+
+
+def test_ttl_zero_disables_expiry_pass() -> None:
+    """epic_ttl_days=0 → behaviour identical to pre-#435: no expiry closes even
+    for an ancient undecomposed epic (it lands in skipped_no_subs)."""
+    epic = _epic(394, created_at="2020-01-01T00:00:00Z")
+    gh = MockGhClient(issues_by_label_response=[epic], sub_issues_by_epic={})
+
+    rep = sweep(gh, owner="o", repo="r", epic_label=EPIC, epic_ttl_days=0, now=NOW)
+
+    assert rep.expired == []
+    assert rep.skipped_no_subs == [394]
+    assert "close_issue" not in [m for m, _ in gh.calls]
+
+
+def test_all_subs_resolved_still_uses_completed_path_not_ttl() -> None:
+    """An old epic whose subs are all CLOSED closes via the completed comment
+    (reason='completed'), NOT the TTL path — even though it is also TTL-aged."""
+    epic = _epic(395, created_at="2020-01-01T00:00:00Z")
+    gh = MockGhClient(
+        issues_by_label_response=[epic],
+        sub_issues_by_epic={395: [_sub(146), _sub(150)]},
+    )
+
+    rep = sweep(gh, owner="o", repo="r", epic_label=EPIC, epic_ttl_days=90, now=NOW)
+
+    assert rep.closed == [395]
+    assert rep.expired == []
+    close_kw = [kw for m, kw in gh.calls if m == "close_issue"][0]
+    assert close_kw["reason"] == "completed"
+    comment = [kw for m, kw in gh.calls if m == "add_comment"][0]["body"]
+    assert "all 2 sub-issues resolved" in comment
+    assert "TTL" not in comment
+
+
+def test_expiry_comment_is_distinct_from_resolved_comment() -> None:
+    """The expiry body must differ from build_close_comment AND name age/TTL."""
+    expiry = build_expiry_comment(390, age_days=158, ttl_days=90)
+    resolved = build_close_comment(390, [_sub(146), _sub(150)])
+    assert expiry != resolved
+    assert "158" in expiry
+    assert "90" in expiry
+    assert "TTL" in expiry
+    # The expiry comment must NOT claim sub-issues were resolved.
+    assert "sub-issues resolved" not in expiry
+
+
+def test_ttl_close_issue_error_is_recorded_not_raised() -> None:
+    """Adversarial: close_issue raises on a TTL-eligible epic → recorded under
+    errors, sweep returns normally (the tick is never crashed)."""
+    epic = _epic(396, created_at="2026-01-01T00:00:00Z")
+    gh = MockGhClient(
+        issues_by_label_response=[epic],
+        sub_issues_by_epic={},
+        raise_on={"close_issue": GhError("close_issue", 500, "boom")},
+    )
+
+    rep = sweep(gh, owner="o", repo="r", epic_label=EPIC, epic_ttl_days=90, now=NOW)
+
+    assert rep.expired == []
+    assert 396 in rep.errors
+    assert "close" in rep.errors[396]
+
+
+# ---------------------------------------------------------------------------
 # Integration — tick wiring + cadence gate
 # ---------------------------------------------------------------------------
 
@@ -248,6 +398,30 @@ def test_run_epic_sweep_writes_event_and_returns_report_on_cadence(tmp_path: Pat
     assert events[0]["skipped_no_subs"] == []
     assert events[0]["errors"] == []
     assert events[0]["tick"] == 5
+
+
+def test_run_epic_sweep_event_carries_expired_with_ttl_and_injected_now(
+    tmp_path: Path,
+) -> None:
+    """Tick wiring threads cfg.epic_ttl_days + an injected ``now`` into the pure
+    sweep, and the EpicSweepDoneEvent carries ``expired`` distinctly."""
+    cfg = Config(
+        repo=tmp_path, github_repo="o/r", maintenance_every_n_ticks=5, epic_ttl_days=90
+    )
+    gh = MockGhClient(
+        issues_by_label_response=[_epic(390, created_at="2026-01-01T00:00:00Z")],
+        sub_issues_by_epic={},
+    )
+
+    rep = run_epic_sweep(cfg, tick=5, client=gh, now=NOW)
+
+    assert rep is not None
+    assert rep.expired == [390]
+    assert rep.closed == []
+    events = [e for e in _read_events(cfg) if e.get("kind") == "epic_sweep_done"]
+    assert len(events) == 1
+    assert events[0]["expired"] == [390]
+    assert events[0]["closed"] == []
 
 
 def test_run_epic_sweep_is_noop_off_cadence(tmp_path: Path) -> None:

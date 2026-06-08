@@ -347,15 +347,19 @@ class EpicSweepDoneEvent(EventBase):
 
     Emitted by ``forge_loop.runner.tick_checks.run_epic_sweep`` on the
     maintenance cadence. Each list holds epic issue NUMBERS: ``closed`` were
-    auto-closed (all tracked sub-issues resolved); ``skipped_open_subs`` had
-    ≥ 1 still-open sub-issue; ``skipped_no_subs`` had no tracked sub-issues;
-    ``errors`` hit a GhClient failure (sub-issue lookup or close) and were
-    left untouched.
+    auto-closed (all tracked sub-issues resolved); ``expired`` were closed by
+    the TTL pass (issue #435 — zero open sub-issues, aged past
+    ``epic_ttl_days``), reported distinctly from ``closed`` because they mean
+    an undecomposed epic reaped for staleness, not finished work;
+    ``skipped_open_subs`` had ≥ 1 still-open sub-issue; ``skipped_no_subs`` had
+    no tracked sub-issues; ``errors`` hit a GhClient failure (sub-issue lookup
+    or close) and were left untouched.
     """
 
     KIND: ClassVar[str] = "epic_sweep_done"
     tick: int = Field(ge=0, default=0)
     closed: list[int] = Field(default_factory=list)
+    expired: list[int] = Field(default_factory=list)
     skipped_open_subs: list[int] = Field(default_factory=list)
     skipped_no_subs: list[int] = Field(default_factory=list)
     errors: list[int] = Field(default_factory=list)
