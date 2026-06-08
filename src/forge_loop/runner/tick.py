@@ -61,6 +61,7 @@ from forge_loop.runner.repairs import (
 )
 from forge_loop.runner.rescue import rescue_uncommitted_work as _rescue_uncommitted_work
 from forge_loop.runner.tick_checks import restore_base_branch as _restore_base_branch
+from forge_loop.runner.tick_checks import run_checkout_reconcile as _run_checkout_reconcile
 from forge_loop.runner.tick_checks import run_codebase_audit as _run_codebase_audit
 from forge_loop.runner.tick_checks import run_branch_sweep as _run_branch_sweep
 from forge_loop.runner.tick_checks import run_epic_sweep as _run_epic_sweep
@@ -579,6 +580,10 @@ def _maybe_run_maintenance(cfg: Config, tick: int, *, short_sleep: Any) -> bool:
         # Deterministic worktree GC: reap orphaned task worktrees under worktree_root
         # that no live in-flight lease owns. Pure Python, conservative, no LLM.
         _run_worktree_sweep(cfg, tick)
+        # Deterministic shared-checkout reconcile (#416): if cfg.repo drifted onto a
+        # loop/<n> branch with a CLEAN tree, switch it back to base_branch. Never
+        # touches a dirty tree. Pure Python, conservative, no LLM.
+        _run_checkout_reconcile(cfg, tick)
     if cfg.maintenance_every_n_ticks > 0 and tick % cfg.maintenance_every_n_ticks == 0:
         _run_maintenance_tick(cfg, tick)
         short_sleep(cfg.tick_interval_s, cfg)
