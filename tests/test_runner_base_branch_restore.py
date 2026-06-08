@@ -107,11 +107,15 @@ def test_restore_moves_head_back_to_base(tmp_path: Path) -> None:
 
     assert result == "moved"
     assert _current_branch(repo) == "trunk"
-    moved = [e for e in _read_events(events) if e["kind"] == "base_branch_restored"]
+    # Event convergence (#422): the end-of-batch restore emits the SAME typed
+    # ``checkout_restored`` event as the maintenance-cadence reconcile.
+    moved = [e for e in _read_events(events) if e["kind"] == "checkout_restored"]
     assert len(moved) == 1
     assert moved[0]["from_branch"] == "loop/412-foo"
     assert moved[0]["to_branch"] == "trunk"
     assert moved[0]["tick"] == 7
+    # And the legacy untyped name is gone — exactly one name, no third path.
+    assert not [e for e in _read_events(events) if e["kind"] == "base_branch_restored"]
 
 
 def test_restore_is_noop_when_already_on_base(tmp_path: Path) -> None:
@@ -275,7 +279,7 @@ def test_tick_restores_base_branch_after_head_hop(tmp_path: Path, monkeypatch: A
 
     assert _current_branch(repo) == "trunk"
     events = _read_events(cfg.events_file)
-    restored = [e for e in events if e["kind"] == "base_branch_restored"]
+    restored = [e for e in events if e["kind"] == "checkout_restored"]
     assert len(restored) == 1
     assert restored[0]["from_branch"] == "loop/412-foo"
 
@@ -296,7 +300,7 @@ def test_tick_restores_even_when_body_raises(tmp_path: Path, monkeypatch: Any) -
         _tick_mod._tick(cfg, 1)
 
     assert _current_branch(repo) == "trunk"
-    restored = [e for e in _read_events(cfg.events_file) if e["kind"] == "base_branch_restored"]
+    restored = [e for e in _read_events(cfg.events_file) if e["kind"] == "checkout_restored"]
     assert len(restored) == 1
 
 
@@ -322,3 +326,43 @@ def test_worker_worktree_branch_untouched_by_restore(tmp_path: Path) -> None:
     # Main checkout restored; the worker worktree's branch is untouched.
     assert _current_branch(repo) == "trunk"
     assert _current_branch(wt) == "loop/77"
+
+
+# --------------------------------------------------------------------------- #
+# Event-name convergence (#422): both return arcs emit ONE documented kind
+# --------------------------------------------------------------------------- #
+
+
+def test_both_return_arcs_emit_same_checkout_restored_kind(tmp_path: Path) -> None:
+    """End-of-batch restore and maintenance reconcile emit the SAME event ``kind``.
+
+    The operational-convergence invariant has two return arcs — the end-of-batch
+    ``restore_base_branch`` (finally-guard) and the maintenance ``run_checkout_reconcile``.
+    #422 converges their observability onto the single typed ``CheckoutRestoredEvent``;
+    this asserts neither path drifts to a second/third name.
+    """
+    from dataclasses import replace
+
+    from forge_loop.events import CheckoutRestoredEvent
+    from forge_loop.runner.tick_checks import run_checkout_reconcile
+
+    # Arc A — end-of-batch restore against a drifted shared checkout.
+    repo_a = _init_repo(tmp_path / "repo_a")
+    _git(["checkout", "-b", "loop/100-a"], repo_a)
+    events_a = tmp_path / "events_a.jsonl"
+    assert restore_base_branch(repo_a, "trunk", events_file=events_a, tick=2) == "moved"
+    kinds_a = {e["kind"] for e in _read_events(events_a)}
+
+    # Arc B — maintenance-cadence reconcile against an equivalent drift.
+    repo_b = _init_repo(tmp_path / "repo_b")
+    cfg_b = replace(_make_cfg(repo_b), maintenance_every_n_ticks=5)
+    run_checkout_reconcile(
+        cfg_b, tick=10, read_branch=lambda: "loop/100-b", read_dirty=lambda: False, switch=lambda _b: True
+    )
+    kinds_b = {e["kind"] for e in _read_events(cfg_b.events_file)}
+
+    assert CheckoutRestoredEvent.KIND == "checkout_restored"
+    assert CheckoutRestoredEvent.KIND in kinds_a
+    assert CheckoutRestoredEvent.KIND in kinds_b
+    # The legacy untyped name must not reappear on either arc.
+    assert "base_branch_restored" not in (kinds_a | kinds_b)
