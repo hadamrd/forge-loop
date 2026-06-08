@@ -253,6 +253,82 @@ def test_legacy_runner_mirror_records_merge_blocked_from_critic_verdict(
     ]
 
 
+def test_critic_done_findings_survive_mirror_to_critique_issued(tmp_path: Path) -> None:
+    """Issue #404: findings + minimal_path_to_green added to critic_done flow
+    straight through the mirror onto the canonical critique.issued payload."""
+    log = SqliteEventLog(tmp_path / "events.db")
+    mirror = LegacyEventMirror(log)
+
+    mirror.mirror_record(
+        {
+            "kind": "critic_done",
+            "issue": 4242,
+            "pr": "https://github.com/o/r/pull/4242",
+            "verdict": "changes_requested",
+            "reasons": [],
+            "duration_s": 3.0,
+            "sev_counts": {"sev1": 0, "sev2": 1, "sev3": 0},
+            "parse_retries": 0,
+            "findings": [
+                {"severity": "sev2", "category": "correctness", "file": "src/a.py", "line": 10, "message": "off-by-one"}
+            ],
+            "minimal_path_to_green": ["fix off-by-one", "add test"],
+        }
+    )
+
+    events = list(log.since(0))
+    assert [e.kind for e in events] == [EventKind.CRITIQUE_ISSUED]
+    payload = events[0].payload
+    assert payload["findings"] == [
+        {"severity": "sev2", "category": "correctness", "file": "src/a.py", "line": 10, "message": "off-by-one"}
+    ]
+    assert payload["minimal_path_to_green"] == ["fix off-by-one", "add test"]
+
+
+def test_critic_done_findings_reach_console_reconstruct_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: real append_event(critic_done, findings=...) → default durable
+    mirror → critique.issued → console _reconstruct_prs surfaces the findings."""
+    import forge_loop.console_api as capi
+    from forge_loop.console_api import _reconstruct_prs
+    from forge_loop.critic import CriticReport, Finding, serialize_findings
+
+    # Deterministic: never touch GitHub for issue reconciliation.
+    monkeypatch.setattr(capi, "_open_issue_numbers", lambda repo: None)
+
+    report = CriticReport(
+        overall="request_changes",
+        findings=[
+            Finding("sev2", "correctness", "src/a.py", 10, "off-by-one"),
+            Finding("sev1", "security", None, None, "no file/line"),
+        ],
+        minimal_path_to_green=["fix off-by-one"],
+    )
+    events_file = tmp_path / "docs" / "ops" / "loop-runner-events.jsonl"
+    append_event(
+        events_file,
+        "critic_done",
+        issue=4242,
+        pr="https://github.com/o/r/pull/4242",
+        verdict="changes_requested",
+        reasons=[],
+        duration_s=3.0,
+        sev_counts={"sev1": 1, "sev2": 1, "sev3": 0},
+        parse_retries=0,
+        findings=serialize_findings(report.findings),
+        minimal_path_to_green=list(report.minimal_path_to_green),
+    )
+
+    prs = _reconstruct_prs(tmp_path)
+    review = next(p for p in prs if p["number"] == 4242)["review"]
+    assert review["findings"] == [
+        {"severity": "sev2", "category": "correctness", "file": "src/a.py", "line": 10, "message": "off-by-one"},
+        {"severity": "sev1", "category": "security", "file": None, "line": None, "message": "no file/line"},
+    ]
+    assert review["minimal_path_to_green"] == ["fix off-by-one"]
+
+
 def test_legacy_runner_mirror_records_default_critic_done(tmp_path: Path) -> None:
     log = SqliteEventLog(tmp_path / "events.db")
     mirror = LegacyEventMirror(log)

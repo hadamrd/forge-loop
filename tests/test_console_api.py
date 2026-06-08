@@ -37,7 +37,29 @@ def _seed(repo: Path) -> None:
     )
     log.append(
         EventKind.CRITIQUE_ISSUED,
-        {"pr": 4242, "round": 1, "verdict": "changes_requested", "sev2": 2},
+        {
+            "pr": 4242,
+            "round": 1,
+            "verdict": "changes_requested",
+            "sev2": 2,
+            "findings": [
+                {
+                    "severity": "sev2",
+                    "category": "correctness",
+                    "file": "src/a.py",
+                    "line": 10,
+                    "message": "off-by-one",
+                },
+                {
+                    "severity": "sev2",
+                    "category": "tests",
+                    "file": None,
+                    "line": None,
+                    "message": "missing adversarial test",
+                },
+            ],
+            "minimal_path_to_green": ["fix off-by-one", "add adversarial test"],
+        },
         task_id="issue:999",
         saga_id="tick:1",
     )
@@ -110,7 +132,96 @@ def test_critic_review_for_pr(client: TestClient) -> None:
     review = client.get("/api/prs/4242/critic").json()
     assert review["verdict"] in {"changes_requested", "approved", "error"}
     assert review["sev_counts"]["sev2"] == 2
+    # Issue #404: the seeded critique carries durable findings + path-to-green.
+    findings = review["findings"]
+    assert len(findings) == 2
+    assert findings[0] == {
+        "severity": "sev2",
+        "category": "correctness",
+        "file": "src/a.py",
+        "line": 10,
+        "message": "off-by-one",
+    }
+    assert findings[1]["file"] is None and findings[1]["line"] is None
+    assert review["minimal_path_to_green"] == ["fix off-by-one", "add adversarial test"]
     assert client.get("/api/prs/123456/critic").status_code == 404
+
+
+def test_reconstruct_prs_reads_findings_from_critique_event(tmp_path: Path) -> None:
+    """_reconstruct_prs surfaces findings + minimal_path_to_green from the event."""
+    from forge_loop.console_api import _reconstruct_prs
+
+    repo = tmp_path
+    (repo / ".forge").mkdir(parents=True, exist_ok=True)
+    log = SqliteEventLog(repo / ".forge" / "events.db")
+    log.append(EventKind.PR_OPENED, {"pr": 7, "title": "P"}, task_id="issue:7", saga_id="t")
+    log.append(
+        EventKind.CRITIQUE_ISSUED,
+        {
+            "pr": 7,
+            "verdict": "changes_requested",
+            "sev2": 1,
+            "findings": [
+                {"severity": "sev2", "category": "correctness", "file": "x.py", "line": 3, "message": "boom"}
+            ],
+            "minimal_path_to_green": ["fix boom"],
+        },
+        task_id="issue:7",
+        saga_id="t",
+    )
+    prs = _reconstruct_prs(repo)
+    review = next(p for p in prs if p["number"] == 7)["review"]
+    assert review["findings"] == [
+        {"severity": "sev2", "category": "correctness", "file": "x.py", "line": 3, "message": "boom"}
+    ]
+    assert review["minimal_path_to_green"] == ["fix boom"]
+
+
+def test_reconstruct_prs_legacy_event_without_findings_degrades_to_empty(tmp_path: Path) -> None:
+    """Back-compat: an old critique.issued with no findings field → findings=[]."""
+    from forge_loop.console_api import _reconstruct_prs
+
+    repo = tmp_path
+    (repo / ".forge").mkdir(parents=True, exist_ok=True)
+    log = SqliteEventLog(repo / ".forge" / "events.db")
+    log.append(EventKind.PR_OPENED, {"pr": 8, "title": "P"}, task_id="issue:8", saga_id="t")
+    log.append(
+        EventKind.CRITIQUE_ISSUED,
+        {"pr": 8, "verdict": "approved", "sev2": 0},  # no findings / mptg fields
+        task_id="issue:8",
+        saga_id="t",
+    )
+    review = next(p for p in _reconstruct_prs(repo) if p["number"] == 8)["review"]
+    assert review["findings"] == []
+    assert review["minimal_path_to_green"] == []
+
+
+def test_reconstruct_prs_malformed_findings_payload_does_not_raise(tmp_path: Path) -> None:
+    """Adversarial: a malformed/partial findings payload degrades, never raises."""
+    from forge_loop.console_api import _reconstruct_prs
+
+    repo = tmp_path
+    (repo / ".forge").mkdir(parents=True, exist_ok=True)
+    log = SqliteEventLog(repo / ".forge" / "events.db")
+    log.append(EventKind.PR_OPENED, {"pr": 9, "title": "P"}, task_id="issue:9", saga_id="t")
+    log.append(
+        EventKind.CRITIQUE_ISSUED,
+        {
+            "pr": 9,
+            "verdict": "changes_requested",
+            "sev2": 1,
+            "findings": ["not-a-dict", {"severity": "sev1"}, {"severity": "sev2", "message": "ok"}],
+            "minimal_path_to_green": "not-a-list",
+        },
+        task_id="issue:9",
+        saga_id="t",
+    )
+    review = next(p for p in _reconstruct_prs(repo) if p["number"] == 9)["review"]
+    # Only the one valid row survives; bad rows skipped, bad mptg → [].
+    assert review["findings"] == [
+        {"severity": "sev2", "category": "", "file": None, "line": None, "message": "ok"}
+    ]
+    assert review["minimal_path_to_green"] == []
 
 
 def test_scorecard_is_honest_nulls(client: TestClient) -> None:

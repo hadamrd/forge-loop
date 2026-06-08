@@ -133,6 +133,57 @@ class Finding:
         )
 
 
+def serialize_findings(findings: list[Finding]) -> list[dict[str, Any]]:
+    """Turn ``CriticReport.findings`` into a plain-JSON payload (issue #404).
+
+    One dict per ``Finding`` with exactly the dataclass field shapes —
+    ``file``/``line`` stay nullable. The result is JSON-serializable (str/int/
+    None only) so it survives the durable event log and replay verbatim.
+    """
+    return [
+        {
+            "severity": f.severity,
+            "category": f.category,
+            "file": f.file,
+            "line": f.line,
+            "message": f.message,
+        }
+        for f in findings
+    ]
+
+
+def deserialize_findings(rows: Any) -> list[Finding]:
+    """Inverse of :func:`serialize_findings` — back-compat & adversarial safe.
+
+    A missing/None/non-list payload yields ``[]`` (old ``critique.issued``
+    events have no findings field). Individual malformed rows are skipped
+    rather than raising, so a partial payload degrades to the rows it can read.
+    """
+    if not isinstance(rows, list):
+        return []
+    out: list[Finding] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sev = row.get("severity")
+        msg = row.get("message")
+        if not isinstance(sev, str) or not isinstance(msg, str):
+            continue
+        category = row.get("category")
+        file = row.get("file")
+        line = row.get("line")
+        out.append(
+            Finding(
+                severity=sev,
+                category=category if isinstance(category, str) else "",
+                file=file if isinstance(file, str) else None,
+                line=line if isinstance(line, int) and not isinstance(line, bool) else None,
+                message=msg,
+            )
+        )
+    return out
+
+
 @dataclass
 class CriticReport:
     overall: str  # approve | request_changes | block

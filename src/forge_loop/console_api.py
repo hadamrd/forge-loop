@@ -18,7 +18,7 @@ Design:
   the console's ``realApi.ts`` targets them with ``VITE_FORGE_BASE_URL=/api``.
 * Bearer auth via ``LOOP_CONSOLE_TOKEN``; ``/healthz`` stays open.
 
-Honest gaps on the live loop today: critic findings detail (not in the event log),
+Honest gaps on the live loop today:
 the OKR/scorecard trend (projection unwired — renders "not yet measured"), backlog
 + manifestos (external; return empty). Everything else is real.
 
@@ -173,6 +173,32 @@ _INFLIGHT = {"RUNNING", "AWAITING_CRITIC", "REVISING"}
 
 def _p(e: dict[str, Any], key: str, default: Any = None) -> Any:
     return e.get("payload", {}).get(key, default)
+
+
+def _findings_from_payload(crit: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Read serialized critic findings off a ``critique.issued`` event (#404).
+
+    Delegates to the single validated parser ``critic.deserialize_findings`` so
+    back-compat / adversarial safety lives in one place (a legacy event with no
+    ``findings`` field, or a malformed/non-list/partially-bad payload, degrades
+    to ``[]`` / skips the bad row — never raises), then re-serializes to the
+    plain-JSON dict shape the console review object expects.
+    """
+    from forge_loop.critic import deserialize_findings, serialize_findings
+
+    raw = _p(crit or {}, "findings", []) if crit else []
+    return serialize_findings(deserialize_findings(raw))
+
+
+def _mptg_from_payload(crit: dict[str, Any] | None) -> list[str]:
+    """Read ``minimal_path_to_green`` off a ``critique.issued`` event (#404).
+
+    Degrades to ``[]`` for legacy/malformed payloads; keeps only str entries.
+    """
+    raw = _p(crit or {}, "minimal_path_to_green", []) if crit else []
+    if not isinstance(raw, list):
+        return []
+    return [x for x in raw if isinstance(x, str)]
 
 
 def _pr_number(val: Any) -> int | None:
@@ -357,8 +383,9 @@ def _reconstruct_workers(repo: Path) -> list[dict[str, Any]]:
 def _reconstruct_prs(repo: Path) -> list[dict[str, Any]]:
     """Fold pr.opened / critique.issued / pr.merged / merge.blocked into console PRs.
 
-    Critic findings detail is not in the event log → findings=[] (honest). The
-    review carries the verdict, sev2 trajectory, and round from critique events.
+    Critic findings + minimal_path_to_green are read off the latest
+    ``critique.issued`` event (#404); legacy events without them degrade to ``[]``.
+    The review also carries the verdict, sev2 trajectory, and round.
     """
     events = _read_events(repo)
     open_issues = _open_issue_numbers(repo)
@@ -413,8 +440,8 @@ def _reconstruct_prs(repo: Path) -> list[dict[str, Any]]:
                 "round": round_n,
                 "suspicious": False,
                 "sev_counts": {"sev1": 0, "sev2": sev2, "sev3": 0},
-                "findings": [],
-                "minimal_path_to_green": [],
+                "findings": _findings_from_payload(last_crit),
+                "minimal_path_to_green": _mptg_from_payload(last_crit),
                 "history": history,
             },
         })
