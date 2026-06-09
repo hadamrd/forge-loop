@@ -89,7 +89,7 @@ _STATIC_DIR = Path(__file__).parent / "static"
 
 
 def _today_iso() -> str:
-    return datetime.now(UTC).date().isoformat()
+    return datetime.now().date().isoformat()
 
 
 def _read_events(events_path: Path, limit: int | None = None) -> list[dict[str, Any]]:
@@ -445,6 +445,7 @@ def serve(
     if token is None:
         try:
             from forge_loop.settings import Settings
+
             token = Settings.load().dashboard.token or None
         except Exception:  # noqa: BLE001 — dashboard must not crash on cfg errors
             token = None
