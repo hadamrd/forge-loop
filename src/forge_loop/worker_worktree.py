@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -43,6 +44,7 @@ _PERMISSIVE_WORKTREE_SETTINGS = """{
 # sandbox profile (see ``worker_permissions``) for host-level Bash confinement.
 _READ_TOOLS: tuple[str, ...] = ("Read", "Grep", "Glob")
 _WRITE_TOOLS: tuple[str, ...] = ("Write", "Edit")
+_WORKTREE_MUTATION_LOCK = threading.Lock()
 
 
 def _mcp_allow_entries(policy: CapabilityPolicy) -> list[str]:
@@ -218,21 +220,22 @@ def prep_worktree(
 ) -> tuple[Path, str | None]:
     wt = worktree_path(repo, n)
     wt.parent.mkdir(parents=True, exist_ok=True)
-    _remove_existing_worktree(repo, wt)
-    quarantine_if_blocking(wt)
-    subprocess.run(["git", "branch", "-D", branch], cwd=repo, capture_output=True)
-    remote_ref = f"refs/remotes/origin/{base_branch}"
-    subprocess.run(
-        ["git", "fetch", "--prune", "origin", f"+refs/heads/{base_branch}:{remote_ref}"],
-        cwd=repo,
-        capture_output=True,
-    )
-    r = subprocess.run(
-        ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{base_branch}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
+    with _WORKTREE_MUTATION_LOCK:
+        _remove_existing_worktree(repo, wt)
+        quarantine_if_blocking(wt)
+        subprocess.run(["git", "branch", "-D", branch], cwd=repo, capture_output=True)
+        remote_ref = f"refs/remotes/origin/{base_branch}"
+        subprocess.run(
+            ["git", "fetch", "--prune", "origin", f"+refs/heads/{base_branch}:{remote_ref}"],
+            cwd=repo,
+            capture_output=True,
+        )
+        r = subprocess.run(
+            ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{base_branch}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
     if r.returncode != 0:
         return wt, r.stderr
     if wt.exists():
@@ -255,20 +258,21 @@ def prep_repair_worktree(
 ) -> tuple[Path, str | None]:
     wt = worktree_path(repo, issue)
     wt.parent.mkdir(parents=True, exist_ok=True)
-    _remove_existing_worktree(repo, wt)
-    quarantine_if_blocking(wt)
-    remote_ref = f"refs/remotes/origin/{branch}"
-    subprocess.run(
-        ["git", "fetch", "--prune", "origin", f"+refs/heads/{branch}:{remote_ref}"],
-        cwd=repo,
-        capture_output=True,
-    )
-    r = subprocess.run(
-        ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{branch}"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
+    with _WORKTREE_MUTATION_LOCK:
+        _remove_existing_worktree(repo, wt)
+        quarantine_if_blocking(wt)
+        remote_ref = f"refs/remotes/origin/{branch}"
+        subprocess.run(
+            ["git", "fetch", "--prune", "origin", f"+refs/heads/{branch}:{remote_ref}"],
+            cwd=repo,
+            capture_output=True,
+        )
+        r = subprocess.run(
+            ["git", "worktree", "add", str(wt), "-B", branch, f"origin/{branch}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
     if r.returncode != 0:
         return wt, r.stderr
     if wt.exists():

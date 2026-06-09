@@ -751,3 +751,12 @@ def test_collect_changed_paths_nonzero_returncode_is_empty(tmp_path: Path) -> No
     # A failed git call yields no paths → the gate is a pass-through, never a
     # false refusal on a transient git failure.
     assert collect_changed_paths(wt, "trunk", run=_run) == []
+
+
+def test_collect_changed_paths_subprocess_error_is_empty(tmp_path: Path) -> None:
+    wt = str(tmp_path / "wt")
+
+    def _run(cmd, **kw):  # type: ignore[no-untyped-def]
+        raise OSError("worktree missing")
+
+    assert collect_changed_paths(wt, "trunk", run=_run) == []

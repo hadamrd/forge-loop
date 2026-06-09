@@ -267,6 +267,8 @@ _ALLOWED_LEGACY_SITES = {
     # TUI-force opt-in for tests is FORGE_LOOP_TUI_FORCE — a single op-mode
     # knob that doesn't fit the Settings tree shape.
     "src/forge_loop/cli_tui.py",
+    # Console ASGI entrypoint reads env at import time for uvicorn deployment.
+    "src/forge_loop/console_api.py",
 }
 
 

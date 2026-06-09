@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from forge_loop import gh_issues as _gh
 from forge_loop import master_log as _mlog
@@ -999,7 +999,9 @@ def _run_critic_for_outcomes(
                         # #311 self-clearing guard: a large zero-finding approve is
                         # held as suspicious UNLESS the PR added tests (best-effort).
                         try:
-                            _changed = _gh.pr_changed_files(o.pr_url, repo=cfg.github_repo)
+                            _changed = _gh.pr_changed_files(
+                                o.pr_url, repo=cast(str, cfg.github_repo)
+                            )
                         except Exception:
                             _changed = []
                         _touches_tests = any(

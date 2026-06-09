@@ -310,14 +310,17 @@ def collect_changed_paths(
     non-zero git returncode yields an empty list (nothing inspectable ⇒ the gate
     is a pass-through, never a false refusal on a transient git failure).
     """
-    proc = run(
-        ["git", "diff", "--name-only", f"origin/{base_branch}"],
-        cwd=worktree,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    try:
+        proc = run(
+            ["git", "diff", "--name-only", f"origin/{base_branch}"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
     if proc.returncode != 0:
         return []
     names = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
