@@ -109,10 +109,15 @@ def reconcile_stale_sagas(
     appended to ``RecoveryReport.errors`` so an operator knows a saga was parked.
 
     A *deferred* kind (enqueued at dispatch but whose handler has not landed
-    yet, e.g. ``DELETE_BRANCH``) does NOT taint the saga: the handled
-    compensations still run and the saga is driven COMPENSATED, while the
-    deferred kind is skipped. That keeps dead-worker worktrees auto-reaped
-    instead of parked for a human while a deferred handler is in flight.
+    yet) does NOT taint the saga: the handled compensations still run and the
+    saga is driven COMPENSATED, while the deferred kind is skipped. That keeps
+    dead-worker worktrees auto-reaped instead of parked for a human while a
+    deferred handler is in flight.
+
+    A saga whose ``delete-branch`` handler raises is driven terminal
+    QUARANTINED instead of being left RUNNING. That preserves the integrity of
+    COMPENSATED: recovery never claims a branch was deleted when its handler
+    failed.
     """
     moment = now or datetime.now(UTC)
     recovered: list[RecoveredSaga] = []
@@ -136,6 +141,7 @@ def reconcile_stale_sagas(
                 )
                 continue
             reaped_worktrees: list[str] = []
+            failed_compensation = False
             for compensation in saga.compensations:
                 # Run only the handled compensations; deferred kinds (no handler
                 # yet) are skipped, never falsely claimed undone. Filtering by
@@ -147,7 +153,21 @@ def reconcile_stale_sagas(
                     reaped_worktrees.append(compensation.target)
                 elif compensation.kind == CompensationKind.DELETE_BRANCH:
                     if reap_branch is not None:
-                        reap_branch(compensation.target)
+                        try:
+                            reap_branch(compensation.target)
+                        except Exception as exc:  # noqa: BLE001 - park this saga, continue sweep
+                            reason = (
+                                "recovered: parked for human, compensation "
+                                f"{CompensationKind.DELETE_BRANCH} for "
+                                f"{compensation.target!r} failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            saga_store.mark_quarantined(saga.task_id, reason=reason)
+                            errors.append(f"{saga.saga_id}: quarantined, {reason}")
+                            failed_compensation = True
+                            break
+            if failed_compensation:
+                continue
             saga_store.mark_compensated(
                 saga.task_id, reason="recovered: dead-worker lease expired at boot"
             )

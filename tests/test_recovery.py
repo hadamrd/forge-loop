@@ -411,6 +411,81 @@ def test_reconcile_delete_branch_without_reaper_still_compensates(tmp_path: Path
     assert store.get("task-42-worker").state == TaskState.COMPENSATED
 
 
+def test_reconcile_quarantines_saga_when_branch_deletion_raises(tmp_path: Path) -> None:
+    """#434: a failed DELETE_BRANCH handler parks the saga terminal."""
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=42,
+        compensations=(
+            Compensation(
+                kind=CompensationKind.DELETE_BRANCH,
+                target="loop/42",
+                reason="delete orphaned branch",
+            ),
+        ),
+    )
+
+    def fail_branch_reap(branch: str) -> None:
+        raise RuntimeError(f"protected branch: {branch}")
+
+    report = reconcile_stale_sagas(
+        store, reap_worktree=lambda _: None, reap_branch=fail_branch_reap
+    )
+
+    saga = store.get("task-42-worker")
+    assert report.recovered == ()
+    assert len(report.errors) == 1
+    assert "saga-42-worker" in report.errors[0]
+    assert "delete-branch" in report.errors[0]
+    assert "protected branch" in report.errors[0]
+    assert saga.state == TaskState.QUARANTINED
+    assert saga.is_terminal is True
+    assert "delete-branch" in (saga.terminal_reason or "")
+    assert "loop/42" in (saga.terminal_reason or "")
+    assert store.list_in_flight() == ()
+
+    second = reconcile_stale_sagas(
+        store, reap_worktree=lambda _: None, reap_branch=fail_branch_reap
+    )
+    assert second.recovered == ()
+    assert second.errors == ()
+
+
+def test_reconcile_branch_failure_does_not_abort_sibling_saga(tmp_path: Path) -> None:
+    """#434: one failed branch reap does not stop another stale saga."""
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=1,
+        compensations=(
+            Compensation(
+                kind=CompensationKind.DELETE_BRANCH,
+                target="loop/1",
+                reason="delete orphaned branch",
+            ),
+        ),
+    )
+    _stale_running(store, issue=2)
+    reaped_worktrees: list[int] = []
+
+    def fail_branch_reap(branch: str) -> None:
+        raise RuntimeError(f"cannot delete {branch}")
+
+    report = reconcile_stale_sagas(
+        store, reap_worktree=reaped_worktrees.append, reap_branch=fail_branch_reap
+    )
+
+    assert [item.issue for item in report.recovered] == [2]
+    assert report.recovered[0].worktrees_reaped == ("/tmp/wt-loop-2",)
+    assert reaped_worktrees == [2]
+    assert store.get("task-1-worker").state == TaskState.QUARANTINED
+    assert store.get("task-2-worker").state == TaskState.COMPENSATED
+    assert store.list_in_flight() == ()
+    assert len(report.errors) == 1
+    assert "saga-1-worker" in report.errors[0]
+
+
 def test_recovery_handler_keyset_is_exhaustive_over_compensation_kinds() -> None:
     """#360 exhaustiveness contract: every CompensationKind is classified.
 
