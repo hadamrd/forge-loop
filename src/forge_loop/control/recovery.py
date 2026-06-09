@@ -21,33 +21,30 @@ from forge_loop.tasks import CompensationKind, TaskSagaStore
 # Reap a worker's worktree, keyed by issue number (best-effort, idempotent).
 ReapWorktree = Callable[[int], None]
 
+# Reap a worker's abandoned branch, keyed by branch name (best-effort,
+# idempotent). The branch name is the ``DELETE_BRANCH`` compensation target.
+ReapBranch = Callable[[str], None]
+
 # Compensation kinds this engine knows how to run during a recovery sweep. This
 # keyset, together with ``_DEFERRED_COMPENSATION_KINDS``, is the load-bearing
 # exhaustiveness guard: a contract test asserts their union equals
 # ``set(CompensationKind)``, so adding a new enum member without classifying it
 # turns that test red (see ``test_recovery``).
 _HANDLED_COMPENSATION_KINDS: frozenset[CompensationKind] = frozenset(
-    {CompensationKind.REMOVE_WORKTREE}
+    {CompensationKind.REMOVE_WORKTREE, CompensationKind.DELETE_BRANCH}
 )
 
-# Kinds dispatch already ENQUEUES but whose recovery handler is a deferred epic
-# issue. A stale saga carrying ONLY handled and/or deferred kinds is still
+# Kinds dispatch already enqueues but whose recovery handler is a deferred epic
+# issue. A stale saga carrying only handled and/or deferred kinds is still
 # auto-recovered: the handled compensations run and the saga is driven
-# COMPENSATED, while the deferred kinds are knowingly skipped (their side effect
-# is left exactly as before this kind existed — never falsely claimed undone).
-# This is what keeps dead-worker worktrees auto-reaped instead of parked for a
-# human while a deferred handler is still in flight. ``DELETE_BRANCH`` (#433,
-# epic "Compensate the branch a failed worker abandons") is enqueued at
-# dispatch; its reclamation handler lands later in the same epic and will move
-# here → handled, at which point recovery will also delete the branch.
+# COMPENSATED, while the deferred kinds are knowingly skipped. No kinds are
+# deferred today; keep the set so the classification invariant remains explicit.
 #
 # A kind that is in NEITHER set is a genuine gap: recovery refuses to
 # half-compensate such a saga and drives it to the terminal QUARANTINED state
 # ("parked for a human, could not auto-compensate") — liveness without lying
 # about the side effect. See ``reconcile_stale_sagas``.
-_DEFERRED_COMPENSATION_KINDS: frozenset[CompensationKind] = frozenset(
-    {CompensationKind.DELETE_BRANCH}
-)
+_DEFERRED_COMPENSATION_KINDS: frozenset[CompensationKind] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -91,14 +88,15 @@ def reconcile_stale_sagas(
     *,
     now: datetime | None = None,
     reap_worktree: ReapWorktree | None = None,
+    reap_branch: ReapBranch | None = None,
 ) -> RecoveryReport:
     """Compensate and close every stale (expired-lease) saga.
 
-    For each stale saga: run its ``remove-worktree`` compensations via
-    ``reap_worktree`` (idempotent, best-effort), then mark it COMPENSATED.
-    A failure on one saga is captured and the sweep continues to the next —
-    recovery must make as much progress as it can, not abort on the first
-    snag.
+    For each stale saga: discharge its compensations by kind. A
+    ``remove-worktree`` compensation runs ``reap_worktree(issue)`` and a
+    ``delete-branch`` compensation runs ``reap_branch(target)``. A failure on
+    one saga is captured and the sweep continues to the next — recovery must
+    make as much progress as it can, not abort on the first snag.
 
     A saga carrying a compensation kind this engine neither handles nor has
     explicitly deferred is NOT marked COMPENSATED: driving it COMPENSATED would
@@ -134,21 +132,22 @@ def reconcile_stale_sagas(
                     ),
                 )
                 errors.append(
-                    f"{saga.saga_id}: quarantined, "
-                    f"unhandled compensation kind(s): {kinds}"
+                    f"{saga.saga_id}: quarantined, unhandled compensation kind(s): {kinds}"
                 )
                 continue
-            reaped: list[str] = []
+            reaped_worktrees: list[str] = []
             for compensation in saga.compensations:
                 # Run only the handled compensations; deferred kinds (no handler
                 # yet) are skipped, never falsely claimed undone. Filtering by
                 # kind also stops a non-worktree entry from double-firing the
                 # reaper or recording its target as a reaped worktree.
-                if compensation.kind != CompensationKind.REMOVE_WORKTREE:
-                    continue
-                if reap_worktree is not None and saga.issue is not None:
-                    reap_worktree(saga.issue)
-                reaped.append(compensation.target)
+                if compensation.kind == CompensationKind.REMOVE_WORKTREE:
+                    if reap_worktree is not None and saga.issue is not None:
+                        reap_worktree(saga.issue)
+                    reaped_worktrees.append(compensation.target)
+                elif compensation.kind == CompensationKind.DELETE_BRANCH:
+                    if reap_branch is not None:
+                        reap_branch(compensation.target)
             saga_store.mark_compensated(
                 saga.task_id, reason="recovered: dead-worker lease expired at boot"
             )
@@ -157,7 +156,7 @@ def reconcile_stale_sagas(
                     task_id=saga.task_id,
                     saga_id=saga.saga_id,
                     issue=saga.issue,
-                    worktrees_reaped=tuple(reaped),
+                    worktrees_reaped=tuple(reaped_worktrees),
                 )
             )
         except Exception as exc:  # noqa: BLE001 - one bad saga must not abort the sweep

@@ -267,9 +267,7 @@ def test_reconcile_mixed_sweep_one_compensated_one_quarantined(tmp_path: Path) -
     _stale_with_compensations(
         store,
         issue=8,
-        compensations=(
-            Compensation(kind="close-pr", target="pr/8", reason="close pr"),
-        ),
+        compensations=(Compensation(kind="close-pr", target="pr/8", reason="close pr"),),
     )
     reaped: list[int] = []
 
@@ -334,6 +332,83 @@ def test_reconcile_quarantines_raw_string_kind_not_in_enum(tmp_path: Path) -> No
     assert saga.is_terminal is True
     assert "some-future-kind-2027" in (saga.terminal_reason or "")
     assert any("some-future-kind-2027" in e for e in report.errors)
+
+
+def test_reconcile_delete_branch_reaps_branch_and_compensates(tmp_path: Path) -> None:
+    """#432: a DELETE_BRANCH compensation deletes the abandoned branch."""
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=42,
+        compensations=(
+            Compensation(
+                kind=CompensationKind.DELETE_BRANCH,
+                target="loop/42",
+                reason="delete orphaned branch left by dead worker",
+            ),
+        ),
+    )
+    branches: list[str] = []
+
+    report = reconcile_stale_sagas(store, reap_worktree=lambda _: None, reap_branch=branches.append)
+
+    assert branches == ["loop/42"]
+    assert report.recovered_count == 1
+    assert store.get("task-42-worker").state == TaskState.COMPENSATED
+    assert store.list_in_flight() == ()
+
+
+def test_reconcile_routes_worktree_and_branch_to_their_own_reaper(tmp_path: Path) -> None:
+    """#432: each compensation kind routes to its own callback."""
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=42,
+        compensations=(
+            Compensation(
+                kind=CompensationKind.REMOVE_WORKTREE,
+                target="/tmp/wt-loop-42",
+                reason="cleanup worktree",
+            ),
+            Compensation(
+                kind=CompensationKind.DELETE_BRANCH,
+                target="loop/42",
+                reason="delete orphaned branch",
+            ),
+        ),
+    )
+    worktrees: list[int] = []
+    branches: list[str] = []
+
+    report = reconcile_stale_sagas(
+        store, reap_worktree=worktrees.append, reap_branch=branches.append
+    )
+
+    assert worktrees == [42]
+    assert branches == ["loop/42"]
+    assert report.recovered_count == 1
+    assert store.get("task-42-worker").state == TaskState.COMPENSATED
+
+
+def test_reconcile_delete_branch_without_reaper_still_compensates(tmp_path: Path) -> None:
+    """#432: reap_branch is optional, matching reap_worktree."""
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=42,
+        compensations=(
+            Compensation(
+                kind=CompensationKind.DELETE_BRANCH,
+                target="loop/42",
+                reason="delete orphaned branch",
+            ),
+        ),
+    )
+
+    report = reconcile_stale_sagas(store, reap_worktree=lambda _: None)
+
+    assert report.recovered_count == 1
+    assert store.get("task-42-worker").state == TaskState.COMPENSATED
 
 
 def test_recovery_handler_keyset_is_exhaustive_over_compensation_kinds() -> None:
