@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from forge_loop.worker_worktree import ensure_subagent_trusted as _ensure_subage
 from forge_loop.worker_worktree import prep_repair_worktree as _prep_repair_worktree
 from forge_loop.worker_worktree import prep_worktree as _prep_worktree
 from forge_loop.worker_worktree import subagent_env as _worktree_subagent_env
+from forge_loop.worker_worktree import worktree_path as _worktree_path
 
 __all__ = [
     "WorkerOutcome",
@@ -82,6 +84,18 @@ class WorkerOutcome:
 def _branch_name(n: int, title: str) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", title.lower())[:40].strip("-")
     return f"loop/{n}-{slug or 'fix'}"
+
+
+def _current_branch(worktree: Path) -> str:
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return branch.stdout.strip() if branch.returncode == 0 else ""
 
 
 def _extract_outcome(log_path: Path) -> tuple[str | None, str]:
@@ -302,6 +316,7 @@ def run_worker(
     env_require: tuple[str, ...] = (),
     verify_commands: tuple[str, ...] = (),
     scope_soft_loc_cap: int = 150,
+    reuse_existing_worktree: bool = False,
 ) -> WorkerOutcome:
     """Run one claude-code worker against an issue.
 
@@ -321,15 +336,32 @@ def run_worker(
     title = issue["title"]
     branch = _branch_name(n, title)
 
-    worktree, err = _prep_worktree(
-        repo,
-        n,
-        branch,
-        base_branch=base_branch,
-        emit=emit,
-        capability_policy=capability_policy,
-        events_file=events_file,
-    )
+    if reuse_existing_worktree and (existing := _worktree_path(repo, n)).exists():
+        existing_branch = _current_branch(existing)
+        if existing_branch != branch:
+            return WorkerOutcome(
+                issue=n,
+                title=title,
+                pr_url=None,
+                status="failed",
+                duration_s=0.0,
+                stdout_tail=(
+                    f"existing worktree {existing} is on branch {existing_branch!r}, "
+                    f"expected {branch!r}; refusing to reset follow-up work"
+                ),
+                error="followup-worktree-branch-mismatch",
+            )
+        worktree, err = existing, None
+    else:
+        worktree, err = _prep_worktree(
+            repo,
+            n,
+            branch,
+            base_branch=base_branch,
+            emit=emit,
+            capability_policy=capability_policy,
+            events_file=events_file,
+        )
     if err is not None:
         return WorkerOutcome(
             issue=n,

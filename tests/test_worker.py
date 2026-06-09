@@ -219,6 +219,56 @@ def test_run_worker_codex_provider_maps_final_json(
     assert out.model == "gpt-5-codex"
 
 
+def test_run_worker_followup_reuses_existing_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from forge_loop import agent_backend
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    def fake_worktree_path(_repo: Path, issue: int) -> Path:
+        assert issue == 12
+        return worktree
+
+    def forbidden_prep(*_args: Any, **_kwargs: Any) -> tuple[Path, None]:
+        raise AssertionError("follow-up worker must not reset the existing worktree")
+
+    def fake_branch(*_args: Any, **_kwargs: Any) -> str:
+        return "loop/12-ship-codex"
+
+    def fake_codex(**kwargs: Any) -> agent_backend.AgentRunResult:
+        assert kwargs["cwd"] == worktree
+        assert kwargs["prompt"] == "commit the dirty work"
+        return agent_backend.AgentRunResult(
+            provider="codex",
+            log_path=kwargs["log_path"],
+            last_message=(
+                'Done.\n{"issue": 12, "pr": "https://github.com/o/r/pull/12", "status": "open"}'
+            ),
+            duration_s=1.0,
+        )
+
+    monkeypatch.setattr("forge_loop.worker._prep_worktree", forbidden_prep)
+    monkeypatch.setattr("forge_loop.worker._worktree_path", fake_worktree_path)
+    monkeypatch.setattr("forge_loop.worker._current_branch", fake_branch)
+    monkeypatch.setattr(agent_backend, "run_codex_exec", fake_codex)
+
+    out = run_worker(
+        {"number": 12, "title": "ship codex", "body": "body"},
+        tmp_path,
+        tmp_path / "logs",
+        30,
+        provider="codex",
+        brief_override="commit the dirty work",
+        reuse_existing_worktree=True,
+    )
+
+    assert out.status == "open"
+    assert out.pr_url == "https://github.com/o/r/pull/12"
+
+
 def test_run_worker_emits_start_and_done_events(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -983,6 +983,7 @@ def _dispatch_follow_up_worker(
         mcp_servers=cfg.worker.mcp_servers,
         base_branch=cfg.base_branch,
         brief_override=brief,
+        reuse_existing_worktree=True,
         permissions=getattr(cfg.worker, "permissions", "full"),
     )
 
