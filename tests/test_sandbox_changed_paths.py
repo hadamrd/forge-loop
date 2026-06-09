@@ -69,6 +69,14 @@ def test_worker_changed_paths_empty_output_is_empty_tuple(tmp_path: Path) -> Non
     assert worker_changed_paths(git, str(tmp_path), base_ref="origin/trunk") == ()
 
 
+def test_worker_changed_paths_preserves_significant_path_spaces(tmp_path: Path) -> None:
+    git = FakeGit(diff=" allowed/escape.py\nallowed/ok.py \n")
+
+    assert worker_changed_paths(git, str(tmp_path), base_ref="origin/trunk") == _abs(
+        tmp_path, " allowed/escape.py", "allowed/ok.py "
+    )
+
+
 @pytest.mark.parametrize(("raise_on", "diff"), [("diff", ""), ("ls-files", "src/a.py\n")])
 def test_worker_changed_paths_returns_empty_and_logs_when_git_raises(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, raise_on: str, diff: str

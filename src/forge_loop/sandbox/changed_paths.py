@@ -12,7 +12,7 @@ GitOutputRunner = Callable[[tuple[str, ...], str], str]
 
 
 def _changed_path(worktree_path: str, name: str) -> str:
-    return os.path.normpath(os.path.abspath(os.path.join(worktree_path, name.strip())))
+    return os.path.normpath(os.path.abspath(os.path.join(worktree_path, name)))
 
 
 def worker_changed_paths(
