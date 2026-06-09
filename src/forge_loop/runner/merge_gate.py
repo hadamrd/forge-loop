@@ -25,13 +25,18 @@ so the last gh check wins.
 from __future__ import annotations
 
 import contextlib
+import os
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from forge_loop.config import MutationGateConfig
+from forge_loop.sandbox.policy import write_root_violations
 from forge_loop.state import append_event
 from forge_loop.worker import WorkerOutcome
+from forge_loop.worker_worktree import quarantine_if_blocking
 
 
 class GhMergeGateClient(Protocol):
@@ -259,6 +264,139 @@ def apply_mutation_survivor_gate(
             append_event(events_file, "merge_refused_mutation_survivors", **payload)
         if emit is not None:
             emit("merge_refused_mutation_survivors", payload)
+
+        if o.status == "merged":
+            o.status = "open"
+        refused.append(o.issue)
+    return refused
+
+
+# ---------------------------------------------------------------------------
+# Write-root-escape gate (issue #443): refuse merge when a worker's diff touched
+# files OUTSIDE the filesystem sandbox it was leased. The lease scopes Write/Edit
+# at the Claude *settings* layer, but ``Bash(*)`` cannot be path-scoped there, so
+# a worker can ``bash``-write outside its worktree and — on an otherwise-green
+# run — sail into mergeable state. This POST-HOC gate inspects the diff's paths
+# against the leased ``write_roots`` and refuses + quarantines an escape, rather
+# than auto-merging a sandbox break into durable cognition.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorkerLeaseRef:
+    """The slice of a worker's leased saga the write-root gate needs.
+
+    Resolved per outcome via an injected callable so tests can supply a fake and
+    production can look the saga up by issue. ``write_roots`` is the leased
+    :class:`~forge_loop.sandbox.policy.FilesystemScope.write_roots`; ``worktree``
+    is where the diff is collected and what gets quarantined on a violation.
+    """
+
+    task_id: str | None
+    worktree: str | None
+    write_roots: tuple[str, ...]
+
+
+def collect_changed_paths(
+    worktree: str,
+    base_branch: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[str]:
+    """Absolute paths a worktree's diff touched vs ``origin/<base_branch>``.
+
+    The production backing for the gate's injectable ``changed_paths`` seam. The
+    ``run`` callable is injected so tests drive it with a fake — no real git. A
+    non-zero git returncode yields an empty list (nothing inspectable ⇒ the gate
+    is a pass-through, never a false refusal on a transient git failure).
+    """
+    proc = run(
+        ["git", "diff", "--name-only", f"origin/{base_branch}"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    names = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    return [os.path.join(worktree, name) for name in names]
+
+
+def _write_root_refusal_comment(violations: tuple[str, ...]) -> str:
+    """PR comment naming the escaping path(s) so the refusal is actionable."""
+    bullets = "\n".join(f"- {p}" for p in violations)
+    return (
+        "Worker diff escaped its leased filesystem sandbox (write-root escape). "
+        "Loop refusing auto-merge and quarantining the worktree: a `Bash(*)` write "
+        "outside the leased `write_roots` must not promote itself into durable "
+        "cognition. Paths outside the sandbox:\n"
+        f"{bullets}"
+    )
+
+
+def apply_write_root_escape_gate(
+    outcomes: list[WorkerOutcome],
+    *,
+    lease_for: Callable[[WorkerOutcome], WorkerLeaseRef | None],
+    changed_paths: Callable[[str], list[str]],
+    gh: GhMergeGateClient,
+    repo: str | None,
+    quarantine: Callable[[Path], Path | None] = quarantine_if_blocking,
+    mark_quarantined: Callable[[str, str], None] | None = None,
+    events_file: Any | None = None,
+    emit: Callable[[str, dict[str, Any]], None] | None = None,
+) -> list[int]:
+    """Refuse merge for outcomes whose diff escaped the leased ``write_roots``.
+
+    Returns the list of issue numbers whose merge was refused (empty when every
+    diff stayed in-bounds). On refusal each PR has auto-merge disabled, an
+    escape-naming comment posted, the worktree quarantined (reusing
+    :func:`forge_loop.worker_worktree.quarantine_if_blocking` and, when a
+    ``mark_quarantined`` sink + ``task_id`` are available,
+    :meth:`tasks.store.mark_quarantined`), and a ``merge_refused_write_root_escape``
+    event emitted carrying the offending paths; a ``merged`` status is flipped to
+    ``open`` so the attempts ledger reflects the refusal.
+
+    Pass-through when the diff is clean (empty violation tuple) — current merge
+    behaviour is unchanged. Outcomes with no ``pr_url``, or whose lease/worktree
+    cannot be resolved, are skipped (nothing inspectable). All GitHub/quarantine
+    side effects are best-effort (``contextlib.suppress``); the event + status
+    flip MUST still fire even if a side effect raises.
+    """
+    refused: list[int] = []
+    for o in outcomes:
+        if not o.pr_url:
+            continue
+        lease = lease_for(o)
+        if lease is None or not lease.worktree:
+            continue
+        violations = write_root_violations(changed_paths(lease.worktree), lease.write_roots)
+        if not violations:
+            continue
+
+        body = _write_root_refusal_comment(violations)
+        # Best-effort side effects; the event + status flip below MUST still fire.
+        with contextlib.suppress(Exception):
+            gh.disable_pr_auto_merge(o.pr_url, repo=repo)
+        with contextlib.suppress(Exception):
+            gh.pr_comment(o.pr_url, body, repo=repo)
+        with contextlib.suppress(Exception):
+            quarantine(Path(lease.worktree))
+        if lease.task_id and mark_quarantined is not None:
+            with contextlib.suppress(Exception):
+                mark_quarantined(lease.task_id, "write-root escape (#443)")
+
+        payload = {
+            "issue": o.issue,
+            "pr": o.pr_url,
+            "paths": list(violations),
+        }
+        if events_file is not None:
+            append_event(events_file, "merge_refused_write_root_escape", **payload)
+        if emit is not None:
+            emit("merge_refused_write_root_escape", payload)
 
         if o.status == "merged":
             o.status = "open"

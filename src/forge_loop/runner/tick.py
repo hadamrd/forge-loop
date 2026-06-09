@@ -1119,6 +1119,12 @@ def _run_merge_gate(
         emit=bus_emit,
     )
 
+    # Write-root-escape gate (#443): refuse + quarantine a PR whose diff touched
+    # files outside the worker's leased ``write_roots`` (a ``Bash(*)`` sandbox
+    # escape the settings layer cannot path-scope). Resolved against the saga's
+    # leased CapabilityPolicy; best-effort so saga bookkeeping never breaks merge.
+    escape_refused = _apply_write_root_escape_gate(cfg, outcomes, gh=_gh, bus_emit=bus_emit)
+
     # Oracle-strength gate (#381). Dormant in production until a result source
     # is wired (mutation_result left _UNSET); a provided result/None engages it.
     mutation_refused: list[int] = []
@@ -1133,7 +1139,7 @@ def _run_merge_gate(
             emit=bus_emit,
         )
 
-    refused_all = set(refused) | set(mutation_refused)
+    refused_all = set(refused) | set(mutation_refused) | set(escape_refused)
     _enable_automerge_for_reviewed_outcomes(
         cfg,
         outcomes,
@@ -1152,6 +1158,61 @@ def _run_merge_gate(
             f"on {cfg.mutation_gate.module}: {mutation_refused}",
         )
     return refused_all
+
+
+def _apply_write_root_escape_gate(
+    cfg: Config,
+    outcomes: list[WorkerOutcome],
+    *,
+    gh: Any,
+    bus_emit: Any,
+) -> list[int]:
+    """Production wiring for the write-root-escape gate (#443).
+
+    Resolves each outcome's leased saga (worktree + ``write_roots`` + task id)
+    from the tick-scoped saga store and collects the worktree's changed paths via
+    a real-git seam, then delegates to the gate. Best-effort: a missing/failed
+    saga store leaves the gate a pass-through rather than breaking merge.
+    """
+    from forge_loop.runner.dispatch import _resolve_task_saga_store, _worker_task_id
+    from forge_loop.runner.merge_gate import (
+        WorkerLeaseRef,
+        apply_write_root_escape_gate,
+        collect_changed_paths,
+    )
+
+    store = _resolve_task_saga_store(cfg)
+    if store is None:
+        return []
+
+    def _lease_for(outcome: WorkerOutcome) -> WorkerLeaseRef | None:
+        try:
+            saga = store.get(_worker_task_id(outcome.issue))
+        except Exception:  # noqa: BLE001 - saga state is advisory
+            saga = None
+        if saga is None:
+            return None
+        return WorkerLeaseRef(
+            task_id=saga.task_id,
+            worktree=saga.worktree,
+            write_roots=saga.capability_policy.filesystem.write_roots,
+        )
+
+    def _mark_quarantined(task_id: str, reason: str) -> None:
+        store.mark_quarantined(task_id, reason=reason)
+
+    return list(
+        apply_write_root_escape_gate(
+            outcomes,
+            lease_for=_lease_for,
+            changed_paths=lambda wt: collect_changed_paths(wt, cfg.base_branch),
+            gh=gh,
+            repo=cfg.github_repo,
+            mark_quarantined=_mark_quarantined,
+            events_file=cfg.events_file,
+            emit=bus_emit,
+        )
+    )
 
 
 def _record_attempts(
