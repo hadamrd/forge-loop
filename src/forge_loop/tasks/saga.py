@@ -34,14 +34,9 @@ class CompensationKind(StrEnum):
     """
 
     REMOVE_WORKTREE = "remove-worktree"
-    # #433 (epic "Compensate the branch a failed worker abandons"): the dispatch
-    # path plants a ``loop/<n>`` branch for every worker and registers this
-    # compensation at saga-creation time so a failed worker can never leak a
-    # branch the control plane doesn't know to delete. The recovery *handler*
-    # for this kind is a sibling epic issue; until it lands, recovery classifies
-    # DELETE_BRANCH as deferred — it still reaps the worktree and drives the saga
-    # COMPENSATED, skipping (never falsely claiming) the branch deletion (see
-    # ``control/recovery.py``).
+    # Reclaim the orphan ``loop/<n>`` branch a dead worker left behind (#432).
+    # Recovery routes this kind to ``reap_branch`` and keeps branch targets out
+    # of the worktree-reaped summary.
     DELETE_BRANCH = "delete-branch"
 
 
