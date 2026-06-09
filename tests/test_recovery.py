@@ -158,7 +158,7 @@ def test_reconcile_quarantines_saga_with_unhandled_compensation(tmp_path: Path) 
 def test_reconcile_quarantines_saga_with_mixed_handled_and_unhandled_kinds(
     tmp_path: Path,
 ) -> None:
-    """#360: any unhandled kind taints the saga → QUARANTINED, no reap claimed."""
+    """#360: any truly-unhandled kind taints the saga → QUARANTINED, no reap claimed."""
     store = _store(tmp_path)
     _stale_with_compensations(
         store,
@@ -170,9 +170,9 @@ def test_reconcile_quarantines_saga_with_mixed_handled_and_unhandled_kinds(
                 reason="cleanup worktree",
             ),
             Compensation(
-                kind="delete-branch",  # unhandled — taints the whole saga
-                target="loop/43",
-                reason="delete orphaned branch",
+                kind="close-pr",  # neither handled nor deferred — taints the whole saga
+                target="https://github.com/o/r/pull/43",
+                reason="close orphaned PR",
             ),
         ),
     )
@@ -184,10 +184,53 @@ def test_reconcile_quarantines_saga_with_mixed_handled_and_unhandled_kinds(
     saga = store.get("task-43-worker")
     assert saga.state == TaskState.QUARANTINED
     assert saga.is_terminal is True
-    assert any("delete-branch" in e for e in report.errors)
+    assert any("close-pr" in e for e in report.errors)
     # We do not run the handled remove-worktree when another kind is unhandled:
     # the saga is quarantined whole, no side effect claimed.
     assert reaped == []
+
+
+def test_reconcile_reaps_worktree_for_dispatch_saga_with_deferred_branch(
+    tmp_path: Path,
+) -> None:
+    """#433 regression guard: the production dispatch tuple still reaps its worktree.
+
+    Dispatch now seeds every worker saga with BOTH REMOVE_WORKTREE and the
+    deferred DELETE_BRANCH. The deferred branch kind must NOT taint the saga
+    into quarantine: recovery still reaps the worktree (handled) and drives the
+    saga COMPENSATED, skipping the not-yet-handled branch deletion. The reaper
+    fires exactly once and only the worktree path — never the branch name — is
+    recorded as reaped.
+    """
+    store = _store(tmp_path)
+    _stale_with_compensations(
+        store,
+        issue=50,
+        compensations=(
+            Compensation(
+                kind=CompensationKind.REMOVE_WORKTREE,
+                target="/tmp/wt-loop-50",
+                reason="cleanup worktree",
+            ),
+            Compensation(
+                kind=CompensationKind.DELETE_BRANCH,
+                target="loop/50",
+                reason="reclaim worker loop branch",
+            ),
+        ),
+    )
+    reaped: list[int] = []
+
+    report = reconcile_stale_sagas(store, reap_worktree=reaped.append)
+
+    # Worktree IS reaped despite the deferred DELETE_BRANCH — exactly once.
+    assert reaped == [50]
+    saga = store.get("task-50-worker")
+    assert saga.state == TaskState.COMPENSATED
+    assert report.recovered_count == 1
+    # Only the worktree target is recorded as reaped, never the branch name.
+    assert report.recovered[0].worktrees_reaped == ("/tmp/wt-loop-50",)
+    assert store.list_in_flight() == ()
 
 
 def test_reconcile_quarantine_reason_lists_every_unhandled_kind(tmp_path: Path) -> None:
@@ -198,7 +241,7 @@ def test_reconcile_quarantine_reason_lists_every_unhandled_kind(tmp_path: Path) 
         issue=44,
         compensations=(
             Compensation(kind="close-pr", target="pr/44", reason="close pr"),
-            Compensation(kind="delete-branch", target="loop/44", reason="del branch"),
+            Compensation(kind="revert-commit", target="abc123", reason="revert commit"),
         ),
     )
     reaped: list[int] = []
@@ -209,7 +252,7 @@ def test_reconcile_quarantine_reason_lists_every_unhandled_kind(tmp_path: Path) 
     assert saga.state == TaskState.QUARANTINED
     reason = saga.terminal_reason or ""
     assert "close-pr" in reason
-    assert "delete-branch" in reason
+    assert "revert-commit" in reason
     assert reaped == []  # no reap_worktree side effect claimed
     assert len(report.errors) == 1
 
@@ -294,15 +337,21 @@ def test_reconcile_quarantines_raw_string_kind_not_in_enum(tmp_path: Path) -> No
 
 
 def test_recovery_handler_keyset_is_exhaustive_over_compensation_kinds() -> None:
-    """#360 exhaustiveness contract: every CompensationKind has a recovery entry.
+    """#360 exhaustiveness contract: every CompensationKind is classified.
 
+    Every member must be either HANDLED (recovery runs its undo) or explicitly
+    DEFERRED (enqueued but recovery quarantines it until its handler lands).
     Goes RED the moment a member is added to ``CompensationKind`` without
-    registering it in ``_HANDLED_COMPENSATION_KINDS`` — the gap is then caught
-    at test time, not in production recovery.
+    registering it in either set — the gap is caught at test time, not in
+    production recovery. The two sets are disjoint: a kind is never both.
     """
-    from forge_loop.control.recovery import _HANDLED_COMPENSATION_KINDS
+    from forge_loop.control.recovery import (
+        _DEFERRED_COMPENSATION_KINDS,
+        _HANDLED_COMPENSATION_KINDS,
+    )
 
-    assert set(CompensationKind) == _HANDLED_COMPENSATION_KINDS
+    assert not (_HANDLED_COMPENSATION_KINDS & _DEFERRED_COMPENSATION_KINDS)
+    assert set(CompensationKind) == _HANDLED_COMPENSATION_KINDS | _DEFERRED_COMPENSATION_KINDS
 
 
 def test_runner_boot_recovery_reconciles_and_emits_event(tmp_path: Path) -> None:
