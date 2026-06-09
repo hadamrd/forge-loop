@@ -33,7 +33,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +498,7 @@ def _reconstruct_prs(repo: Path) -> list[dict[str, Any]]:
                 "history": history,
             },
         })
-    prs.sort(key=lambda p: p["number"], reverse=True)
+    prs.sort(key=lambda p: cast(int, p["number"]), reverse=True)
     return prs
 
 

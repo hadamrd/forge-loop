@@ -25,10 +25,9 @@ with logically-equivalent state at one fixed ``now`` and pins that their
 ``status``'s task counts disagree with ``boot``'s reconstructed in-flight/stale
 saga sets for the same ``repo`` and ``now``.
 
-It also characterises the one genuine divergence this work surfaced: the stale
-cutoff is ``<`` in ``status`` but ``<=`` in ``boot``, so a lease that expires
-*exactly at* ``now`` is classified differently. That is pinned as a known bug
-(see :class:`TestStaleLeaseBoundaryDivergence`), not silently "fixed".
+It also characterises the stale cutoff boundary: a lease that expires exactly at
+``now`` must be classified consistently by both readers (see
+:class:`TestStaleLeaseBoundaryDivergence`).
 """
 
 from __future__ import annotations
@@ -36,8 +35,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
-
-import pytest
 
 from forge_loop.control.boot import (
     BootContext,
@@ -240,15 +237,7 @@ class TestVacuousPassGuard:
 
 
 class TestStaleLeaseBoundaryDivergence:
-    """Characterise the one real divergence #374's parity work surfaced.
-
-    A lease that expires *exactly at* ``now`` is classified differently by the
-    two readers because ``status`` uses ``lease_expires_at < now`` (strict) while
-    ``boot``/``SqliteTaskSagaStore.list_stale`` uses ``<= now``. The in-flight
-    *count* still agrees (the saga is non-terminal in both); only the stale
-    cutoff diverges. This is pinned as a known bug — fixing it (aligning the
-    cutoffs) is out of scope for #374 and tracked as a follow-up.
-    """
+    """Characterise the lease-expiry boundary shared by status and boot."""
 
     _BOUNDARY: tuple[_Spec, ...] = (_Spec(issue=201, lease=T0, terminal=False),)
 
@@ -260,28 +249,15 @@ class TestStaleLeaseBoundaryDivergence:
 
         assert status_tasks["in_flight_count"] == len(boot.in_flight_task_ids) == 1
 
-    def test_stale_cutoff_diverges_at_the_boundary(self, tmp_path: Path) -> None:
-        # KNOWN DIVERGENCE (pinned, not fixed): at lease == now, status's strict
-        # ``<`` excludes the lease while boot's ``<=`` includes it. If a future
-        # change aligns the two cutoffs, this characterisation test must be
-        # updated alongside that fix.
+    def test_stale_cutoff_agrees_at_the_boundary(self, tmp_path: Path) -> None:
         _seed(tmp_path, self._BOUNDARY)
 
         status_tasks = _status_tasks(tmp_path)
         boot = _boot(tmp_path)
 
-        assert status_tasks["stale_lease_count"] == 0  # status: lease < now is False
-        assert len(boot.stale_saga_ids) == 1  # boot: lease <= now is True
+        assert status_tasks["stale_lease_count"] == len(boot.stale_saga_ids) == 1
 
-    @pytest.mark.xfail(
-        reason="status uses '<' and boot uses '<=' at the lease boundary (#374 follow-up)",
-        strict=True,
-    )
     def test_readers_should_agree_at_the_boundary(self, tmp_path: Path) -> None:
-        # The behaviour #374 *wants*: both readers classify a lease at exactly
-        # ``now`` identically. strict xfail keeps the run green while the
-        # divergence exists and flips to a failure once the cutoffs are unified,
-        # forcing this guard to be removed with the fix.
         _seed(tmp_path, self._BOUNDARY)
 
         status_tasks = _status_tasks(tmp_path)

@@ -11,11 +11,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from forge_loop.branch_sweep import BranchSweepReport
+from forge_loop.branch_sweep import GhClientLike as BranchGhClientLike
 from forge_loop.branch_sweep import sweep as _branch_sweep
 from forge_loop.checkout_reconcile import CheckoutReconcileReport, ReconcileOutcome
 from forge_loop.checkout_reconcile import reconcile as _reconcile
 from forge_loop.config import Config
-from forge_loop.epic_sweep import EpicSweepReport, GhClientLike
+from forge_loop.epic_sweep import EpicSweepReport
+from forge_loop.epic_sweep import GhClientLike as EpicGhClientLike
 from forge_loop.epic_sweep import sweep as _epic_sweep
 from forge_loop.maintenance import run_maintenance
 from forge_loop.state import append_event, write_state
@@ -71,7 +73,7 @@ def run_epic_sweep(
     cfg: Config,
     tick: int,
     *,
-    client: GhClientLike | None = None,
+    client: EpicGhClientLike | None = None,
     now: datetime | None = None,
 ) -> EpicSweepReport | None:
     """Auto-close resolved epics (#367) + expire stale undecomposed epics (#435).
@@ -158,7 +160,7 @@ def run_branch_sweep(
     cfg: Config,
     tick: int,
     *,
-    client: GhClientLike | None = None,
+    client: BranchGhClientLike | None = None,
     branch_lister: Callable[[], list[str]] | None = None,
 ) -> BranchSweepReport | None:
     """Delete ``loop/<n>`` branches whose issue is closed (operational-convergence axis).
