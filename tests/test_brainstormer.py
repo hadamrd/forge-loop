@@ -84,6 +84,7 @@ def _stub_sdk(payload: dict | str, *, error: str | None = None, timed_out: bool 
         captured["cwd"] = cwd
         captured["timeout_s"] = timeout_s
         captured["model"] = model
+        captured["kwargs"] = _kw
         return _StubResult(
             last_message=body,
             duration_s=0.01,
@@ -145,6 +146,24 @@ def test_happy_path_two_epics_three_tickets() -> None:
     assert len(report.proposed_tickets) == 3
     assert all(isinstance(e, ProposedEpic) for e in report.proposed_epics)
     assert all(isinstance(t, ProposedTicket) for t in report.proposed_tickets)
+
+
+def test_sdk_session_is_mcp_isolated_by_default() -> None:
+    """The brainstormer session must NOT inherit the operator's global MCP config.
+
+    Regression: an operator with ~10 global MCP servers (or a target repo whose
+    .claude config registers servers that need live backends) hit
+    "Control request timeout: initialize" on every `forge-loop brainstorm` run.
+    The worker path already defends via strict_mcp_config (settings.py); the
+    brainstormer never passed the knobs at all. It needs zero MCP servers —
+    the backlog scan happens in-process before the session starts.
+    """
+    fn = _stub_sdk({"proposed_epics": [], "proposed_tickets": []})
+    Brainstormer(sdk_fn=fn).run(_vision())
+    kw = fn.captured["kwargs"]
+    assert kw["strict_mcp_config"] is True
+    assert kw["mcp_servers"] == {}
+    assert kw["load_timeout_ms"] == 180000
 
 
 def test_codex_provider_uses_codex_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -918,16 +937,18 @@ def test_run_drops_ticket_duplicating_open_backlog_issue() -> None:
             _solo_ticket("Ship cost telemetry widget"),
         ],
     }
-    report = Brainstormer(
-        sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client
-    ).run(_vision())
+    report = Brainstormer(sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client).run(
+        _vision()
+    )
     assert [t.title for t in report.proposed_tickets] == ["Ship cost telemetry widget"]
 
 
 def test_run_drops_epic_duplicating_open_backlog_issue() -> None:
     """A proposed epic whose normalized title matches an open issue is dropped;
     matching is against the union of backlog epics+tickets."""
-    client = _backlog_client(epics=[Issue(number=88, title="Resumable worker loop", labels=["epic"])])
+    client = _backlog_client(
+        epics=[Issue(number=88, title="Resumable worker loop", labels=["epic"])]
+    )
     payload = {
         "proposed_epics": [
             _solo_epic("Resumable worker loop"),
@@ -935,9 +956,9 @@ def test_run_drops_epic_duplicating_open_backlog_issue() -> None:
         ],
         "proposed_tickets": [],
     }
-    report = Brainstormer(
-        sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client
-    ).run(_vision())
+    report = Brainstormer(sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client).run(
+        _vision()
+    )
     assert [e.title for e in report.proposed_epics] == ["Self-improving critic"]
 
 
@@ -950,9 +971,9 @@ def test_open_backlog_match_is_whitespace_and_case_insensitive() -> None:
         "proposed_epics": [],
         "proposed_tickets": [_solo_ticket("  stream   worker  logs ")],
     }
-    report = Brainstormer(
-        sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client
-    ).run(_vision())
+    report = Brainstormer(sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client).run(
+        _vision()
+    )
     assert report.proposed_tickets == []
 
 
@@ -965,9 +986,7 @@ def test_run_noop_when_backlog_empty() -> None:
     }
     report = Brainstormer(sdk_fn=_stub_sdk(payload)).run(_vision())
     assert [e.title for e in report.proposed_epics] == ["Resumable worker loop"]
-    assert [t.title for t in report.proposed_tickets] == [
-        "Stream worker logs to operator console"
-    ]
+    assert [t.title for t in report.proposed_tickets] == ["Stream worker logs to operator console"]
 
 
 def test_open_backlog_drop_logs_reason_and_issue_number(monkeypatch) -> None:
@@ -985,15 +1004,14 @@ def test_open_backlog_drop_logs_reason_and_issue_number(monkeypatch) -> None:
         "proposed_epics": [],
         "proposed_tickets": [_solo_ticket("  Stream   Worker  Logs to operator console ")],
     }
-    report = Brainstormer(
-        sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client
-    ).run(_vision())
+    report = Brainstormer(sdk_fn=_stub_sdk(payload), owner="o", repo="r", gh_client=client).run(
+        _vision()
+    )
     assert report.proposed_tickets == []
     drop = next(
         r
         for r in rec.records
-        if r["event"] == "brainstormer_dropped"
-        and r.get("reason") == "duplicate_open_backlog"
+        if r["event"] == "brainstormer_dropped" and r.get("reason") == "duplicate_open_backlog"
     )
     assert drop["number"] == 212
     assert drop["kind"] == "ticket"
