@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+
 import json
 from pathlib import Path
 from typing import Any
@@ -398,3 +400,62 @@ def test_plant_worker_settings_none_policy_withholds_all_secrets(
     lines = [json.loads(line) for line in events_file.read_text().splitlines() if line.strip()]
     enforced = [rec for rec in lines if rec.get("kind") == "worker_policy_enforced"]
     assert enforced[0]["withheld_secrets"] == ["DB_PASSWORD", "GITHUB_TOKEN"]
+
+
+class TestPlantShieldedFromGit:
+    """#449 — the planted settings file must never reach a worker commit.
+
+    A getadaptiq worker committed the plant over the operator's TRACKED
+    .claude/settings.json (hooks + permissions destroyed on merge). The
+    plant now shields the path at the git level, so even `git add -A`
+    inside the worker session stages nothing for it."""
+
+    def _repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        run = lambda *a: subprocess.run(  # noqa: E731
+            ["git", *a], cwd=repo, capture_output=True, text=True, check=True
+        )
+        run("init", "-b", "main")
+        run("config", "user.email", "t@t")
+        run("config", "user.name", "t")
+        return repo, run
+
+    def test_tracked_settings_overwrite_invisible_to_git(self, tmp_path):
+        repo, run = self._repo(tmp_path)
+        cdir = repo / ".claude"
+        cdir.mkdir()
+        (cdir / "settings.json").write_text('{"operator": "hooks"}')
+        (repo / "README.md").write_text("x")
+        run("add", "-A")
+        run("commit", "-m", "operator config")
+
+        plant_worker_settings(repo, None)
+
+        run2 = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repo, capture_output=True, text=True, check=True,
+        )
+        assert ".claude/settings.json" not in run2.stdout
+        # and a worker-style add-all stages nothing for it
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=repo, capture_output=True, text=True, check=True,
+        )
+        assert ".claude/settings.json" not in staged.stdout
+
+    def test_untracked_plant_excluded_from_add_all(self, tmp_path):
+        repo, run = self._repo(tmp_path)
+        (repo / "README.md").write_text("x")
+        run("add", "-A")
+        run("commit", "-m", "init")
+
+        plant_worker_settings(repo, None)
+
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=repo, capture_output=True, text=True, check=True,
+        )
+        assert ".claude/settings.json" not in staged.stdout
