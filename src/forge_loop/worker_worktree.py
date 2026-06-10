@@ -166,7 +166,54 @@ def plant_worker_settings(
     settings_path.write_text(render_worker_settings(policy))
     settings_path.chmod(0o444)
     cdir.chmod(0o555)
+    _shield_plant_from_git(worktree)
     _emit_worker_policy_event(events_file, worktree, policy)
+
+
+_PLANT_REL = ".claude/settings.json"
+
+
+def _shield_plant_from_git(worktree: Path) -> None:
+    """Keep the planted settings out of any worker commit (#449).
+
+    A worker committed the plant over the target repo's TRACKED
+    ``.claude/settings.json`` — the operator's hooks and permissions
+    would have been destroyed on merge. Shield at the git level so no
+    worker cooperation is needed:
+
+      * tracked file  → ``git update-index --skip-worktree`` (the
+        overwrite never shows in status/diff/add -A)
+      * untracked     → append to ``info/exclude`` (worktree-local,
+        never committed; resolved via ``--git-path`` so linked
+        worktrees hit the right file)
+
+    Best-effort: a non-git target_dir (unit fixtures, bare staging
+    dirs) silently skips — the plant itself still applies."""
+    git = lambda *a: subprocess.run(  # noqa: E731
+        ["git", *a], cwd=worktree, capture_output=True, text=True,
+        timeout=15, check=False,
+    )
+    tracked = git("ls-files", "--error-unmatch", _PLANT_REL)
+    if tracked.returncode == 0:
+        git("update-index", "--skip-worktree", _PLANT_REL)
+        return
+    git_path = git("rev-parse", "--git-path", "info/exclude")
+    if git_path.returncode != 0:
+        return
+    exclude = Path(git_path.stdout.strip())
+    if not exclude.is_absolute():
+        exclude = worktree / exclude
+    try:
+        existing = exclude.read_text() if exclude.exists() else ""
+        if _PLANT_REL not in existing:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            exclude.write_text(
+                existing
+                + ("" if existing.endswith("\n") or not existing else "\n")
+                + f"{_PLANT_REL}\n"
+            )
+    except OSError:
+        return
 
 
 def _emit_worker_policy_event(
