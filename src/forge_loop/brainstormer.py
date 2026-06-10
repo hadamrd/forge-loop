@@ -22,6 +22,7 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
@@ -325,6 +326,16 @@ class Brainstormer:
     model: str | None = None
     provider: str = "claude"
     memory_store: Any = None
+    # MCP isolation for the SDK session. The brainstormer needs ZERO MCP
+    # servers — the backlog scan happens in-process before the session, and
+    # the session itself only reads the repo + emits JSON. Without strict
+    # isolation the session enumerates the operator's global MCP config (plus
+    # the target repo's .claude servers, which may need live backends) and
+    # dies on "Control request timeout: initialize". Mirrors the worker's
+    # hardened defaults in settings.WorkerSettings.
+    strict_mcp_config: bool = True
+    mcp_servers: dict[str, Any] = dataclass_field(default_factory=dict)
+    load_timeout_ms: int = 180000
 
     def run(self, vision: ProductVision) -> BrainstormReport:
         """Entry point — see module docstring."""
@@ -341,7 +352,15 @@ class Brainstormer:
 
         # 2. Drive the SDK session.
         sdk_fn = self.sdk_fn or self._default_sdk_fn()
-        result = sdk_fn(prompt, cwd=self.repo_path, timeout_s=self.timeout_s, model=self.model)
+        result = sdk_fn(
+            prompt,
+            cwd=self.repo_path,
+            timeout_s=self.timeout_s,
+            model=self.model,
+            strict_mcp_config=self.strict_mcp_config,
+            mcp_servers=dict(self.mcp_servers),
+            load_timeout_ms=self.load_timeout_ms,
+        )
         err = getattr(result, "error", None)
         timed_out = getattr(result, "timed_out", False)
         if timed_out or err == "timeout":
@@ -547,8 +566,17 @@ class Brainstormer:
         return run_brainstormer_sdk
 
     def _codex_sdk_fn(
-        self, prompt: str, *, cwd: Path, timeout_s: int, model: str | None = None
+        self,
+        prompt: str,
+        *,
+        cwd: Path,
+        timeout_s: int,
+        model: str | None = None,
+        **_mcp_isolation_kwargs: Any,
     ) -> Any:
+        # MCP-isolation knobs (strict_mcp_config / mcp_servers /
+        # load_timeout_ms) are Claude-SDK init concerns; codex exec has no
+        # MCP enumeration handshake, so they are absorbed and ignored here.
         from forge_loop.agent_backend import run_codex_exec
 
         log_dir = Path(cwd) / "docs" / "ops" / "loop-runner-logs"
