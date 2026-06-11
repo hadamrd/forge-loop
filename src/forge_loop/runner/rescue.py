@@ -64,12 +64,12 @@ def rescue_uncommitted_work(outcome: WorkerOutcome, cfg: Config) -> str | None:
     url = _open_rescue_pr(branch, outcome, cfg, has_tests=has_tests)
     if url is None:
         return None
-    if has_tests and not _issue_is_risk_gated(outcome.issue, cfg):
+    if has_tests and not issue_is_risk_gated(outcome.issue, cfg):
         _enable_best_effort_automerge(url, cfg)
     return url
 
 
-def _issue_is_risk_gated(issue: int, cfg: Config) -> bool:
+def issue_is_risk_gated(issue: int, cfg: Config) -> bool:
     """#453 — a rescue from a risk-gated issue must stop at PR-open like
     any worker PR; `has_tests` is not consent (two live incidents:
     rescue PRs from risk:high issues auto-merged into a live-prod repo
@@ -299,3 +299,7 @@ def _enable_best_effort_automerge(url: str, cfg: Config) -> None:
 
     with contextlib.suppress(Exception):
         _gh.enable_pr_auto_merge(url, repo=cfg.github_repo)
+
+
+# Back-compat alias (promoted to public for the adoption gate, #108 incident).
+_issue_is_risk_gated = issue_is_risk_gated

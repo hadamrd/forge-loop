@@ -334,6 +334,7 @@ def _patch_gh(monkeypatch, *, threads: list[Any] | None = None) -> list[str]:
     """Stub gh so adoption never touches the network; return the merge log."""
     merged: list[str] = []
     monkeypatch.setattr(_ghmod, "unresolved_review_threads", lambda *_a, **_k: threads or [])
+    monkeypatch.setattr(_ghmod, "fetch_issue", lambda issue, repo=None: {"labels": []})
     monkeypatch.setattr(
         _ghmod,
         "ensure_pr_merged",
@@ -878,3 +879,42 @@ def test_pre_dispatch_repairs_merges_approved_pr_no_repair_worker_across_n_ticks
         e["kind"] == "orphan_pr_skipped" and e.get("reason") == "already_adopted"
         for e in _events(cfg)
     )
+
+
+
+def test_adopted_automerge_skips_risk_gated_issue(tmp_path: Path, monkeypatch) -> None:
+    """Live incident (getadaptiq #108, 2026-06-11): an adopted PR from a
+    risk:high issue auto-merged MID-HUMAN-REVIEW — the adoption path's
+    docstring says it mirrors `_enable_automerge_for_reviewed_outcomes`,
+    but the mirror dropped `risk_gated_issues`. Adopted PRs predate the
+    tick's dispatch metadata, so the gate must check the ISSUE's labels
+    fresh."""
+    cfg = _cfg(tmp_path)
+    merged = _patch_gh(monkeypatch)
+    monkeypatch.setattr(
+        _ghmod, "fetch_issue",
+        lambda issue, repo=None: {"labels": [{"name": "risk:high"}]},
+    )
+    o = _outcome(89)
+    pr = {"number": 89, "url": o.pr_url, "mergeStateStatus": "CLEAN"}
+
+    _enable_automerge_for_adopted_prs(cfg, [(o, pr)], refused_issues=set(), emit=None)
+
+    assert merged == []
+    assert o.status == "open"
+    reasons = {(e["issue"], e["reason"]) for e in _events(cfg) if e["kind"] == "orphan_pr_skipped"}
+    assert (89, "risk_gated") in reasons
+
+
+def test_adopted_automerge_label_fetch_failure_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path)
+    merged = _patch_gh(monkeypatch)
+    monkeypatch.setattr(_ghmod, "fetch_issue", lambda issue, repo=None: None)
+    o = _outcome(90)
+    pr = {"number": 90, "url": o.pr_url, "mergeStateStatus": "CLEAN"}
+
+    _enable_automerge_for_adopted_prs(cfg, [(o, pr)], refused_issues=set(), emit=None)
+
+    assert merged == []
+    reasons = {(e["issue"], e["reason"]) for e in _events(cfg) if e["kind"] == "orphan_pr_skipped"}
+    assert (90, "risk_gated") in reasons

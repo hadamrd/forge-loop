@@ -261,6 +261,15 @@ def _enable_automerge_for_reviewed_outcomes(
             )
 
 
+def _issue_is_risk_gated_for_adoption(issue: int, cfg: Config) -> bool:
+    """Label-fresh risk-gate check for adopted PRs (they predate the
+    tick's dispatch metadata). Delegates to the rescue gate's logic —
+    one source of truth, fail-closed semantics included."""
+    from forge_loop.runner.rescue import issue_is_risk_gated
+
+    return issue_is_risk_gated(issue, cfg)
+
+
 def _enable_automerge_for_adopted_prs(
     cfg: Config,
     adoptions: list[tuple[WorkerOutcome, dict[str, Any]]],
@@ -355,6 +364,19 @@ def _enable_automerge_for_adopted_prs(
                 pr=outcome.pr_url,
                 reason="human_review_unresolved",
                 unresolved_human_threads=len(human_threads),
+            )
+            continue
+        # Risk gate (live incident: getadaptiq #108 auto-merged MID-HUMAN-
+        # REVIEW). The sibling dispatch-path gate uses this tick's
+        # workers_meta, which adopted PRs predate — check the ISSUE's
+        # labels fresh, fail closed (same contract as the rescue gate).
+        if _issue_is_risk_gated_for_adoption(outcome.issue, cfg):
+            append_event(
+                cfg.events_file,
+                "orphan_pr_skipped",
+                issue=outcome.issue,
+                pr=outcome.pr_url,
+                reason="risk_gated",
             )
             continue
         result = _gh.ensure_pr_merged(outcome.pr_url, repo=cfg.github_repo)
