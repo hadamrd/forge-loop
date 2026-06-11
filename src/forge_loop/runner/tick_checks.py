@@ -535,6 +535,38 @@ def _inflight_worktrees(cfg: Config) -> set[str]:
         return set()
 
 
+_SYSTEM_ROOTS = {"/", "/tmp", "/var/tmp", "/home"}
+
+
+def _clamp_overbroad_root(cfg: Config, root, tick: int):
+    """#451 — never honor a worktree_root that is a SYSTEM directory.
+
+    A live run configured ``worktree_root: /tmp``; the sweep then treated
+    every /tmp worktree as loop-owned and reaped two OPERATOR worktrees
+    (one seconds old, uncommitted work destroyed). Roots resolving to /,
+    /tmp, /var/tmp, /home or $HOME are clamped to the loop's own per-repo
+    namespace (``worktree_base(repo)``) and a typed event is emitted so
+    the operator sees the config smell."""
+    import os
+    from pathlib import Path as _P
+
+    from forge_loop.worker_worktree import worktree_base
+
+    resolved = str(_P(root).resolve())
+    home = os.path.expanduser("~")
+    if resolved in _SYSTEM_ROOTS or resolved == home:
+        clamped = worktree_base(cfg.repo)
+        append_event(
+            cfg.events_file,
+            "worktree_root_clamped",
+            tick=tick,
+            configured=str(root),
+            clamped_to=str(clamped),
+        )
+        return clamped
+    return root
+
+
 def run_worktree_sweep(
     cfg: Config,
     tick: int,
@@ -558,6 +590,7 @@ def run_worktree_sweep(
     root = getattr(cfg, "worktree_root", None)
     if not root:
         return None
+    root = _clamp_overbroad_root(cfg, root, tick)
     wts = worktrees if worktrees is not None else _list_worktrees(cfg.repo)
     live = (
         live_paths

@@ -204,3 +204,35 @@ def test_e2e_reaps_intact_stale_agent_worktree(tmp_path: Path) -> None:
     assert not wt.exists()  # orphan gone
     assert (repo / ".git").exists()  # checkout intact
     assert (repo / "f.txt").read_text() == "x\n"
+
+
+def test_run_worktree_sweep_clamps_system_temp_root(tmp_path: Path) -> None:
+    """#451 — `worktree_root: /tmp` (a system temp dir) must NOT make every
+    /tmp worktree reapable. A live run reaped two OPERATOR worktrees
+    seconds after creation because the config declared all of /tmp as the
+    loop's namespace. Over-broad roots get clamped to the loop's own
+    per-repo base (worktree_base) and a clamp event is emitted."""
+    cfg = Config(
+        repo=tmp_path,
+        github_repo="o/r",
+        labels=Labels(),
+        briefs=Briefs(),
+        worktree_root=Path("/tmp"),  # the footgun config
+        maintenance_every_n_ticks=5,
+    )
+    removed: list[str] = []
+    report = tc.run_worktree_sweep(
+        cfg,
+        tick=5,
+        worktrees=[
+            "/tmp/wt-operator",            # operator worktree → MUST survive
+            "/tmp/clone-x",                # operator clone-ish dir → MUST survive
+        ],
+        live_paths=set(),
+        remove=lambda p: removed.append(p) or True,
+    )
+    assert removed == []
+    assert report is None or report.reaped == []
+    evts = [e for e in _read_events(cfg) if e["kind"] == "worktree_root_clamped"]
+    assert len(evts) == 1
+    assert "/tmp" in evts[0]["configured"]
