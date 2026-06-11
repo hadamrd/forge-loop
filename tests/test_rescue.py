@@ -253,3 +253,71 @@ def test_lookalike_sibling_is_rescued_not_skipped(
     files = {f for f in committed.splitlines() if f.strip()}
     assert ".claude/settings.json.bak" in files
     assert _SETTINGS not in files
+
+
+# --------------------------------------------------------------------------- #
+# #453 — rescue automerge must respect the risk gate
+# --------------------------------------------------------------------------- #
+
+
+def _write_tested_change(wt: Path) -> None:
+    (wt / "src").mkdir(exist_ok=True)
+    (wt / "src" / "foo.py").write_text("x = 1\n")
+    (wt / "tests").mkdir(exist_ok=True)
+    (wt / "tests" / "test_foo.py").write_text("def test_x():\n    assert True\n")
+
+
+def test_risk_gated_issue_rescue_never_automerges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_gh: dict[str, list]
+) -> None:
+    """#453: two live incidents — rescue PRs from risk:high issues
+    auto-merged into a live-prod repo with zero review (the 'has_tests'
+    signal was a Dockerfile text lint). A rescue from a risk-gated
+    issue stops at PR-open like any worker PR."""
+    wt = _init_worktree(tmp_path / "wt", with_remote=True)
+    _patch_worktree(monkeypatch, wt)
+    cfg = _config(tmp_path)
+    _write_tested_change(wt)
+    monkeypatch.setattr(
+        gh_issues, "fetch_issue",
+        lambda issue, repo=None: {"labels": [{"name": "risk:high"}]},
+    )
+
+    url = rescue_uncommitted_work(_outcome(), cfg)
+    assert url is not None  # the PR still opens — work is preserved
+    assert fake_gh["auto_merge"] == []  # but NEVER automerged
+    kinds = [e.get("kind") for e in _read_events(cfg)]
+    assert "rescue_automerge_blocked_risk_gate" in kinds
+
+
+def test_ungated_issue_with_tests_still_automerges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_gh: dict[str, list]
+) -> None:
+    wt = _init_worktree(tmp_path / "wt", with_remote=True)
+    _patch_worktree(monkeypatch, wt)
+    cfg = _config(tmp_path)
+    _write_tested_change(wt)
+    monkeypatch.setattr(
+        gh_issues, "fetch_issue",
+        lambda issue, repo=None: {"labels": [{"name": "backend"}]},
+    )
+
+    url = rescue_uncommitted_work(_outcome(), cfg)
+    assert url is not None
+    assert len(fake_gh["auto_merge"]) == 1  # existing behavior preserved
+
+
+def test_label_fetch_failure_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_gh: dict[str, list]
+) -> None:
+    """Unknown risk = gated. Automerge is the dangerous path; an API
+    hiccup must not open it."""
+    wt = _init_worktree(tmp_path / "wt", with_remote=True)
+    _patch_worktree(monkeypatch, wt)
+    cfg = _config(tmp_path)
+    _write_tested_change(wt)
+    monkeypatch.setattr(gh_issues, "fetch_issue", lambda issue, repo=None: None)
+
+    url = rescue_uncommitted_work(_outcome(), cfg)
+    assert url is not None
+    assert fake_gh["auto_merge"] == []
