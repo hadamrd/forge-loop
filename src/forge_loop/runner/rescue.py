@@ -64,9 +64,45 @@ def rescue_uncommitted_work(outcome: WorkerOutcome, cfg: Config) -> str | None:
     url = _open_rescue_pr(branch, outcome, cfg, has_tests=has_tests)
     if url is None:
         return None
-    if has_tests:
+    if has_tests and not _issue_is_risk_gated(outcome.issue, cfg):
         _enable_best_effort_automerge(url, cfg)
     return url
+
+
+def _issue_is_risk_gated(issue: int, cfg: Config) -> bool:
+    """#453 — a rescue from a risk-gated issue must stop at PR-open like
+    any worker PR; `has_tests` is not consent (two live incidents:
+    rescue PRs from risk:high issues auto-merged into a live-prod repo
+    unreviewed — one of them carried only a Dockerfile text lint as its
+    'tests'). FAIL CLOSED: if the labels can't be fetched, treat the
+    issue as gated — automerge is the dangerous path and an API hiccup
+    must not open it."""
+    gate = getattr(getattr(cfg, "labels", None), "risk_gate", None)
+    if not gate:
+        return True  # no configured gate label = can't prove safety
+    try:
+        from forge_loop import gh_issues as _gh
+
+        data = _gh.fetch_issue(issue, repo=cfg.github_repo)
+    except Exception:
+        data = None
+    if not data:
+        append_event(
+            cfg.events_file, "rescue_automerge_blocked_risk_gate",
+            issue=issue, reason="label_fetch_failed",
+        )
+        return True
+    names = {
+        (lbl.get("name") if isinstance(lbl, dict) else str(lbl))
+        for lbl in (data.get("labels") or [])
+    }
+    if gate in names:
+        append_event(
+            cfg.events_file, "rescue_automerge_blocked_risk_gate",
+            issue=issue, reason="risk_gated",
+        )
+        return True
+    return False
 
 
 def _dirty_paths(worktree: Path) -> list[str]:
