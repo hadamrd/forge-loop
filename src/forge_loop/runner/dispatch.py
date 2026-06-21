@@ -1004,15 +1004,39 @@ def _run_critic_for_outcomes(
                             )
                         except Exception:
                             _changed = []
-                        _touches_tests = any(
-                            isinstance(p, str)
-                            and (
-                                p.startswith("tests/")
-                                or "/tests/" in p
-                                or p.rsplit("/", 1)[-1].startswith("test_")
-                                or p.endswith("_test.py")
+                        # Broad, multi-language test-file detection. A MISSED convention
+                        # (e.g. Rust `*_tests.rs`, JS `*.test.tsx`) wrongly flags a
+                        # well-tested PR as a suspicious rubber-stamp and blocks its merge
+                        # FOREVER (the critic re-approves, the hold re-fires, every tick).
+                        def _looks_like_test(p: str) -> bool:
+                            b = p.lower().rsplit("/", 1)[-1]
+                            return (
+                                "tests/" in p
+                                or "/test/" in p
+                                or p.startswith(("tests/", "test/"))
+                                or b.startswith("test_")
+                                or b.endswith(
+                                    (
+                                        "_test.rs",
+                                        "_tests.rs",
+                                        "_test.py",
+                                        "_test.go",
+                                        "_spec.rb",
+                                        "_test.exs",
+                                    )
+                                )
+                                or b == "tests.rs"
+                                or any(
+                                    b.endswith(f".{kind}.{ext}")
+                                    for kind in ("test", "spec")
+                                    for ext in ("js", "jsx", "ts", "tsx", "mjs", "cjs")
+                                )
                             )
+
+                        _touches_tests = any(
+                            _looks_like_test(p)
                             for p in (_changed or [])
+                            if isinstance(p, str)
                         )
                         plan = apply_critic_report(
                             critic_outcome.report,
@@ -1030,6 +1054,28 @@ def _run_critic_for_outcomes(
                             reason = "; ".join(critic_outcome.reasons) or critic_outcome.verdict
                             note = f"critic blocked merge: {reason}"[:200]
                             o.error = f"{o.error}; {note}" if o.error else note
+                            # Loop-breaker (PR #361 burned ~9h / 43 re-reviews here): a
+                            # SUSPICIOUS-approve block is NOT repairable by a worker — the
+                            # critic APPROVED, there is nothing to fix — so re-reviewing it
+                            # every tick spins forever. Only a human can adjudicate "looks
+                            # like a rubber-stamp". Escalate ONCE (drop loop:ready, add
+                            # loop:needs-human) so the dispatcher stops re-picking it.
+                            if plan.suspicious_approve:
+                                try:
+                                    _gh.update_issue(
+                                        o.issue,
+                                        add_labels=["loop:needs-human"],
+                                        remove_labels=["loop:ready"],
+                                        repo=cfg.github_repo,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                append_event(
+                                    cfg.events_file,
+                                    "suspicious_approve_escalated_to_human",
+                                    issue=o.issue,
+                                    pr=o.pr_url,
+                                )
                         else:
                             _clear_stale_critic_block_labels(
                                 o.pr_url, repo=cfg.github_repo, bus_emit=bus_emit
