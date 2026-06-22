@@ -254,7 +254,20 @@ def run_critic_sdk(
         # missed it. ``SDKRunResult.final_result_text`` is the single source
         # of truth (issue #148 removed the legacy ``last_message`` alias).
         final_text = getattr(result, "final_result_text", "") or last_text
-        return final_text, getattr(result, "error", None)
+        err = getattr(result, "error", None)
+        # A trailing CLI ProcessError AFTER a successful result must not poison
+        # a critic run that already produced its verdict text. The bundled
+        # Claude Code CLI exits non-zero on teardown (e.g. MCP server
+        # disconnect) even when it emitted a ``ResultMessage(subtype="success")``
+        # first; the SDK then surfaces the contradictory string
+        # "Claude Code returned an error result: success". The worker tolerates
+        # this (it uses the captured final_text); the critic must too, or every
+        # clean PR's verdict collapses to ``error`` and nothing ever auto-merges.
+        # Only suppress when we actually captured usable verdict text — a truly
+        # empty run still propagates the error.
+        if err and final_text.strip():
+            err = None
+        return final_text, err
 
     try:
         try:
