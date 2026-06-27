@@ -23,6 +23,31 @@ _PRIOR_EPISODE_CAP = 2
 _PRIOR_EPISODE_BODY_CAP = 600
 #: Marker appended to a truncated episode body.
 _PRIOR_EPISODE_TRUNCATION_MARKER = "…[truncated]"
+#: Max learned skill cards injected into a brief (token budget).
+_SKILL_TREE_CAP = 3
+
+
+def _render_skill_tree(memory_store: MemoryStore | None, issue: dict[str, Any]) -> str:
+    """Render the retrieved learned-skills section for an issue, or ``""``.
+
+    Retrieves up to :data:`_SKILL_TREE_CAP` active procedural skill cards most
+    relevant to the issue (title + body) and renders them. Degrades to ``""``
+    when no store is wired, nothing matches, or the store raises — so the brief
+    is byte-identical to the historical output in every empty case, mirroring
+    :func:`_render_prior_episodes`.
+    """
+    if memory_store is None:
+        return ""
+    try:
+        from forge_loop.memory.skills import render_skill_section, retrieve_skills_for
+
+        query = f"{issue.get('title', '')} {issue.get('body', '') or ''}"
+        hits = retrieve_skills_for(memory_store, query, k=_SKILL_TREE_CAP)
+    except Exception:  # noqa: BLE001 — boundary; degrade gracefully
+        _log.warning("worker_brief_skill_tree_unavailable")
+        return ""
+    section = render_skill_section(hits)
+    return f"\n{section}" if section else ""
 
 
 def _render_prior_episodes(memory_store: MemoryStore | None, n: int) -> str:
@@ -45,8 +70,7 @@ def _render_prior_episodes(memory_store: MemoryStore | None, n: int) -> str:
         return ""
     try:
         active = {
-            item.memory_id: item
-            for item in memory_store.list_active(kind=MemoryKind.EPISODIC)
+            item.memory_id: item for item in memory_store.list_active(kind=MemoryKind.EPISODIC)
         }
     except Exception:  # noqa: BLE001 — boundary; degrade gracefully
         _log.warning("repair_brief_prior_episodes_unavailable")
@@ -126,7 +150,7 @@ def _render_scope_discipline(cap: int, *, repair: bool) -> str:
     return (
         "\nSCOPE DISCIPLINE — ship the SMALLEST viable change:\n"
         "- ONE mechanism: implement the acceptance criteria's PRIMARY ask, "
-        "nothing more. No alternative implementations \"to be safe\".\n"
+        'nothing more. No alternative implementations "to be safe".\n'
         "- Prefer EDITING or DELETING over ADDING. A large pure-addition diff "
         "is a red flag, not progress.\n"
         f"{cap_line}\n"
@@ -151,6 +175,7 @@ def make_brief(
     capability_policy: CapabilityPolicy | None = None,
     verify_commands: tuple[str, ...] = (),
     scope_soft_loc_cap: int = 150,
+    memory_store: MemoryStore | None = None,
 ) -> str:
     """Render the worker brief for an issue."""
     body = (issue.get("body") or "")[:6000]
@@ -236,6 +261,9 @@ def make_brief(
         from forge_loop.manifestos import inject_into_brief
 
         rendered = inject_into_brief(rendered, manifesto_bundle)
+    skill_tree_section = _render_skill_tree(memory_store, issue)
+    if skill_tree_section:
+        rendered = skill_tree_section + rendered
     return rendered
 
 
@@ -256,6 +284,7 @@ def make_repair_brief(
     body = (issue.get("body") or "")[:6000]
     n = issue["number"]
     prior_episodes_section = _render_prior_episodes(memory_store, n)
+    skill_tree_section = _render_skill_tree(memory_store, issue)
     pr_url = pr.get("url") or f"https://github.com/pull/{pr.get('number', '')}"
     pr_number = pr.get("number", "")
     head = pr.get("headRefName") or ""
@@ -281,7 +310,7 @@ REVIEW / CRITIC CONTEXT TO ADDRESS:
 ---
 {review_context[:12000]}
 ---
-{prior_episodes_section}{scope_discipline_section}
+{skill_tree_section}{prior_episodes_section}{scope_discipline_section}
 CONTRACT:
 1. Repair the EXISTING PR branch. Do not create a new branch and do not open a new PR.
 2. Address every unresolved review thread and every sev1/blocking review point with production behavior and tests.

@@ -81,6 +81,50 @@ def skill_from_tags(tags: tuple[str, ...]) -> str:
     return ""
 
 
+#: Tag prefix carrying a procedural skill's *area path* — its address in the
+#: skill tree (e.g. ``area:pulsar-node/http-route``). The ``/``-delimited path
+#: IS the tree: a leaf sits at a full path; an internal node summarises a
+#: subtree prefix. Mirrors ``AXIS_TAG_PREFIX`` / ``SKILL_TAG_PREFIX``.
+AREA_TAG_PREFIX = "area:"
+
+#: Marker tag distinguishing an *internal node* card (a generalised pattern
+#: distilled over an area subtree) from a *leaf* card (a concrete procedure).
+AREA_NODE_TAG = "area-node"
+
+#: Marker tag retiring a skill card whose proof commit has aged out of history
+#: (rebased/squashed away). An expired card stays in the store for provenance
+#: but is filtered out of retrieval — a confidently-stale recipe is worse than
+#: none. Distinct from supersession, which means "replaced by a better version".
+EXPIRED_TAG = "expired"
+
+
+def area_tag(path: str) -> str:
+    """Render an ``area:<path>`` tag for ``path`` (stripped)."""
+    return f"{AREA_TAG_PREFIX}{path.strip()}"
+
+
+def area_from_tags(tags: tuple[str, ...]) -> str:
+    """Extract the area path from an ``area:<path>`` tag, or ``""`` if absent."""
+    for tag in tags:
+        if tag.startswith(AREA_TAG_PREFIX):
+            return tag[len(AREA_TAG_PREFIX) :]
+    return ""
+
+
+def area_ancestors(path: str) -> tuple[str, ...]:
+    """Return the area path and its ancestors, most-specific first.
+
+    ``"a/b/c"`` → ``("a/b/c", "a/b", "a")`` — the retrieval walk order: the most
+    specific leaf area first, then its ancestor internal nodes. A blank path
+    yields ``()``. Leading/trailing slashes are ignored.
+    """
+    cleaned = path.strip().strip("/")
+    if not cleaned:
+        return ()
+    segments = cleaned.split("/")
+    return tuple("/".join(segments[:i]) for i in range(len(segments), 0, -1))
+
+
 def derive_memory_id(source_key: str, *, prefix: str) -> str:
     """Derive a stable ``memory_id`` from a source key.
 
