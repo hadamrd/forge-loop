@@ -47,10 +47,14 @@ New helpers in `memory/models.py` (mirror `axis_tag`): `AREA_TAG_PREFIX`,
    critic-clean merge, a one-shot LLM "librarian" distills the merged diff +
    acceptance criteria into a `SkillCard(area, trigger, procedure, pitfalls,
    failing_signal, target, confidence)`. `harvest_skills_from_merge(...)` is pure
-   and injectable (the LLM call is a passed-in callable) so the wiring is unit
-   tested without network. It calls `record_procedural_skill` with the `area:`
-   tag and provenance carrying the merged SHA in `evidence_refs`. Emits
-   `skill_harvested`.
+   and injectable (both the diff fetch and the LLM call are passed-in callables)
+   so the wiring is unit tested without network. The diff is fetched in prod via
+   `gh_issues.pr_diff(pr_url, repo)` (forge-loop's githubkit client — the gh CLI
+   is deliberately unused and a loop `GH_TOKEN` would break it). It calls
+   `record_procedural_skill` with the `area:` tag and `pr:<url>` provenance in
+   `evidence_refs`. Emits `skill_harvested`. (Commit-SHA-based age/expiry of
+   harvested cards is a follow-up; recipe freshness is held by supersession on
+   the skill-key.)
 2. **Retrieve + inject** (`memory/skills.py` + `worker_brief.py`):
    `retrieve_skills_for(store, query, *, k)` ranks active procedural cards by
    area/title/tag token overlap with the ticket, walking most-specific-leaf →

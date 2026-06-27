@@ -369,7 +369,7 @@ class HarvestedSkill:
     issue: int
     area: str
     skill_key: str
-    sha: str
+    pr_url: str
     confidence: float
     title: str
 
@@ -378,38 +378,40 @@ def harvest_skills_from_merge(
     memory_store: MemoryStore,
     merged: Iterable[object],
     *,
-    fetch_diff: Callable[[int], tuple[str, str]],
+    fetch_diff: Callable[[str], str],
     call_llm: Callable[[str], str],
     now: datetime | None = None,
 ) -> tuple[HarvestedSkill, ...]:
     """Distil and record one PROCEDURAL skill card per merged outcome.
 
-    For each merged issue: fetch its diff + merged SHA via ``fetch_diff(issue)``,
-    distil a :class:`~forge_loop.skill_librarian.SkillCard` via the injected
-    ``call_llm`` librarian, and record it as a procedural skill tagged with its
-    ``area:`` path and stamped with ``commit:<sha>`` provenance. Outcomes whose
-    diff is empty, or whose distillation fails to parse, are skipped — only a
-    real, proven recipe is harvested. Idempotent per ``(issue, sha)``: the same
-    merge re-harvested upserts in place rather than duplicating.
+    For each merged issue: fetch its unified diff via ``fetch_diff(pr_url)``
+    (matching ``gh_issues.pr_diff(pr_url, repo)`` — forge-loop's githubkit path;
+    the gh CLI is deliberately not used), distil a
+    :class:`~forge_loop.skill_librarian.SkillCard` via the injected ``call_llm``
+    librarian, and record it as a procedural skill tagged with its ``area:`` path
+    and stamped with ``pr:<url>`` provenance. Outcomes without a PR URL, with an
+    empty diff, or whose distillation fails to parse are skipped — only a real,
+    proven recipe is harvested. Idempotent per PR URL: the same merge re-harvested
+    upserts in place rather than duplicating.
 
     Both I/O concerns (the diff fetch and the model call) are injected, so the
-    harvest control flow is fully unit-testable without git or the SDK. Returns
-    one :class:`HarvestedSkill` per recorded card so the caller can emit events.
+    harvest control flow is fully unit-testable without the network. Returns one
+    :class:`HarvestedSkill` per recorded card so the caller can emit events.
     """
     from forge_loop.skill_librarian import distill_skill_from_merge
 
     harvested: list[HarvestedSkill] = []
-    seen: set[int] = set()
+    seen: set[str] = set()
     for record in merged:
         coerced = _coerce_issue(record)
         if coerced is None:
             continue
-        n, title, _pr = coerced
-        if n in seen:
+        n, title, pr_url = coerced
+        if not pr_url or pr_url in seen:
             continue
-        seen.add(n)
+        seen.add(pr_url)
 
-        diff, sha = fetch_diff(n)
+        diff = fetch_diff(pr_url)
         if not diff.strip():
             continue
         card = distill_skill_from_merge(
@@ -426,10 +428,10 @@ def harvest_skills_from_merge(
             target=card.target,
             title=card_title,
             body=card.to_body(),
-            source_key=f"harvest:{n}:{sha}",
+            source_key=f"harvest:{pr_url}",
             source_task_ref=f"issue:#{n}",
             extra_tags=(area_tag(card.area),) if card.area.strip() else (),
-            evidence_refs=(f"commit:{sha}",),
+            evidence_refs=(f"pr:{pr_url}",),
             confidence=card.confidence,
             now=now,
         )
@@ -439,7 +441,7 @@ def harvest_skills_from_merge(
                 issue=n,
                 area=card.area,
                 skill_key=skill_key,
-                sha=sha,
+                pr_url=pr_url,
                 confidence=card.confidence,
                 title=card_title,
             )

@@ -454,7 +454,7 @@ class SkillHarvestedEvent(EventBase):
     area: str = ""
     skill_key: str = ""
     memory_id: str = ""
-    sha: str = ""
+    pr: str = ""
     confidence: float = Field(ge=0.0, le=1.0, default=1.0)
 
 
