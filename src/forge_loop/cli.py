@@ -290,6 +290,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _cmd_audit,
     _cmd_research_add,
     _cmd_memory_list,
+    _cmd_memory_skills,
     _cmd_manifesto_suggest,
     _cmd_record_session,
     _cmd_retry,
@@ -321,6 +322,7 @@ def _make_cmd(name: str) -> Callable[[SimpleNamespace], int]:
     _make_cmd("audit"),
     _make_cmd("research_add"),
     _make_cmd("memory_list"),
+    _make_cmd("memory_skills"),
     _make_cmd("manifesto_suggest"),
     _make_cmd("record_session"),
     _make_cmd("retry"),
@@ -579,6 +581,17 @@ def cmd_memory_list(
     ),
 ) -> None:
     _exit(_cmd_memory_list(SimpleNamespace(kind=kind, tag=tag)))
+
+
+@memory_app.command(
+    "skills",
+    help=(
+        "Read-only: print the learned skill-tree inventory — leaf recipes, "
+        "internal nodes, expired cards, and the per-area distribution (#458)."
+    ),
+)
+def cmd_memory_skills() -> None:
+    _exit(_cmd_memory_skills(SimpleNamespace()))
 
 
 @app.command("record-session", help="Record a real SDK session to a JSONL fixture.")

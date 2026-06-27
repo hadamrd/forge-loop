@@ -790,6 +790,48 @@ class ProductCommandsMixin:
             f"source={_format_memory_source(prov)}"
         )
 
+    def _cmd_memory_skills(self, args: SimpleNamespace) -> int:
+        """`forge-loop memory skills` — read-only skill-tree inventory (#458).
+
+        Surfaces the learned procedural skill cards — leaf recipes and the
+        internal nodes distilled over them — plus the per-area distribution, so
+        an operator can see at a glance whether the skill tree is auto-
+        maintaining. Strictly read-only (calls only ``compute_skill_inventory``
+        over ``list_active``). Store absent/unreadable → fail soft (exit 1),
+        mirroring ``memory list``.
+        """
+        from forge_loop.settings import ConfigError
+        from forge_loop.skill_stats import compute_skill_inventory
+
+        repo_path = Path.cwd()
+        try:
+            cfg = self.load()
+            repo_path = Path(cfg.repo).resolve() if getattr(cfg, "repo", None) else repo_path
+        except ConfigError as exc:
+            _log.warning(
+                "memory_skills: config load failed; using cwd",
+                repo_path=str(repo_path),
+                error=str(exc),
+            )
+
+        try:
+            store = self.memory_store_factory(repo_path)
+            inv = compute_skill_inventory(store)
+        except Exception as exc:  # noqa: BLE001 — clear operator-facing failure, no traceback
+            typer.echo(f"memory skills: memory store unavailable: {exc}", err=True)
+            return 1
+
+        typer.echo(
+            f"skill tree: {inv.leaves} leaves + {inv.nodes} internal nodes ({inv.expired} expired)"
+        )
+        if inv.areas:
+            typer.echo("by area:")
+            for area, count in sorted(inv.areas.items(), key=lambda kv: (-kv[1], kv[0])):
+                typer.echo(f"  {count:3d}  {area}")
+        else:
+            typer.echo("  (no skills harvested yet)")
+        return 0
+
     def _cmd_audit(self, args: SimpleNamespace) -> int:
         """`forge-loop audit` — codebase-state audit (issue #156).
 
