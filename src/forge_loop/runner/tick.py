@@ -172,6 +172,64 @@ def _record_merged_memory(
     except Exception as ex_:  # noqa: BLE001 — best-effort, must not break tick
         append_event(cfg.events_file, "memory_promote_failed", err=str(ex_)[:200])
 
+    _harvest_merged_skills(cfg, merged)
+
+
+def _merged_pr_diff(cfg: Config, issue_n: int) -> tuple[str, str]:
+    """Fetch a merged PR's diff + merge-commit SHA for an issue via ``gh``."""
+    import subprocess
+
+    diff_cmd = ["gh", "pr", "diff", str(issue_n)]
+    sha_cmd = ["gh", "pr", "view", str(issue_n), "--json", "mergeCommit", "-q", ".mergeCommit.oid"]
+    if cfg.github_repo:
+        diff_cmd += ["-R", cfg.github_repo]
+        sha_cmd += ["-R", cfg.github_repo]
+    diff = subprocess.run(diff_cmd, capture_output=True, text=True, timeout=60, cwd=cfg.repo)
+    sha = subprocess.run(sha_cmd, capture_output=True, text=True, timeout=30, cwd=cfg.repo)
+    return diff.stdout, sha.stdout.strip()
+
+
+def _harvest_merged_skills(cfg: Config, merged: list[WorkerOutcome]) -> None:
+    """Best-effort: distil + record one procedural skill card per merged PR.
+
+    Isolated from :func:`_record_merged_memory`'s episodic write and broadly
+    wrapped: a librarian/``gh`` failure emits ``skill_harvest_failed`` and never
+    breaks the tick. Gated by ``misc.skill_tree_harvest`` (env
+    ``FORGE_SKILL_TREE_HARVEST``); on by default.
+    """
+    from forge_loop.settings import get_settings
+
+    if not merged or not get_settings().misc.skill_tree_harvest:
+        return
+    try:
+        from forge_loop.control.boot import canonical_task_saga_path
+        from forge_loop.events import SkillHarvestedEvent, emit
+        from forge_loop.memory.store import SqliteMemoryStore
+        from forge_loop.runner.learning import harvest_skills_from_merge
+        from forge_loop.skill_librarian import default_librarian
+
+        store = SqliteMemoryStore(canonical_task_saga_path(cfg.repo).parent / "memory.db")
+        harvested = harvest_skills_from_merge(
+            store,
+            merged,
+            fetch_diff=lambda issue_n: _merged_pr_diff(cfg, issue_n),
+            call_llm=default_librarian(cwd=cfg.repo),
+        )
+        for skill in harvested:
+            emit(
+                cfg.events_file,
+                SkillHarvestedEvent(
+                    issue=skill.issue,
+                    area=skill.area,
+                    skill_key=skill.skill_key,
+                    memory_id=skill.memory_id,
+                    sha=skill.sha,
+                    confidence=skill.confidence,
+                ),
+            )
+    except Exception as ex_:  # noqa: BLE001 — best-effort, must not break tick
+        append_event(cfg.events_file, "skill_harvest_failed", err=str(ex_)[:200])
+
 
 # Issue #267 (safety): the affirmative critic verdict token that — and ONLY
 # which — clears a PR for auto-merge. Any other token (changes_requested,

@@ -445,6 +445,53 @@ class WorkerPolicyEnforcedEvent(EventBase):
     withheld_secrets: list[str] = Field(default_factory=list)
 
 
+@register_event
+class SkillHarvestedEvent(EventBase):
+    """A procedural skill card was distilled from a critic-clean merge."""
+
+    KIND: ClassVar[str] = "skill_harvested"
+    issue: int = Field(ge=1)
+    area: str = ""
+    skill_key: str = ""
+    memory_id: str = ""
+    sha: str = ""
+    confidence: float = Field(ge=0.0, le=1.0, default=1.0)
+
+
+@register_event
+class SkillInjectedEvent(EventBase):
+    """A skill card was retrieved and injected into a worker brief.
+
+    ``rank`` is its position in the retrieval ranking (0 = best match) so the
+    measurement track can correlate which cards actually drove a cheaper run.
+    """
+
+    KIND: ClassVar[str] = "skill_injected"
+    issue: int = Field(ge=1)
+    memory_id: str = ""
+    area: str = ""
+    rank: int = Field(ge=0, default=0)
+
+
+@register_event
+class SkillPromotedEvent(EventBase):
+    """Leaves under an area were generalised into an internal-node card."""
+
+    KIND: ClassVar[str] = "skill_promoted"
+    area: str = ""
+    memory_id: str = ""
+    leaf_count: int = Field(ge=1, default=1)
+
+
+@register_event
+class SkillExpiredEvent(EventBase):
+    """A stale skill card was superseded/retired (its proof SHA aged out)."""
+
+    KIND: ClassVar[str] = "skill_expired"
+    memory_id: str = ""
+    reason: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Emit + back-compat shim. ``emit`` is the typed path; ``append_event_with_
 # registry_check`` is the back-compat wrapper called by state.append_event.

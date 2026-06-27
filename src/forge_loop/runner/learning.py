@@ -24,7 +24,8 @@ maestro rebuilding its working set from ``list_active`` never sees a stale
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from forge_loop.eventlog.models import EventRef
@@ -32,6 +33,7 @@ from forge_loop.memory.models import (
     MemoryItem,
     MemoryKind,
     MemoryProvenance,
+    area_tag,
     derive_memory_id,
     derive_skill_key,
     skill_tag,
@@ -39,6 +41,8 @@ from forge_loop.memory.models import (
 from forge_loop.memory.store import MemoryStore
 
 __all__ = [
+    "HarvestedSkill",
+    "harvest_skills_from_merge",
     "record_failed_outcomes",
     "record_merged_outcomes",
     "record_procedural_skill",
@@ -121,6 +125,9 @@ def record_procedural_skill(
     authored_by: str = "maestro",
     source_task_ref: str | None = None,
     source_event: EventRef | None = None,
+    extra_tags: tuple[str, ...] = (),
+    evidence_refs: tuple[str, ...] = (),
+    confidence: float = 1.0,
     now: datetime | None = None,
 ) -> str:
     """Record a validated repair as a PROCEDURAL skill, superseding any prior.
@@ -187,11 +194,12 @@ def record_procedural_skill(
             source_event=source_event,
             authored_by=authored_by,
             source_task_ref=source_task_ref,
-            confidence=1.0,
+            confidence=confidence,
             created_at=created_at,
             supersedes=tuple(old.memory_id for old in prior),
+            evidence_refs=evidence_refs,
         ),
-        tags=(tag,),
+        tags=(tag, *extra_tags),
     )
     # Persist the replacement first, THEN supersede — see docstring.
     memory_store.put(item)
@@ -351,3 +359,90 @@ def record_merged_outcomes(
             memory_store.supersede(failure_id, by_memory_id=memory_id)
 
     return tuple(promoted)
+
+
+@dataclass(frozen=True)
+class HarvestedSkill:
+    """Descriptor of one skill harvested from a merge — enough to emit an event."""
+
+    memory_id: str
+    issue: int
+    area: str
+    skill_key: str
+    sha: str
+    confidence: float
+    title: str
+
+
+def harvest_skills_from_merge(
+    memory_store: MemoryStore,
+    merged: Iterable[object],
+    *,
+    fetch_diff: Callable[[int], tuple[str, str]],
+    call_llm: Callable[[str], str],
+    now: datetime | None = None,
+) -> tuple[HarvestedSkill, ...]:
+    """Distil and record one PROCEDURAL skill card per merged outcome.
+
+    For each merged issue: fetch its diff + merged SHA via ``fetch_diff(issue)``,
+    distil a :class:`~forge_loop.skill_librarian.SkillCard` via the injected
+    ``call_llm`` librarian, and record it as a procedural skill tagged with its
+    ``area:`` path and stamped with ``commit:<sha>`` provenance. Outcomes whose
+    diff is empty, or whose distillation fails to parse, are skipped — only a
+    real, proven recipe is harvested. Idempotent per ``(issue, sha)``: the same
+    merge re-harvested upserts in place rather than duplicating.
+
+    Both I/O concerns (the diff fetch and the model call) are injected, so the
+    harvest control flow is fully unit-testable without git or the SDK. Returns
+    one :class:`HarvestedSkill` per recorded card so the caller can emit events.
+    """
+    from forge_loop.skill_librarian import distill_skill_from_merge
+
+    harvested: list[HarvestedSkill] = []
+    seen: set[int] = set()
+    for record in merged:
+        coerced = _coerce_issue(record)
+        if coerced is None:
+            continue
+        n, title, _pr = coerced
+        if n in seen:
+            continue
+        seen.add(n)
+
+        diff, sha = fetch_diff(n)
+        if not diff.strip():
+            continue
+        card = distill_skill_from_merge(
+            diff=diff, issue_title=title, acceptance="", call_llm=call_llm
+        )
+        if card is None:
+            continue
+
+        skill_key = derive_skill_key(card.failing_signal, card.target)
+        card_title = f"{card.area}: {card.trigger}" if card.area else card.trigger
+        memory_id = record_procedural_skill(
+            memory_store,
+            failing_signal=card.failing_signal,
+            target=card.target,
+            title=card_title,
+            body=card.to_body(),
+            source_key=f"harvest:{n}:{sha}",
+            source_task_ref=f"issue:#{n}",
+            extra_tags=(area_tag(card.area),) if card.area.strip() else (),
+            evidence_refs=(f"commit:{sha}",),
+            confidence=card.confidence,
+            now=now,
+        )
+        harvested.append(
+            HarvestedSkill(
+                memory_id=memory_id,
+                issue=n,
+                area=card.area,
+                skill_key=skill_key,
+                sha=sha,
+                confidence=card.confidence,
+                title=card_title,
+            )
+        )
+
+    return tuple(harvested)

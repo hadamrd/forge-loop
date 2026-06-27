@@ -416,6 +416,31 @@ def run_worker(
     manifesto_bundle = load_manifestos(repo)
     manifesto_sha = manifesto_bundle.sha_payload() if manifesto_bundle.any_present else None
 
+    # Skill-tree (issue #458): retrieve learned procedural skills relevant to
+    # this issue so make_brief can inject them. Best-effort — a missing store or
+    # a retrieval error degrades to no skill section. Retrieval is cheap + local
+    # (a SQLite read), so it is always on; the expensive harvest half is gated by
+    # ``misc.skill_tree_harvest``. ``skill_hits`` drives skill_injected events.
+    skill_store = None
+    skill_hits: tuple[Any, ...] = ()
+    if brief_override is None:
+        try:
+            from forge_loop.memory import memory_db_path
+            from forge_loop.memory.skills import retrieve_skills_for
+            from forge_loop.memory.store import SqliteMemoryStore
+
+            _skill_db = memory_db_path(repo)
+            if _skill_db.exists():
+                skill_store = SqliteMemoryStore(_skill_db)
+                skill_hits = retrieve_skills_for(
+                    skill_store,
+                    f"{issue.get('title', '')} {issue.get('body', '') or ''}",
+                    k=3,
+                )
+        except Exception:  # noqa: BLE001 — best-effort; degrade to no skills
+            skill_store = None
+            skill_hits = ()
+
     # Iteration loop (issue #78) passes a focused follow-up brief that
     # short-circuits ``make_brief`` — the follow-up session reuses the same
     # worktree + branch and just gets told "your ONLY job is X".
@@ -439,7 +464,27 @@ def run_worker(
             capability_policy=capability_policy,
             verify_commands=verify_commands,
             scope_soft_loc_cap=scope_soft_loc_cap,
+            memory_store=skill_store,
         )
+
+    if skill_hits and events_file is not None:
+        import contextlib
+
+        from forge_loop.events import SkillInjectedEvent
+        from forge_loop.events import emit as _emit_skill
+        from forge_loop.memory.models import area_from_tags
+
+        for _rank, _hit in enumerate(skill_hits):
+            with contextlib.suppress(Exception):  # telemetry is best-effort
+                _emit_skill(
+                    events_file,
+                    SkillInjectedEvent(
+                        issue=n,
+                        memory_id=_hit.memory_id,
+                        area=area_from_tags(_hit.tags),
+                        rank=_rank,
+                    ),
+                )
 
     # Maestro advisory context (frontier + memory) rides on top of the brief.
     # Prepended here — downstream of fingerprint/template-hash computation — so

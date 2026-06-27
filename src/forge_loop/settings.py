@@ -493,6 +493,11 @@ class MiscSettings(BaseSettings):
     queue_url: str | None = None
     # Legacy FORGE_LOOP_EXPERIMENTAL — extras gate.
     experimental_enabled: bool = False
+    # FORGE_SKILL_TREE_HARVEST — distil a procedural skill card from each
+    # critic-clean merge (issue #458). On by default; off disables the LLM
+    # librarian call per merge (retrieval/injection are unaffected — those are
+    # cheap and local).
+    skill_tree_harvest: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +706,7 @@ ENV_MAP: tuple[tuple[str, str, Any], ...] = (
     ("LOOP_MCP_CAP_DEFAULT", "misc.mcp_cap_default", int),
     ("LOOP_QUEUE_URL", "misc.queue_url", str),
     ("FORGE_LOOP_EXPERIMENTAL", "misc.experimental_enabled", _coerce_bool),
+    ("FORGE_SKILL_TREE_HARVEST", "misc.skill_tree_harvest", _coerce_bool),
 )
 
 
