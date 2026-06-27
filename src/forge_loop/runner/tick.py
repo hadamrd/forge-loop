@@ -175,33 +175,22 @@ def _record_merged_memory(
     _harvest_merged_skills(cfg, merged)
 
 
-def _merged_pr_diff(cfg: Config, issue_n: int) -> tuple[str, str]:
-    """Fetch a merged PR's diff + merge-commit SHA for an issue via ``gh``."""
-    import subprocess
-
-    diff_cmd = ["gh", "pr", "diff", str(issue_n)]
-    sha_cmd = ["gh", "pr", "view", str(issue_n), "--json", "mergeCommit", "-q", ".mergeCommit.oid"]
-    if cfg.github_repo:
-        diff_cmd += ["-R", cfg.github_repo]
-        sha_cmd += ["-R", cfg.github_repo]
-    diff = subprocess.run(diff_cmd, capture_output=True, text=True, timeout=60, cwd=cfg.repo)
-    sha = subprocess.run(sha_cmd, capture_output=True, text=True, timeout=30, cwd=cfg.repo)
-    return diff.stdout, sha.stdout.strip()
-
-
 def _harvest_merged_skills(cfg: Config, merged: list[WorkerOutcome]) -> None:
     """Best-effort: distil + record one procedural skill card per merged PR.
 
     Isolated from :func:`_record_merged_memory`'s episodic write and broadly
-    wrapped: a librarian/``gh`` failure emits ``skill_harvest_failed`` and never
-    breaks the tick. Gated by ``misc.skill_tree_harvest`` (env
-    ``FORGE_SKILL_TREE_HARVEST``); on by default.
+    wrapped: a librarian/diff-fetch failure emits ``skill_harvest_failed`` and
+    never breaks the tick. Gated by ``misc.skill_tree_harvest`` (env
+    ``FORGE_SKILL_TREE_HARVEST``); on by default. The diff is fetched through
+    forge-loop's githubkit client (``gh_issues.pr_diff``) — the gh CLI is
+    deliberately not used and a loop ``GH_TOKEN`` would break it.
     """
     from forge_loop.settings import get_settings
 
     if not merged or not get_settings().misc.skill_tree_harvest:
         return
     try:
+        from forge_loop import gh_issues
         from forge_loop.control.boot import canonical_task_saga_path
         from forge_loop.events import SkillHarvestedEvent, emit
         from forge_loop.memory.store import SqliteMemoryStore
@@ -212,7 +201,7 @@ def _harvest_merged_skills(cfg: Config, merged: list[WorkerOutcome]) -> None:
         harvested = harvest_skills_from_merge(
             store,
             merged,
-            fetch_diff=lambda issue_n: _merged_pr_diff(cfg, issue_n),
+            fetch_diff=lambda pr_url: gh_issues.pr_diff(pr_url, cfg.github_repo or ""),
             call_llm=default_librarian(cwd=cfg.repo),
         )
         for skill in harvested:
@@ -223,7 +212,7 @@ def _harvest_merged_skills(cfg: Config, merged: list[WorkerOutcome]) -> None:
                     area=skill.area,
                     skill_key=skill.skill_key,
                     memory_id=skill.memory_id,
-                    sha=skill.sha,
+                    pr=skill.pr_url,
                     confidence=skill.confidence,
                 ),
             )

@@ -19,7 +19,7 @@ def test_skill_harvested_registered_and_roundtrips() -> None:
         area="pulsar-node/http-route",
         skill_key="k",
         memory_id="m",
-        sha="s",
+        pr="https://github.com/o/r/pull/9",
         confidence=0.9,
     )
     rec = ev.to_record()
@@ -31,7 +31,7 @@ def test_skill_harvested_registered_and_roundtrips() -> None:
 
 def test_skill_harvested_rejects_out_of_range_confidence() -> None:
     with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
-        SkillHarvestedEvent(issue=1, area="a", skill_key="k", memory_id="m", sha="s", confidence=5)
+        SkillHarvestedEvent(issue=1, area="a", skill_key="k", memory_id="m", pr="p", confidence=5)
 
 
 def test_skill_injected_carries_rank_and_kind() -> None:
