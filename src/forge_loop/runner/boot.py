@@ -237,7 +237,12 @@ def _install_signal_handlers(cfg: Config, state: RunnerState | None = None) -> N
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGUSR1, _pause_toggle)
+    # ☠ SIGUSR1 IS POSIX-ONLY. On Windows `signal.SIGUSR1` does not exist, so this raised
+    # AttributeError during boot and the runner could not start AT ALL — a pause CONVENIENCE taking
+    # down the whole loop on an entire platform. Pause/resume still works there: `_short_sleep`
+    # already polls `cfg.pause_file`, which is the touchfile this handler merely toggles.
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, _pause_toggle)
 
 
 def _short_sleep(seconds: int, cfg: Config, state: RunnerState | None = None) -> None:

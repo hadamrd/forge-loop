@@ -6,14 +6,17 @@ import re
 from typing import Any
 
 from forge_loop.config import Config
+from forge_loop.critic import count_prior_critic_rounds
 from forge_loop.gh_issues import (
     CRITIC_BLOCK_LABELS,
     fetch_issue,
+    label,
     open_prs,
     pr_review_context,
     prs_by_label,
     prs_requiring_repair,
 )
+from forge_loop.runner.critic_flow import NEEDS_REVIEW_LABEL
 from forge_loop.state import append_event
 from forge_loop.worker import WorkerOutcome
 
@@ -93,6 +96,37 @@ def blocking_pr_repairs(
                 reason="source_issue_not_found",
             )
             continue
+        # ☠ ROUND CAP — the loop must CONVERGE, not grind.
+        #
+        # Repair ticks run their workers SYNCHRONOUSLY (dispatch collects fut.result() inside the
+        # executor), so a PR that never converges holds the WHOLE loop for a worker_timeout_s per
+        # round and no new issue is dispatched meanwhile. Measured: two PRs consumed an entire day
+        # at 17-44 min a round while the backlog sat untouched.
+        #
+        # `block_on_spec` covers the case where the critic RECOGNISES the issue is at fault. This cap
+        # covers the case where it does NOT — a wrong-but-confident sev1 repeated forever. After
+        # `max_repair_rounds` the PR stops being selected, is labelled for a human, and the loop moves
+        # on. The PR is NOT closed and the branch is NOT touched: the work stays intact and a human
+        # can resume it. Lost throughput is recoverable; lost work is not.
+        max_rounds = getattr(cfg.critic, "max_repair_rounds", 0)
+        if max_rounds:
+            rounds = count_prior_critic_rounds(issue_num, cfg.logs_dir)
+            if rounds >= max_rounds:
+                append_event(
+                    cfg.events_file,
+                    "repair_round_cap_reached",
+                    pr=pr.get("url"),
+                    issue=issue_num,
+                    rounds=rounds,
+                    cap=max_rounds,
+                    reason="not converging — parked for a human so the loop can dispatch new work",
+                )
+                try:
+                    label(issue_num, [NEEDS_REVIEW_LABEL], repo=cfg.github_repo)
+                except Exception:  # noqa: BLE001 — labelling must never break the tick
+                    pass
+                continue
+
         issue = fetch_issue_fn(issue_num, repo=cfg.github_repo)
         if not issue:
             append_event(

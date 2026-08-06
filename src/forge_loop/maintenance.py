@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -77,6 +78,32 @@ class MaintenanceOutcome:
     stdout_tail: str
 
 
+
+
+def _claude_executable() -> str | None:
+    """Locate the `claude` CLI, or None.
+
+    ☠ A BARE "claude" IS NOT ENOUGH. The agent SDK ships its own claude binary and the workers use
+    that one, so a machine can run workers perfectly while having no `claude` on PATH — which is
+    exactly the state that crashed this runner every 5th tick. Prefer PATH, then the bundled binary
+    the SDK already uses.
+    """
+    found = shutil.which("claude")
+    if found:
+        return found
+    try:
+        import claude_agent_sdk
+
+        bundled = Path(claude_agent_sdk.__file__).parent / "_bundled"
+        for name in ("claude.exe", "claude"):
+            candidate = bundled / name
+            if candidate.exists():
+                return str(candidate)
+    except Exception:  # noqa: BLE001 — resolution must never raise
+        pass
+    return None
+
+
 def run_maintenance(
     repo: Path,
     logs_dir: Path,
@@ -89,11 +116,24 @@ def run_maintenance(
     log_path = logs_dir / f"maintenance-{int(time.time())}.log"
     started = time.time()
 
+    # ☠ MAINTENANCE MUST NEVER TAKE THE RUNNER DOWN. It is a periodic nicety; the loop's job is to
+    # dispatch work. Before this guard a missing `claude` raised FileNotFoundError straight out of
+    # run_maintenance and killed the whole process every `maintenance_every_n_ticks` ticks — the same
+    # class of bug as the POSIX-only SIGUSR1 handler: an optional feature ending the service.
+    exe = _claude_executable()
+    if exe is None:
+        return MaintenanceOutcome(
+            duration_s=0.0,
+            acted_on=0, added_ready=[], closed_dupes=[], retitled=[],
+            raw={"error": "no claude CLI on PATH and none bundled with claude_agent_sdk"},
+            stdout_tail="(maintenance skipped: claude CLI not found)",
+        )
+
     try:
         with open(log_path, "wb") as logf:
             subprocess.run(
                 [
-                    "claude", "-p", brief,
+                    exe, "-p", brief,
                     "--max-turns", "30",
                     "--allow-dangerously-skip-permissions",
                     "--add-dir", str(repo),
@@ -106,6 +146,15 @@ def run_maintenance(
                 timeout=timeout_s,
                 env=_subagent_env(),
             )
+    except (FileNotFoundError, OSError) as exc:
+        # The resolver said it existed; the spawn still failed (deleted, not executable, bad perms).
+        # Degrade — never let a maintenance nicety end the runner.
+        return MaintenanceOutcome(
+            duration_s=time.time() - started,
+            acted_on=0, added_ready=[], closed_dupes=[], retitled=[],
+            raw={"error": f"maintenance spawn failed: {type(exc).__name__}: {exc}"},
+            stdout_tail="(maintenance spawn failed)",
+        )
     except subprocess.TimeoutExpired:
         return MaintenanceOutcome(
             duration_s=time.time() - started,
