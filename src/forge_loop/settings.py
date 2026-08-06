@@ -35,7 +35,14 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Recognised Claude model aliases — same as the legacy loader.
-_MODEL_PATTERN = re.compile(r"^claude-(opus|sonnet|haiku)-\d+-\d+(-[a-z0-9.-]+)?$")
+# ☠ THE MINOR VERSION IS OPTIONAL, and the family list is not closed. The old pattern demanded
+# ``claude-<family>-<major>-<minor>`` with BOTH numbers, so it could not express the Claude 5
+# family at all (claude-opus-5, claude-sonnet-5) and rejected a valid config at startup with
+# "unknown model alias" — which reads as a typo rather than as a stale validator. A validator that
+# refuses the current generation of the thing it validates is worse than no validator: it blocks
+# the correct value and points the operator at the wrong file.
+# Accepts: claude-opus-5, claude-sonnet-5, claude-opus-4-8, claude-haiku-4-5-20251001.
+_MODEL_PATTERN = re.compile(r"^claude-(opus|sonnet|haiku|fable)-\d+(-\d+)?(-[a-z0-9.-]+)?$")
 _CODEX_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _AGENT_PROVIDERS = frozenset({"claude", "codex"})
 _THINKING_VALUES = frozenset({"off", "low", "medium", "high"})
