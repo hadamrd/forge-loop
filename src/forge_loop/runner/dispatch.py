@@ -190,7 +190,18 @@ def reserved_new_work_slots(
     """
     if repairs_pending <= 0 or ready_count <= 0 or reserve <= 0:
         return 0
-    return max(0, min(reserve, parallel - 1))
+    # ☠ USE EVERY GENUINELY FREE SLOT, not a constant 1.
+    #
+    # `reserve` is a FLOOR (never starve new work), never a ceiling. The old
+    # `min(reserve, parallel - 1)` capped new dispatch at ONE issue whenever any repair
+    # was in flight — so raising `parallel` bought nothing and the extra workers idled
+    # while the backlog waited. Repairs keep exactly the slots they are actually using
+    # (`repairs_pending`); everything left over goes to new work.
+    #
+    # Measured: with parallel=2 and one repair, one ready issue was dispatched and the
+    # second slot sat empty for the whole tick.
+    free = parallel - repairs_pending
+    return max(0, min(max(reserve, free), parallel - 1))
 
 
 def _branch_for_issue(issue: dict[str, Any]) -> str:

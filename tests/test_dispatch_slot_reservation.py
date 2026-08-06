@@ -80,8 +80,13 @@ def test_reserved_count_always_within_zero_to_parallel_minus_one(parallel: int) 
     slot, and the count is never negative."""
     reserved = reserved_new_work_slots(parallel, repairs_pending=3, ready_count=3)
     assert 0 <= reserved <= max(0, parallel - 1)
-    # And specifically: with the default single-slot reserve it is min(1, p-1).
-    assert reserved == min(RESERVED_NEW_WORK_SLOTS, max(0, parallel - 1))
+    # ☠ CONTRACT CHANGED DELIBERATELY. `reserve` is a FLOOR, not a ceiling: new work takes
+    # every slot the repairs in flight are not using. The old assertion pinned
+    # min(RESERVED_NEW_WORK_SLOTS, p-1), which capped new dispatch at ONE issue whenever any
+    # repair ran — so raising `parallel` bought nothing and the extra workers idled while the
+    # backlog waited. Repairs keep exactly `repairs_pending`; the remainder goes to new work.
+    free = parallel - 3
+    assert reserved == max(0, min(max(RESERVED_NEW_WORK_SLOTS, free), max(0, parallel - 1)))
 
 
 def test_custom_reserve_is_clamped_to_parallel_minus_one() -> None:
