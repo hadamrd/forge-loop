@@ -43,6 +43,33 @@ means the findings were wasted work.
       check graded on runtime behaviour it cannot observe. The worker can build
       the right thing and still never satisfy it.
 
+  Q2b. IS IT A METHOD CRITERION OR AN OUTCOME CRITERION? ★ THE MOST COMMON DEFECT, AND THE
+      SUBTLEST. Split every criterion into what the DIFF controls and what the WORLD controls:
+
+        METHOD  — the work ran, it ran correctly, and it reported honestly. The harness executes;
+                  the operators match what they claim; the report's headline numbers describe the
+                  SAME run as its table; the walk used a sound oracle. ☠ BLOCK ON THESE. They are
+                  entirely within the author's control and they are where real defects live.
+
+        OUTCOME — what the work FOUND. How many survivors exist. How many places resolved. How much
+                  XP a quest paid. Whether a giver offered at level 1. These are properties of the
+                  SUBJECT, not of the diff. ☠ NEVER BLOCK ON THESE.
+
+      THE TELL: a criterion whose cost scales with what the work discovers — "every survivor is
+      strengthened or deleted", ">=8 of the 36 rows filled", "the run reaches level 5". The author
+      cannot bound that work when they write the PR, because the number is not known until the
+      instrument runs. Such a criterion offers exactly two outs: explode the scope, or be
+      non-compliant. Both are failures the diff did not cause.
+
+      THE CORRECTION — demand DISPOSITION AND HONESTY, never a disposition COUNT. Every finding must
+      carry a verdict and nothing may be silently dropped; "deferred, because it lives in a module
+      this PR does not touch" IS a legitimate verdict when it names the file and the reason. A PR that
+      reports 10 survivors, fixes 4 and defers 6 WITH REASONS is complete. A PR that reports 4 and
+      hides 6 is not — that is the defect worth blocking, and it is a method defect.
+
+      ☠ Do not confuse this with letting work slide. Sloppiness is still sloppiness: an unrun
+      harness, a wrong operator, a self-contradicting report, a dropped finding — all still block.
+
   Q3. DOES IT DEMAND DESTROYING EARNED WORK? A criterion that requires deleting,
       blanking or reverting a value that was obtained from an IRREVERSIBLE or
       EXPENSIVE act — a live run, a measurement, a manual walk, a paid API call
@@ -172,7 +199,7 @@ FINAL OUTPUT (one JSON line, no prose after it, no markdown fence)
     "ordered, minimal must-fix steps — the EXACT set that makes this PR mergeable. One string per blocking finding. Empty iff overall == approve. When overall == block_on_spec, these are steps for the HUMAN (split the issue / rescope criterion N / drop criterion M), NOT for the worker."
   ],
   "spec_defects": [
-    {{"kind": "unsatisfiable_in_one_pr|undecidable_by_deliverable|destroys_earned_work|environment",
+    {{"kind": "unsatisfiable_in_one_pr|undecidable_by_deliverable|outcome_not_method|destroys_earned_work|environment",
       "criterion": "the acceptance criterion, quoted verbatim from the issue",
       "why": "which of Q1/Q2/Q3 it fails and why no diff can satisfy it",
       "fix": "the concrete change to the ISSUE — split into two tickets, rescope to X, drop it, or grant access Y",

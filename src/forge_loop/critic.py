@@ -203,6 +203,11 @@ class SpecDefect:
     VALID_KINDS = (
         "unsatisfiable_in_one_pr",
         "undecidable_by_deliverable",
+        # ☠ The commonest and subtlest: the criterion constrains what the work FOUND (an outcome the
+        # SUBJECT determines) instead of how it ran and reported (a method the DIFF determines). Its
+        # tell is that its cost scales with discovery — "every survivor fixed", ">=8 rows filled".
+        # It leaves the author only scope explosion or non-compliance, neither caused by the diff.
+        "outcome_not_method",
         "destroys_earned_work",
         "environment",
     )
