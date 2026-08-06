@@ -182,6 +182,7 @@ class CriticSettings(BaseSettings):
     # Teaching-critic (Ch9): rounds after which sev3 nits are demoted to
     # non-blocking follow-ups. sev1/sev2 are never demoted. 0 disables.
     sev3_demotion_round_threshold: int = 3
+    max_repair_rounds: int = 4
 
     @field_validator("provider")
     @classmethod

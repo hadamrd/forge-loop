@@ -91,6 +91,13 @@ class CriticConfig:
     # so rounds are not burned on nits. sev1/sev2 are NEVER demoted — this is
     # triage, not standard erosion. ``0`` disables demotion entirely.
     sev3_demotion_round_threshold: int = 3
+    # ☠ HARD CONVERGENCE GUARANTEE. Repair ticks run their workers SYNCHRONOUSLY
+    # (dispatch.py collects fut.result() inside the executor), so ONE PR that never converges
+    # holds the whole loop for a worker_timeout_s at a time and no new issue is ever
+    # dispatched. Measured: two PRs consumed an entire day at 17-44 min per round while the
+    # backlog sat untouched. block_on_spec fixes the case where the critic RECOGNISES the
+    # issue is at fault; this cap covers the case where it does not. 0 disables.
+    max_repair_rounds: int = 4
 
 
 @dataclass(frozen=True)
@@ -328,6 +335,7 @@ def _from_settings(s: Settings) -> Config:
             thinking=s.critic.thinking,
             provider=s.critic.provider,
             sev3_demotion_round_threshold=s.critic.sev3_demotion_round_threshold,
+            max_repair_rounds=s.critic.max_repair_rounds,
         ),
         mutation_gate=MutationGateConfig(
             enabled=s.mutation_gate.enabled,
