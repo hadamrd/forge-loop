@@ -581,6 +581,7 @@ def run_repair_worker(
     logs_dir: Path,
     timeout_s: int,
     *,
+    base_branch: str = "main",
     emit: Callable[[str, dict[str, Any]], None] | None = None,
     lumen_top_k: int = 3,
     lumen_test_pattern: str = "**/*Test.*",
@@ -621,6 +622,9 @@ def run_repair_worker(
         repo,
         n,
         branch,
+        # Bring the PR branch forward onto the freshest base before the repair round runs, so a
+        # 5th-round worker is not still reasoning about the base its branch was cut from.
+        base_branch=base_branch,
         emit=emit,
         capability_policy=capability_policy,
         events_file=events_file,

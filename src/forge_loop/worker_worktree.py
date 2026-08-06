@@ -293,11 +293,73 @@ def prep_worktree(
     return wt, None
 
 
+
+def _sync_base_into_worktree(
+    repo: Path,
+    wt: Path,
+    base_branch: str,
+    branch: str,
+    issue: int,
+    emit: Callable[[str, dict[str, Any]], None] | None,
+) -> None:
+    """Merge the freshest ``origin/<base_branch>`` into an existing PR worktree.
+
+    Best-effort by design: a repair round on a stale base is worth running, a repair round on a
+    CONFLICTED tree is not. On conflict we abort and emit, leaving the worktree exactly as it was.
+    """
+
+    def _emit(kind: str, **kw: Any) -> None:
+        if emit is not None:
+            try:
+                emit(kind, {"issue": issue, "branch": branch, **kw})
+            except Exception:  # noqa: BLE001 — telemetry must never break dispatch
+                pass
+
+    remote_ref = f"refs/remotes/origin/{base_branch}"
+    subprocess.run(
+        ["git", "fetch", "--prune", "origin", f"+refs/heads/{base_branch}:{remote_ref}"],
+        cwd=repo,
+        capture_output=True,
+    )
+
+    behind = subprocess.run(
+        ["git", "rev-list", "--count", f"HEAD..origin/{base_branch}"],
+        cwd=wt,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        n_behind = int((behind.stdout or "0").strip())
+    except ValueError:
+        n_behind = 0
+    if n_behind == 0:
+        return  # already current — say nothing, this is the common case
+
+    merged = subprocess.run(
+        ["git", "merge", "--no-edit", f"origin/{base_branch}"],
+        cwd=wt,
+        capture_output=True,
+        text=True,
+    )
+    if merged.returncode == 0:
+        _emit("repair_base_synced", behind=n_behind, base=base_branch)
+        return
+
+    subprocess.run(["git", "merge", "--abort"], cwd=wt, capture_output=True)
+    _emit(
+        "repair_base_sync_conflict",
+        behind=n_behind,
+        base=base_branch,
+        detail=(merged.stdout or merged.stderr or "")[-400:],
+    )
+
+
 def prep_repair_worktree(
     repo: Path,
     issue: int,
     branch: str,
     *,
+    base_branch: str = "main",
     emit: Callable[[str, dict[str, Any]], None] | None = None,
     precommit_runner: PreCommitRunner | None = None,
     capability_policy: CapabilityPolicy | None = None,
@@ -322,6 +384,20 @@ def prep_repair_worktree(
         )
     if r.returncode != 0:
         return wt, r.stderr
+
+    # ☠ BRING THE BASE FORWARD. Without this a repair round works on the base the branch was CUT
+    # from, however long ago and however much has merged since. PR #161 reached its fifth round still
+    # sitting on an 08:00 base. The worker then reasons about, and is reviewed against, a repo that no
+    # longer exists — and git only ever warns about TEXTUAL conflicts, never about two workers having
+    # independently "fixed" the same thing in incompatible ways.
+    #
+    # Merge, do not rebase: the branch is already published as a PR, so rebasing would need a
+    # force-push and would invalidate the review history the critic's round counting depends on.
+    #
+    # A CONFLICT IS REPORTED, NEVER SWALLOWED. We abort back to a clean tree and hand the worker a
+    # warning: a half-merged worktree is a far worse starting point than a stale one.
+    _sync_base_into_worktree(repo, wt, base_branch, branch, issue, emit)
+
     if wt.exists():
         plant_worker_settings(wt, capability_policy, events_file=events_file)
         _install_and_emit_worker_precommit_hook(

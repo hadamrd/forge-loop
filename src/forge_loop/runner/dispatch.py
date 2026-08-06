@@ -873,6 +873,9 @@ def _run_repair_workers(
                 cfg.repo,
                 cfg.logs_dir,
                 cfg.worker_timeout_s,
+                # The repair worktree merges this forward before the round runs — a 5th-round
+                # worker must not still be sitting on the base its branch was cut from.
+                base_branch=cfg.base_branch,
                 emit=bus_emit,
                 lumen_top_k=cfg.lumen.top_k,
                 lumen_test_pattern=cfg.lumen_test_pattern,
