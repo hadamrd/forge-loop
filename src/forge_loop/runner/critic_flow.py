@@ -182,6 +182,44 @@ def handle_critic_verdict(
         )
         return "abandoned"
 
+    if overall == "block_on_spec":
+        # ☠ THE DEFECT IS IN THE ISSUE, NOT THE DIFF — so do NOT dispatch a revision. This is the
+        # branch that actually saves the wasted rounds: under the old three-verdict model an
+        # unsatisfiable acceptance criterion came back as request_changes, a worker was dispatched
+        # against something no diff can satisfy, it answered with more code, and the cycle repeated
+        # until a human noticed. Park the session for a human and say WHICH criterion is broken.
+        store.transition_to(
+            session_id, WorkerState.ABANDONED, reason="critic blocked on spec (issue defect)"
+        )
+        defects = list(getattr(report, "spec_defects", []) or [])
+        if pr_url:
+            _label_pr_best_effort(
+                gh,
+                pr_url,
+                NEEDS_REVIEW_LABEL,
+                repo=repo,
+                emit=emit,
+                event="critic_block_label_failed",
+                issue=sess.issue,
+            )
+        _emit_best_effort(
+            emit,
+            "critic_verdict_blocked_on_spec",
+            issue=sess.issue,
+            session_id=session_id,
+            pr=pr_url,
+            defects=[
+                {
+                    "kind": getattr(d, "kind", ""),
+                    "criterion": str(getattr(d, "criterion", ""))[:300],
+                    "fix": str(getattr(d, "fix", ""))[:300],
+                    "rounds_burned": getattr(d, "rounds_burned", 0),
+                }
+                for d in defects
+            ],
+        )
+        return "blocked_on_spec"
+
     if overall == "request_changes":
         new_count = store.increment_iterations(session_id)
         store.transition_to(session_id, WorkerState.REVISING, reason="critic requested changes")

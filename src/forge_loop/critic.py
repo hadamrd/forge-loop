@@ -54,7 +54,13 @@ _TRANSIENT_BACKOFF_S = 2.0
 # Shared by parse-failure retries and transient-SDK-error retries.
 _CRITIC_ATTEMPTS = 2
 
-VALID_OVERALL = {"approve", "request_changes", "block"}
+# ``block_on_spec`` is NOT a softer ``request_changes`` — it is a different ADDRESSEE.
+# request_changes asks the WORKER to change the diff; block_on_spec asks a HUMAN/PO to change
+# the ISSUE, and tells the worker to leave the diff alone. Without it the critic is required to
+# emit sev1 for a "missing acceptance criterion" and forbidden to demote it, so an UNSATISFIABLE
+# criterion blocks forever: the worker cannot edit the issue, so it answers with more code and
+# the cycle repeats. Measured on a live repo: 5 repair passes on one PR, ~2h with zero merges.
+VALID_OVERALL = {"approve", "request_changes", "block", "block_on_spec"}
 # The severity / category vocabulary lives in ``critic_format`` (the single
 # source of truth shared with the gh_issues thread classifier — #230). We alias
 # it here so existing call sites keep using ``VALID_SEVERITY`` / ``VALID_CATEGORY``
@@ -185,6 +191,27 @@ def deserialize_findings(rows: Any) -> list[Finding]:
 
 
 @dataclass
+class SpecDefect:
+    """A defect in the ISSUE that no diff can satisfy. Addressed to a human, not the worker."""
+
+    kind: str
+    criterion: str = ""
+    why: str = ""
+    fix: str = ""
+    rounds_burned: int = 0
+
+    VALID_KINDS = (
+        "unsatisfiable_in_one_pr",
+        "undecidable_by_deliverable",
+        "destroys_earned_work",
+        "environment",
+    )
+
+    def is_valid(self) -> bool:
+        return self.kind in self.VALID_KINDS and bool(self.criterion.strip())
+
+
+@dataclass
 class CriticReport:
     overall: str  # approve | request_changes | block
     findings: list[Finding] = field(default_factory=list)
@@ -200,6 +227,12 @@ class CriticReport:
     minimal_path_to_green: list[str] = field(default_factory=list)
     follow_ups: list[Finding] = field(default_factory=list)
     round_number: int = 0
+    # Non-empty IFF overall == "block_on_spec". Never carries diff defects.
+    spec_defects: list[SpecDefect] = field(default_factory=list)
+
+    def blocks_on_spec(self) -> bool:
+        """True when the ISSUE must change, not the diff — do NOT dispatch a repair worker."""
+        return self.overall == "block_on_spec"
 
     def severities(self) -> set[str]:
         return {f.severity for f in self.findings}
@@ -1125,6 +1158,34 @@ def _coerce_report(obj: dict[str, Any], raw: str) -> CriticReport | None:
             if f.is_valid():
                 follow_ups.append(f)
 
+    # ☠ PARSE THE SPEC DEFECTS. Without this the new verdict arrives with an empty payload and the
+    # runner cannot tell a human WHICH criterion is broken — which is the entire point of it.
+    spec_defects: list[SpecDefect] = []
+    for item in obj.get("spec_defects") or []:
+        if not isinstance(item, dict):
+            continue
+        rounds = item.get("rounds_burned", 0)
+        if isinstance(rounds, str) and rounds.isdigit():
+            rounds = int(rounds)
+        elif not isinstance(rounds, int):
+            rounds = 0
+        sd = SpecDefect(
+            kind=str(item.get("kind", "")),
+            criterion=str(item.get("criterion", "")),
+            why=str(item.get("why", "")),
+            fix=str(item.get("fix", "")),
+            rounds_burned=rounds,
+        )
+        if sd.is_valid():
+            spec_defects.append(sd)
+
+    # The verdict and its payload must agree or the runner routes to the wrong actor. Degrade
+    # rather than raise: an unusable block_on_spec is just an ordinary request_changes.
+    if overall == "block_on_spec" and not spec_defects:
+        overall = "request_changes"
+    elif overall != "block_on_spec" and spec_defects:
+        spec_defects = []
+
     return CriticReport(
         overall=overall,
         findings=findings,
@@ -1132,6 +1193,7 @@ def _coerce_report(obj: dict[str, Any], raw: str) -> CriticReport | None:
         raw=raw,
         minimal_path_to_green=minimal_path_to_green,
         follow_ups=follow_ups,
+        spec_defects=spec_defects,
     )
 
 
